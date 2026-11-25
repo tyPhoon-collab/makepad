@@ -74,6 +74,11 @@ pub(crate) fn find() -> Result<PathBuf, String> {
         std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().and_then(|dir| from_ancestors(dir, platform)))
+            .or_else(|| {
+                std::env::var_os("MAKEPAD_WM_ROOT")
+                    .map(PathBuf::from)
+                    .and_then(|root| from_ancestors(&root, platform))
+            })
             .or_else(|| from_ancestors(Path::new(env!("CARGO_MANIFEST_DIR")), platform))
             .ok_or_else(|| format!("No installed CEF distribution for {platform}. {hint}"))?
     };

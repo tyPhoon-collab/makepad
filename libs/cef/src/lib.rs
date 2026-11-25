@@ -239,9 +239,9 @@ mod native;
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 pub use native::{
     accelerated_paint_requested, background_color, bootstrap, do_message_loop_work, initialize,
-    is_initialized, initialization_error, prepare, set_application_dark_mode,
+    is_initialized, initialization_error, prepare, remote_debugging_port, set_application_dark_mode,
     set_background_color, shutdown, flush_profile, AcceleratedStats, Browser,
-    BrowserOptions, RenderMode,
+    BrowserOptions, DevToolsTargetRequest, RenderMode,
 };
 
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
@@ -265,6 +265,11 @@ pub struct AcceleratedStats {
     pub target_frames: u64,
     pub last_copy_width: usize,
     pub last_copy_height: usize,
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn remote_debugging_port() -> Option<u16> {
+    None
 }
 
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
@@ -293,7 +298,21 @@ pub struct BrowserOptions {
 pub struct Browser;
 
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub struct DevToolsTargetRequest;
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+impl DevToolsTargetRequest {
+    pub fn poll(&self) -> Option<Result<String>> {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 impl Browser {
+    pub fn request_devtools_target(&self) -> Result<DevToolsTargetRequest> {
+        Err(Error::new("CEF DevTools unavailable"))
+    }
+
     pub fn set_dark_mode(&mut self, _dark: bool) -> Result<()> {
         Ok(())
     }
@@ -398,6 +417,18 @@ impl Browser {
 
     pub fn ime_commit_text(&mut self, _text: &str) -> Result<()> {
         Ok(())
+    }
+
+    pub fn ime_set_composition(&mut self, _text: &str) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn ime_cancel_composition(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn ime_caret_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        None
     }
 
     pub fn take_frame(&mut self) -> Option<Frame> {

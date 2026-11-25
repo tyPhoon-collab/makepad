@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -445,6 +445,14 @@ struct SharedBrowserState {
     /// (`OnTextSelectionChanged`): what a copy or cut puts on the
     /// embedder's clipboard. Written and read on the thread that pumps CEF.
     selection: Mutex<String>,
+    ime_caret: Mutex<Option<(i32, i32, i32, i32)>>,
+}
+
+static REMOTE_DEBUGGING_PORT: AtomicU16 = AtomicU16::new(0);
+
+pub fn remote_debugging_port() -> Option<u16> {
+    let port = REMOTE_DEBUGGING_PORT.load(Ordering::Relaxed);
+    (port != 0).then_some(port)
 }
 
 /// Packets the queue to the embedder holds before the capture thread drops
@@ -628,6 +636,75 @@ struct DownloadImageCallback {
     state: Arc<SharedBrowserState>,
 }
 
+const TARGET_INFO_MESSAGE_ID: c_int = c_int::MAX;
+
+#[repr(C)]
+struct TargetInfoObserver {
+    cef_observer: ffi::cef_dev_tools_message_observer_t,
+    ref_count: AtomicUsize,
+    reply: SyncSender<Result<String>>,
+}
+
+/// A pending page-scoped `Target.getTargetInfo` request.
+pub struct DevToolsTargetRequest {
+    reply: Receiver<Result<String>>,
+    registration: Arc<AtomicUsize>,
+    started: Instant,
+}
+
+impl DevToolsTargetRequest {
+    pub fn poll(&self) -> Option<Result<String>> {
+        match self.reply.try_recv() {
+            Ok(reply) => Some(reply),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Some(Err(Error::new("CEF target request ended without a response")))
+            }
+            Err(_) if self.started.elapsed().as_secs() >= 3 => {
+                Some(Err(Error::new("CEF target request timed out")))
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+impl Drop for DevToolsTargetRequest {
+    fn drop(&mut self) {
+        let registration = self.registration.clone();
+        let _ = on_cef_thread(move || unsafe {
+            let registration = registration.swap(0, Ordering::AcqRel) as *mut ffi::cef_base_ref_counted_t;
+            if !registration.is_null() {
+                release_ref_counted(registration);
+            }
+        });
+    }
+}
+
+unsafe extern "system" fn target_info_result(
+    self_: *mut ffi::cef_dev_tools_message_observer_t,
+    browser: *mut ffi::cef_browser_t,
+    message_id: c_int,
+    success: c_int,
+    result: *const c_void,
+    result_size: usize,
+) {
+    release_param(browser);
+    if message_id != TARGET_INFO_MESSAGE_ID {
+        return;
+    }
+    let observer = &*self_.cast::<TargetInfoObserver>();
+    let result = if result.is_null() {
+        Err(Error::new("CEF returned no target information"))
+    } else {
+        let json = String::from_utf8_lossy(slice::from_raw_parts(result.cast(), result_size));
+        if success != 0 {
+            Ok(json.into_owned())
+        } else {
+            Err(Error::new(format!("CEF target lookup failed: {json}")))
+        }
+    };
+    let _ = observer.reply.try_send(result);
+}
+
 /// The `cef_base_ref_counted_t` vtable for a `#[repr(C)]` handler whose first
 /// field is the CEF struct. `$drop_hook` runs right before the box is freed.
 macro_rules! impl_ref_counted {
@@ -671,6 +748,14 @@ impl_ref_counted!(
     completion_release,
     completion_has_one_ref,
     completion_has_at_least_one_ref,
+    no_drop_hook
+);
+impl_ref_counted!(
+    TargetInfoObserver,
+    target_info_add_ref,
+    target_info_release,
+    target_info_has_one_ref,
+    target_info_has_at_least_one_ref,
     no_drop_hook
 );
 impl_ref_counted!(
@@ -1741,6 +1826,19 @@ fn ensure_initialized() -> Result<()> {
     let cache_path = CefString::new(&runtime.api, root_cache_path.to_string_lossy())?;
     let root_cache_path = CefString::new(&runtime.api, root_cache_path.to_string_lossy())?;
 
+    let debug_port: u16 = env::var("MAKEPAD_CEF_REMOTE_DEBUGGING_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|&p| p != 0)
+        .or_else(|| {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .ok()
+                .and_then(|l| l.local_addr().ok())
+                .map(|a| a.port())
+        })
+        .unwrap_or(0);
+    REMOTE_DEBUGGING_PORT.store(debug_port, Ordering::Relaxed);
+
     let mut settings = ffi::cef_settings_t {
         size: std::mem::size_of::<ffi::cef_settings_t>(),
         no_sandbox: 1,
@@ -1765,6 +1863,7 @@ fn ensure_initialized() -> Result<()> {
         javascript_flags: ffi::cef_string_t::default(),
         resources_dir_path,
         locales_dir_path,
+        remote_debugging_port: debug_port as c_int,
         ..Default::default()
     };
 
@@ -2844,6 +2943,18 @@ unsafe extern "system" fn app_on_before_command_line_processing(
     let Ok(runtime) = runtime() else {
         return;
     };
+    if process_type.is_null() || (*process_type).length == 0 {
+        if let (Ok(name), Ok(value)) = (
+            CefString::new(&runtime.api, "remote-allow-origins"),
+            CefString::new(&runtime.api, "*"),
+        ) {
+            let name_raw = name.raw();
+            let value_raw = value.raw();
+            if let Some(append_switch_with_value) = (*command_line).append_switch_with_value {
+                append_switch_with_value(command_line, &name_raw, &value_raw);
+            }
+        }
+    }
     #[cfg(target_os = "linux")]
     let _ = (runtime, process_type);
     #[cfg(target_os = "macos")]
@@ -4391,6 +4502,22 @@ impl DownloadImageCallback {
     }
 }
 
+unsafe extern "system" fn render_on_ime_composition_range_changed(
+    self_: *mut ffi::cef_render_handler_t,
+    browser: *mut ffi::cef_browser_t,
+    _selected_range: *const ffi::cef_range_t,
+    character_bounds_count: usize,
+    character_bounds: *const ffi::cef_rect_t,
+) {
+    release_param(browser);
+    if character_bounds_count > 0 && !character_bounds.is_null() {
+        let bounds = std::slice::from_raw_parts(character_bounds, character_bounds_count);
+        let r = bounds[bounds.len() - 1];
+        let render = &*(self_ as *mut RenderHandler);
+        *render.state.ime_caret.lock().unwrap() = Some((r.x, r.y, r.width, r.height));
+    }
+}
+
 unsafe extern "system" fn render_on_text_selection_changed(
     self_: *mut ffi::cef_render_handler_t,
     browser: *mut ffi::cef_browser_t,
@@ -4439,7 +4566,7 @@ impl RenderHandler {
                 start_dragging: None,
                 update_drag_cursor: None,
                 on_scroll_offset_changed: None,
-                on_ime_composition_range_changed: None,
+                on_ime_composition_range_changed: Some(render_on_ime_composition_range_changed),
                 on_text_selection_changed: Some(render_on_text_selection_changed),
                 on_virtual_keyboard_requested: Some(render_on_virtual_keyboard_requested),
             },
@@ -4568,6 +4695,54 @@ impl AppHandler {
 }
 
 impl Browser {
+    pub fn request_devtools_target(&self) -> Result<DevToolsTargetRequest> {
+        let (reply, rx) = sync_channel(1);
+        let request = DevToolsTargetRequest {
+            reply: rx,
+            registration: Arc::new(AtomicUsize::new(0)),
+            started: Instant::now(),
+        };
+        let registration = request.registration.clone();
+        self.with_host(move |host| unsafe {
+            let (Some(add), Some(send)) =
+                ((*host).add_dev_tools_message_observer, (*host).send_dev_tools_message)
+            else {
+                let _ = reply.try_send(Err(Error::new("CEF DevTools API unavailable")));
+                return Ok(());
+            };
+            let observer = Box::into_raw(Box::new(TargetInfoObserver {
+                cef_observer: ffi::cef_dev_tools_message_observer_t {
+                    base: ffi::cef_base_ref_counted_t {
+                        size: std::mem::size_of::<ffi::cef_dev_tools_message_observer_t>(),
+                        add_ref: Some(target_info_add_ref),
+                        release: Some(target_info_release),
+                        has_one_ref: Some(target_info_has_one_ref),
+                        has_at_least_one_ref: Some(target_info_has_at_least_one_ref),
+                    },
+                    on_dev_tools_message: None,
+                    on_dev_tools_method_result: Some(target_info_result),
+                    on_dev_tools_event: None,
+                    on_dev_tools_agent_attached: None,
+                    on_dev_tools_agent_detached: None,
+                },
+                ref_count: AtomicUsize::new(1),
+                reply: reply.clone(),
+            }));
+            let handle = add(host, &mut (*observer).cef_observer);
+            if handle.is_null() {
+                let _ = reply.try_send(Err(Error::new("CEF did not register the DevTools observer")));
+                return Ok(());
+            }
+            registration.store(handle as usize, Ordering::Release);
+            let message = format!(r#"{{"id":{TARGET_INFO_MESSAGE_ID},"method":"Target.getTargetInfo"}}"#);
+            if send(host, message.as_ptr().cast(), message.len()) == 0 {
+                let _ = reply.try_send(Err(Error::new("CEF rejected the DevTools target request")));
+            }
+            Ok(())
+        })?;
+        Ok(request)
+    }
+
     /// Select Chromium's native light/dark appearance for this profile.
     /// Offscreen pages also need their media environment updated: they have
     /// no native Chrome window to propagate the profile theme to Blink.
@@ -5343,6 +5518,41 @@ impl Browser {
                 host, &text.value, &no_replacement, 0);
             Ok(())
         })
+    }
+
+    pub fn ime_set_composition(&mut self, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return self.ime_cancel_composition();
+        }
+        let text = text.to_string();
+        self.with_host(move |host| unsafe {
+            let utf16_len = text.encode_utf16().count() as u32;
+            let text = CefString::new(&runtime()?.api, &text)?;
+            let underline = ffi::cef_composition_underline_t {
+                size: std::mem::size_of::<ffi::cef_composition_underline_t>(),
+                range: ffi::cef_range_t { from: 0, to: utf16_len },
+                color: 0xFF00_0000,
+                background_color: 0,
+                thick: 0,
+                style: ffi::CEF_CUS_SOLID,
+            };
+            let no_replacement = ffi::cef_range_t { from: u32::MAX, to: u32::MAX };
+            let selection = ffi::cef_range_t { from: utf16_len, to: utf16_len };
+            (*host).ime_set_composition.ok_or_else(|| Error::new("cef_browser_host_t::ime_set_composition missing"))?(
+                host, &text.value, 1, &underline, &no_replacement, &selection);
+            Ok(())
+        })
+    }
+
+    pub fn ime_cancel_composition(&mut self) -> Result<()> {
+        self.with_host(move |host| unsafe {
+            (*host).ime_cancel_composition.ok_or_else(|| Error::new("cef_browser_host_t::ime_cancel_composition missing"))?(host);
+            Ok(())
+        })
+    }
+
+    pub fn ime_caret_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        *self.state.ime_caret.lock().unwrap()
     }
     pub fn enable_audio_capture(&mut self, config: AudioCaptureConfig) {
         if self.audio.is_none() {

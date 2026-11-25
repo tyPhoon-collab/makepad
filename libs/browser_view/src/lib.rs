@@ -27,6 +27,9 @@ pub mod protocol;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT_SCRATCH_INSTANCE: AtomicUsize = AtomicUsize::new(1);
 
 use makepad_app_host::{forward_hit, ChildEvent, ChildSpec, Children, Forwarded, Home, HostAudioRing, HostRing, HostedApp, Life, RingSpec};
 use makepad_error_log::log;
@@ -58,6 +61,9 @@ pub struct ViewState {
     pub can_go_forward: bool,
     /// The committed main-frame navigation.
     pub navigation_epoch: u64,
+    /// Active IME composition caret rectangle in page points.
+    pub ime_caret: Option<(i32, i32, i32, i32)>,
+    pub devtools_target: Option<Result<String, String>>,
     /// The page failed (or the host went away); it shows nothing more.
     pub error: Option<String>,
     window: Option<usize>,
@@ -157,6 +163,7 @@ impl View {
 
 pub struct BrowserViews {
     children: Option<Children<(), ()>>,
+    instance_id: usize,
     /// The profile the pages share: cookies, logins, storage.
     profile: Option<PathBuf>,
     views: Vec<View>,
@@ -169,6 +176,8 @@ pub struct BrowserViews {
     start_pending: bool,
     /// Pages closed since the last `service`, with their windows.
     closing: Vec<(ViewId, Option<usize>)>,
+    /// Remote debugging port reported by the running browser host.
+    devtools_port: Option<u16>,
 }
 
 impl BrowserViews {
@@ -181,7 +190,20 @@ impl BrowserViews {
         } else {
             home_dir().map(|home| home.join(".makepad-cef").join(profile))
         };
-        BrowserViews { children: None, profile, views: Vec::new(), next_view: 1, next_eval: 1, unavailable: None, cursor: MouseCursor::Default, start_pending: false, closing: Vec::new() }
+        BrowserViews { children: None, instance_id: NEXT_SCRATCH_INSTANCE.fetch_add(1, Ordering::Relaxed), profile, views: Vec::new(), next_view: 1, next_eval: 1, unavailable: None, cursor: MouseCursor::Default, start_pending: false, closing: Vec::new(), devtools_port: None }
+    }
+
+    pub fn new_with_profile_dir(profile_dir: PathBuf) -> BrowserViews {
+        let profile = if std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_some() {
+            None
+        } else {
+            Some(profile_dir)
+        };
+        BrowserViews { children: None, instance_id: NEXT_SCRATCH_INSTANCE.fetch_add(1, Ordering::Relaxed), profile, views: Vec::new(), next_view: 1, next_eval: 1, unavailable: None, cursor: MouseCursor::Default, start_pending: false, closing: Vec::new(), devtools_port: None }
+    }
+
+    pub fn devtools_port(&self) -> Option<u16> {
+        self.devtools_port
     }
 
     /// Whether pages can be shown: from a checkout the browser host's sources are there
@@ -225,13 +247,17 @@ impl BrowserViews {
         let root = std::env::temp_dir().join("makepad-browser-view");
         if let Ok(entries) = std::fs::read_dir(&root) {
             for entry in entries.flatten() {
-                let dead = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()).is_some_and(|pid| !makepad_app_host::launch::process_alive(pid));
+                let dead = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.split('-').next()?.parse::<u32>().ok())
+                    .is_some_and(|pid| !makepad_app_host::launch::process_alive(pid));
                 if dead {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
         }
-        let scratch = root.join(std::process::id().to_string());
+        let scratch = root.join(format!("{}-{}", std::process::id(), self.instance_id));
         let children = self.children.get_or_insert_with(|| Children::new(cx, "browser view:", scratch));
         let mut spec = ChildSpec::new(protocol::HOST_APP);
         spec.home = Home::Inherit;
@@ -552,7 +578,7 @@ impl BrowserViews {
             match child_event {
                 ChildEvent::Custom { json, .. } => {
                     if let Some((view, event)) = protocol::parse_event(&json) {
-                        changed |= Self::apply(cx, &mut self.views, children, ViewId(view), event);
+                        changed |= Self::apply(cx, &mut self.views, &mut self.devtools_port, children, ViewId(view), event);
                     }
                 }
                 ChildEvent::Message { msg: AppToStudio::SetCursor(cursor), .. } => {
@@ -577,7 +603,7 @@ impl BrowserViews {
         changed
     }
 
-    fn apply(cx: &mut Cx, views: &mut [View], children: &mut Children<(), ()>, id: ViewId, event: ViewEvent) -> bool {
+    fn apply(cx: &mut Cx, views: &mut [View], devtools_port: &mut Option<u16>, children: &mut Children<(), ()>, id: ViewId, event: ViewEvent) -> bool {
         let Some(view) = views.iter_mut().find(|view| view.id == id) else {
             // A view closed meanwhile: its window goes with it.
             if let (ViewEvent::Window { window_id }, Some(slot)) = (&event, children.slot_mut(&())) {
@@ -613,6 +639,22 @@ impl BrowserViews {
             }
             ViewEvent::Evaluated { id, ok, value } => {
                 state.evaluations.push((id, if ok { Ok(value) } else { Err(value) }));
+                return false;
+            }
+            ViewEvent::ImeCaret { x, y, width, height } => {
+                state.ime_caret = Some((x, y, width, height));
+                return false;
+            }
+            ViewEvent::DevToolsReady { port } => {
+                *devtools_port = Some(port);
+                return false;
+            }
+            ViewEvent::DevToolsTarget { target_id } => {
+                state.devtools_target = Some(Ok(target_id));
+                return false;
+            }
+            ViewEvent::DevToolsTargetError { message } => {
+                state.devtools_target = Some(Err(message));
                 return false;
             }
             ViewEvent::Error { message } => {

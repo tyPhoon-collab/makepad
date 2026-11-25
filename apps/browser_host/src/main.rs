@@ -21,7 +21,8 @@ pub use makepad_widgets;
 use makepad_app_host::{AudioRecord, AudioRingPacket, AudioRingSetup, ProducerAudioRing, ProducerRing, RingSetup};
 use makepad_browser_view::cef_input;
 use makepad_browser_view::protocol::{self, ViewEvent, ViewOp};
-use makepad_cef::{AudioCaptureConfig, AudioEvent, BootstrapResult, Browser, CaptureTimestamp, FrameSink, SinkTarget};
+use makepad_cef::{AudioCaptureConfig, AudioEvent, BootstrapResult, Browser, CaptureTimestamp, DevToolsTargetRequest, FrameSink, SinkTarget};
+use makepad_widgets::makepad_platform::makepad_micro_serde::{DeJson, JsonValue};
 use makepad_widgets::*;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -68,6 +69,7 @@ struct Page {
     scroll_remainder: Vec2d,
     /// A paste arrived as text ahead of its key chord.
     pasted_text: bool,
+    composing: bool,
     /// The last press: when, where, and its click count.
     last_press: (f64, Vec2d, i32),
     /// Applied at the next poll once the page exists.
@@ -83,6 +85,9 @@ struct Page {
     audio: Option<ProducerAudioRing>,
     audio_start: bool,
     audio_backlog: VecDeque<AudioRecord>,
+    last_ime_caret: Option<(i32, i32, i32, i32)>,
+    devtools_port_sent: bool,
+    devtools_target_request: Option<DevToolsTargetRequest>,
 }
 
 /// A frame ring as CEF's frame sink.
@@ -136,6 +141,7 @@ impl Page {
             pressed: MouseButton::empty(),
             scroll_remainder: Vec2d::default(),
             pasted_text: false,
+            composing: false,
             last_press: (f64::MIN, Vec2d::default(), 0),
             dark: None,
             hidden: None,
@@ -146,6 +152,9 @@ impl Page {
             audio: None,
             audio_start: false,
             audio_backlog: VecDeque::new(),
+            last_ime_caret: None,
+            devtools_port_sent: false,
+            devtools_target_request: None,
         }
     }
 
@@ -190,20 +199,37 @@ impl Page {
             ViewOp::History { delta } => browser.execute_javascript(&format!("window.history.go({delta})")),
             ViewOp::Reload => browser.reload(),
             ViewOp::Stop => browser.stop_load(),
-            ViewOp::Focus { on } => browser.set_focus(on),
+            ViewOp::Focus { on } => {
+                if !on && std::mem::take(&mut self.composing) {
+                    let _ = browser.ime_cancel_composition();
+                }
+                browser.set_focus(on)
+            }
             ViewOp::MouseMove { x, y, modifiers, leave } => browser.send_mouse_move(x, y, modifiers, leave),
             ViewOp::MouseClick { x, y, modifiers, button, up, clicks } => browser.send_mouse_click(x, y, modifiers, button, up, clicks),
             ViewOp::MouseWheel { x, y, modifiers, dx, dy } => browser.send_mouse_wheel(x, y, modifiers, dx, dy),
             ViewOp::Key { kind, modifiers, windows_key_code, native_key_code, character, unmodified_character, system } => {
                 browser.send_key_event(kind, modifiers, windows_key_code, native_key_code, character, unmodified_character, system)
             }
-            ViewOp::Text { text } => browser.ime_commit_text(&text),
+            ViewOp::Text { text } => {
+                self.composing = false;
+                browser.ime_commit_text(&text)
+            }
+            ViewOp::ImeComposition { text } => {
+                self.composing = !text.is_empty();
+                browser.ime_set_composition(&text)
+            }
+            ViewOp::ImeCancelComposition => {
+                self.composing = false;
+                browser.ime_cancel_composition()
+            }
             ViewOp::CaptureLost => browser.send_capture_lost_event(),
             _ => Ok(()),
         };
     }
 
     fn navigate(&mut self, url: &str) {
+        self.composing = false;
         match &mut self.browser {
             Some(browser) => {
                 if let Err(error) = browser.set_url(url) {
@@ -292,8 +318,21 @@ impl Page {
                 if text.was_paste {
                     self.pasted_text = true;
                 }
-                match cef_input::char_event_data(&text.input) {
-                    Some((windows_key_code, character)) if !text.was_paste && !text.replace_last => {
+                if text.replace_last {
+                    self.composing = !text.input.is_empty();
+                    let _ = if text.input.is_empty() {
+                        browser.ime_cancel_composition()
+                    } else {
+                        browser.ime_set_composition(&text.input)
+                    };
+                    return;
+                }
+                if text.input.is_empty() {
+                    return;
+                }
+                let composing = std::mem::take(&mut self.composing);
+                match typed_char_event(text, composing) {
+                    Some((windows_key_code, character)) => {
                         let modifiers = cef_input::cef_modifiers(cx.keyboard.modifiers(), MouseButton::empty());
                         let native_key_code = cef_input::native_key_code_for_char(char::from_u32(character as u32).unwrap_or('\0'));
                         let _ = browser.send_key_event(cef_input::KEY_EVENT_CHAR, modifiers, windows_key_code, native_key_code, character, character, false);
@@ -308,6 +347,22 @@ impl Page {
             _ => {}
         }
     }
+}
+
+fn typed_char_event(text: &TextInputEvent, composing: bool) -> Option<(i32, u16)> {
+    if composing || text.was_paste {
+        return None;
+    }
+    cef_input::char_event_data(&text.input)
+}
+
+#[test]
+fn single_character_composition_and_paste_use_text_commit() {
+    let mut text = TextInputEvent { input: "字".into(), ..Default::default() };
+    assert!(typed_char_event(&text, false).is_some());
+    assert!(typed_char_event(&text, true).is_none());
+    text.was_paste = true;
+    assert!(typed_char_event(&text, false).is_none());
 }
 
 impl App {
@@ -337,6 +392,8 @@ impl App {
             page.error_sent = false;
             page.dark = Some(dark);
             page.hidden = Some(false);
+            page.last_ime_caret = None;
+            page.devtools_port_sent = false;
             page.navigate(&url);
             Self::send(view, ViewEvent::Window { window_id: page.window.window_id().id() });
             return;
@@ -355,6 +412,7 @@ impl App {
         }
         if let ViewOp::Close = op {
             // The window stays for the next page; the browser goes.
+            page.devtools_target_request = None;
             page.browser = None;
             page.url = None;
             page.ring = None;
@@ -365,6 +423,9 @@ impl App {
             page.eval_ids.clear();
             page.commands.clear();
             page.pressed = MouseButton::empty();
+            page.composing = false;
+            page.last_ime_caret = None;
+            page.devtools_port_sent = false;
             if self.focus == Some(view) {
                 self.focus = None;
             }
@@ -429,6 +490,7 @@ impl App {
                 page.browser = None;
             }
             if let Some(message) = page.error.clone() {
+                page.devtools_target_request = None;
                 if !std::mem::replace(&mut page.error_sent, true) {
                     Self::send(view, ViewEvent::Error { message });
                 }
@@ -491,13 +553,48 @@ impl App {
                     can_go_forward: cef.can_go_forward(),
                     epoch: cef.navigation_epoch(),
                 };
-                (started, shown, cef.take_popup_requests(), cef.take_console_messages(), cef.take_evaluations())
+                (started, shown, cef.take_popup_requests(), cef.take_console_messages(), cef.take_evaluations(), cef.ime_caret_rect())
             });
-            let Some((started, shown, popups, console, evaluations)) = polled else {
+            let Some((started, shown, popups, console, evaluations, ime_caret)) = polled else {
                 // No page yet (it waits for its size): keep what waits.
                 page.evals = evals;
                 continue;
             };
+            if let Some(rect) = ime_caret {
+                if page.last_ime_caret != Some(rect) {
+                    page.last_ime_caret = Some(rect);
+                    Self::send(view, ViewEvent::ImeCaret { x: rect.0, y: rect.1, width: rect.2, height: rect.3 });
+                }
+            }
+            if !page.devtools_port_sent {
+                if let Some(port) = makepad_cef::remote_debugging_port() {
+                    page.devtools_port_sent = true;
+                    Self::send(view, ViewEvent::DevToolsReady { port });
+                    if let Some(browser) = &page.browser {
+                        match browser.request_devtools_target() {
+                            Ok(request) => page.devtools_target_request = Some(request),
+                            Err(error) => Self::send(view, ViewEvent::DevToolsTargetError { message: error.to_string() }),
+                        }
+                    }
+                }
+            }
+            if let Some(result) = page.devtools_target_request.as_ref().and_then(DevToolsTargetRequest::poll) {
+                page.devtools_target_request = None;
+                let event = match result {
+                    Ok(json) => {
+                        let response = JsonValue::deserialize_json(&json).ok();
+                        match response.as_ref().and_then(|value| value.key("targetInfo"))
+                            .and_then(|target| target.key("targetId")).and_then(JsonValue::string)
+                            .filter(|target_id| !target_id.is_empty())
+                        {
+                            Some(target_id) => ViewEvent::DevToolsTarget { target_id: target_id.to_owned() },
+                            None => ViewEvent::DevToolsTargetError { message: "CEF did not return a page target ID".into() },
+                        }
+                    }
+                    Err(error) => ViewEvent::DevToolsTargetError { message: error.to_string() },
+                };
+                Self::send(view, event);
+            }
             page.dark = None;
             page.hidden = None;
             page.ring = None;

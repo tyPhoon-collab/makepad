@@ -44,6 +44,10 @@ pub enum ViewOp {
     Key { kind: i32, modifiers: u32, windows_key_code: i32, native_key_code: i32, character: u16, unmodified_character: u16, system: bool },
     /// Text committed as an input method would.
     Text { text: String },
+    /// Uncommitted IME preedit text.
+    ImeComposition { text: String },
+    /// Cancel active IME composition.
+    ImeCancelComposition,
     /// A pressed button's gesture ends with no release (nothing clicks).
     CaptureLost,
     /// Close the view and its window.
@@ -64,6 +68,12 @@ pub enum ViewEvent {
     Console { level: i32, message: String, source: String, line: i32 },
     /// The answer to `ViewOp::Eval`: the value as JSON, or the exception.
     Evaluated { id: u64, ok: bool, value: String },
+    /// Active IME composition caret rectangle in page points.
+    ImeCaret { x: i32, y: i32, width: i32, height: i32 },
+    /// Remote debugging port exposed by the browser host.
+    DevToolsReady { port: u16 },
+    DevToolsTarget { target_id: String },
+    DevToolsTargetError { message: String },
     /// The page (or the engine) failed; the view shows nothing more.
     Error { message: String },
     /// The view is gone (after `ViewOp::Close`).
@@ -115,6 +125,8 @@ mod tests {
             ViewOp::Back,
             ViewOp::Focus { on: true },
             ViewOp::Eval { id: 7, expression: "1 + 1".into() },
+            ViewOp::ImeComposition { text: "かな".into() },
+            ViewOp::ImeCancelComposition,
             ViewOp::Close,
         ] {
             let json = op_to_json(3, &op);
@@ -129,6 +141,8 @@ mod tests {
             ViewEvent::Window { window_id: 2 },
             ViewEvent::State { title: "t".into(), url: "u".into(), loading: true, can_go_back: false, can_go_forward: true, epoch: 3 },
             ViewEvent::Evaluated { id: 7, ok: true, value: "2".into() },
+            ViewEvent::ImeCaret { x: 10, y: 20, width: 8, height: 18 },
+            ViewEvent::DevToolsReady { port: 9222 },
             ViewEvent::Closed,
         ] {
             let json = event_to_json(5, &event);

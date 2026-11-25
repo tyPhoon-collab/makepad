@@ -78,7 +78,19 @@ pub type cef_state_t = c_int;
 pub type cef_text_input_mode_t = c_int;
 pub type cef_touch_event_type_t = c_int;
 pub type cef_touch_handle_state_t = c_void;
-pub type cef_composition_underline_t = c_void;
+pub type cef_composition_underline_style_t = c_int;
+pub const CEF_CUS_SOLID: cef_composition_underline_style_t = 0;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct cef_composition_underline_t {
+    pub size: usize,
+    pub range: cef_range_t,
+    pub color: u32,
+    pub background_color: u32,
+    pub thick: c_int,
+    pub style: cef_composition_underline_style_t,
+}
 pub type cef_color_type_t = c_int;
 pub type cef_alpha_type_t = c_int;
 pub type cef_channel_layout_t = c_int;
@@ -94,7 +106,6 @@ pub type cef_file_dialog_mode_t = c_int;
 pub type cef_point_t = c_void;
 pub type cef_pdf_print_settings_t = c_void;
 pub type cef_registration_t = c_void;
-pub type cef_dev_tools_message_observer_t = c_void;
 pub type cef_navigation_entry_visitor_t = c_void;
 pub type cef_run_file_dialog_callback_t = c_void;
 pub type cef_pdf_print_callback_t = c_void;
@@ -1258,7 +1269,9 @@ pub struct cef_browser_host_t {
         self_: *mut cef_browser_host_t, message: *const c_void, message_size: usize,
     ) -> c_int>,
     pub execute_dev_tools_method: cef_unused_callback_t,
-    pub add_dev_tools_message_observer: cef_unused_callback_t,
+    pub add_dev_tools_message_observer: Option<unsafe extern "system" fn(
+        self_: *mut cef_browser_host_t, observer: *mut cef_dev_tools_message_observer_t,
+    ) -> *mut cef_registration_t>,
     pub get_navigation_entries: cef_unused_callback_t,
     pub replace_misspelling: cef_unused_callback_t,
     pub add_word_to_dictionary: cef_unused_callback_t,
@@ -1327,4 +1340,17 @@ pub struct cef_browser_host_t {
     pub ime_finish_composing_text:
         Option<unsafe extern "system" fn(self_: *mut cef_browser_host_t, keep_selection: c_int)>,
     pub ime_cancel_composition: Option<unsafe extern "system" fn(self_: *mut cef_browser_host_t)>,
+}
+
+#[repr(C)]
+pub struct cef_dev_tools_message_observer_t {
+    pub base: cef_base_ref_counted_t,
+    pub on_dev_tools_message: cef_unused_callback_t,
+    pub on_dev_tools_method_result: Option<unsafe extern "system" fn(
+        self_: *mut cef_dev_tools_message_observer_t, browser: *mut cef_browser_t,
+        message_id: c_int, success: c_int, result: *const c_void, result_size: usize,
+    )>,
+    pub on_dev_tools_event: cef_unused_callback_t,
+    pub on_dev_tools_agent_attached: cef_unused_callback_t,
+    pub on_dev_tools_agent_detached: cef_unused_callback_t,
 }
