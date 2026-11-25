@@ -5,7 +5,7 @@ mod tar;
 
 use std::path::{Path, PathBuf};
 
-fn run() -> Result<(), String> {
+fn run(workspace: &Path) -> Result<(), String> {
     let mut fetch = false;
     let mut dry_run = false;
     let mut platform = match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -49,10 +49,6 @@ fn run() -> Result<(), String> {
     {
         return Err("network access requested while CARGO_NET_OFFLINE is set".into());
     }
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("cannot find workspace")?;
     let prebuilt = workspace.join("local/cef-prebuilt");
     let shared = std::fs::read_to_string(workspace.join(".git"))
         .ok()
@@ -98,8 +94,9 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn main() -> std::process::ExitCode {
-    match run() {
+/// Run the CEF setup CLI using the caller's workspace for the runtime files.
+pub fn run_from_workspace(workspace: &Path) -> std::process::ExitCode {
+    match run(workspace) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{err}");

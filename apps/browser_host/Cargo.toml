@@ -14,9 +14,12 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+[lib]
+path = "src/main.rs"
+
 [[bin]]
 name = "makepad-app-browser-host"
-path = "src/main.rs"
+path = "src/bin/makepad-app-browser-host.rs"
 
 [dependencies]
 makepad-widgets = { path = "../../widgets", default-features = false }

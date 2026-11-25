@@ -947,7 +947,8 @@ impl AppMain for App {
     }
 }
 
-fn main() {
+/// Run the Browser Host with the current process arguments.
+pub fn run() {
     if let Some(code) = makepad_cef::run_helper_if_subprocess() {
         std::process::exit(code);
     }
