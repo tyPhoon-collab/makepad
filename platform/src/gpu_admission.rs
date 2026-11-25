@@ -232,7 +232,7 @@ impl GpuLedger {
         let mut state = self.state.borrow_mut();
         let base = state.device_used.saturating_add(state.pending_bytes).max(state.reserved);
         // Reserve atomically across Cx instances; release hooks run on arbitrary threads.
-        if let Err(held) = READBACK_BYTES.try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+        if let Err(held) = READBACK_BYTES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
             let total = held.checked_add(bytes)?;
             base.checked_add(total).filter(|n| *n <= state.budget.device_bytes).map(|_| total)
         }) {

@@ -316,7 +316,7 @@ pub fn submit_encode(mut job: EncodeJob, raw: bool) {
     let len = loop {
         let len = job.pixels.len();
         let fits = GRAB_BYTES
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(len)
                     .filter(|total| *total <= MAX_GRAB_BYTES)
             })
@@ -1401,7 +1401,7 @@ pub fn arm_grabs(
             .ok_or("no windows")?,
     );
     PENDING_GRABS
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
             used.checked_add(n)
                 .filter(|total| *total <= MAX_PENDING_GRABS)
         })
