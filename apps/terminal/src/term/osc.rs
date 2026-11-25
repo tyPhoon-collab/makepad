@@ -240,11 +240,18 @@ fn parse(data: &[u8], terminator: OscTerminator) -> Option<OscCommand> {
             url: lossy(payload?),
         }),
         "8" => parse_hyperlink(&lossy(payload?)),
-        // OSC 9: iTerm2 notification, body only.
-        "9" => Some(OscCommand::ShowDesktopNotification {
-            title: String::new(),
-            body: lossy(payload?),
-        }),
+        // OSC 9: iTerm2 notification, except ConEmu progress (`9;4;...`).
+        "9" => {
+            let body = lossy(payload?);
+            if body == "4" || body.starts_with("4;") {
+                None
+            } else {
+                Some(OscCommand::ShowDesktopNotification {
+                    title: String::new(),
+                    body,
+                })
+            }
+        }
         "52" => parse_clipboard(&lossy(payload?), terminator),
         "133" => parse_semantic_prompt(&lossy(payload?)),
         "777" => parse_rxvt_extension(&lossy(payload?)),
@@ -1287,6 +1294,10 @@ mod tests {
             })
         );
         assert_eq!(osc("9"), None);
+        // ConEmu / Neovim progress bar (`OSC 9;4;...`) must not fire a notification.
+        assert_eq!(osc("9;4;0;0"), None);
+        assert_eq!(osc("9;4;1;50"), None);
+        assert_eq!(osc("9;4"), None);
     }
 
     #[test]

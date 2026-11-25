@@ -10,11 +10,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use makepad_widgets::text::geom::Point;
-use makepad_widgets::makepad_draw::shader::draw_text::PreparedGlyph;
+use makepad_widgets::makepad_draw::shader::draw_text::{FontFamily, PreparedGlyph};
 use makepad_widgets::*;
 
 use crate::session::Session;
-use crate::term::color::Rgb;
+use crate::term::color::{default_palette, Rgb};
 use crate::term::key_encode::{
     encode_key, Key, KeyAction, KeyEncodeOptions, KeyEvent as TermKeyEvent, KeyMods, KittyFlags,
 };
@@ -26,7 +26,7 @@ use crate::term::mouse_encode::{
 use crate::term::page::CellContent;
 use crate::term::screen::CursorStyle;
 use crate::term::style::{StyleColor, StyleFlags};
-use crate::term::terminal::TermEvent;
+use crate::term::terminal::{TermEvent, Terminal};
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -196,54 +196,9 @@ script_mod! {
         }
         draw_text +: {
             draw_call_group: @term_text
-            // The shell and Omarchy prompts are designed around JetBrains
-            // Mono. Liberation Mono lacks even common prompt symbols such as
-            // U+276F; keep Font Awesome as a fallback for the icon codepoints
-            // it does cover. The distro package can add a full Nerd Font
-            // member here without making terminal depend on host fontconfig.
-            text_style: TextStyle{
-                font_family: FontFamily{
-                    latin := FontMember{
-                        res: crate_resource("makepad_widgets:resources/jetbrains_mono_variable.ttf")
-                        asc: 0.0 desc: 0.0 weight: 400.0
-                    }
-                    icons := FontMember{
-                        res: crate_resource("makepad_widgets:resources/fa-solid-900.ttf")
-                        asc: 0.0 desc: 0.0
-                    }
-                    emoji := FontMember{
-                        res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf")
-                        asc: 0.0 desc: 0.0
-                    }
-                    symbols := FontMember{
-                        res: crate_resource("makepad_widgets:resources/Inter.ttf")
-                        asc: 0.0 desc: 0.0
-                    }
-                }
-                line_spacing: 1.0
-            }
+            text_style: theme.font_code{line_spacing: 1.0}
         }
-        bold_text_style: TextStyle{
-            font_family: FontFamily{
-                latin := FontMember{
-                    res: crate_resource("makepad_widgets:resources/jetbrains_mono_variable.ttf")
-                    asc: 0.0 desc: 0.0 weight: 800.0
-                }
-                icons := FontMember{
-                    res: crate_resource("makepad_widgets:resources/fa-solid-900.ttf")
-                    asc: 0.0 desc: 0.0
-                }
-                emoji := FontMember{
-                    res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf")
-                    asc: 0.0 desc: 0.0
-                }
-                symbols := FontMember{
-                    res: crate_resource("makepad_widgets:resources/Inter.ttf")
-                    asc: 0.0 desc: 0.0
-                }
-            }
-            line_spacing: 1.0
-        }
+        bold_text_style: theme.font_code{line_spacing: 1.0}
         draw_cell_bg +: {}
         draw_underline +: {}
         draw_cursor +: {}
@@ -307,6 +262,10 @@ pub enum MpTermAction {
     TitleChanged(String),
     PwdChanged(String),
     Bell,
+    Notification {
+        title: String,
+        body: String,
+    },
     Exited,
     FileDropped {
         path: PathBuf,
@@ -369,6 +328,15 @@ pub struct TerminalPresentationFrame {
     pub border_color: Vec4f,
 }
 
+#[derive(Default)]
+pub struct TerminalColors {
+    pub foreground: Option<Rgb>,
+    pub background: Option<Rgb>,
+    pub cursor: Option<Rgb>,
+    pub palette: Vec<(u8, Rgb)>,
+    pub background_opacity: Option<f32>,
+}
+
 #[derive(Script, Widget)]
 pub struct MpTerm {
     #[uid]
@@ -398,6 +366,12 @@ pub struct MpTerm {
     draw_cursor: DrawTermCursor,
     #[live(10.0)]
     font_size: f64,
+    #[rust((1.0, 0.0))]
+    cell_height_adjustment: (f64, f64),
+    #[rust]
+    system_fonts_configured: bool,
+    #[rust]
+    color_overrides: TerminalColors,
     #[live(6.0)]
     pad_x: f64,
     #[live(4.0)]
@@ -423,10 +397,16 @@ pub struct MpTerm {
     /// the pager on a file); the session ends when it exits.
     #[rust]
     pub command: Option<String>,
+    #[rust]
+    pub copy_on_select: bool,
+    #[rust(true)]
+    pub ligatures: bool,
     /// An unloaded Quick Look panel: no session, and none respawned until
     /// the next retarget (`restart_with`).
     #[rust]
     dormant: bool,
+    #[rust]
+    ime_preedit: String,
     #[rust]
     area: Area,
     /// Key focus grabbed on the first draw (a terminal owns the keyboard
@@ -443,6 +423,8 @@ pub struct MpTerm {
     cell_baseline: f64,
     #[rust]
     glyph_cache: HashMap<(char, bool, u8), Option<CachedGlyph>>,
+    #[rust]
+    run_cache: HashMap<(String, bool), Option<Vec<CachedGlyph>>>,
     #[rust]
     glyph_cache_key: (u64, u64, u64, u64, u64),
     /// Lines scrolled back from the bottom (0 = live).
@@ -527,18 +509,74 @@ impl ScriptHook for MpTerm {
         if let (Some(session), Some(cursor)) = (&mut self.session, self.style_cursor) {
             session.terminal.cursor_color = Some(cursor);
         }
-        if let (Some(session), Some((mut palette, fg, bg))) =
-            (&mut self.session, self.original_colors)
-        {
-            let (fg, bg) = self.style_colors.unwrap_or((fg, bg));
-            palette[0] = bg;
-            palette[7] = fg;
-            session.terminal.set_theme(&palette, fg, bg);
+        if let (Some(session), Some(colors)) = (&mut self.session, self.original_colors) {
+            self.color_overrides.apply(&mut session.terminal, colors, self.style_colors);
         }
     }
 }
 
 impl MpTerm {
+    /// Prepend installed faces to the template's bundled glyph fallbacks.
+    pub fn apply_system_font_families(
+        &mut self,
+        cx: &mut Cx,
+        regular: &[String],
+        bold: &[String],
+        bold_weight: f32,
+    ) {
+        if regular.is_empty() && bold.is_empty() {
+            return;
+        }
+        cx.with_vm(|vm| {
+            let source: ScriptValue = self.source.clone().into();
+            let Some(source) = source.as_object() else {
+                return;
+            };
+            if !regular.is_empty() {
+                if let Some(style) = vm
+                    .value(source, id!(draw_text))
+                    .as_object()
+                    .and_then(|draw| vm.value(draw, id!(text_style)).as_object())
+                {
+                    self.draw_text.text_style.font_family =
+                        system_font_family(vm, style, regular.iter(), 400.0);
+                }
+            }
+            if let Some(style) = vm.value(source, id!(bold_text_style)).as_object() {
+                self.bold_text_style.font_family =
+                    system_font_family(vm, style, bold.iter().chain(regular), bold_weight);
+                self.system_fonts_configured = true;
+            }
+        });
+        self.glyph_cache.clear();
+    }
+
+    /// Override the widget template's font settings when creating a hosted terminal.
+    pub fn apply_font_overrides(
+        &mut self,
+        size: Option<f64>,
+        bold_weight: Option<f32>,
+        height_scale: f64,
+        height_pixels: f64,
+    ) {
+        if let Some(size) = size {
+            self.font_size = size;
+        }
+        if let Some(weight) = bold_weight {
+            self.bold_text_style.font_family = self
+                .bold_text_style
+                .font_family
+                .with_axes(&[(u32::from_be_bytes(*b"wght"), weight)]);
+        }
+        self.cell_height_adjustment = (height_scale, height_pixels);
+        self.glyph_cache.clear();
+    }
+
+    /// Set the initial colors for a hosted terminal before its session is started.
+    pub fn set_color_overrides(&mut self, colors: TerminalColors) {
+        self.color_overrides = colors;
+    }
+
     pub fn set_presentation_frame(&mut self, cx: &mut Cx, frame: Option<TerminalPresentationFrame>) {
         if self.presentation_frame != frame {
             self.presentation_frame = frame;
@@ -665,6 +703,50 @@ impl MpTerm {
         true
     }
 
+    pub fn run_command(&mut self, cx: &mut Cx, command: &str) -> Result<(), String> {
+        if command.trim().is_empty() {
+            return Err("Terminal command must not be empty".into());
+        }
+        let enter = self.encoded_key_chord(Key::Enter, KeyMods::default(), "", 0);
+        if !self.paste_bytes_with_suffix(command, &enter) {
+            return Err("Terminal did not accept command input".into());
+        }
+        self.redraw(cx);
+        Ok(())
+    }
+
+    pub fn press_key(&mut self, cx: &mut Cx, chord: &str) -> Result<(), String> {
+        let (key, mods, text, unshifted) = parse_key_chord(chord)?;
+        let input = self.encoded_key_chord(key, mods, &text, unshifted);
+        if !self.session.as_mut().is_some_and(|session| session.try_write(&input)) {
+            return Err("Terminal did not accept the key chord".into());
+        }
+        self.scroll_to_bottom();
+        self.redraw(cx);
+        Ok(())
+    }
+
+    pub fn signal_foreground(&mut self, name: &str) -> Result<(), String> {
+        self.session.as_mut().ok_or("Terminal session is not running")?
+            .signal_foreground(name).map_err(|err| format!("Cannot signal the foreground job: {err}"))
+    }
+
+    fn encoded_key_chord(&self, key: Key, mods: KeyMods, text: &str, unshifted: u32) -> Vec<u8> {
+        let opts = self.key_opts();
+        let mut event = TermKeyEvent {
+            action: KeyAction::Press,
+            key,
+            mods,
+            consumed_mods: KeyMods::default(),
+            utf8: text.to_string(),
+            unshifted_codepoint: unshifted,
+        };
+        let mut bytes = encode_key(&event, &opts);
+        event.action = KeyAction::Release;
+        bytes.extend(encode_key(&event, &opts));
+        bytes
+    }
+
     /// Insert one file exactly as a native terminal drop: shell-quoted path,
     /// trailing space, normal bracketed-paste protocol, and never Enter.
     /// The caller owns any file inspection/copying; this performs no file I/O.
@@ -772,13 +854,7 @@ impl MpTerm {
                 if session.terminal.cursor_color.is_none() {
                     session.terminal.cursor_color = self.style_cursor;
                 }
-                if let Some((style_fg, style_bg)) = self.style_colors {
-                    fg = style_fg;
-                    bg = style_bg;
-                    base16[0] = bg;
-                    base16[7] = fg;
-                }
-                session.terminal.set_theme(&base16, fg, bg);
+                self.color_overrides.apply(&mut session.terminal, (base16, fg, bg), self.style_colors);
                 session.terminal.primary.scrollback_sink = self.scrollback_sink.clone();
                 self.session = Some(session);
             }
@@ -791,6 +867,11 @@ impl MpTerm {
     fn refresh_metrics(&mut self, cx: &mut Cx2d) {
         let font_size = self.font_size * self.presentation_font_scale;
         self.draw_text.text_style.font_size = font_size as f32;
+        let metrics = self.draw_text.prepare_single_line_run(cx, "M");
+        if self.system_fonts_configured {
+            // Resolve finished bold lookups before checking for cached glyphs.
+            self.bold_text_style.ensure_fonts_loaded(cx);
+        }
         // The atlas epoch moves when glyph slots are evicted or the atlas
         // starts over: cached slots are void then.
         // So does a font family taking a face it lacked (a lazy CJK or emoji
@@ -806,13 +887,16 @@ impl MpTerm {
         );
         if key != self.glyph_cache_key {
             self.glyph_cache.clear();
+            self.run_cache.clear();
             self.glyph_cache_key = key;
         }
-        if let Some(run) = self.draw_text.prepare_single_line_run(cx, "M") {
+        if let Some(run) = metrics {
             let g = &run.glyphs[0];
             self.cell_w = g.advance_in_lpxs as f64;
             let glyph_h = (run.ascender_in_lpxs - run.descender_in_lpxs) as f64;
-            self.cell_h = glyph_h * self.draw_text.text_style.line_spacing as f64;
+            let (scale, pixels) = self.cell_height_adjustment;
+            let height = glyph_h * self.draw_text.text_style.line_spacing as f64;
+            self.cell_h = (height * scale + pixels / cx.current_dpi_factor().max(1.0)).max(1.0);
             self.cell_baseline = (self.cell_h - glyph_h) * 0.5 + run.ascender_in_lpxs as f64;
         }
         if self.cell_w <= 0.0 {
@@ -892,6 +976,42 @@ impl MpTerm {
         let resolved = cached.is_some_and(|g| !g.glyph.is_pending());
         if resolved {
             self.glyph_cache.insert((ch, bold, columns), cached);
+        }
+        cached
+    }
+
+    fn cached_run(&mut self, cx: &mut Cx2d, text: &str, bold: bool) -> Option<Vec<CachedGlyph>> {
+        let key = (text.to_string(), bold);
+        if let Some(hit) = self.run_cache.get(&key) {
+            return hit.clone();
+        }
+        let scale = self.raster_scale() as f32;
+        let style = self.draw_text.text_style.clone();
+        if bold {
+            self.draw_text.text_style.font_family = self.bold_text_style.font_family.clone();
+        }
+        self.draw_text.text_style.font_size *= scale;
+        let prepared = self.draw_text.prepare_single_line_run(cx, text);
+        self.draw_text.text_style = style;
+        let cached = prepared.map(|run| {
+            run.glyphs
+                .into_iter()
+                .map(|g| CachedGlyph {
+                    glyph: g.glyph,
+                    font_size_in_lpxs: g.font_size_in_lpxs / scale,
+                    x_offset_in_lpxs: (g.pen_x_in_lpxs + g.offset_x_in_lpxs) / scale,
+                    y_offset_in_lpxs: g.offset_y_in_lpxs / scale,
+                })
+                .collect::<Vec<_>>()
+        });
+        let resolved = cached
+            .as_ref()
+            .is_some_and(|gs| !gs.is_empty() && gs.iter().all(|g| !g.glyph.is_pending()));
+        if resolved {
+            if self.run_cache.len() >= 4096 {
+                self.run_cache.clear();
+            }
+            self.run_cache.insert(key, cached.clone());
         }
         cached
     }
@@ -1221,6 +1341,10 @@ impl MpTerm {
     }
 
     fn paste_bytes(&mut self, text: &str) -> bool {
+        self.paste_bytes_with_suffix(text, &[])
+    }
+
+    fn paste_bytes_with_suffix(&mut self, text: &str, suffix: &[u8]) -> bool {
         let Some(bracketed) = self
             .session
             .as_ref()
@@ -1241,6 +1365,7 @@ impl MpTerm {
                 bytes.push(if b == b'\n' { b'\r' } else { b });
             }
         }
+        bytes.extend_from_slice(suffix);
         self.scroll_to_bottom();
         self.session
             .as_mut()
@@ -1429,9 +1554,11 @@ impl MpTerm {
     // --------------------------------------------------------------
 
     fn draw_terminal_background(&mut self, cx: &mut Cx2d, bg: Rgb, inverse: bool) {
-        let alpha = if self.opaque_style { 1.0 }
+        let alpha = self.color_overrides.background_opacity.unwrap_or_else(|| {
+            if self.opaque_style { 1.0 }
             else if cx.has_key_focus(self.area) { self.bg_opacity.0 }
-            else { self.bg_opacity.1 };
+            else { self.bg_opacity.1 }
+        });
         let mut v = Self::rgb_to_vec4(bg, alpha);
         if !inverse {
             let scale = 1.0 - self.background_dimming;
@@ -1455,7 +1582,8 @@ impl MpTerm {
         // The session moves out of self for the draw so cached-glyph and
         // selection helpers can borrow self freely.
         let Some(mut session) = self.session.take() else {
-            let bg = self.style_colors.map(|(_, bg)| bg)
+            let bg = self.color_overrides.background
+                .or_else(|| self.style_colors.map(|(_, bg)| bg))
                 .or_else(|| self.original_colors.map(|(_, _, bg)| bg))
                 .unwrap_or_else(|| default_theme().2);
             self.draw_terminal_background(cx, bg, false);
@@ -1480,7 +1608,7 @@ impl MpTerm {
             (
                 t.default_bg,
                 t.default_fg,
-                t.cursor_color.unwrap_or(t.default_fg),
+                t.cursor_color.or(t.base_cursor).unwrap_or(t.default_fg),
                 t.cursor_style,
             )
         };
@@ -1652,6 +1780,10 @@ impl MpTerm {
         } else {
             None
         };
+        let cursor_span = cursor.map(|(col, row)| {
+            let (head, width) = screen.row(row).cell_span(col);
+            (col, row, head, width)
+        });
 
         // Layer 1: backgrounds.
         self.draw_cell_bg.new_draw_call(cx);
@@ -1667,9 +1799,11 @@ impl MpTerm {
         }
 
         // Layer 2: cursor under text (block) — text stays readable on top.
-        if let Some((cx_col, cx_row)) = cursor {
+        if let Some((cx_col, cx_row, head, width)) = cursor_span {
             let x = origin_x + cx_col as f64 * cell_w;
             let y = origin_y + cx_row as f64 * cell_h;
+            let span_x = origin_x + head as f64 * cell_w;
+            let span_width = f64::from(width) * cell_w;
             let color = Self::rgb_to_vec4(cursor_color, 1.0);
             self.draw_cursor.new_draw_call(cx);
             self.draw_cursor.color = color;
@@ -1684,15 +1818,15 @@ impl MpTerm {
                 ),
                 CursorStyle::BlinkingUnderline | CursorStyle::SteadyUnderline => (
                     Rect {
-                        pos: dvec2(x, y + cell_h - (cell_h * 0.12).max(2.0)),
-                        size: dvec2(cell_w, (cell_h * 0.12).max(2.0)),
+                        pos: dvec2(span_x, y + cell_h - (cell_h * 0.12).max(2.0)),
+                        size: dvec2(span_width, (cell_h * 0.12).max(2.0)),
                     },
                     Some(0.0),
                 ),
                 _ => (
                     Rect {
-                        pos: dvec2(x, y),
-                        size: dvec2(cell_w, cell_h),
+                        pos: dvec2(span_x, y),
+                        size: dvec2(span_width, cell_h),
                     },
                     None,
                 ),
@@ -1712,14 +1846,14 @@ impl MpTerm {
         self.draw_dots.begin();
         self.draw_text.new_draw_call(cx);
         self.draw_text.begin_many_instances(cx);
+        self.draw_text.glyph_depth = self.draw_text.draw_depth;
         let baseline = self.cell_baseline;
-        for g in &glyphs {
-            // A block cursor inverts the glyph on top of it for contrast.
+        let effective_color = |g: &GlyphDraw| -> Vec4f {
             let mut color = g.color;
-            if let Some((ccol, crow)) = cursor {
+            if let Some((_, crow, head, _)) = cursor_span {
                 let gx = ((g.x - origin_x) / cell_w).round() as usize;
                 let gy = ((g.y - origin_y) / cell_h).round() as usize;
-                if gx == ccol
+                if gx == head
                     && gy == crow
                     && has_focus
                     && matches!(
@@ -1732,10 +1866,59 @@ impl MpTerm {
                     color = Self::rgb_to_vec4(default_bg, 1.0);
                 }
             }
+            color
+        };
+
+        let mut i = 0;
+        while i < glyphs.len() {
+            let g = &glyphs[i];
+            let color = effective_color(g);
+            if self.ligatures && g.columns == 1 && g.ch.is_ascii_graphic() {
+                let mut end = i + 1;
+                let mut run_text = String::new();
+                run_text.push(g.ch);
+                while end < glyphs.len() {
+                    let prev = &glyphs[end - 1];
+                    let next = &glyphs[end];
+                    if next.columns != 1
+                        || !next.ch.is_ascii_graphic()
+                        || next.bold != g.bold
+                        || (next.y - g.y).abs() > 0.5
+                        || ((next.x - prev.x) - cell_w).abs() > 0.5
+                        || effective_color(next) != color
+                    {
+                        break;
+                    }
+                    run_text.push(next.ch);
+                    end += 1;
+                }
+                if end - i >= 2 {
+                    if let Some(shaped) = self.cached_run(cx, &run_text, g.bold) {
+                        for sg in shaped {
+                            let point = Point::new(
+                                (g.x + sg.x_offset_in_lpxs as f64) as f32,
+                                (g.y + baseline) as f32 + sg.y_offset_in_lpxs,
+                            );
+                            self.draw_text.draw_prepared_glyph_abs(
+                                cx,
+                                point,
+                                sg.font_size_in_lpxs,
+                                sg.glyph,
+                                color,
+                            );
+                        }
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+
             if self.draw_box_glyph(cx, g.ch, g.x, g.y, color) {
+                i += 1;
                 continue;
             }
             if self.draw_braille_glyph(g.ch, g.x, g.y, color) {
+                i += 1;
                 continue;
             }
             if let Some(glyph) = self.cached_glyph(cx, g.ch, g.bold, g.columns) {
@@ -1751,6 +1934,7 @@ impl MpTerm {
                     color,
                 );
             }
+            i += 1;
         }
         self.draw_text.end_many_instances(cx);
         self.draw_dots.end(cx);
@@ -1778,6 +1962,42 @@ impl MpTerm {
                         size: dvec2(d.w, dh),
                     },
                 );
+            }
+        }
+
+        // Inline IME preedit preview at the terminal cursor.
+        if !self.ime_preedit.is_empty() && has_focus {
+            if let Some((cx_col, cx_row)) = cursor {
+                let x = origin_x + cx_col as f64 * cell_w;
+                let y = origin_y + cx_row as f64 * cell_h;
+                let cols: usize = self
+                    .ime_preedit
+                    .chars()
+                    .map(|c| makepad_cell_width::char_width(c as u32).max(1) as usize)
+                    .sum();
+                let w = (cols as f64 * cell_w).max(cell_w);
+                self.draw_cell_bg.new_draw_call(cx);
+                self.draw_cell_bg.color = vec4(0.18, 0.24, 0.38, 1.0);
+                self.draw_cell_bg.draw_abs(
+                    cx,
+                    Rect {
+                        pos: dvec2(x, y),
+                        size: dvec2(w, cell_h),
+                    },
+                );
+                self.draw_underline.new_draw_call(cx);
+                self.draw_underline.color = vec4(0.48, 0.64, 0.97, 1.0);
+                self.draw_underline.kind = 1.0;
+                self.draw_underline.draw_abs(
+                    cx,
+                    Rect {
+                        pos: dvec2(x, y + cell_h - 2.0),
+                        size: dvec2(w, 2.0),
+                    },
+                );
+                self.draw_text.new_draw_call(cx);
+                self.draw_text.color = vec4(0.95, 0.97, 1.0, 1.0);
+                self.draw_text.draw_abs(cx, dvec2(x, y), &self.ime_preedit);
             }
         }
 
@@ -1842,21 +2062,18 @@ impl MpTerm {
                         cx.copy_to_clipboard(&text);
                     }
                     TermEvent::PwdChanged(url) => {
-                        // file://host/path -> path
-                        let path = url
-                            .strip_prefix("file://")
-                            .map(|rest| match rest.find('/') {
-                                Some(idx) => rest[idx..].to_string(),
-                                None => rest.to_string(),
-                            })
-                            .unwrap_or(url);
+                        let Some(path) = osc7_path(&url) else {
+                            continue;
+                        };
                         self.cwd = Some(PathBuf::from(&path));
                         // Hosted: new terminals open here (Omarchy's
                         // terminal-in-cwd); no-op standalone.
                         makepad_wm_api::set_cwd(cx, Path::new(&path));
                         actions.push(MpTermAction::PwdChanged(path));
                     }
-                    TermEvent::Notification { .. } => {}
+                    TermEvent::Notification { title, body } => {
+                        actions.push(MpTermAction::Notification { title, body });
+                    }
                 }
             }
             if session.exited {
@@ -1870,6 +2087,31 @@ impl MpTerm {
             self.draw_bg.redraw(cx);
         }
     }
+}
+
+fn osc7_path(value: &str) -> Option<String> {
+    let Some(uri) = value.strip_prefix("file://") else {
+        return Some(value.to_owned());
+    };
+    let path = &uri[uri.find('/')?..];
+    #[cfg(windows)]
+    let path = if matches!(path.as_bytes(), [b'/', b'a'..=b'z' | b'A'..=b'Z', b':', b'/', ..]) {
+        &path[1..]
+    } else {
+        path
+    };
+    let mut bytes = path.bytes();
+    let mut decoded = Vec::with_capacity(path.len());
+    while let Some(byte) = bytes.next() {
+        decoded.push(if byte == b'%' {
+            let high = (bytes.next()? as char).to_digit(16)?;
+            let low = (bytes.next()? as char).to_digit(16)?;
+            (high * 16 + low) as u8
+        } else {
+            byte
+        });
+    }
+    String::from_utf8(decoded).ok()
 }
 
 impl Widget for MpTerm {
@@ -2051,13 +2293,22 @@ impl Widget for MpTerm {
                 }
             }
             Hit::FingerUp(e) => {
-                self.report_mouse(
+                let consumed = self.report_mouse(
                     cx,
                     e.abs,
                     MouseEventKind::Release,
                     TermMouseButton::Left,
                     &e.modifiers,
                 );
+                if !consumed
+                    && self.copy_on_select
+                    && self.sel_anchor.is_some()
+                    && self.sel_anchor != self.sel_cursor
+                {
+                    if let Some(text) = self.selected_text() {
+                        cx.copy_to_clipboard(&text);
+                    }
+                }
                 self.selecting = false;
                 self.last_finger = None;
             }
@@ -2076,6 +2327,7 @@ impl Widget for MpTerm {
                 self.draw_bg.redraw(cx);
             }
             Hit::KeyFocusLost(_) => {
+                self.ime_preedit.clear();
                 if let Some(session) = self.session.as_mut() {
                     if session.terminal.modes.get(Mode::FocusEvent) {
                         session.write(b"\x1b[O");
@@ -2128,7 +2380,13 @@ impl Widget for MpTerm {
             }
             Hit::TextInput(e) => {
                 if e.replace_last {
+                    self.ime_preedit = e.input.clone();
+                    self.redraw(cx);
                     return;
+                }
+                if !self.ime_preedit.is_empty() {
+                    self.ime_preedit.clear();
+                    self.redraw(cx);
                 }
                 if e.was_paste {
                     self.paste(cx, &e.input);
@@ -2198,6 +2456,51 @@ impl MpTerm {
     }
 }
 
+fn system_font_family<'a>(
+    vm: &mut ScriptVm,
+    style: ScriptObject,
+    names: impl Iterator<Item = &'a String>,
+    weight: f32,
+) -> FontFamily {
+    let family = vm.new_object();
+    for name in names {
+        let member = vm.new_object();
+        let system = vm.new_string(name);
+        vm.set_value_def(member, id!(system), system);
+        vm.set_value_def(member, id!(weight), weight);
+        vm.vec_push(family, NIL, member);
+    }
+    if let Some(fallback) = vm.value(style, id!(font_family)).as_object() {
+        vm.heap_mut().vec_push_vec(family, fallback, NoTrap);
+    }
+    FontFamily::script_from_value(vm, family.into())
+}
+
+impl TerminalColors {
+    fn apply(
+        &self,
+        terminal: &mut Terminal,
+        (mut base16, fg, bg): ([Rgb; 16], Rgb, Rgb),
+        style: Option<(Rgb, Rgb)>,
+    ) {
+        let (fg, bg) = style.unwrap_or((fg, bg));
+        if style.is_some() {
+            base16[0] = bg;
+            base16[7] = fg;
+        }
+        let mut palette = default_palette();
+        palette[..16].copy_from_slice(&base16);
+        for &(index, color) in &self.palette {
+            palette[usize::from(index)] = color;
+        }
+        if let Some(cursor) = self.cursor {
+            terminal.base_cursor = Some(cursor);
+            terminal.cursor_color = Some(cursor);
+        }
+        terminal.set_palette_theme(palette, self.foreground.unwrap_or(fg), self.background.unwrap_or(bg));
+    }
+}
+
 fn parse_hex_rgb(s: &str) -> Option<Rgb> {
     let s = s.trim().trim_start_matches('#');
     if s.len() != 6 {
@@ -2208,6 +2511,71 @@ fn parse_hex_rgb(s: &str) -> Option<Rgb> {
         u8::from_str_radix(&s[2..4], 16).ok()?,
         u8::from_str_radix(&s[4..6], 16).ok()?,
     ))
+}
+
+fn parse_key_chord(chord: &str) -> Result<(Key, KeyMods, String, u32), String> {
+    let invalid = || format!("Invalid terminal key chord: {chord}");
+    let mut parts = chord.rsplit('+');
+    let name = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let mut mods = KeyMods::default();
+    for part in parts {
+        let flag = match part.to_ascii_lowercase().as_str() {
+            "ctrl" => &mut mods.ctrl,
+            "alt" => &mut mods.alt,
+            "shift" => &mut mods.shift,
+            "meta" | "cmd" => &mut mods.super_,
+            _ => return Err(invalid()),
+        };
+        if *flag {
+            return Err(invalid());
+        }
+        *flag = true;
+    }
+    let key = match name.as_str() {
+        "enter" => Key::Enter,
+        "escape" => Key::Escape,
+        "tab" => Key::Tab,
+        "backspace" => Key::Backspace,
+        "delete" => Key::Delete,
+        "insert" => Key::Insert,
+        "home" => Key::Home,
+        "end" => Key::End,
+        "pageup" => Key::PageUp,
+        "pagedown" => Key::PageDown,
+        "arrowup" => Key::ArrowUp,
+        "arrowdown" => Key::ArrowDown,
+        "arrowleft" => Key::ArrowLeft,
+        "arrowright" => Key::ArrowRight,
+        _ => {
+            let ch = match name.as_str() {
+                "space" => ' ',
+                "plus" => '+',
+                _ if name.len() == 1 => name.as_bytes()[0] as char,
+                _ => return Err(invalid()),
+            };
+            if let Some(key) = letter_key(ch) {
+                let text = if mods.shift { ch.to_ascii_uppercase() } else { ch };
+                return Ok((key, mods, text.to_string(), ch as u32));
+            }
+            const SYMBOLS: [(Key, char, char); 22] = [
+                (Key::Digit0, '0', ')'), (Key::Digit1, '1', '!'), (Key::Digit2, '2', '@'),
+                (Key::Digit3, '3', '#'), (Key::Digit4, '4', '$'), (Key::Digit5, '5', '%'),
+                (Key::Digit6, '6', '^'), (Key::Digit7, '7', '&'), (Key::Digit8, '8', '*'),
+                (Key::Digit9, '9', '('), (Key::Minus, '-', '_'), (Key::Equal, '=', '+'),
+                (Key::BracketLeft, '[', '{'), (Key::BracketRight, ']', '}'),
+                (Key::Backslash, '\\', '|'), (Key::Semicolon, ';', ':'), (Key::Quote, '\'', '"'),
+                (Key::Backquote, '`', '~'), (Key::Comma, ',', '<'), (Key::Period, '.', '>'),
+                (Key::Slash, '/', '?'), (Key::Space, ' ', ' '),
+            ];
+            let (key, base, shifted) = SYMBOLS.into_iter()
+                .find(|&(_, base, shifted)| ch == base || ch == shifted)
+                .ok_or_else(invalid)?;
+            mods.shift |= base != shifted && ch == shifted;
+            let text = if mods.shift { shifted } else { base };
+            return Ok((key, mods, text.to_string(), base as u32));
+        }
+    };
+    Ok((key, mods, String::new(), 0))
 }
 
 fn letter_key(ch: char) -> Option<Key> {

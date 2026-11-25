@@ -132,8 +132,13 @@ impl Terminal {
 
     /// Install the app theme as the reset baseline (and current values).
     pub fn set_theme(&mut self, base16: &[Rgb; 16], fg: Rgb, bg: Rgb) {
-        self.base_palette = default_palette();
-        self.base_palette[..16].copy_from_slice(base16);
+        let mut palette = default_palette();
+        palette[..16].copy_from_slice(base16);
+        self.set_palette_theme(palette, fg, bg);
+    }
+
+    pub fn set_palette_theme(&mut self, palette: Palette, fg: Rgb, bg: Rgb) {
+        self.base_palette = palette;
         self.base_fg = fg;
         self.base_bg = bg;
         self.palette = self.base_palette;

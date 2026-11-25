@@ -17,15 +17,7 @@ use std::path::{Path, PathBuf};
 
 mod ai;
 
-app_main!(
-    App,
-    font_assets: [
-        "makepad_widgets/resources/jetbrains_mono_variable.ttf",
-        "makepad_widgets/resources/fa-solid-900.ttf",
-        "makepad_widgets/resources/NotoColorEmoji.ttf",
-        INTER_FONT_ASSET,
-    ]
-);
+app_main!(App);
 
 script_mod! {
     use mod.prelude.widgets.*

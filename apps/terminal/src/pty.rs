@@ -341,6 +341,49 @@ impl Pty {
         })
     }
 
+    pub fn signal_foreground(&self, name: &str) -> io::Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let name = name.to_ascii_uppercase();
+            let name = name.strip_prefix("SIG").unwrap_or(&name);
+            let signal = match name {
+                "HUP" => 1,
+                "INT" => 2,
+                "QUIT" => 3,
+                "KILL" => 9,
+                "TERM" => 15,
+                "USR1" => if cfg!(target_os = "macos") { 30 } else { 10 },
+                "USR2" => if cfg!(target_os = "macos") { 31 } else { 12 },
+                "CONT" => if cfg!(target_os = "macos") { 19 } else { 18 },
+                "STOP" => if cfg!(target_os = "macos") { 17 } else { 19 },
+                "TSTP" => if cfg!(target_os = "macos") { 18 } else { 20 },
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Unknown signal: {name}"))),
+            };
+            #[cfg(target_os = "macos")]
+            let result = unsafe { libc_ffi::ioctl(self.master_fd, libc_ffi::TIOCSIG, signal) };
+            #[cfg(target_os = "linux")]
+            let result = unsafe {
+                let group = libc_ffi::tcgetpgrp(self.master_fd);
+                if group < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if group == 0 {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, "Terminal has no foreground process group"));
+                }
+                libc_ffi::killpg(group, signal)
+            };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = name;
+            Err(io::Error::new(io::ErrorKind::Unsupported, "Foreground signals require macOS or Linux"))
+        }
+    }
+
     pub fn try_write(&self, data: &[u8]) -> io::Result<usize> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
@@ -1008,9 +1051,13 @@ mod libc_ffi {
         pub fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         pub fn setsid() -> i32;
         pub fn killpg(pgrp: i32, sig: i32) -> i32;
+        #[cfg(target_os = "linux")]
+        pub fn tcgetpgrp(fd: i32) -> i32;
     }
 
     pub const SIGKILL: i32 = 9;
+    #[cfg(target_os = "macos")]
+    pub const TIOCSIG: usize = 0x2000_745f;
 
     pub unsafe fn fcntl_int(fd: i32, cmd: i32, arg: i32) -> i32 {
         fcntl(fd, cmd, arg)

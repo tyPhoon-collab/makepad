@@ -173,6 +173,15 @@ impl Row {
         col
     }
 
+    /// The first column and display width of the cell containing `col`.
+    pub(crate) fn cell_span(&self, col: usize) -> (usize, u8) {
+        let head = self.head_of(col);
+        let width = self
+            .cell(head)
+            .map_or(1, |cell| cell.content.width().max(1));
+        (head, width)
+    }
+
     /// Clearing/overwriting `col` must not leave halves of wide chars:
     /// if `col` is a wide head, blank its tail; if a tail, blank its head.
     /// Returns nothing; the caller writes `col` itself afterwards.
@@ -216,6 +225,19 @@ impl Row {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cell_span_covers_both_halves_of_a_wide_cell() {
+        let mut row = Row::new();
+        row.cell_mut(0).content = CellContent::Char('a');
+        row.cell_mut(1).content = CellContent::WideChar('漢');
+        row.cell_mut(2).content = CellContent::WideTail;
+
+        assert_eq!(row.cell_span(0), (0, 1));
+        assert_eq!(row.cell_span(1), (1, 2));
+        assert_eq!(row.cell_span(2), (1, 2));
+        assert_eq!(row.cell_span(3), (3, 1));
+    }
 
     #[test]
     fn wide_split() {

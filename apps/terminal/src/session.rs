@@ -156,6 +156,13 @@ impl Session {
         !self.exited && !bytes.is_empty() && self.writer.send(bytes.to_vec()).is_ok()
     }
 
+    pub fn signal_foreground(&mut self, signal: &str) -> io::Result<()> {
+        if self.process_exited() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Terminal session ended"));
+        }
+        self.pty.signal_foreground(signal)
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let cols = cols.max(2);
         let rows = rows.max(2);
