@@ -4,6 +4,7 @@ use std::collections::HashMap;
 struct ImeKeyEvent {
     view: Option<usize>,
     composition: bool,
+    committed: bool,
     handled: bool,
     command: bool,
     cancel: bool,
@@ -11,9 +12,10 @@ struct ImeKeyEvent {
 
 impl ImeKeyEvent {
     fn consumed(&self) -> bool {
-        self.composition
-            && (self.handled || self.cancel)
-            && (!self.command || self.cancel)
+        self.committed
+            || (self.composition
+                && (self.handled || self.cancel)
+                && (!self.command || self.cancel))
     }
 }
 
@@ -48,6 +50,13 @@ impl ImeKeyboard {
     pub(crate) fn composition_changed(&mut self, view: usize) {
         if let Some(event) = self.event_for_view(view) {
             event.composition = true;
+        }
+    }
+
+    pub(crate) fn committed(&mut self, view: usize) {
+        if let Some(event) = self.event_for_view(view) {
+            event.composition = true;
+            event.committed = true;
         }
     }
 
@@ -147,6 +156,17 @@ mod tests {
         ime.end_input_context(VIEW, true, false);
         assert!(ime.end_key_down(RETURN, false));
         assert!(ime.key_up(RETURN));
+    }
+
+    #[test]
+    fn commit_consumes_return_even_when_ime_also_sends_command_or_returns_unhandled() {
+        let mut ime = ImeKeyboard::default();
+        begin(&mut ime, true);
+        ime.committed(VIEW);
+        ime.command(VIEW, false);
+        ime.end_input_context(VIEW, false, false);
+        assert!(!ime.end_key_down(RETURN, false));
+        assert!(!ime.key_up(RETURN));
     }
 
     #[test]

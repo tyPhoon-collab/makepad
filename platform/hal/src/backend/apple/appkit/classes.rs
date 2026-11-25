@@ -560,7 +560,7 @@ fn define_view_class() -> *const Class {
     extern "C" fn marked_range(this: &Object, _sel: Sel) -> NSRange {
         let length = marked_length(this);
         if length > 0 {
-            NSRange { location: 0, length: length - 1 }
+            NSRange { location: 0, length }
         } else {
             NSRange { location: i64::MAX as u64, length: 0 }
         }
@@ -637,14 +637,14 @@ fn define_view_class() -> *const Class {
 
     extern "C" fn insert_text(this: &Object, _sel: Sel, string: ObjcId, replacement_range: NSRange) {
         shielded("insertText", std::panic::AssertUnwindSafe(|| unsafe {
-            if marked_length(this) > 0 {
-                app().ime_composition_changed(this as *const Object as usize);
+            let composing = marked_length(this) > 0;
+            if composing {
+                app().ime_committed(this as *const Object as usize);
             }
             let has_attr = msg_send![string, isKindOfClass: class!(NSAttributedString)];
             let characters = if has_attr { msg_send![string, string] } else { string };
             let string = nsstring_to_string(characters);
             // finish native composition before the app can move focus or start another one
-            let composing = marked_length(this) > 0;
             clear_marked_text(this);
             win_of(this).text_commit(&string, replacement_range.length != 0 || composing);
             let input_context: ObjcId = msg_send![this, inputContext];

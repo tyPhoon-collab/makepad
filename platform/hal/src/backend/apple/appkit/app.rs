@@ -738,6 +738,9 @@ impl App {
     pub fn ime_composition_changed(&self, view: usize) {
         self.ime.borrow_mut().composition_changed(view);
     }
+    pub fn ime_committed(&self, view: usize) {
+        self.ime.borrow_mut().committed(view);
+    }
     pub fn ime_command(&self, view: usize, cancel: bool) {
         self.ime.borrow_mut().command(view, cancel);
     }
