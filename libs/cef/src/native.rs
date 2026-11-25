@@ -319,6 +319,7 @@ struct CefApi {
         output: *mut ffi::cef_string_t,
     ) -> c_int,
     cef_string_utf16_clear: unsafe extern "C" fn(str_: *mut ffi::cef_string_t),
+    cef_string_userfree_free: unsafe extern "C" fn(str_: ffi::cef_string_userfree_t),
     cef_string_list_size: unsafe extern "C" fn(list: ffi::cef_string_list_t) -> usize,
     cef_string_list_value: unsafe extern "C" fn(
         list: ffi::cef_string_list_t,
@@ -428,6 +429,14 @@ struct SharedBrowserState {
     /// `window.open` / target=_blank requests, cancelled as native popups and
     /// handed to the embedder to open as tabs.
     popup_requests: Mutex<Vec<String>>,
+    /// URLs intercepted for the host OS (such as `mailto:` or `tel:`).
+    external_url_requests: Mutex<Vec<String>>,
+    /// Live popup browsers created with `window.opener` preserved.
+    popup_browsers: Mutex<Vec<Browser>>,
+    /// Parent state when this state belongs to a pending OSR popup browser.
+    popup_parent: Mutex<Option<(Arc<SharedBrowserState>, bool)>>,
+    accelerated: AtomicBool,
+    closed: AtomicBool,
     /// The latest decoded favicon bitmap (BGRA, premultiplied).
     favicon: Mutex<Option<Frame>>,
     favicon_url: Mutex<String>,
@@ -585,7 +594,15 @@ struct ClientHandler {
     display_handler: *mut DisplayHandler,
     load_handler: *mut LoadHandler,
     life_span_handler: *mut LifeSpanHandler,
+    request_handler: *mut RequestHandler,
     audio_handler: *mut AudioHandler,
+}
+
+#[repr(C)]
+struct RequestHandler {
+    cef_request_handler: ffi::cef_request_handler_t,
+    ref_count: AtomicUsize,
+    state: Arc<SharedBrowserState>,
 }
 
 #[repr(C)]
@@ -1125,6 +1142,7 @@ fn runtime() -> Result<&'static Runtime> {
                 )?,
                 cef_string_utf8_to_utf16: load_symbol(&library, b"cef_string_utf8_to_utf16\0")?,
                 cef_string_utf16_clear: load_symbol(&library, b"cef_string_utf16_clear\0")?,
+                cef_string_userfree_free: load_symbol(&library, b"cef_string_userfree_utf16_free\0")?,
                 cef_string_list_size: load_symbol(&library, b"cef_string_list_size\0")?,
                 cef_string_list_value: load_symbol(&library, b"cef_string_list_value\0")?,
             }
@@ -2711,6 +2729,25 @@ impl SharedBrowserState {
         }
     }
 
+    fn new_popup(
+        logical_width: usize,
+        logical_height: usize,
+        scale_factor: f32,
+        parent: Arc<SharedBrowserState>,
+        accelerated: bool,
+    ) -> Self {
+        Self {
+            view: Mutex::new(ViewState {
+                width: logical_width.max(1),
+                height: logical_height.max(1),
+                scale_factor: scale_factor.max(0.1),
+            }),
+            popup_parent: Mutex::new(Some((parent, accelerated))),
+            accelerated: AtomicBool::new(accelerated),
+            ..Default::default()
+        }
+    }
+
     fn view(&self) -> ViewState {
         *self.view.lock().unwrap()
     }
@@ -2809,6 +2846,11 @@ unsafe extern "system" fn client_release(self_: *mut ffi::cef_base_ref_counted_t
         if !(*client).life_span_handler.is_null() {
             release_ref_counted(
                 &mut (*(*client).life_span_handler).cef_life_span_handler.base as *mut _,
+            );
+        }
+        if !(*client).request_handler.is_null() {
+            release_ref_counted(
+                &mut (*(*client).request_handler).cef_request_handler.base as *mut _,
             );
         }
         if !(*client).audio_handler.is_null() {
@@ -3101,6 +3143,13 @@ unsafe extern "system" fn client_get_life_span_handler(
 ) -> *mut c_void {
     let client = self_ as *mut ClientHandler;
     add_ref_and_return((*client).life_span_handler) as *mut c_void
+}
+
+unsafe extern "system" fn client_get_request_handler(
+    self_: *mut ffi::cef_client_t,
+) -> *mut c_void {
+    let client = self_ as *mut ClientHandler;
+    add_ref_and_return((*client).request_handler) as *mut c_void
 }
 
 /// JavaScript dialogs (`alert`, `confirm`, `prompt`, "leave this page?")
@@ -4314,6 +4363,98 @@ unsafe extern "system" fn load_on_load_start(
 /// Popups (`window.open`, target=_blank) never become native windows here:
 /// the request is cancelled and its URL queued for the embedder to open as a
 /// tab.
+fn is_external_app_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.bytes();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic()
+        || !chars.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return false;
+    }
+    if rest.is_empty() || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    !matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http"
+            | "https"
+            | "ws"
+            | "wss"
+            | "about"
+            | "data"
+            | "blob"
+            | "javascript"
+            | "vbscript"
+            | "file"
+            | "devtools"
+            | "chrome"
+            | "chrome-devtools"
+            | "chrome-extension"
+            | "view-source"
+    )
+}
+
+unsafe fn configure_windowless_info(
+    window_info: *mut ffi::cef_window_info_t,
+    logical_width: usize,
+    logical_height: usize,
+    accelerated: bool,
+) {
+    let bounds = ffi::cef_rect_t {
+        x: 0,
+        y: 0,
+        width: logical_width.max(1) as c_int,
+        height: logical_height.max(1) as c_int,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        *window_info = ffi::cef_window_info_t {
+            size: std::mem::size_of::<ffi::cef_window_info_t>(),
+            window_name: ffi::cef_string_t::default(),
+            bounds,
+            hidden: 0,
+            parent_view: ptr::null_mut(),
+            windowless_rendering_enabled: 1,
+            shared_texture_enabled: accelerated as c_int,
+            external_begin_frame_enabled: 0,
+            view: ptr::null_mut(),
+            runtime_style: 0,
+        };
+    }
+    #[cfg(windows)]
+    {
+        *window_info = ffi::cef_window_info_t {
+            size: std::mem::size_of::<ffi::cef_window_info_t>(),
+            ex_style: 0,
+            window_name: ffi::cef_string_t::default(),
+            style: 0,
+            bounds,
+            parent_window: ptr::null_mut(),
+            menu: ptr::null_mut(),
+            windowless_rendering_enabled: 1,
+            shared_texture_enabled: accelerated as c_int,
+            external_begin_frame_enabled: 0,
+            window: ptr::null_mut(),
+            runtime_style: 0,
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        *window_info = ffi::cef_window_info_t {
+            size: std::mem::size_of::<ffi::cef_window_info_t>(),
+            bounds,
+            windowless_rendering_enabled: 1,
+            shared_texture_enabled: accelerated as c_int,
+            ..Default::default()
+        };
+    }
+}
+
 unsafe extern "system" fn life_span_on_before_popup(
     self_: *mut ffi::cef_life_span_handler_t,
     browser: *mut ffi::cef_browser_t,
@@ -4321,11 +4462,11 @@ unsafe extern "system" fn life_span_on_before_popup(
     _popup_id: c_int,
     target_url: *const ffi::cef_string_t,
     _target_frame_name: *const ffi::cef_string_t,
-    _target_disposition: ffi::cef_window_open_disposition_t,
+    target_disposition: ffi::cef_window_open_disposition_t,
     _user_gesture: c_int,
-    _popup_features: *const ffi::cef_popup_features_t,
-    _window_info: *mut ffi::cef_window_info_t,
-    _client: *mut *mut ffi::cef_client_t,
+    popup_features: *const ffi::cef_popup_features_t,
+    window_info: *mut ffi::cef_window_info_t,
+    client: *mut *mut ffi::cef_client_t,
     _settings: *mut ffi::cef_browser_settings_t,
     _extra_info: *mut *mut ffi::cef_dictionary_value_t,
     _no_javascript_access: *mut c_int,
@@ -4333,13 +4474,139 @@ unsafe extern "system" fn life_span_on_before_popup(
     release_param(browser);
     release_param(frame);
     let handler = self_ as *mut LifeSpanHandler;
+    let state: &Arc<SharedBrowserState> = &(*handler).state;
     let url = cef_string_to_string(target_url);
+    if is_external_app_url(&url) {
+        state.external_url_requests.lock().unwrap().push(url);
+        state.nav_gen.fetch_add(1, Ordering::AcqRel);
+        return 1;
+    }
+    if target_disposition == ffi::CEF_WOD_NEW_POPUP && !window_info.is_null() && !client.is_null()
+    {
+        let parent_view = state.view();
+        let (width, height) = if !popup_features.is_null() {
+            let features = &*popup_features;
+            let w = if features.width_set != 0 && features.width > 0 {
+                (features.width as usize).max(100)
+            } else {
+                parent_view.width
+            };
+            let h = if features.height_set != 0 && features.height > 0 {
+                (features.height as usize).max(100)
+            } else {
+                parent_view.height
+            };
+            (w, h)
+        } else {
+            (parent_view.width, parent_view.height)
+        };
+        let accelerated = state.accelerated.load(Ordering::Acquire);
+        let child_state = Arc::new(SharedBrowserState::new_popup(
+            width,
+            height,
+            parent_view.scale_factor,
+            state.clone(),
+            accelerated,
+        ));
+        let child_client = ClientHandler::allocate_for_state(child_state);
+        *client = &mut (*child_client).cef_client;
+        configure_windowless_info(window_info, width, height, accelerated);
+        return 0;
+    }
     if !url.is_empty() {
-        let state: &SharedBrowserState = &(*handler).state;
         state.popup_requests.lock().unwrap().push(url);
         state.nav_gen.fetch_add(1, Ordering::AcqRel);
     }
     1
+}
+
+unsafe extern "system" fn request_add_ref(self_: *mut ffi::cef_base_ref_counted_t) {
+    let handler = self_ as *mut RequestHandler;
+    (*handler).ref_count.fetch_add(1, Ordering::Relaxed);
+}
+
+unsafe extern "system" fn request_release(self_: *mut ffi::cef_base_ref_counted_t) -> c_int {
+    let handler = self_ as *mut RequestHandler;
+    if (*handler).ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        drop(Box::from_raw(handler));
+        1
+    } else {
+        0
+    }
+}
+
+unsafe extern "system" fn request_has_one_ref(self_: *mut ffi::cef_base_ref_counted_t) -> c_int {
+    let handler = self_ as *mut RequestHandler;
+    ((*handler).ref_count.load(Ordering::Acquire) == 1) as c_int
+}
+
+unsafe extern "system" fn request_has_at_least_one_ref(
+    self_: *mut ffi::cef_base_ref_counted_t,
+) -> c_int {
+    let handler = self_ as *mut RequestHandler;
+    ((*handler).ref_count.load(Ordering::Acquire) >= 1) as c_int
+}
+
+unsafe extern "system" fn request_on_before_browse(
+    self_: *mut ffi::cef_request_handler_t,
+    browser: *mut ffi::cef_browser_t,
+    frame: *mut ffi::cef_frame_t,
+    request: *mut ffi::cef_request_t,
+    _user_gesture: c_int,
+    _is_redirect: c_int,
+) -> c_int {
+    release_param(browser);
+    release_param(frame);
+    let mut cancel = 0;
+    if !request.is_null() {
+        if let Some(get_url) = (*request).get_url {
+            let url_ptr = get_url(request);
+            if !url_ptr.is_null() {
+                let url = cef_string_to_string(url_ptr);
+                if let Ok(rt) = runtime() {
+                    (rt.api.cef_string_userfree_free)(url_ptr);
+                }
+                if is_external_app_url(&url) {
+                    let handler = self_ as *mut RequestHandler;
+                    let state: &SharedBrowserState = &(*handler).state;
+                    state.external_url_requests.lock().unwrap().push(url);
+                    state.nav_gen.fetch_add(1, Ordering::AcqRel);
+                    cancel = 1;
+                }
+            }
+        }
+        release_param(request);
+    }
+    cancel
+}
+
+impl RequestHandler {
+    fn allocate(state: Arc<SharedBrowserState>) -> *mut RequestHandler {
+        Box::into_raw(Box::new(Self {
+            cef_request_handler: ffi::cef_request_handler_t {
+                base: ffi::cef_base_ref_counted_t {
+                    size: std::mem::size_of::<ffi::cef_request_handler_t>(),
+                    add_ref: Some(request_add_ref),
+                    release: Some(request_release),
+                    has_one_ref: Some(request_has_one_ref),
+                    has_at_least_one_ref: Some(request_has_at_least_one_ref),
+                },
+                on_before_browse: Some(request_on_before_browse),
+                on_open_urlfrom_tab: None,
+                get_resource_request_handler: None,
+                get_auth_credentials: None,
+                on_certificate_error: None,
+                on_select_client_certificate: None,
+                on_render_view_ready: None,
+                on_render_process_unresponsive: None,
+                on_render_process_responsive: None,
+                on_render_process_terminated: None,
+                on_document_available_in_main_frame: None,
+            },
+            ref_count: AtomicUsize::new(1),
+            state,
+        }))
+    }
 }
 
 impl DisplayHandler {
@@ -4409,7 +4676,7 @@ impl LifeSpanHandler {
                 on_before_popup: Some(life_span_on_before_popup),
                 on_before_popup_aborted: None,
                 on_before_dev_tools_popup: None,
-                on_after_created: None,
+                on_after_created: Some(life_span_on_after_created),
                 do_close: None,
                 on_before_close: Some(life_span_on_before_close),
             },
@@ -4419,12 +4686,45 @@ impl LifeSpanHandler {
     }
 }
 
+unsafe extern "system" fn life_span_on_after_created(
+    self_: *mut ffi::cef_life_span_handler_t,
+    browser: *mut ffi::cef_browser_t,
+) {
+    if browser.is_null() {
+        return;
+    }
+    let handler = self_ as *mut LifeSpanHandler;
+    let state = (*handler).state.clone();
+    let parent = state.popup_parent.lock().unwrap().take();
+    if let Some((parent_state, accelerated)) = parent {
+        if let Some(add_ref) = (*browser).base.add_ref {
+            add_ref(&mut (*browser).base);
+        }
+        if let Ok(runtime) = runtime() {
+            runtime.live_browsers.fetch_add(1, Ordering::AcqRel);
+        }
+        let popup_browser = Browser::from_popup(browser, state, accelerated);
+        parent_state
+            .popup_browsers
+            .lock()
+            .unwrap()
+            .push(popup_browser);
+        parent_state.nav_gen.fetch_add(1, Ordering::AcqRel);
+    }
+    release_param(browser);
+}
+
 /// The browser is gone: one fewer for `shutdown` to wait for.
 unsafe extern "system" fn life_span_on_before_close(
-    _self: *mut ffi::cef_life_span_handler_t,
+    self_: *mut ffi::cef_life_span_handler_t,
     browser: *mut ffi::cef_browser_t,
 ) {
     release_param(browser);
+    if !self_.is_null() {
+        let handler = self_ as *mut LifeSpanHandler;
+        let state: &SharedBrowserState = &(*handler).state;
+        state.closed.store(true, Ordering::Release);
+    }
     if let Ok(runtime) = runtime() {
         let mut count = runtime.live_browsers.load(Ordering::Acquire);
         while let Err(now) = runtime.live_browsers.compare_exchange(count, count.saturating_sub(1), Ordering::AcqRel, Ordering::Acquire) {
@@ -4632,11 +4932,23 @@ impl AudioHandler {
 }
 
 impl ClientHandler {
+    fn allocate_for_state(state: Arc<SharedBrowserState>) -> *mut ClientHandler {
+        Self::allocate(
+            RenderHandler::allocate(state.clone()),
+            DisplayHandler::allocate(state.clone()),
+            LoadHandler::allocate(state.clone()),
+            LifeSpanHandler::allocate(state.clone()),
+            RequestHandler::allocate(state.clone()),
+            AudioHandler::allocate(state),
+        )
+    }
+
     fn allocate(
         render_handler: *mut RenderHandler,
         display_handler: *mut DisplayHandler,
         load_handler: *mut LoadHandler,
         life_span_handler: *mut LifeSpanHandler,
+        request_handler: *mut RequestHandler,
         audio_handler: *mut AudioHandler,
     ) -> *mut ClientHandler {
         Box::into_raw(Box::new(Self {
@@ -4665,7 +4977,7 @@ impl ClientHandler {
                 get_load_handler: Some(client_get_load_handler),
                 get_print_handler: Some(client_null_handler),
                 get_render_handler: Some(client_get_render_handler),
-                get_request_handler: Some(client_null_handler),
+                get_request_handler: Some(client_get_request_handler),
                 on_process_message_received: None,
             },
             ref_count: AtomicUsize::new(1),
@@ -4673,6 +4985,7 @@ impl ClientHandler {
             display_handler,
             load_handler,
             life_span_handler,
+            request_handler,
             audio_handler,
         }))
     }
@@ -4911,18 +5224,8 @@ impl Browser {
                 let runtime = runtime()?;
 
                 let logical = state.view();
-                let render_handler = RenderHandler::allocate(state.clone());
-                let display_handler = DisplayHandler::allocate(state.clone());
-                let load_handler = LoadHandler::allocate(state.clone());
-                let life_span_handler = LifeSpanHandler::allocate(state.clone());
-                let audio_handler = AudioHandler::allocate(state.clone());
-                let client = ClientHandler::allocate(
-                    render_handler,
-                    display_handler,
-                    load_handler,
-                    life_span_handler,
-                    audio_handler,
-                );
+                state.accelerated.store(accelerated, Ordering::Release);
+                let client = ClientHandler::allocate_for_state(state.clone());
 
                 let url = CefString::new(
                     &runtime.api,
@@ -5264,9 +5567,52 @@ impl Browser {
         self.hidden
     }
 
+    fn from_popup(
+        raw_browser: *mut ffi::cef_browser_t,
+        state: Arc<SharedBrowserState>,
+        accelerated: bool,
+    ) -> Self {
+        let browser = Arc::new(AtomicUsize::new(raw_browser as usize));
+        #[cfg(target_os = "macos")]
+        if let Ok(runtime) = runtime() {
+            let mut browsers = runtime.browsers.lock().unwrap();
+            browsers.retain(|b| b.strong_count() != 0);
+            browsers.push(Arc::downgrade(&browser));
+        }
+        let view = state.view();
+        Self {
+            browser,
+            error: Arc::new(Mutex::new(None)),
+            state,
+            width: ((view.width as f32) * view.scale_factor).round() as usize,
+            height: ((view.height as f32) * view.scale_factor).round() as usize,
+            scale_factor: view.scale_factor,
+            page_zoom: 1.0,
+            visual_pinch: None,
+            accelerated,
+            hidden: false,
+            audio: None,
+        }
+    }
+
     /// URLs the page asked to open in a new window (cancelled as popups).
     pub fn take_popup_requests(&mut self) -> Vec<String> {
         std::mem::take(&mut *self.state.popup_requests.lock().unwrap())
+    }
+
+    /// URLs intercepted for the host OS (such as `mailto:` or `tel:`).
+    pub fn take_external_url_requests(&mut self) -> Vec<String> {
+        std::mem::take(&mut *self.state.external_url_requests.lock().unwrap())
+    }
+
+    /// Live popup browsers opened with `window.opener` preserved.
+    pub fn take_popup_browsers(&mut self) -> Vec<Browser> {
+        std::mem::take(&mut *self.state.popup_browsers.lock().unwrap())
+    }
+
+    /// Whether CEF has closed this browser (e.g. via `window.close()`).
+    pub fn is_closed(&self) -> bool {
+        self.state.closed.load(Ordering::Acquire)
     }
 
     /// The latest favicon bitmap (BGRA8 premultiplied), once per change.
@@ -6205,5 +6551,22 @@ mod tests {
     fn api_version_is_pinned_to_the_ffi_layout() {
         // `ffi.rs` is the 138 layout; a newer libcef serves it when asked.
         assert_eq!(CEF_API_VERSION, 13800);
+    }
+
+    #[test]
+    fn external_app_url_allows_non_browser_schemes() {
+        assert!(is_external_app_url("mailto:user@example.com"));
+        assert!(is_external_app_url("TEL:+819012345678"));
+        assert!(is_external_app_url("slack://open"));
+        assert!(is_external_app_url("vscode://file/tmp/a"));
+        assert!(!is_external_app_url("https://example.com"));
+        assert!(!is_external_app_url("http://example.com"));
+        assert!(!is_external_app_url("about:blank"));
+        assert!(!is_external_app_url("data:text/html,ok"));
+        assert!(!is_external_app_url("file:///tmp/a.html"));
+        assert!(!is_external_app_url("javascript:alert(1)"));
+        assert!(!is_external_app_url("mailto:"));
+        assert!(!is_external_app_url("/relative/path:1"));
+        assert!(!is_external_app_url("mailto:user@example.com\n"));
     }
 }

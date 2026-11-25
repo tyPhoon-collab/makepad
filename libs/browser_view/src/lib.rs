@@ -68,6 +68,9 @@ pub struct ViewState {
     pub error: Option<String>,
     window: Option<usize>,
     popups: Vec<String>,
+    popup_views: Vec<(ViewId, String)>,
+    external_urls: Vec<String>,
+    closed: bool,
     console: Vec<ConsoleLine>,
     evaluations: Vec<(u64, Result<String, String>)>,
     /// Sent once the host is connected.
@@ -348,6 +351,18 @@ impl BrowserViews {
         self.view_mut(id).map(|view| std::mem::take(&mut view.state.popups)).unwrap_or_default()
     }
 
+    pub fn take_popup_views(&mut self, id: ViewId) -> Vec<(ViewId, String)> {
+        self.view_mut(id).map(|view| std::mem::take(&mut view.state.popup_views)).unwrap_or_default()
+    }
+
+    pub fn take_external_urls(&mut self, id: ViewId) -> Vec<String> {
+        self.view_mut(id).map(|view| std::mem::take(&mut view.state.external_urls)).unwrap_or_default()
+    }
+
+    pub fn take_closed(&mut self, id: ViewId) -> bool {
+        self.view_mut(id).is_some_and(|view| std::mem::take(&mut view.state.closed))
+    }
+
     pub fn take_console(&mut self, id: ViewId) -> Vec<ConsoleLine> {
         self.view_mut(id).map(|view| std::mem::take(&mut view.state.console)).unwrap_or_default()
     }
@@ -583,7 +598,24 @@ impl BrowserViews {
             match child_event {
                 ChildEvent::Custom { json, .. } => {
                     if let Some((view, event)) = protocol::parse_event(&json) {
-                        changed |= Self::apply(cx, &mut self.views, &mut self.devtools_port, children, ViewId(view), event);
+                        if let ViewEvent::PopupWindow { popup_id, url, window_id } = event {
+                            let new_id = ViewId(self.next_view);
+                            self.next_view += 1;
+                            if let Some(slot) = children.slot_mut(&()) {
+                                if slot.life == Life::Live {
+                                    slot.open_window(cx, window_id);
+                                }
+                            }
+                            let mut state = ViewState { url: url.clone(), loading: true, window: Some(window_id), ..ViewState::default() };
+                            state.queued.push(ViewOp::AdoptPopup { popup_id, view_id: new_id.0 });
+                            self.views.push(View::new(new_id, state));
+                            if let Some(parent) = self.views.iter_mut().find(|v| v.id == ViewId(view)) {
+                                parent.state.popup_views.push((new_id, url));
+                            }
+                            changed = true;
+                        } else {
+                            changed |= Self::apply(cx, &mut self.views, &mut self.devtools_port, children, ViewId(view), event);
+                        }
                     }
                 }
                 ChildEvent::Message { msg: AppToStudio::SetCursor(cursor), .. } => {
@@ -638,6 +670,11 @@ impl BrowserViews {
                 state.can_go_forward = can_go_forward;
             }
             ViewEvent::Popup { url } => state.popups.push(url),
+            ViewEvent::PopupWindow { .. } => return false,
+            ViewEvent::ExternalUrl { url } => {
+                state.external_urls.push(url);
+                return false;
+            }
             ViewEvent::Console { level, message, source, line } => {
                 state.console.push(ConsoleLine { level, message, source, line });
                 return false;
@@ -666,7 +703,10 @@ impl BrowserViews {
                 log!("browser view {}: {message}", id.0);
                 state.error = Some(message);
             }
-            ViewEvent::Closed => return false,
+            ViewEvent::Closed => {
+                state.closed = true;
+                return false;
+            }
         }
         true
     }

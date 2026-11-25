@@ -60,6 +60,8 @@ pub enum ViewOp {
     CaptureLost,
     /// Close the view and its window.
     Close,
+    /// Adopt a host-created popup browser under an embedder-assigned `view_id`.
+    AdoptPopup { popup_id: u64, view_id: u64 },
 }
 
 /// From the browser host to the owner.
@@ -72,6 +74,10 @@ pub enum ViewEvent {
     State { title: String, url: String, loading: bool, can_go_back: bool, can_go_forward: bool, epoch: u64 },
     /// The page asked for a new window.
     Popup { url: String },
+    /// The page opened a live popup browser (`window.opener` preserved).
+    PopupWindow { popup_id: u64, url: String, window_id: usize },
+    /// A URL intended for the host OS (such as `mailto:` or `tel:`).
+    ExternalUrl { url: String },
     /// A line the page wrote to its console.
     Console { level: i32, message: String, source: String, line: i32 },
     /// The answer to `ViewOp::Eval`: the value as JSON, or the exception.
@@ -141,6 +147,7 @@ mod tests {
             ViewOp::ImeComposition { text: "かな".into() },
             ViewOp::ImeCancelComposition,
             ViewOp::Close,
+            ViewOp::AdoptPopup { popup_id: 2, view_id: 9 },
         ] {
             let json = op_to_json(3, &op);
             assert_eq!(parse_op(&json), Some((3, op)));
@@ -156,6 +163,8 @@ mod tests {
             ViewEvent::Evaluated { id: 7, ok: true, value: "2".into() },
             ViewEvent::ImeCaret { x: 10, y: 20, width: 8, height: 18 },
             ViewEvent::DevToolsReady { port: 9222 },
+            ViewEvent::PopupWindow { popup_id: 2, url: "https://auth.example".into(), window_id: 4 },
+            ViewEvent::ExternalUrl { url: "mailto:user@example.com".into() },
             ViewEvent::Closed,
         ] {
             let json = event_to_json(5, &event);

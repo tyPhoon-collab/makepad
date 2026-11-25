@@ -97,6 +97,7 @@ pub type cef_channel_layout_t = c_int;
 pub type cef_transition_type_t = c_int;
 pub type cef_errorcode_t = c_int;
 pub type cef_window_open_disposition_t = c_int;
+pub const CEF_WOD_NEW_POPUP: cef_window_open_disposition_t = 5;
 pub type cef_jsdialog_type_t = c_int;
 pub type cef_cursor_type_t = c_int;
 pub type cef_cursor_handle_t = *mut c_void;
@@ -1353,4 +1354,56 @@ pub struct cef_dev_tools_message_observer_t {
     pub on_dev_tools_event: cef_unused_callback_t,
     pub on_dev_tools_agent_attached: cef_unused_callback_t,
     pub on_dev_tools_agent_detached: cef_unused_callback_t,
+}
+
+#[repr(C)]
+pub struct cef_request_t {
+    pub base: cef_base_ref_counted_t,
+    pub is_read_only: cef_unused_callback_t,
+    pub get_url: Option<unsafe extern "system" fn(self_: *mut cef_request_t) -> cef_string_userfree_t>,
+    pub set_url: cef_unused_callback_t,
+    pub get_method: cef_unused_callback_t,
+    pub set_method: cef_unused_callback_t,
+    pub set_referrer: cef_unused_callback_t,
+    pub get_referrer_url: cef_unused_callback_t,
+    pub get_referrer_policy: cef_unused_callback_t,
+    pub get_post_data: cef_unused_callback_t,
+    pub set_post_data: cef_unused_callback_t,
+    pub get_header_map: cef_unused_callback_t,
+    pub set_header_map: cef_unused_callback_t,
+    pub get_header_by_name: cef_unused_callback_t,
+    pub set_header_by_name: cef_unused_callback_t,
+    pub set: cef_unused_callback_t,
+    pub get_flags: cef_unused_callback_t,
+    pub set_flags: cef_unused_callback_t,
+    pub get_first_party_for_cookies: cef_unused_callback_t,
+    pub set_first_party_for_cookies: cef_unused_callback_t,
+    pub get_resource_type: cef_unused_callback_t,
+    pub get_transition_type: cef_unused_callback_t,
+    pub get_identifier: cef_unused_callback_t,
+}
+
+#[repr(C)]
+pub struct cef_request_handler_t {
+    pub base: cef_base_ref_counted_t,
+    pub on_before_browse: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_request_handler_t,
+            browser: *mut cef_browser_t,
+            frame: *mut cef_frame_t,
+            request: *mut cef_request_t,
+            user_gesture: c_int,
+            is_redirect: c_int,
+        ) -> c_int,
+    >,
+    pub on_open_urlfrom_tab: cef_unused_callback_t,
+    pub get_resource_request_handler: cef_unused_callback_t,
+    pub get_auth_credentials: cef_unused_callback_t,
+    pub on_certificate_error: cef_unused_callback_t,
+    pub on_select_client_certificate: cef_unused_callback_t,
+    pub on_render_view_ready: cef_unused_callback_t,
+    pub on_render_process_unresponsive: cef_unused_callback_t,
+    pub on_render_process_responsive: cef_unused_callback_t,
+    pub on_render_process_terminated: cef_unused_callback_t,
+    pub on_document_available_in_main_frame: cef_unused_callback_t,
 }

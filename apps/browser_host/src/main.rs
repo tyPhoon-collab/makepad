@@ -56,6 +56,7 @@ struct Shown {
 struct Page {
     /// The app's view id; None: a free window waiting for the next page.
     view: Option<u64>,
+    popup_id: Option<u64>,
     window: WindowHandle,
     browser: Option<Browser>,
     /// The page's size in points and its dpi, from the window's geometry.
@@ -127,12 +128,15 @@ pub struct App {
     /// The page holding the keyboard (its view id).
     #[rust]
     focus: Option<u64>,
+    #[rust]
+    next_popup_id: u64,
 }
 
 impl Page {
     fn new(cx: &mut Cx) -> Page {
         Page {
             view: None,
+            popup_id: None,
             window: WindowHandle::new(cx),
             browser: None,
             size: None,
@@ -409,7 +413,7 @@ impl App {
         if let ViewOp::Open { url, dark, background, document_script } = op {
             makepad_cef::set_background_color(background);
             makepad_cef::set_application_dark_mode(dark);
-            let at = match self.pages.iter().position(|page| page.view.is_none()) {
+            let at = match self.pages.iter().position(|page| page.view.is_none() && page.popup_id.is_none()) {
                 Some(at) => at,
                 None => {
                     self.pages.push(Page::new(cx));
@@ -418,6 +422,7 @@ impl App {
             };
             let page = &mut self.pages[at];
             page.view = Some(view);
+            page.popup_id = None;
             page.shown = None;
             page.error = None;
             page.error_sent = false;
@@ -428,6 +433,13 @@ impl App {
             page.document_script = document_script;
             page.navigate(&url);
             Self::send(view, ViewEvent::Window { window_id: page.window.window_id().id() });
+            return;
+        }
+        if let ViewOp::AdoptPopup { popup_id, view_id } = op {
+            if let Some(page) = self.pages.iter_mut().find(|page| page.popup_id == Some(popup_id)) {
+                page.popup_id = None;
+                page.view = Some(view_id);
+            }
             return;
         }
         if let ViewOp::Focus { on } = op {
@@ -515,8 +527,9 @@ impl App {
     }
 
     /// Apply what waits for a page and report what changed.
-    fn poll(&mut self) {
+    fn poll(&mut self, cx: &mut Cx) {
         makepad_cef::do_message_loop_work();
+        let mut spawned_popups: Vec<(u64, Browser)> = Vec::new();
         for page in &mut self.pages {
             let Some(view) = page.view else { continue };
             if let Some(result) = page.document_setup.as_ref().and_then(DevToolsTargetRequest::poll) {
@@ -604,9 +617,19 @@ impl App {
                     can_go_forward: cef.can_go_forward(),
                     epoch: cef.navigation_epoch(),
                 };
-                (started, shown, cef.take_popup_requests(), cef.take_console_messages(), cef.take_evaluations(), cef.ime_caret_rect())
+                (
+                    started,
+                    shown,
+                    cef.take_popup_requests(),
+                    cef.take_external_url_requests(),
+                    cef.take_popup_browsers(),
+                    cef.is_closed(),
+                    cef.take_console_messages(),
+                    cef.take_evaluations(),
+                    cef.ime_caret_rect(),
+                )
             });
-            let Some((started, shown, popups, console, evaluations, ime_caret)) = polled else {
+            let Some((started, shown, popups, external_urls, popup_browsers, closed, console, evaluations, ime_caret)) = polled else {
                 // No page yet (it waits for its size): keep what waits.
                 page.evals = evals;
                 continue;
@@ -681,6 +704,35 @@ impl App {
             for url in popups {
                 Self::send(view, ViewEvent::Popup { url });
             }
+            for url in external_urls {
+                Self::send(view, ViewEvent::ExternalUrl { url });
+            }
+            for popup_browser in popup_browsers {
+                spawned_popups.push((view, popup_browser));
+            }
+            if closed {
+                page.devtools_target_request = None;
+                page.browser = None;
+                page.url = None;
+                page.document_script = None;
+                page.document_setup = None;
+                page.ring = None;
+                page.audio = None;
+                page.audio_backlog.clear();
+                page.view = None;
+                page.popup_id = None;
+                page.evals.clear();
+                page.eval_ids.clear();
+                page.commands.clear();
+                page.pressed = MouseButton::empty();
+                page.composing = false;
+                page.last_ime_caret = None;
+                page.devtools_port_sent = false;
+                if self.focus == Some(view) {
+                    self.focus = None;
+                }
+                Self::send(view, ViewEvent::Closed);
+            }
             for line in console {
                 Self::send(view, ViewEvent::Console { level: line.level, message: line.message, source: line.source, line: line.line });
             }
@@ -693,6 +745,30 @@ impl App {
                 };
                 Self::send(view, ViewEvent::Evaluated { id, ok, value });
             }
+        }
+        for (parent_view, popup_browser) in spawned_popups {
+            self.next_popup_id += 1;
+            let popup_id = self.next_popup_id;
+            let url = popup_browser.url();
+            let at = match self.pages.iter().position(|page| page.view.is_none() && page.popup_id.is_none()) {
+                Some(at) => at,
+                None => {
+                    self.pages.push(Page::new(cx));
+                    self.pages.len() - 1
+                }
+            };
+            let page = &mut self.pages[at];
+            page.view = None;
+            page.popup_id = Some(popup_id);
+            page.browser = Some(popup_browser);
+            page.shown = None;
+            page.error = None;
+            page.error_sent = false;
+            page.hidden = Some(false);
+            page.last_ime_caret = None;
+            page.devtools_port_sent = false;
+            let window_id = page.window.window_id().id();
+            Self::send(parent_view, ViewEvent::PopupWindow { popup_id, url, window_id });
         }
     }
 }
@@ -740,7 +816,7 @@ impl AppMain for App {
             _ => {}
         }
         if self.poll.is_event(event).is_some() {
-            self.poll();
+            self.poll(cx);
         }
         // Pointer input goes to its window's page, keys to the focused one.
         let window = match event {
