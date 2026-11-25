@@ -24,6 +24,7 @@ impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
 mod distribution;
+pub use distribution::set_distribution_workspace;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod malloc_compat;
 

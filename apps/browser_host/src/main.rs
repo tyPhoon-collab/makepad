@@ -955,6 +955,12 @@ pub fn run() {
     run_app(app_main);
 }
 
+/// Run the Browser Host with CEF installed in the embedding app's workspace.
+pub fn run_with_cef_workspace(workspace: &'static std::path::Path, setup_command: &'static str) {
+    makepad_cef::set_distribution_workspace(workspace, setup_command);
+    run();
+}
+
 /// CEF's process bootstrap, then the hosted makepad event loop.
 pub fn app_main() {
     match makepad_cef::bootstrap() {

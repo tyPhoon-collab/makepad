@@ -1,5 +1,15 @@
 //! Read-only discovery of an explicitly installed CEF distribution.
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static WORKSPACE: OnceLock<(&'static Path, &'static str)> = OnceLock::new();
+
+/// Register the embedding workspace and its CEF setup command before starting the host.
+pub fn set_distribution_workspace(root: &'static Path, setup_command: &'static str) {
+    WORKSPACE
+        .set((root, setup_command))
+        .expect("CEF distribution workspace already set");
+}
 
 pub(crate) fn platform() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -56,9 +66,12 @@ fn from_ancestors(start: &Path, platform: &str) -> Option<PathBuf> {
 
 pub(crate) fn find() -> Result<PathBuf, String> {
     let platform = platform().ok_or("CEF distribution is unsupported on this platform")?;
+    let setup_command = WORKSPACE.get().map_or_else(
+        || format!("cargo run --release -p makepad-cef-fetch -- --fetch --platform {platform}"),
+        |(_, command)| (*command).to_owned(),
+    );
     let hint = format!(
-        "Set MAKEPAD_CEF_DIST_DIR to an extracted distribution, or fetch explicitly with \
-         cargo run --release -p makepad-cef-fetch -- --fetch --platform {platform}"
+        "Set MAKEPAD_CEF_DIST_DIR to an extracted distribution, or run `{setup_command}`."
     );
     let dist = if let Some(dir) = std::env::var_os("MAKEPAD_CEF_DIST_DIR") {
         let dir = PathBuf::from(dir);
@@ -79,6 +92,7 @@ pub(crate) fn find() -> Result<PathBuf, String> {
                     .map(PathBuf::from)
                     .and_then(|root| from_ancestors(&root, platform))
             })
+            .or_else(|| WORKSPACE.get().and_then(|(root, _)| from_ancestors(root, platform)))
             .or_else(|| from_ancestors(Path::new(env!("CARGO_MANIFEST_DIR")), platform))
             .or_else(|| from_cargo_git_checkouts(platform))
             .ok_or_else(|| format!("No installed CEF distribution for {platform}. {hint}"))?
