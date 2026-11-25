@@ -510,6 +510,10 @@ impl Browser {
         Ok(())
     }
 
+    pub fn reset_zoom(&mut self) -> Result<()> {
+        Err(Error::new("CEF is not supported on this platform"))
+    }
+
     pub fn set_page_zoom(&mut self, _factor: f64) -> Result<()> {
         Err(Error::new("CEF is not supported on this platform"))
     }

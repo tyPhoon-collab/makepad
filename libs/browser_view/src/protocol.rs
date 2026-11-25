@@ -25,6 +25,8 @@ pub enum ViewOp {
     Stop,
     /// Set the page's local content scale. One restores native view metrics.
     PageZoom { factor: f64 },
+    /// Restore the native page metrics and visual viewport scale.
+    ResetZoom,
     /// A trackpad pinch centered at this point in the view.
     BeginVisualPinch { x: f64, y: f64 },
     UpdateVisualPinch { scale: f64 },
@@ -130,6 +132,7 @@ mod tests {
             ViewOp::Open { url: "https://makepad.nl/?a=\"b\"".into(), dark: true, background: 0xff102030 },
             ViewOp::Back,
             ViewOp::PageZoom { factor: 1.4 },
+            ViewOp::ResetZoom,
             ViewOp::BeginVisualPinch { x: 135.5, y: 48.0 },
             ViewOp::UpdateVisualPinch { scale: 1.05 },
             ViewOp::EndVisualPinch,

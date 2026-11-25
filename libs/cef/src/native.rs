@@ -5449,6 +5449,12 @@ impl Browser {
         })
     }
 
+    pub fn reset_zoom(&mut self) -> Result<()> {
+        self.end_visual_pinch()?;
+        self.set_page_zoom(1.0)?;
+        self.send_zoom_command("Emulation.setPageScaleFactor", r#"{"pageScaleFactor":1}"#)
+    }
+
     /// Scale and reflow one offscreen page without changing the profile's host zoom map.
     pub fn set_page_zoom(&mut self, factor: f64) -> Result<()> {
         if !(0.5..=2.0).contains(&factor) {

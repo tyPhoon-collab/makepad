@@ -199,6 +199,7 @@ impl Page {
             ViewOp::History { delta } => browser.execute_javascript(&format!("window.history.go({delta})")),
             ViewOp::Reload => browser.reload(),
             ViewOp::PageZoom { factor } => browser.set_page_zoom(factor),
+            ViewOp::ResetZoom => browser.reset_zoom(),
             ViewOp::BeginVisualPinch { x, y } => browser.begin_visual_pinch(x, y),
             ViewOp::UpdateVisualPinch { scale } => browser.update_visual_pinch(scale),
             ViewOp::EndVisualPinch => browser.end_visual_pinch(),
