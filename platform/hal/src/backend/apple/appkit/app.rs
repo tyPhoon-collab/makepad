@@ -102,6 +102,7 @@ pub struct App {
     /// the main menu consumed the key event being dispatched (`menuAction:` ran)
     menu_command_fired: Cell<bool>,
     menu_sid: Cell<u32>,
+    pending_app_opens: RefCell<Vec<(u32, Vec<u8>)>>,
     pulse: Cell<ObjcId>,
     menu_delegate: Cell<ObjcId>,
     /// The Dock icon's menu (`menu_kind::DOCK` items; the system adds the windows), nil: none.
@@ -142,6 +143,7 @@ pub fn app() -> &'static App {
             last_key_mod: Cell::new(0),
             menu_command_fired: Cell::new(false),
             menu_sid: Cell::new(0),
+            pending_app_opens: RefCell::new(Vec::new()),
             pulse: Cell::new(nil),
             menu_delegate: Cell::new(nil),
             dock_menu: Cell::new(nil),
@@ -628,6 +630,9 @@ impl App {
 
     pub fn add_window(&self, win: &'static Win) {
         self.windows.borrow_mut().push(win);
+        for (count, payload) in self.pending_app_opens.take() {
+            Shared::global().push(win.sid.get(), |q| q.app_open(count, &payload));
+        }
     }
 
     /// A window is gone (closing or closed): its display link and fallback timer go with it.
@@ -684,10 +689,16 @@ impl App {
 
     /// Files and URLs the OS asks the app to open go to the newest session.
     pub fn send_app_open(&self, items: &[(u32, String)]) {
-        let Some(sid) = self.windows.borrow().iter().rev().find(|w| !w.retired.get()).map(|w| w.sid.get()).or(Some(self.menu_sid.get()).filter(|s| *s != 0)) else { return };
+        let sid = self.windows.borrow().iter().rev().find(|w| !w.retired.get()).map(|w| w.sid.get()).or(Some(self.menu_sid.get()).filter(|s| *s != 0));
         let list: Vec<(u32, &str)> = items.iter().map(|(k, s)| (*k, s.as_str())).collect();
         let payload = pack_drag_items(&list);
-        Shared::global().push(sid, |q| q.app_open(items.len() as u32, &payload));
+        let count = items.len() as u32;
+        if let Some(sid) = sid {
+            Shared::global().push(sid, |q| q.app_open(count, &payload));
+        } else if count != 0 {
+            // AppKit can deliver launch URLs in finishLaunching, before the first window.
+            self.pending_app_opens.borrow_mut().push((count, payload));
+        }
     }
 
     pub fn menu_command(&self, cmd: u64) {

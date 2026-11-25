@@ -1804,22 +1804,22 @@ fn ensure_initialized() -> Result<()> {
     // macOS: Chromium's subprocesses are the helper app inside the synthetic
     // bundle. Windows: this executable is its own subprocess — `bootstrap()`
     // runs `cef_execute_process` before anything else.
-    // The process itself stays where it is (no exec into the bundle): an executable outside an
-    // app bundle (a dev build, the Relax loader) names the synthetic bundle as Chromium's main
-    // bundle and framework directory instead.
+    // A dev executable may be inside an app bundle without its own CEF framework.
+    // In that case Chromium still needs the synthetic bundle and framework paths.
     #[cfg(target_os = "macos")]
     let (helper_executable, log_file, main_bundle, framework_dir) = {
-        let synthetic_bundle =
-            ensure_synthetic_app_bundle(&runtime_paths()?, &current_exe)?;
+        let paths = runtime_paths()?;
+        let has_bundled_framework =
+            framework_dir_for_bundle_executable(&current_exe).as_ref() == Some(&paths.framework_dir);
+        let synthetic_bundle = ensure_synthetic_app_bundle(&paths, &current_exe)?;
         if let Some(root) = synthetic_bundle.bundle_dir.parent() {
             remove_unused_synthetic_bundles(root);
         }
-        let outside = !is_running_inside_app_bundle(&current_exe);
         (
             synthetic_bundle.helper_executable.to_string_lossy().to_string(),
             synthetic_bundle.log_file.to_string_lossy().to_string(),
-            outside.then(|| synthetic_bundle.bundle_dir.to_string_lossy().to_string()),
-            outside.then(|| synthetic_bundle.framework_dir.to_string_lossy().to_string()),
+            (!has_bundled_framework).then(|| synthetic_bundle.bundle_dir.to_string_lossy().to_string()),
+            (!has_bundled_framework).then(|| synthetic_bundle.framework_dir.to_string_lossy().to_string()),
         )
     };
     #[cfg(target_os = "macos")]
