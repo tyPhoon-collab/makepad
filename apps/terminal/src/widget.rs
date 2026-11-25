@@ -386,6 +386,8 @@ pub struct MpTerm {
     session: Option<Session>,
     #[rust]
     pub cwd: Option<PathBuf>,
+    #[rust]
+    pub shell: Option<String>,
     /// Variables the session's shell starts with on top of this process's
     /// environment (a host naming a context file for the job it runs).
     #[rust]
@@ -819,7 +821,7 @@ impl MpTerm {
             cols,
             rows,
             self.cwd.as_deref(),
-            None,
+            self.shell.as_deref(),
             self.command.as_deref(),
             &env,
         ) {
