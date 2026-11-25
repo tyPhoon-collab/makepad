@@ -80,6 +80,7 @@ pub(crate) fn find() -> Result<PathBuf, String> {
                     .and_then(|root| from_ancestors(&root, platform))
             })
             .or_else(|| from_ancestors(Path::new(env!("CARGO_MANIFEST_DIR")), platform))
+            .or_else(|| from_cargo_git_checkouts(platform))
             .ok_or_else(|| format!("No installed CEF distribution for {platform}. {hint}"))?
     };
     dist.canonicalize()
@@ -96,4 +97,84 @@ pub(crate) fn version() -> Option<String> {
                 .map(|value| value.trim_matches('"').to_owned())
         })?
     })
+}
+
+fn cargo_home() -> Option<PathBuf> {
+    std::env::var_os("CARGO_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .filter(|v| !v.is_empty())
+                .map(|home| PathBuf::from(home).join(".cargo"))
+        })
+}
+
+fn parse_makepad_lock_rev(text: &str) -> Option<String> {
+    let mut in_pkg = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "[[package]]" {
+            in_pkg = false;
+        } else if line == r#"name = "makepad-widgets""# {
+            in_pkg = true;
+        } else if in_pkg {
+            if let Some(src) = line.strip_prefix("source = ") {
+                let hash = src.trim_matches('"').split('#').nth(1)?;
+                return hash.get(..7).map(str::to_owned);
+            }
+        }
+    }
+    None
+}
+
+fn from_cargo_git_checkouts(platform: &str) -> Option<PathBuf> {
+    let checkouts = cargo_home()?.join("git/checkouts");
+    let target_rev = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .map(|p| p.join("Cargo.lock"))
+        .find(|p| p.is_file())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| parse_makepad_lock_rev(&text));
+    let entries = std::fs::read_dir(checkouts).ok()?;
+    let mut fallback = None;
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("makepad-") {
+            continue;
+        }
+        let Ok(revs) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for rev_entry in revs.flatten() {
+            let rev_path = rev_entry.path();
+            if let Some(dist) = pointer(&rev_path.join("local/cef-prebuilt"), platform) {
+                if target_rev.as_deref() == rev_entry.file_name().to_str() {
+                    return Some(dist);
+                }
+                fallback.get_or_insert(dist);
+            }
+        }
+    }
+    fallback
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_makepad_lock_rev;
+
+    #[test]
+    fn parses_makepad_widgets_rev_from_cargo_lock() {
+        let lock = r#"
+[[package]]
+name = "other"
+source = "git+https://example.com/other#1234567890"
+
+[[package]]
+name = "makepad-widgets"
+version = "1.0.0"
+source = "git+https://github.com/makepad/makepad?branch=main#506ec051abcdef"
+"#;
+        assert_eq!(parse_makepad_lock_rev(lock).as_deref(), Some("506ec05"));
+    }
 }
