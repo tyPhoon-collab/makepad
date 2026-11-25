@@ -21,7 +21,10 @@ pub use makepad_widgets;
 use makepad_app_host::{AudioRecord, AudioRingPacket, AudioRingSetup, ProducerAudioRing, ProducerRing, RingSetup};
 use makepad_browser_view::cef_input;
 use makepad_browser_view::protocol::{self, ViewEvent, ViewOp};
-use makepad_cef::{AudioCaptureConfig, AudioEvent, BootstrapResult, Browser, CaptureTimestamp, DevToolsTargetRequest, FrameSink, SinkTarget};
+use makepad_cef::{
+    AudioCaptureConfig, AudioEvent, BootstrapResult, Browser, CaptureTimestamp,
+    DevToolsTargetRequest, DownloadState, FileDialogMode, FrameSink, SinkTarget,
+};
 use makepad_widgets::makepad_platform::makepad_micro_serde::{DeJson, JsonValue, SerJson};
 use makepad_widgets::*;
 use std::cell::RefCell;
@@ -493,6 +496,16 @@ impl App {
                     browser.disable_audio_capture();
                 }
             }
+            ViewOp::FileDialogResult { request_id, paths } => {
+                if let Some(browser) = &page.browser {
+                    let _ = browser.resolve_file_dialog(request_id, paths);
+                }
+            }
+            ViewOp::DownloadResult { download_id, save_path } => {
+                if let Some(browser) = &page.browser {
+                    let _ = browser.resolve_download(download_id, save_path);
+                }
+            }
             op => page.command(op),
         }
     }
@@ -623,13 +636,16 @@ impl App {
                     cef.take_popup_requests(),
                     cef.take_external_url_requests(),
                     cef.take_popup_browsers(),
+                    cef.take_file_dialog_requests(),
+                    cef.take_download_requests(),
+                    cef.take_download_updates(),
                     cef.is_closed(),
                     cef.take_console_messages(),
                     cef.take_evaluations(),
                     cef.ime_caret_rect(),
                 )
             });
-            let Some((started, shown, popups, external_urls, popup_browsers, closed, console, evaluations, ime_caret)) = polled else {
+            let Some((started, shown, popups, external_urls, popup_browsers, file_dialogs, download_requests, download_updates, closed, console, evaluations, ime_caret)) = polled else {
                 // No page yet (it waits for its size): keep what waits.
                 page.evals = evals;
                 continue;
@@ -709,6 +725,43 @@ impl App {
             }
             for popup_browser in popup_browsers {
                 spawned_popups.push((view, popup_browser));
+            }
+            for req in file_dialogs {
+                let mode = match req.mode {
+                    FileDialogMode::Open => 0,
+                    FileDialogMode::OpenMultiple => 1,
+                    FileDialogMode::OpenFolder => 2,
+                    FileDialogMode::Save => 3,
+                };
+                Self::send(view, ViewEvent::FileDialog {
+                    request_id: req.request_id,
+                    mode,
+                    title: req.title,
+                    default_path: req.default_path,
+                    accept_filters: req.accept_filters,
+                });
+            }
+            for req in download_requests {
+                Self::send(view, ViewEvent::DownloadRequested {
+                    download_id: req.download_id,
+                    suggested_name: req.suggested_name,
+                    url: req.url,
+                });
+            }
+            for upd in download_updates {
+                let state = match upd.state {
+                    DownloadState::InProgress => 0,
+                    DownloadState::Complete => 1,
+                    DownloadState::Canceled => 2,
+                    DownloadState::Interrupted => 3,
+                };
+                Self::send(view, ViewEvent::DownloadUpdated {
+                    download_id: upd.download_id,
+                    file_name: upd.file_name,
+                    full_path: upd.full_path,
+                    state,
+                    percent: upd.percent,
+                });
             }
             if closed {
                 page.devtools_target_request = None;

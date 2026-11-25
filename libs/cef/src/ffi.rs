@@ -104,6 +104,10 @@ pub type cef_cursor_handle_t = *mut c_void;
 pub type cef_cursor_info_t = c_void;
 pub type cef_zoom_command_t = c_int;
 pub type cef_file_dialog_mode_t = c_int;
+pub const CEF_FILE_DIALOG_OPEN: cef_file_dialog_mode_t = 0;
+pub const CEF_FILE_DIALOG_OPEN_MULTIPLE: cef_file_dialog_mode_t = 1;
+pub const CEF_FILE_DIALOG_OPEN_FOLDER: cef_file_dialog_mode_t = 2;
+pub const CEF_FILE_DIALOG_SAVE: cef_file_dialog_mode_t = 3;
 pub type cef_point_t = c_void;
 pub type cef_pdf_print_settings_t = c_void;
 pub type cef_registration_t = c_void;
@@ -1406,4 +1410,112 @@ pub struct cef_request_handler_t {
     pub on_render_process_responsive: cef_unused_callback_t,
     pub on_render_process_terminated: cef_unused_callback_t,
     pub on_document_available_in_main_frame: cef_unused_callback_t,
+}
+
+#[repr(C)]
+pub struct cef_file_dialog_callback_t {
+    pub base: cef_base_ref_counted_t,
+    pub cont: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_file_dialog_callback_t,
+            file_paths: cef_string_list_t,
+        ),
+    >,
+    pub cancel: Option<unsafe extern "system" fn(self_: *mut cef_file_dialog_callback_t)>,
+}
+
+#[repr(C)]
+pub struct cef_dialog_handler_t {
+    pub base: cef_base_ref_counted_t,
+    pub on_file_dialog: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_dialog_handler_t,
+            browser: *mut cef_browser_t,
+            mode: cef_file_dialog_mode_t,
+            title: *const cef_string_t,
+            default_file_path: *const cef_string_t,
+            accept_filters: cef_string_list_t,
+            accept_extensions: cef_string_list_t,
+            accept_descriptions: cef_string_list_t,
+            callback: *mut cef_file_dialog_callback_t,
+        ) -> c_int,
+    >,
+}
+
+#[repr(C)]
+pub struct cef_download_item_t {
+    pub base: cef_base_ref_counted_t,
+    pub is_valid: Option<unsafe extern "system" fn(self_: *mut cef_download_item_t) -> c_int>,
+    pub is_in_progress: Option<unsafe extern "system" fn(self_: *mut cef_download_item_t) -> c_int>,
+    pub is_complete: Option<unsafe extern "system" fn(self_: *mut cef_download_item_t) -> c_int>,
+    pub is_canceled: Option<unsafe extern "system" fn(self_: *mut cef_download_item_t) -> c_int>,
+    pub is_interrupted: Option<unsafe extern "system" fn(self_: *mut cef_download_item_t) -> c_int>,
+    pub get_interrupt_reason: cef_unused_callback_t,
+    pub get_current_speed: cef_unused_callback_t,
+    pub get_percent_complete:
+        Option<unsafe extern "system" fn(self_: *mut cef_download_item_t) -> c_int>,
+    pub get_total_bytes: cef_unused_callback_t,
+    pub get_received_bytes: cef_unused_callback_t,
+    pub get_start_time: cef_unused_callback_t,
+    pub get_end_time: cef_unused_callback_t,
+    pub get_full_path:
+        Option<unsafe extern "system" fn(self_: *mut cef_download_item_t) -> cef_string_userfree_t>,
+    pub get_id: Option<unsafe extern "system" fn(self_: *mut cef_download_item_t) -> u32>,
+    pub get_url:
+        Option<unsafe extern "system" fn(self_: *mut cef_download_item_t) -> cef_string_userfree_t>,
+    pub get_original_url: cef_unused_callback_t,
+    pub get_suggested_file_name:
+        Option<unsafe extern "system" fn(self_: *mut cef_download_item_t) -> cef_string_userfree_t>,
+    pub get_content_disposition: cef_unused_callback_t,
+    pub get_mime_type: cef_unused_callback_t,
+}
+
+#[repr(C)]
+pub struct cef_before_download_callback_t {
+    pub base: cef_base_ref_counted_t,
+    pub cont: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_before_download_callback_t,
+            download_path: *const cef_string_t,
+            show_dialog: c_int,
+        ),
+    >,
+}
+
+#[repr(C)]
+pub struct cef_download_item_callback_t {
+    pub base: cef_base_ref_counted_t,
+    pub cancel: Option<unsafe extern "system" fn(self_: *mut cef_download_item_callback_t)>,
+    pub pause: cef_unused_callback_t,
+    pub resume: cef_unused_callback_t,
+}
+
+#[repr(C)]
+pub struct cef_download_handler_t {
+    pub base: cef_base_ref_counted_t,
+    pub can_download: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_download_handler_t,
+            browser: *mut cef_browser_t,
+            url: *const cef_string_t,
+            request_method: *const cef_string_t,
+        ) -> c_int,
+    >,
+    pub on_before_download: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_download_handler_t,
+            browser: *mut cef_browser_t,
+            download_item: *mut cef_download_item_t,
+            suggested_name: *const cef_string_t,
+            callback: *mut cef_before_download_callback_t,
+        ) -> c_int,
+    >,
+    pub on_download_updated: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_download_handler_t,
+            browser: *mut cef_browser_t,
+            download_item: *mut cef_download_item_t,
+            callback: *mut cef_download_item_callback_t,
+        ),
+    >,
 }

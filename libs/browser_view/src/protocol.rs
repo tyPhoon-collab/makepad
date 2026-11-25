@@ -62,6 +62,10 @@ pub enum ViewOp {
     Close,
     /// Adopt a host-created popup browser under an embedder-assigned `view_id`.
     AdoptPopup { popup_id: u64, view_id: u64 },
+    /// Answer a pending file chooser dialog (`paths == None` cancels).
+    FileDialogResult { request_id: u64, paths: Option<Vec<String>> },
+    /// Answer a pending download request (`save_path == None` cancels).
+    DownloadResult { download_id: u32, save_path: Option<String> },
 }
 
 /// From the browser host to the owner.
@@ -78,6 +82,12 @@ pub enum ViewEvent {
     PopupWindow { popup_id: u64, url: String, window_id: usize },
     /// A URL intended for the host OS (such as `mailto:` or `tel:`).
     ExternalUrl { url: String },
+    /// The page asked to open or save a file (`mode`: 0=open, 1=multi, 2=folder, 3=save).
+    FileDialog { request_id: u64, mode: u8, title: String, default_path: String, accept_filters: Vec<String> },
+    /// A file download is waiting for a destination path.
+    DownloadRequested { download_id: u32, suggested_name: String, url: String },
+    /// A file download finished, was canceled, or was interrupted (`state`: 0=complete, 1=canceled, 2=interrupted).
+    DownloadUpdated { download_id: u32, file_name: String, full_path: String, state: u8, percent: i32 },
     /// A line the page wrote to its console.
     Console { level: i32, message: String, source: String, line: i32 },
     /// The answer to `ViewOp::Eval`: the value as JSON, or the exception.
@@ -148,6 +158,8 @@ mod tests {
             ViewOp::ImeCancelComposition,
             ViewOp::Close,
             ViewOp::AdoptPopup { popup_id: 2, view_id: 9 },
+            ViewOp::FileDialogResult { request_id: 4, paths: Some(vec!["/tmp/a.txt".into()]) },
+            ViewOp::DownloadResult { download_id: 7, save_path: None },
         ] {
             let json = op_to_json(3, &op);
             assert_eq!(parse_op(&json), Some((3, op)));
@@ -165,6 +177,9 @@ mod tests {
             ViewEvent::DevToolsReady { port: 9222 },
             ViewEvent::PopupWindow { popup_id: 2, url: "https://auth.example".into(), window_id: 4 },
             ViewEvent::ExternalUrl { url: "mailto:user@example.com".into() },
+            ViewEvent::FileDialog { request_id: 4, mode: 1, title: "Pick".into(), default_path: "".into(), accept_filters: vec![".png".into()] },
+            ViewEvent::DownloadRequested { download_id: 7, suggested_name: "a.zip".into(), url: "https://example.com/a.zip".into() },
+            ViewEvent::DownloadUpdated { download_id: 7, file_name: "a.zip".into(), full_path: "/tmp/a.zip".into(), state: 0, percent: 42 },
             ViewEvent::Closed,
         ] {
             let json = event_to_json(5, &event);

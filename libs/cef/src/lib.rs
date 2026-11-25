@@ -206,6 +206,47 @@ pub struct Evaluation {
     pub result: std::result::Result<String, String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileDialogMode {
+    Open,
+    OpenMultiple,
+    OpenFolder,
+    Save,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileDialogRequest {
+    pub request_id: u64,
+    pub mode: FileDialogMode,
+    pub title: String,
+    pub default_path: String,
+    pub accept_filters: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadRequest {
+    pub download_id: u32,
+    pub url: String,
+    pub suggested_name: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadState {
+    InProgress,
+    Complete,
+    Canceled,
+    Interrupted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadUpdate {
+    pub download_id: u32,
+    pub file_name: String,
+    pub full_path: String,
+    pub state: DownloadState,
+    pub percent: i32,
+}
+
 pub const EVENTFLAG_NONE: u32 = 0;
 pub const EVENTFLAG_CAPS_LOCK_ON: u32 = 1 << 0;
 pub const EVENTFLAG_SHIFT_DOWN: u32 = 1 << 1;

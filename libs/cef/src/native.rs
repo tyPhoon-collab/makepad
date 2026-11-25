@@ -1,7 +1,8 @@
 use crate::{
     ffi, AudioCaptureConfig, AudioCaptureStats, AudioEvent, AudioFormat, AudioPacket,
-    BootstrapResult, CapturedFrame, CaptureTimestamp, ConsoleMessage, Error, Evaluation, Frame,
-    Result, TEXT_INPUT_MODE_NONE,
+    BootstrapResult, CapturedFrame, CaptureTimestamp, ConsoleMessage, DownloadRequest, DownloadState,
+    DownloadUpdate, Error, Evaluation, FileDialogMode, FileDialogRequest, Frame, Result,
+    TEXT_INPUT_MODE_NONE,
 };
 
 /// A diagnostic line on stderr that survives a closed pipe. A browser hosted
@@ -33,7 +34,7 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -326,6 +327,10 @@ struct CefApi {
         index: usize,
         value: *mut ffi::cef_string_t,
     ) -> c_int,
+    cef_string_list_alloc: unsafe extern "C" fn() -> ffi::cef_string_list_t,
+    cef_string_list_append:
+        unsafe extern "C" fn(list: ffi::cef_string_list_t, value: *const ffi::cef_string_t),
+    cef_string_list_free: unsafe extern "C" fn(list: ffi::cef_string_list_t),
 }
 
 #[cfg(target_os = "macos")]
@@ -437,6 +442,13 @@ struct SharedBrowserState {
     popup_parent: Mutex<Option<(Arc<SharedBrowserState>, bool)>>,
     accelerated: AtomicBool,
     closed: AtomicBool,
+    next_dialog_id: AtomicU64,
+    file_dialog_requests: Mutex<Vec<FileDialogRequest>>,
+    pending_file_dialogs: Mutex<HashMap<u64, usize>>,
+    download_requests: Mutex<Vec<DownloadRequest>>,
+    pending_downloads: Mutex<HashMap<u32, usize>>,
+    download_updates: Mutex<Vec<DownloadUpdate>>,
+    reported_download_states: Mutex<HashMap<u32, (DownloadState, i32)>>,
     /// The latest decoded favicon bitmap (BGRA, premultiplied).
     favicon: Mutex<Option<Frame>>,
     favicon_url: Mutex<String>,
@@ -595,7 +607,23 @@ struct ClientHandler {
     load_handler: *mut LoadHandler,
     life_span_handler: *mut LifeSpanHandler,
     request_handler: *mut RequestHandler,
+    dialog_handler: *mut DialogHandler,
+    download_handler: *mut DownloadHandler,
     audio_handler: *mut AudioHandler,
+}
+
+#[repr(C)]
+struct DialogHandler {
+    cef_dialog_handler: ffi::cef_dialog_handler_t,
+    ref_count: AtomicUsize,
+    state: Arc<SharedBrowserState>,
+}
+
+#[repr(C)]
+struct DownloadHandler {
+    cef_download_handler: ffi::cef_download_handler_t,
+    ref_count: AtomicUsize,
+    state: Arc<SharedBrowserState>,
 }
 
 #[repr(C)]
@@ -1145,6 +1173,9 @@ fn runtime() -> Result<&'static Runtime> {
                 cef_string_userfree_free: load_symbol(&library, b"cef_string_userfree_utf16_free\0")?,
                 cef_string_list_size: load_symbol(&library, b"cef_string_list_size\0")?,
                 cef_string_list_value: load_symbol(&library, b"cef_string_list_value\0")?,
+                cef_string_list_alloc: load_symbol(&library, b"cef_string_list_alloc\0")?,
+                cef_string_list_append: load_symbol(&library, b"cef_string_list_append\0")?,
+                cef_string_list_free: load_symbol(&library, b"cef_string_list_free\0")?,
             }
         };
 
@@ -2853,6 +2884,16 @@ unsafe extern "system" fn client_release(self_: *mut ffi::cef_base_ref_counted_t
                 &mut (*(*client).request_handler).cef_request_handler.base as *mut _,
             );
         }
+        if !(*client).dialog_handler.is_null() {
+            release_ref_counted(
+                &mut (*(*client).dialog_handler).cef_dialog_handler.base as *mut _,
+            );
+        }
+        if !(*client).download_handler.is_null() {
+            release_ref_counted(
+                &mut (*(*client).download_handler).cef_download_handler.base as *mut _,
+            );
+        }
         if !(*client).audio_handler.is_null() {
             release_ref_counted(&mut (*(*client).audio_handler).cef_audio_handler.base as *mut _);
         }
@@ -3150,6 +3191,20 @@ unsafe extern "system" fn client_get_request_handler(
 ) -> *mut c_void {
     let client = self_ as *mut ClientHandler;
     add_ref_and_return((*client).request_handler) as *mut c_void
+}
+
+unsafe extern "system" fn client_get_dialog_handler(
+    self_: *mut ffi::cef_client_t,
+) -> *mut c_void {
+    let client = self_ as *mut ClientHandler;
+    add_ref_and_return((*client).dialog_handler) as *mut c_void
+}
+
+unsafe extern "system" fn client_get_download_handler(
+    self_: *mut ffi::cef_client_t,
+) -> *mut c_void {
+    let client = self_ as *mut ClientHandler;
+    add_ref_and_return((*client).download_handler) as *mut c_void
 }
 
 /// JavaScript dialogs (`alert`, `confirm`, `prompt`, "leave this page?")
@@ -4609,6 +4664,296 @@ impl RequestHandler {
     }
 }
 
+unsafe fn take_userfree_string(ptr: ffi::cef_string_userfree_t) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let text = cef_string_to_string(ptr);
+    if let Ok(rt) = runtime() {
+        (rt.api.cef_string_userfree_free)(ptr);
+    }
+    text
+}
+
+unsafe extern "system" fn dialog_add_ref(self_: *mut ffi::cef_base_ref_counted_t) {
+    let handler = self_ as *mut DialogHandler;
+    (*handler).ref_count.fetch_add(1, Ordering::Relaxed);
+}
+
+unsafe extern "system" fn dialog_release(self_: *mut ffi::cef_base_ref_counted_t) -> c_int {
+    let handler = self_ as *mut DialogHandler;
+    if (*handler).ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        drop(Box::from_raw(handler));
+        1
+    } else {
+        0
+    }
+}
+
+unsafe extern "system" fn dialog_has_one_ref(self_: *mut ffi::cef_base_ref_counted_t) -> c_int {
+    let handler = self_ as *mut DialogHandler;
+    ((*handler).ref_count.load(Ordering::Acquire) == 1) as c_int
+}
+
+unsafe extern "system" fn dialog_has_at_least_one_ref(
+    self_: *mut ffi::cef_base_ref_counted_t,
+) -> c_int {
+    let handler = self_ as *mut DialogHandler;
+    ((*handler).ref_count.load(Ordering::Acquire) >= 1) as c_int
+}
+
+unsafe extern "system" fn dialog_on_file_dialog(
+    self_: *mut ffi::cef_dialog_handler_t,
+    browser: *mut ffi::cef_browser_t,
+    mode: ffi::cef_file_dialog_mode_t,
+    title: *const ffi::cef_string_t,
+    default_file_path: *const ffi::cef_string_t,
+    accept_filters: ffi::cef_string_list_t,
+    _accept_extensions: ffi::cef_string_list_t,
+    _accept_descriptions: ffi::cef_string_list_t,
+    callback: *mut ffi::cef_file_dialog_callback_t,
+) -> c_int {
+    release_param(browser);
+    if callback.is_null() {
+        return 0;
+    }
+    let handler = self_ as *mut DialogHandler;
+    let state: &SharedBrowserState = &(*handler).state;
+    let request_id = state.next_dialog_id.fetch_add(1, Ordering::AcqRel) + 1;
+    let mode = match mode {
+        ffi::CEF_FILE_DIALOG_OPEN_MULTIPLE => FileDialogMode::OpenMultiple,
+        ffi::CEF_FILE_DIALOG_OPEN_FOLDER => FileDialogMode::OpenFolder,
+        ffi::CEF_FILE_DIALOG_SAVE => FileDialogMode::Save,
+        _ => FileDialogMode::Open,
+    };
+    let mut filters = Vec::new();
+    if !accept_filters.is_null() {
+        if let Ok(rt) = runtime() {
+            let count = (rt.api.cef_string_list_size)(accept_filters);
+            for i in 0..count {
+                let mut value = ffi::cef_string_t::default();
+                if (rt.api.cef_string_list_value)(accept_filters, i, &mut value) != 0 {
+                    let s = cef_string_to_string(&value);
+                    (rt.api.cef_string_utf16_clear)(&mut value);
+                    if !s.is_empty() {
+                        filters.push(s);
+                    }
+                }
+            }
+        }
+    }
+    state
+        .pending_file_dialogs
+        .lock()
+        .unwrap()
+        .insert(request_id, callback as usize);
+    state.file_dialog_requests.lock().unwrap().push(FileDialogRequest {
+        request_id,
+        mode,
+        title: cef_string_to_string(title),
+        default_path: cef_string_to_string(default_file_path),
+        accept_filters: filters,
+    });
+    state.nav_gen.fetch_add(1, Ordering::AcqRel);
+    1
+}
+
+impl DialogHandler {
+    fn allocate(state: Arc<SharedBrowserState>) -> *mut DialogHandler {
+        Box::into_raw(Box::new(Self {
+            cef_dialog_handler: ffi::cef_dialog_handler_t {
+                base: ffi::cef_base_ref_counted_t {
+                    size: std::mem::size_of::<ffi::cef_dialog_handler_t>(),
+                    add_ref: Some(dialog_add_ref),
+                    release: Some(dialog_release),
+                    has_one_ref: Some(dialog_has_one_ref),
+                    has_at_least_one_ref: Some(dialog_has_at_least_one_ref),
+                },
+                on_file_dialog: Some(dialog_on_file_dialog),
+            },
+            ref_count: AtomicUsize::new(1),
+            state,
+        }))
+    }
+}
+
+unsafe extern "system" fn download_add_ref(self_: *mut ffi::cef_base_ref_counted_t) {
+    let handler = self_ as *mut DownloadHandler;
+    (*handler).ref_count.fetch_add(1, Ordering::Relaxed);
+}
+
+unsafe extern "system" fn download_release(self_: *mut ffi::cef_base_ref_counted_t) -> c_int {
+    let handler = self_ as *mut DownloadHandler;
+    if (*handler).ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        drop(Box::from_raw(handler));
+        1
+    } else {
+        0
+    }
+}
+
+unsafe extern "system" fn download_has_one_ref(self_: *mut ffi::cef_base_ref_counted_t) -> c_int {
+    let handler = self_ as *mut DownloadHandler;
+    ((*handler).ref_count.load(Ordering::Acquire) == 1) as c_int
+}
+
+unsafe extern "system" fn download_has_at_least_one_ref(
+    self_: *mut ffi::cef_base_ref_counted_t,
+) -> c_int {
+    let handler = self_ as *mut DownloadHandler;
+    ((*handler).ref_count.load(Ordering::Acquire) >= 1) as c_int
+}
+
+unsafe extern "system" fn download_can_download(
+    _self: *mut ffi::cef_download_handler_t,
+    browser: *mut ffi::cef_browser_t,
+    _url: *const ffi::cef_string_t,
+    _request_method: *const ffi::cef_string_t,
+) -> c_int {
+    release_param(browser);
+    1
+}
+
+unsafe extern "system" fn download_on_before_download(
+    self_: *mut ffi::cef_download_handler_t,
+    browser: *mut ffi::cef_browser_t,
+    download_item: *mut ffi::cef_download_item_t,
+    suggested_name: *const ffi::cef_string_t,
+    callback: *mut ffi::cef_before_download_callback_t,
+) -> c_int {
+    release_param(browser);
+    if callback.is_null() {
+        release_param(download_item);
+        return 0;
+    }
+    let mut download_id = 0u32;
+    let mut url = String::new();
+    let mut item_name = String::new();
+    if !download_item.is_null() {
+        let valid = (*download_item).is_valid.is_none_or(|f| f(download_item) != 0);
+        if valid {
+            if let Some(get_id) = (*download_item).get_id {
+                download_id = get_id(download_item);
+            }
+            if let Some(get_url) = (*download_item).get_url {
+                url = take_userfree_string(get_url(download_item));
+            }
+            if let Some(get_name) = (*download_item).get_suggested_file_name {
+                item_name = take_userfree_string(get_name(download_item));
+            }
+        }
+        release_param(download_item);
+    }
+    let suggested = cef_string_to_string(suggested_name);
+    let suggested_name = if !suggested.is_empty() {
+        suggested
+    } else if !item_name.is_empty() {
+        item_name
+    } else {
+        "download".to_string()
+    };
+    let handler = self_ as *mut DownloadHandler;
+    let state: &SharedBrowserState = &(*handler).state;
+    state
+        .pending_downloads
+        .lock()
+        .unwrap()
+        .insert(download_id, callback as usize);
+    state.download_requests.lock().unwrap().push(DownloadRequest {
+        download_id,
+        url,
+        suggested_name,
+    });
+    state.nav_gen.fetch_add(1, Ordering::AcqRel);
+    1
+}
+
+unsafe extern "system" fn download_on_download_updated(
+    self_: *mut ffi::cef_download_handler_t,
+    browser: *mut ffi::cef_browser_t,
+    download_item: *mut ffi::cef_download_item_t,
+    callback: *mut ffi::cef_download_item_callback_t,
+) {
+    release_param(browser);
+    release_param(callback);
+    if download_item.is_null() {
+        return;
+    }
+    let valid = (*download_item).is_valid.is_none_or(|f| f(download_item) != 0);
+    if valid {
+        let complete = (*download_item).is_complete.is_some_and(|f| f(download_item) != 0);
+        let canceled = (*download_item).is_canceled.is_some_and(|f| f(download_item) != 0);
+        let interrupted = (*download_item).is_interrupted.is_some_and(|f| f(download_item) != 0);
+        let in_progress = (*download_item).is_in_progress.is_some_and(|f| f(download_item) != 0);
+        let next_state = if complete {
+            Some(DownloadState::Complete)
+        } else if canceled {
+            Some(DownloadState::Canceled)
+        } else if interrupted {
+            Some(DownloadState::Interrupted)
+        } else if in_progress {
+            Some(DownloadState::InProgress)
+        } else {
+            None
+        };
+        if let Some(next_state) = next_state {
+            let download_id = (*download_item).get_id.map_or(0, |f| f(download_item));
+            let percent = (*download_item).get_percent_complete.map_or(-1, |f| f(download_item));
+            let full_path = (*download_item)
+                .get_full_path
+                .map_or_else(String::new, |f| take_userfree_string(f(download_item)));
+            let suggested_name = (*download_item)
+                .get_suggested_file_name
+                .map_or_else(String::new, |f| take_userfree_string(f(download_item)));
+            let file_name = Path::new(&full_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(suggested_name);
+            let handler = self_ as *mut DownloadHandler;
+            let state: &SharedBrowserState = &(*handler).state;
+            let mut reported = state.reported_download_states.lock().unwrap();
+            let prev = reported.get(&download_id).copied();
+            let should_emit = match next_state {
+                DownloadState::InProgress => prev != Some((next_state, percent)),
+                _ => prev.map(|(s, _)| s) != Some(next_state),
+            };
+            if should_emit {
+                reported.insert(download_id, (next_state, percent));
+                state.download_updates.lock().unwrap().push(DownloadUpdate {
+                    download_id,
+                    file_name,
+                    full_path,
+                    state: next_state,
+                    percent,
+                });
+            }
+        }
+    }
+    release_param(download_item);
+}
+
+impl DownloadHandler {
+    fn allocate(state: Arc<SharedBrowserState>) -> *mut DownloadHandler {
+        Box::into_raw(Box::new(Self {
+            cef_download_handler: ffi::cef_download_handler_t {
+                base: ffi::cef_base_ref_counted_t {
+                    size: std::mem::size_of::<ffi::cef_download_handler_t>(),
+                    add_ref: Some(download_add_ref),
+                    release: Some(download_release),
+                    has_one_ref: Some(download_has_one_ref),
+                    has_at_least_one_ref: Some(download_has_at_least_one_ref),
+                },
+                can_download: Some(download_can_download),
+                on_before_download: Some(download_on_before_download),
+                on_download_updated: Some(download_on_download_updated),
+            },
+            ref_count: AtomicUsize::new(1),
+            state,
+        }))
+    }
+}
+
 impl DisplayHandler {
     fn allocate(state: Arc<SharedBrowserState>) -> *mut DisplayHandler {
         Box::into_raw(Box::new(Self {
@@ -4720,10 +5065,20 @@ unsafe extern "system" fn life_span_on_before_close(
     browser: *mut ffi::cef_browser_t,
 ) {
     release_param(browser);
-    if !self_.is_null() {
+        if !self_.is_null() {
         let handler = self_ as *mut LifeSpanHandler;
         let state: &SharedBrowserState = &(*handler).state;
         state.closed.store(true, Ordering::Release);
+        for (_, raw) in state.pending_file_dialogs.lock().unwrap().drain() {
+            if raw != 0 {
+                release_ref_counted(raw as *mut ffi::cef_base_ref_counted_t);
+            }
+        }
+        for (_, raw) in state.pending_downloads.lock().unwrap().drain() {
+            if raw != 0 {
+                release_ref_counted(raw as *mut ffi::cef_base_ref_counted_t);
+            }
+        }
     }
     if let Ok(runtime) = runtime() {
         let mut count = runtime.live_browsers.load(Ordering::Acquire);
@@ -4939,6 +5294,8 @@ impl ClientHandler {
             LoadHandler::allocate(state.clone()),
             LifeSpanHandler::allocate(state.clone()),
             RequestHandler::allocate(state.clone()),
+            DialogHandler::allocate(state.clone()),
+            DownloadHandler::allocate(state.clone()),
             AudioHandler::allocate(state),
         )
     }
@@ -4949,6 +5306,8 @@ impl ClientHandler {
         load_handler: *mut LoadHandler,
         life_span_handler: *mut LifeSpanHandler,
         request_handler: *mut RequestHandler,
+        dialog_handler: *mut DialogHandler,
+        download_handler: *mut DownloadHandler,
         audio_handler: *mut AudioHandler,
     ) -> *mut ClientHandler {
         Box::into_raw(Box::new(Self {
@@ -4963,9 +5322,9 @@ impl ClientHandler {
                 get_audio_handler: Some(client_get_audio_handler),
                 get_command_handler: Some(client_null_handler),
                 get_context_menu_handler: Some(client_null_handler),
-                get_dialog_handler: Some(client_null_handler),
+                get_dialog_handler: Some(client_get_dialog_handler),
                 get_display_handler: Some(client_get_display_handler),
-                get_download_handler: Some(client_null_handler),
+                get_download_handler: Some(client_get_download_handler),
                 get_drag_handler: Some(client_null_handler),
                 get_find_handler: Some(client_null_handler),
                 get_focus_handler: Some(client_null_handler),
@@ -4986,6 +5345,8 @@ impl ClientHandler {
             load_handler,
             life_span_handler,
             request_handler,
+            dialog_handler,
+            download_handler,
             audio_handler,
         }))
     }
@@ -5613,6 +5974,95 @@ impl Browser {
     /// Whether CEF has closed this browser (e.g. via `window.close()`).
     pub fn is_closed(&self) -> bool {
         self.state.closed.load(Ordering::Acquire)
+    }
+
+    pub fn take_file_dialog_requests(&mut self) -> Vec<FileDialogRequest> {
+        std::mem::take(&mut *self.state.file_dialog_requests.lock().unwrap())
+    }
+
+    pub fn resolve_file_dialog(&self, request_id: u64, paths: Option<Vec<String>>) -> Result<()> {
+        let raw = self
+            .state
+            .pending_file_dialogs
+            .lock()
+            .unwrap()
+            .remove(&request_id);
+        let Some(raw) = raw else {
+            return Ok(());
+        };
+        if raw == 0 {
+            return Ok(());
+        }
+        on_cef_thread(move || unsafe {
+            let callback = raw as *mut ffi::cef_file_dialog_callback_t;
+            let runtime = match runtime() {
+                Ok(rt) => rt,
+                Err(_) => {
+                    release_ref_counted(&mut (*callback).base);
+                    return;
+                }
+            };
+            match paths.filter(|list| !list.is_empty()) {
+                Some(paths) => {
+                    let list = (runtime.api.cef_string_list_alloc)();
+                    if !list.is_null() {
+                        for path in paths {
+                            if let Ok(cef_str) = CefString::new(&runtime.api, &path) {
+                                (runtime.api.cef_string_list_append)(list, &cef_str.value);
+                            }
+                        }
+                        if let Some(cont) = (*callback).cont {
+                            cont(callback, list);
+                        }
+                        (runtime.api.cef_string_list_free)(list);
+                    } else if let Some(cancel) = (*callback).cancel {
+                        cancel(callback);
+                    }
+                }
+                None => {
+                    if let Some(cancel) = (*callback).cancel {
+                        cancel(callback);
+                    }
+                }
+            }
+            release_ref_counted(&mut (*callback).base);
+        })
+    }
+
+    pub fn take_download_requests(&mut self) -> Vec<DownloadRequest> {
+        std::mem::take(&mut *self.state.download_requests.lock().unwrap())
+    }
+
+    pub fn take_download_updates(&mut self) -> Vec<DownloadUpdate> {
+        std::mem::take(&mut *self.state.download_updates.lock().unwrap())
+    }
+
+    pub fn resolve_download(&self, download_id: u32, save_path: Option<String>) -> Result<()> {
+        let raw = self
+            .state
+            .pending_downloads
+            .lock()
+            .unwrap()
+            .remove(&download_id);
+        let Some(raw) = raw else {
+            return Ok(());
+        };
+        if raw == 0 {
+            return Ok(());
+        }
+        on_cef_thread(move || unsafe {
+            let callback = raw as *mut ffi::cef_before_download_callback_t;
+            if let Some(path) = save_path.filter(|p| !p.is_empty()) {
+                if let Ok(runtime) = runtime() {
+                    if let Ok(cef_path) = CefString::new(&runtime.api, &path) {
+                        if let Some(cont) = (*callback).cont {
+                            cont(callback, &cef_path.value, 0);
+                        }
+                    }
+                }
+            }
+            release_ref_counted(&mut (*callback).base);
+        })
     }
 
     /// The latest favicon bitmap (BGRA8 premultiplied), once per change.

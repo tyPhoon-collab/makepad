@@ -70,11 +70,39 @@ pub struct ViewState {
     popups: Vec<String>,
     popup_views: Vec<(ViewId, String)>,
     external_urls: Vec<String>,
+    file_dialogs: Vec<FileDialogEvent>,
+    download_requests: Vec<DownloadRequestEvent>,
+    download_updates: Vec<DownloadUpdateEvent>,
     closed: bool,
     console: Vec<ConsoleLine>,
     evaluations: Vec<(u64, Result<String, String>)>,
     /// Sent once the host is connected.
     queued: Vec<ViewOp>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileDialogEvent {
+    pub request_id: u64,
+    pub mode: u8,
+    pub title: String,
+    pub default_path: String,
+    pub accept_filters: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadRequestEvent {
+    pub download_id: u32,
+    pub suggested_name: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadUpdateEvent {
+    pub download_id: u32,
+    pub file_name: String,
+    pub full_path: String,
+    pub state: u8,
+    pub percent: i32,
 }
 
 /// Slots of a displaying ring.
@@ -357,6 +385,18 @@ impl BrowserViews {
 
     pub fn take_external_urls(&mut self, id: ViewId) -> Vec<String> {
         self.view_mut(id).map(|view| std::mem::take(&mut view.state.external_urls)).unwrap_or_default()
+    }
+
+    pub fn take_file_dialogs(&mut self, id: ViewId) -> Vec<FileDialogEvent> {
+        self.view_mut(id).map(|view| std::mem::take(&mut view.state.file_dialogs)).unwrap_or_default()
+    }
+
+    pub fn take_download_requests(&mut self, id: ViewId) -> Vec<DownloadRequestEvent> {
+        self.view_mut(id).map(|view| std::mem::take(&mut view.state.download_requests)).unwrap_or_default()
+    }
+
+    pub fn take_download_updates(&mut self, id: ViewId) -> Vec<DownloadUpdateEvent> {
+        self.view_mut(id).map(|view| std::mem::take(&mut view.state.download_updates)).unwrap_or_default()
     }
 
     pub fn take_closed(&mut self, id: ViewId) -> bool {
@@ -673,6 +713,18 @@ impl BrowserViews {
             ViewEvent::PopupWindow { .. } => return false,
             ViewEvent::ExternalUrl { url } => {
                 state.external_urls.push(url);
+                return false;
+            }
+            ViewEvent::FileDialog { request_id, mode, title, default_path, accept_filters } => {
+                state.file_dialogs.push(FileDialogEvent { request_id, mode, title, default_path, accept_filters });
+                return false;
+            }
+            ViewEvent::DownloadRequested { download_id, suggested_name, url } => {
+                state.download_requests.push(DownloadRequestEvent { download_id, suggested_name, url });
+                return false;
+            }
+            ViewEvent::DownloadUpdated { download_id, file_name, full_path, state: status, percent } => {
+                state.download_updates.push(DownloadUpdateEvent { download_id, file_name, full_path, state: status, percent });
                 return false;
             }
             ViewEvent::Console { level, message, source, line } => {
