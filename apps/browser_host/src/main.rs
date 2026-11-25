@@ -516,6 +516,11 @@ impl App {
                     let _ = browser.resolve_auth_request(request_id, username.as_deref(), &password);
                 }
             }
+            ViewOp::PermissionResult { request_id, granted } => {
+                if let Some(browser) = &page.browser {
+                    let _ = browser.resolve_permission_request(request_id, granted);
+                }
+            }
             op => page.command(op),
         }
     }
@@ -651,13 +656,14 @@ impl App {
                     cef.take_download_updates(),
                     cef.take_js_dialog_requests(),
                     cef.take_auth_requests(),
+                    cef.take_permission_requests(),
                     cef.is_closed(),
                     cef.take_console_messages(),
                     cef.take_evaluations(),
                     cef.ime_caret_rect(),
                 )
             });
-            let Some((started, shown, popups, external_urls, popup_browsers, file_dialogs, download_requests, download_updates, js_dialogs, auth_requests, closed, console, evaluations, ime_caret)) = polled else {
+            let Some((started, shown, popups, external_urls, popup_browsers, file_dialogs, download_requests, download_updates, js_dialogs, auth_requests, permission_requests, closed, console, evaluations, ime_caret)) = polled else {
                 // No page yet (it waits for its size): keep what waits.
                 page.evals = evals;
                 continue;
@@ -798,6 +804,13 @@ impl App {
                     port: req.port,
                     realm: req.realm,
                     scheme: req.scheme,
+                });
+            }
+            for req in permission_requests {
+                Self::send(view, ViewEvent::PermissionRequested {
+                    request_id: req.request_id,
+                    origin: req.origin,
+                    permissions: req.permissions,
                 });
             }
             if closed {

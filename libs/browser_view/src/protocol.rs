@@ -70,6 +70,8 @@ pub enum ViewOp {
     JsDialogResult { request_id: u64, accept: bool, user_input: String },
     /// Answer a pending HTTP authentication challenge (`username == None` cancels).
     AuthResult { request_id: u64, username: Option<String>, password: String },
+    /// Answer a pending site permission prompt.
+    PermissionResult { request_id: u64, granted: bool },
 }
 
 /// From the browser host to the owner.
@@ -96,6 +98,8 @@ pub enum ViewEvent {
     JsDialog { request_id: u64, kind: u8, origin_url: String, message: String, default_prompt: String },
     /// An HTTP or proxy authentication challenge.
     AuthRequested { request_id: u64, is_proxy: bool, host: String, port: i32, realm: String, scheme: String },
+    /// A site permission prompt (camera, microphone, geolocation, etc.).
+    PermissionRequested { request_id: u64, origin: String, permissions: u32 },
     /// A line the page wrote to its console.
     Console { level: i32, message: String, source: String, line: i32 },
     /// The answer to `ViewOp::Eval`: the value as JSON, or the exception.
@@ -170,6 +174,7 @@ mod tests {
             ViewOp::DownloadResult { download_id: 7, save_path: None },
             ViewOp::JsDialogResult { request_id: 8, accept: true, user_input: "ok".into() },
             ViewOp::AuthResult { request_id: 9, username: Some("alice".into()), password: "pw".into() },
+            ViewOp::PermissionResult { request_id: 10, granted: true },
         ] {
             let json = op_to_json(3, &op);
             assert_eq!(parse_op(&json), Some((3, op)));
@@ -192,6 +197,7 @@ mod tests {
             ViewEvent::DownloadUpdated { download_id: 7, file_name: "a.zip".into(), full_path: "/tmp/a.zip".into(), state: 0, percent: 42 },
             ViewEvent::JsDialog { request_id: 8, kind: 2, origin_url: "https://example.com".into(), message: "Name?".into(), default_prompt: "a".into() },
             ViewEvent::AuthRequested { request_id: 9, is_proxy: false, host: "example.com".into(), port: 443, realm: "Admin".into(), scheme: "basic".into() },
+            ViewEvent::PermissionRequested { request_id: 10, origin: "https://example.com".into(), permissions: 5 },
             ViewEvent::Closed,
         ] {
             let json = event_to_json(5, &event);

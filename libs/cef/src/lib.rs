@@ -274,6 +274,19 @@ pub struct AuthRequest {
     pub scheme: String,
 }
 
+pub const SITE_PERMISSION_CAMERA: u32 = 1 << 0;
+pub const SITE_PERMISSION_MICROPHONE: u32 = 1 << 1;
+pub const SITE_PERMISSION_GEOLOCATION: u32 = 1 << 2;
+pub const SITE_PERMISSION_DESKTOP_CAPTURE: u32 = 1 << 3;
+pub const SITE_PERMISSION_OTHER: u32 = 1 << 4;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SitePermissionRequest {
+    pub request_id: u64,
+    pub origin: String,
+    pub permissions: u32,
+}
+
 pub const EVENTFLAG_NONE: u32 = 0;
 pub const EVENTFLAG_CAPS_LOCK_ON: u32 = 1 << 0;
 pub const EVENTFLAG_SHIFT_DOWN: u32 = 1 << 1;
@@ -675,6 +688,14 @@ impl Browser {
         _username: Option<&str>,
         _password: &str,
     ) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn take_permission_requests(&mut self) -> Vec<SitePermissionRequest> {
+        Vec::new()
+    }
+
+    pub fn resolve_permission_request(&self, _request_id: u64, _granted: bool) -> Result<()> {
         Ok(())
     }
 }

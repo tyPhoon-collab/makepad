@@ -2,7 +2,9 @@ use crate::{
     ffi, AudioCaptureConfig, AudioCaptureStats, AudioEvent, AudioFormat, AudioPacket, AuthRequest,
     BootstrapResult, CapturedFrame, CaptureTimestamp, ConsoleMessage, DownloadRequest, DownloadState,
     DownloadUpdate, Error, Evaluation, FileDialogMode, FileDialogRequest, Frame, JsDialogKind,
-    JsDialogRequest, Result, TEXT_INPUT_MODE_NONE,
+    JsDialogRequest, Result, SitePermissionRequest, SITE_PERMISSION_CAMERA,
+    SITE_PERMISSION_DESKTOP_CAPTURE, SITE_PERMISSION_GEOLOCATION, SITE_PERMISSION_MICROPHONE,
+    SITE_PERMISSION_OTHER, TEXT_INPUT_MODE_NONE,
 };
 
 /// A diagnostic line on stderr that survives a closed pipe. A browser hosted
@@ -453,6 +455,8 @@ struct SharedBrowserState {
     pending_js_dialogs: Mutex<HashMap<u64, usize>>,
     auth_requests: Mutex<Vec<AuthRequest>>,
     pending_auth_requests: Mutex<HashMap<u64, usize>>,
+    permission_requests: Mutex<Vec<SitePermissionRequest>>,
+    pending_permissions: Mutex<HashMap<u64, PendingPermission>>,
     /// The latest decoded favicon bitmap (BGRA, premultiplied).
     favicon: Mutex<Option<Frame>>,
     favicon_url: Mutex<String>,
@@ -614,7 +618,20 @@ struct ClientHandler {
     dialog_handler: *mut DialogHandler,
     download_handler: *mut DownloadHandler,
     jsdialog_handler: *mut JsDialogHandler,
+    permission_handler: *mut PermissionHandler,
     audio_handler: *mut AudioHandler,
+}
+
+enum PendingPermission {
+    Media { callback: usize, requested: u32 },
+    Prompt { callback: usize, prompt_id: u64 },
+}
+
+#[repr(C)]
+struct PermissionHandler {
+    cef_permission_handler: ffi::cef_permission_handler_t,
+    ref_count: AtomicUsize,
+    state: Arc<SharedBrowserState>,
 }
 
 #[repr(C)]
@@ -1565,6 +1582,13 @@ fn chromium_switches() -> Vec<String> {
             switches.push("--enable-features=Vulkan,VulkanFromANGLE,DefaultANGLEVulkan".to_string());
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        switches.push(
+            "--enable-features=LocationProviderManager:LocationProviderManagerMode/PlatformOnly"
+                .to_string(),
+        );
+    }
     for switch in [
         "--disable-background-networking",
         "--disable-sync",
@@ -2334,6 +2358,14 @@ fn main_bundle_info_plist(executable_name: &str, bundle_name: &str, bundle_id: &
     <string>NSApplication</string>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>Allow websites to access your camera.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Allow websites to access your microphone.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Allow websites to access your location.</string>
+    <key>NSLocationUsageDescription</key>
+    <string>Allow websites to access your location.</string>
 </dict>
 </plist>
 "#
@@ -2911,6 +2943,11 @@ unsafe extern "system" fn client_release(self_: *mut ffi::cef_base_ref_counted_t
                 &mut (*(*client).jsdialog_handler).cef_jsdialog_handler.base as *mut _,
             );
         }
+        if !(*client).permission_handler.is_null() {
+            release_ref_counted(
+                &mut (*(*client).permission_handler).cef_permission_handler.base as *mut _,
+            );
+        }
         if !(*client).audio_handler.is_null() {
             release_ref_counted(&mut (*(*client).audio_handler).cef_audio_handler.base as *mut _);
         }
@@ -3392,6 +3429,213 @@ unsafe extern "system" fn jsdialog_on_dialog_closed(
     browser: *mut ffi::cef_browser_t,
 ) {
     jsdialog_on_reset_dialog_state(self_, browser);
+}
+
+unsafe extern "system" fn client_get_permission_handler(
+    self_: *mut ffi::cef_client_t,
+) -> *mut c_void {
+    let client = self_ as *mut ClientHandler;
+    let handler = (*client).permission_handler;
+    if handler.is_null() {
+        return ptr::null_mut();
+    }
+    if let Some(add_ref) = (*handler).cef_permission_handler.base.add_ref {
+        add_ref(&mut (*handler).cef_permission_handler.base);
+    }
+    handler as *mut c_void
+}
+
+unsafe extern "system" fn permission_add_ref(self_: *mut ffi::cef_base_ref_counted_t) {
+    let handler = self_ as *mut PermissionHandler;
+    (*handler).ref_count.fetch_add(1, Ordering::Relaxed);
+}
+
+unsafe extern "system" fn permission_release(self_: *mut ffi::cef_base_ref_counted_t) -> c_int {
+    let handler = self_ as *mut PermissionHandler;
+    if (*handler).ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        drop(Box::from_raw(handler));
+        1
+    } else {
+        0
+    }
+}
+
+unsafe extern "system" fn permission_has_one_ref(self_: *mut ffi::cef_base_ref_counted_t) -> c_int {
+    let handler = self_ as *mut PermissionHandler;
+    ((*handler).ref_count.load(Ordering::Acquire) == 1) as c_int
+}
+
+unsafe extern "system" fn permission_has_at_least_one_ref(
+    self_: *mut ffi::cef_base_ref_counted_t,
+) -> c_int {
+    let handler = self_ as *mut PermissionHandler;
+    ((*handler).ref_count.load(Ordering::Acquire) >= 1) as c_int
+}
+
+impl PermissionHandler {
+    fn allocate(state: Arc<SharedBrowserState>) -> *mut PermissionHandler {
+        Box::into_raw(Box::new(Self {
+            cef_permission_handler: ffi::cef_permission_handler_t {
+                base: ffi::cef_base_ref_counted_t {
+                    size: std::mem::size_of::<ffi::cef_permission_handler_t>(),
+                    add_ref: Some(permission_add_ref),
+                    release: Some(permission_release),
+                    has_one_ref: Some(permission_has_one_ref),
+                    has_at_least_one_ref: Some(permission_has_at_least_one_ref),
+                },
+                on_request_media_access_permission: Some(
+                    permission_on_request_media_access_permission,
+                ),
+                on_show_permission_prompt: Some(permission_on_show_permission_prompt),
+                on_dismiss_permission_prompt: Some(permission_on_dismiss_permission_prompt),
+            },
+            ref_count: AtomicUsize::new(1),
+            state,
+        }))
+    }
+}
+
+unsafe extern "system" fn permission_on_request_media_access_permission(
+    self_: *mut ffi::cef_permission_handler_t,
+    browser: *mut ffi::cef_browser_t,
+    frame: *mut ffi::cef_frame_t,
+    requesting_origin: *const ffi::cef_string_t,
+    requested_permissions: u32,
+    callback: *mut ffi::cef_media_access_callback_t,
+) -> c_int {
+    release_param(browser);
+    release_param(frame);
+    if self_.is_null() || callback.is_null() {
+        release_param(callback);
+        return 0;
+    }
+    let mut permissions = 0u32;
+    if (requested_permissions & ffi::CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE) != 0 {
+        permissions |= SITE_PERMISSION_CAMERA;
+    }
+    if (requested_permissions & ffi::CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE) != 0 {
+        permissions |= SITE_PERMISSION_MICROPHONE;
+    }
+    if (requested_permissions
+        & (ffi::CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE
+            | ffi::CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE))
+        != 0
+    {
+        permissions |= SITE_PERMISSION_DESKTOP_CAPTURE;
+    }
+    if permissions == 0 {
+        if let Some(cancel) = (*callback).cancel {
+            cancel(callback);
+        }
+        release_param(callback);
+        return 1;
+    }
+    let handler = self_ as *mut PermissionHandler;
+    let state: &SharedBrowserState = &(*handler).state;
+    let request_id = state.next_dialog_id.fetch_add(1, Ordering::Relaxed) + 1;
+    state.pending_permissions.lock().unwrap().insert(
+        request_id,
+        PendingPermission::Media {
+            callback: callback as usize,
+            requested: requested_permissions,
+        },
+    );
+    state
+        .permission_requests
+        .lock()
+        .unwrap()
+        .push(SitePermissionRequest {
+            request_id,
+            origin: cef_string_to_string(requesting_origin),
+            permissions,
+        });
+    state.nav_gen.fetch_add(1, Ordering::AcqRel);
+    1
+}
+
+unsafe extern "system" fn permission_on_show_permission_prompt(
+    self_: *mut ffi::cef_permission_handler_t,
+    browser: *mut ffi::cef_browser_t,
+    prompt_id: u64,
+    requesting_origin: *const ffi::cef_string_t,
+    requested_permissions: u32,
+    callback: *mut ffi::cef_permission_prompt_callback_t,
+) -> c_int {
+    release_param(browser);
+    if self_.is_null() || callback.is_null() {
+        release_param(callback);
+        return 0;
+    }
+    if requested_permissions == ffi::CEF_PERMISSION_TYPE_NOTIFICATIONS {
+        if let Some(cont) = (*callback).cont {
+            cont(callback, ffi::CEF_PERMISSION_RESULT_ACCEPT);
+        }
+        release_param(callback);
+        return 1;
+    }
+    let mut permissions = 0u32;
+    if (requested_permissions
+        & (ffi::CEF_PERMISSION_TYPE_CAMERA_STREAM | ffi::CEF_PERMISSION_TYPE_CAMERA_PAN_TILT_ZOOM))
+        != 0
+    {
+        permissions |= SITE_PERMISSION_CAMERA;
+    }
+    if (requested_permissions & ffi::CEF_PERMISSION_TYPE_MIC_STREAM) != 0 {
+        permissions |= SITE_PERMISSION_MICROPHONE;
+    }
+    if (requested_permissions & ffi::CEF_PERMISSION_TYPE_GEOLOCATION) != 0 {
+        permissions |= SITE_PERMISSION_GEOLOCATION;
+    }
+    if permissions == 0 {
+        permissions = SITE_PERMISSION_OTHER;
+    }
+    let handler = self_ as *mut PermissionHandler;
+    let state: &SharedBrowserState = &(*handler).state;
+    let request_id = state.next_dialog_id.fetch_add(1, Ordering::Relaxed) + 1;
+    state.pending_permissions.lock().unwrap().insert(
+        request_id,
+        PendingPermission::Prompt {
+            callback: callback as usize,
+            prompt_id,
+        },
+    );
+    state
+        .permission_requests
+        .lock()
+        .unwrap()
+        .push(SitePermissionRequest {
+            request_id,
+            origin: cef_string_to_string(requesting_origin),
+            permissions,
+        });
+    state.nav_gen.fetch_add(1, Ordering::AcqRel);
+    1
+}
+
+unsafe extern "system" fn permission_on_dismiss_permission_prompt(
+    self_: *mut ffi::cef_permission_handler_t,
+    browser: *mut ffi::cef_browser_t,
+    prompt_id: u64,
+    _result: ffi::cef_permission_request_result_t,
+) {
+    release_param(browser);
+    if self_.is_null() {
+        return;
+    }
+    let handler = self_ as *mut PermissionHandler;
+    let state: &SharedBrowserState = &(*handler).state;
+    let mut pending = state.pending_permissions.lock().unwrap();
+    let remove_id = pending.iter().find_map(|(&id, item)| match item {
+        PendingPermission::Prompt { prompt_id: p, .. } if *p == prompt_id => Some(id),
+        _ => None,
+    });
+    if let Some(id) = remove_id {
+        if let Some(PendingPermission::Prompt { callback, .. }) = pending.remove(&id) {
+            if callback != 0 {
+                release_ref_counted(callback as *mut ffi::cef_base_ref_counted_t);
+            }
+        }
+    }
 }
 
 /// Null unless the embedder enabled capture on this browser. CEF asks each
@@ -5236,6 +5480,15 @@ unsafe extern "system" fn life_span_on_before_close(
                 release_ref_counted(raw as *mut ffi::cef_base_ref_counted_t);
             }
         }
+        for (_, pending) in state.pending_permissions.lock().unwrap().drain() {
+            let raw = match pending {
+                PendingPermission::Media { callback, .. } => callback,
+                PendingPermission::Prompt { callback, .. } => callback,
+            };
+            if raw != 0 {
+                release_ref_counted(raw as *mut ffi::cef_base_ref_counted_t);
+            }
+        }
     }
     if let Ok(runtime) = runtime() {
         let mut count = runtime.live_browsers.load(Ordering::Acquire);
@@ -5454,6 +5707,7 @@ impl ClientHandler {
             DialogHandler::allocate(state.clone()),
             DownloadHandler::allocate(state.clone()),
             JsDialogHandler::allocate(state.clone()),
+            PermissionHandler::allocate(state.clone()),
             AudioHandler::allocate(state),
         )
     }
@@ -5467,6 +5721,7 @@ impl ClientHandler {
         dialog_handler: *mut DialogHandler,
         download_handler: *mut DownloadHandler,
         jsdialog_handler: *mut JsDialogHandler,
+        permission_handler: *mut PermissionHandler,
         audio_handler: *mut AudioHandler,
     ) -> *mut ClientHandler {
         Box::into_raw(Box::new(Self {
@@ -5488,7 +5743,7 @@ impl ClientHandler {
                 get_find_handler: Some(client_null_handler),
                 get_focus_handler: Some(client_null_handler),
                 get_frame_handler: Some(client_null_handler),
-                get_permission_handler: Some(client_null_handler),
+                get_permission_handler: Some(client_get_permission_handler),
                 get_jsdialog_handler: Some(client_get_jsdialog_handler),
                 get_keyboard_handler: Some(client_null_handler),
                 get_life_span_handler: Some(client_get_life_span_handler),
@@ -5507,6 +5762,7 @@ impl ClientHandler {
             dialog_handler,
             download_handler,
             jsdialog_handler,
+            permission_handler,
             audio_handler,
         }))
     }
@@ -6311,6 +6567,56 @@ impl Browser {
                 }
             }
             release_ref_counted(&mut (*callback).base);
+        })
+    }
+
+    pub fn take_permission_requests(&mut self) -> Vec<SitePermissionRequest> {
+        std::mem::take(&mut *self.state.permission_requests.lock().unwrap())
+    }
+
+    pub fn resolve_permission_request(&self, request_id: u64, granted: bool) -> Result<()> {
+        let pending = self
+            .state
+            .pending_permissions
+            .lock()
+            .unwrap()
+            .remove(&request_id);
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        on_cef_thread(move || unsafe {
+            match pending {
+                PendingPermission::Media {
+                    callback,
+                    requested,
+                } => {
+                    if callback != 0 {
+                        let cb = callback as *mut ffi::cef_media_access_callback_t;
+                        if granted {
+                            if let Some(cont) = (*cb).cont {
+                                cont(cb, requested);
+                            }
+                        } else if let Some(cancel) = (*cb).cancel {
+                            cancel(cb);
+                        }
+                        release_ref_counted(&mut (*cb).base);
+                    }
+                }
+                PendingPermission::Prompt { callback, .. } => {
+                    if callback != 0 {
+                        let cb = callback as *mut ffi::cef_permission_prompt_callback_t;
+                        if let Some(cont) = (*cb).cont {
+                            let result = if granted {
+                                ffi::CEF_PERMISSION_RESULT_ACCEPT
+                            } else {
+                                ffi::CEF_PERMISSION_RESULT_DENY
+                            };
+                            cont(cb, result);
+                        }
+                        release_ref_counted(&mut (*cb).base);
+                    }
+                }
+            }
         })
     }
 

@@ -75,6 +75,7 @@ pub struct ViewState {
     download_updates: Vec<DownloadUpdateEvent>,
     js_dialogs: Vec<JsDialogEvent>,
     auth_requests: Vec<AuthRequestEvent>,
+    permission_requests: Vec<SitePermissionEvent>,
     closed: bool,
     console: Vec<ConsoleLine>,
     evaluations: Vec<(u64, Result<String, String>)>,
@@ -124,6 +125,13 @@ pub struct AuthRequestEvent {
     pub port: i32,
     pub realm: String,
     pub scheme: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SitePermissionEvent {
+    pub request_id: u64,
+    pub origin: String,
+    pub permissions: u32,
 }
 
 /// Slots of a displaying ring.
@@ -426,6 +434,10 @@ impl BrowserViews {
 
     pub fn take_auth_requests(&mut self, id: ViewId) -> Vec<AuthRequestEvent> {
         self.view_mut(id).map(|view| std::mem::take(&mut view.state.auth_requests)).unwrap_or_default()
+    }
+
+    pub fn take_permission_requests(&mut self, id: ViewId) -> Vec<SitePermissionEvent> {
+        self.view_mut(id).map(|view| std::mem::take(&mut view.state.permission_requests)).unwrap_or_default()
     }
 
     pub fn take_closed(&mut self, id: ViewId) -> bool {
@@ -762,6 +774,10 @@ impl BrowserViews {
             }
             ViewEvent::AuthRequested { request_id, is_proxy, host, port, realm, scheme } => {
                 state.auth_requests.push(AuthRequestEvent { request_id, is_proxy, host, port, realm, scheme });
+                return false;
+            }
+            ViewEvent::PermissionRequested { request_id, origin, permissions } => {
+                state.permission_requests.push(SitePermissionEvent { request_id, origin, permissions });
                 return false;
             }
             ViewEvent::Console { level, message, source, line } => {

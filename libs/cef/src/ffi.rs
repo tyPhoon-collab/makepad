@@ -1547,3 +1547,74 @@ pub struct cef_download_handler_t {
         ),
     >,
 }
+
+pub const CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE: u32 = 1;
+pub const CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE: u32 = 2;
+pub const CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE: u32 = 4;
+pub const CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE: u32 = 8;
+
+pub const CEF_PERMISSION_TYPE_CAMERA_PAN_TILT_ZOOM: u32 = 2;
+pub const CEF_PERMISSION_TYPE_CAMERA_STREAM: u32 = 4;
+pub const CEF_PERMISSION_TYPE_GEOLOCATION: u32 = 256;
+pub const CEF_PERMISSION_TYPE_MIC_STREAM: u32 = 4096;
+pub const CEF_PERMISSION_TYPE_NOTIFICATIONS: u32 = 32768;
+
+pub type cef_permission_request_result_t = c_int;
+pub const CEF_PERMISSION_RESULT_ACCEPT: cef_permission_request_result_t = 0;
+pub const CEF_PERMISSION_RESULT_DENY: cef_permission_request_result_t = 1;
+
+#[repr(C)]
+pub struct cef_media_access_callback_t {
+    pub base: cef_base_ref_counted_t,
+    pub cont: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_media_access_callback_t,
+            allowed_permissions: u32,
+        ),
+    >,
+    pub cancel: Option<unsafe extern "system" fn(self_: *mut cef_media_access_callback_t)>,
+}
+
+#[repr(C)]
+pub struct cef_permission_prompt_callback_t {
+    pub base: cef_base_ref_counted_t,
+    pub cont: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_permission_prompt_callback_t,
+            result: cef_permission_request_result_t,
+        ),
+    >,
+}
+
+#[repr(C)]
+pub struct cef_permission_handler_t {
+    pub base: cef_base_ref_counted_t,
+    pub on_request_media_access_permission: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_permission_handler_t,
+            browser: *mut cef_browser_t,
+            frame: *mut cef_frame_t,
+            requesting_origin: *const cef_string_t,
+            requested_permissions: u32,
+            callback: *mut cef_media_access_callback_t,
+        ) -> c_int,
+    >,
+    pub on_show_permission_prompt: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_permission_handler_t,
+            browser: *mut cef_browser_t,
+            prompt_id: u64,
+            requesting_origin: *const cef_string_t,
+            requested_permissions: u32,
+            callback: *mut cef_permission_prompt_callback_t,
+        ) -> c_int,
+    >,
+    pub on_dismiss_permission_prompt: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_permission_handler_t,
+            browser: *mut cef_browser_t,
+            prompt_id: u64,
+            result: cef_permission_request_result_t,
+        ),
+    >,
+}
