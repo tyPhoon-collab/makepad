@@ -66,6 +66,10 @@ pub enum ViewOp {
     FileDialogResult { request_id: u64, paths: Option<Vec<String>> },
     /// Answer a pending download request (`save_path == None` cancels).
     DownloadResult { download_id: u32, save_path: Option<String> },
+    /// Answer a pending JavaScript dialog (`accept == false` cancels).
+    JsDialogResult { request_id: u64, accept: bool, user_input: String },
+    /// Answer a pending HTTP authentication challenge (`username == None` cancels).
+    AuthResult { request_id: u64, username: Option<String>, password: String },
 }
 
 /// From the browser host to the owner.
@@ -88,6 +92,10 @@ pub enum ViewEvent {
     DownloadRequested { download_id: u32, suggested_name: String, url: String },
     /// A file download finished, was canceled, or was interrupted (`state`: 0=complete, 1=canceled, 2=interrupted).
     DownloadUpdated { download_id: u32, file_name: String, full_path: String, state: u8, percent: i32 },
+    /// A JavaScript dialog or beforeunload prompt (`kind`: 0=alert, 1=confirm, 2=prompt, 3=beforeunload).
+    JsDialog { request_id: u64, kind: u8, origin_url: String, message: String, default_prompt: String },
+    /// An HTTP or proxy authentication challenge.
+    AuthRequested { request_id: u64, is_proxy: bool, host: String, port: i32, realm: String, scheme: String },
     /// A line the page wrote to its console.
     Console { level: i32, message: String, source: String, line: i32 },
     /// The answer to `ViewOp::Eval`: the value as JSON, or the exception.
@@ -160,6 +168,8 @@ mod tests {
             ViewOp::AdoptPopup { popup_id: 2, view_id: 9 },
             ViewOp::FileDialogResult { request_id: 4, paths: Some(vec!["/tmp/a.txt".into()]) },
             ViewOp::DownloadResult { download_id: 7, save_path: None },
+            ViewOp::JsDialogResult { request_id: 8, accept: true, user_input: "ok".into() },
+            ViewOp::AuthResult { request_id: 9, username: Some("alice".into()), password: "pw".into() },
         ] {
             let json = op_to_json(3, &op);
             assert_eq!(parse_op(&json), Some((3, op)));
@@ -180,6 +190,8 @@ mod tests {
             ViewEvent::FileDialog { request_id: 4, mode: 1, title: "Pick".into(), default_path: "".into(), accept_filters: vec![".png".into()] },
             ViewEvent::DownloadRequested { download_id: 7, suggested_name: "a.zip".into(), url: "https://example.com/a.zip".into() },
             ViewEvent::DownloadUpdated { download_id: 7, file_name: "a.zip".into(), full_path: "/tmp/a.zip".into(), state: 0, percent: 42 },
+            ViewEvent::JsDialog { request_id: 8, kind: 2, origin_url: "https://example.com".into(), message: "Name?".into(), default_prompt: "a".into() },
+            ViewEvent::AuthRequested { request_id: 9, is_proxy: false, host: "example.com".into(), port: 443, realm: "Admin".into(), scheme: "basic".into() },
             ViewEvent::Closed,
         ] {
             let json = event_to_json(5, &event);

@@ -73,6 +73,8 @@ pub struct ViewState {
     file_dialogs: Vec<FileDialogEvent>,
     download_requests: Vec<DownloadRequestEvent>,
     download_updates: Vec<DownloadUpdateEvent>,
+    js_dialogs: Vec<JsDialogEvent>,
+    auth_requests: Vec<AuthRequestEvent>,
     closed: bool,
     console: Vec<ConsoleLine>,
     evaluations: Vec<(u64, Result<String, String>)>,
@@ -103,6 +105,25 @@ pub struct DownloadUpdateEvent {
     pub full_path: String,
     pub state: u8,
     pub percent: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JsDialogEvent {
+    pub request_id: u64,
+    pub kind: u8,
+    pub origin_url: String,
+    pub message: String,
+    pub default_prompt: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthRequestEvent {
+    pub request_id: u64,
+    pub is_proxy: bool,
+    pub host: String,
+    pub port: i32,
+    pub realm: String,
+    pub scheme: String,
 }
 
 /// Slots of a displaying ring.
@@ -397,6 +418,14 @@ impl BrowserViews {
 
     pub fn take_download_updates(&mut self, id: ViewId) -> Vec<DownloadUpdateEvent> {
         self.view_mut(id).map(|view| std::mem::take(&mut view.state.download_updates)).unwrap_or_default()
+    }
+
+    pub fn take_js_dialogs(&mut self, id: ViewId) -> Vec<JsDialogEvent> {
+        self.view_mut(id).map(|view| std::mem::take(&mut view.state.js_dialogs)).unwrap_or_default()
+    }
+
+    pub fn take_auth_requests(&mut self, id: ViewId) -> Vec<AuthRequestEvent> {
+        self.view_mut(id).map(|view| std::mem::take(&mut view.state.auth_requests)).unwrap_or_default()
     }
 
     pub fn take_closed(&mut self, id: ViewId) -> bool {
@@ -725,6 +754,14 @@ impl BrowserViews {
             }
             ViewEvent::DownloadUpdated { download_id, file_name, full_path, state: status, percent } => {
                 state.download_updates.push(DownloadUpdateEvent { download_id, file_name, full_path, state: status, percent });
+                return false;
+            }
+            ViewEvent::JsDialog { request_id, kind, origin_url, message, default_prompt } => {
+                state.js_dialogs.push(JsDialogEvent { request_id, kind, origin_url, message, default_prompt });
+                return false;
+            }
+            ViewEvent::AuthRequested { request_id, is_proxy, host, port, realm, scheme } => {
+                state.auth_requests.push(AuthRequestEvent { request_id, is_proxy, host, port, realm, scheme });
                 return false;
             }
             ViewEvent::Console { level, message, source, line } => {

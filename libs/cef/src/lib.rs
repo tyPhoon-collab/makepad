@@ -247,6 +247,33 @@ pub struct DownloadUpdate {
     pub percent: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsDialogKind {
+    Alert,
+    Confirm,
+    Prompt,
+    BeforeUnload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JsDialogRequest {
+    pub request_id: u64,
+    pub kind: JsDialogKind,
+    pub origin_url: String,
+    pub message: String,
+    pub default_prompt: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthRequest {
+    pub request_id: u64,
+    pub is_proxy: bool,
+    pub host: String,
+    pub port: i32,
+    pub realm: String,
+    pub scheme: String,
+}
+
 pub const EVENTFLAG_NONE: u32 = 0;
 pub const EVENTFLAG_CAPS_LOCK_ON: u32 = 1 << 0;
 pub const EVENTFLAG_SHIFT_DOWN: u32 = 1 << 1;
@@ -623,6 +650,32 @@ impl Browser {
 
     pub fn audio_capture_stats(&self) -> AudioCaptureStats {
         AudioCaptureStats::default()
+    }
+
+    pub fn take_js_dialog_requests(&mut self) -> Vec<JsDialogRequest> {
+        Vec::new()
+    }
+
+    pub fn resolve_js_dialog(
+        &self,
+        _request_id: u64,
+        _success: bool,
+        _user_input: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn take_auth_requests(&mut self) -> Vec<AuthRequest> {
+        Vec::new()
+    }
+
+    pub fn resolve_auth_request(
+        &self,
+        _request_id: u64,
+        _username: Option<&str>,
+        _password: &str,
+    ) -> Result<()> {
+        Ok(())
     }
 }
 

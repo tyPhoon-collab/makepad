@@ -506,6 +506,16 @@ impl App {
                     let _ = browser.resolve_download(download_id, save_path);
                 }
             }
+            ViewOp::JsDialogResult { request_id, accept, user_input } => {
+                if let Some(browser) = &page.browser {
+                    let _ = browser.resolve_js_dialog(request_id, accept, &user_input);
+                }
+            }
+            ViewOp::AuthResult { request_id, username, password } => {
+                if let Some(browser) = &page.browser {
+                    let _ = browser.resolve_auth_request(request_id, username.as_deref(), &password);
+                }
+            }
             op => page.command(op),
         }
     }
@@ -639,13 +649,15 @@ impl App {
                     cef.take_file_dialog_requests(),
                     cef.take_download_requests(),
                     cef.take_download_updates(),
+                    cef.take_js_dialog_requests(),
+                    cef.take_auth_requests(),
                     cef.is_closed(),
                     cef.take_console_messages(),
                     cef.take_evaluations(),
                     cef.ime_caret_rect(),
                 )
             });
-            let Some((started, shown, popups, external_urls, popup_browsers, file_dialogs, download_requests, download_updates, closed, console, evaluations, ime_caret)) = polled else {
+            let Some((started, shown, popups, external_urls, popup_browsers, file_dialogs, download_requests, download_updates, js_dialogs, auth_requests, closed, console, evaluations, ime_caret)) = polled else {
                 // No page yet (it waits for its size): keep what waits.
                 page.evals = evals;
                 continue;
@@ -761,6 +773,31 @@ impl App {
                     full_path: upd.full_path,
                     state,
                     percent: upd.percent,
+                });
+            }
+            for req in js_dialogs {
+                let kind = match req.kind {
+                    makepad_cef::JsDialogKind::Alert => 0,
+                    makepad_cef::JsDialogKind::Confirm => 1,
+                    makepad_cef::JsDialogKind::Prompt => 2,
+                    makepad_cef::JsDialogKind::BeforeUnload => 3,
+                };
+                Self::send(view, ViewEvent::JsDialog {
+                    request_id: req.request_id,
+                    kind,
+                    origin_url: req.origin_url,
+                    message: req.message,
+                    default_prompt: req.default_prompt,
+                });
+            }
+            for req in auth_requests {
+                Self::send(view, ViewEvent::AuthRequested {
+                    request_id: req.request_id,
+                    is_proxy: req.is_proxy,
+                    host: req.host,
+                    port: req.port,
+                    realm: req.realm,
+                    scheme: req.scheme,
                 });
             }
             if closed {

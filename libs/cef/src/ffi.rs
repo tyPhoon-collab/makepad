@@ -99,6 +99,9 @@ pub type cef_errorcode_t = c_int;
 pub type cef_window_open_disposition_t = c_int;
 pub const CEF_WOD_NEW_POPUP: cef_window_open_disposition_t = 5;
 pub type cef_jsdialog_type_t = c_int;
+pub const JSDIALOGTYPE_ALERT: cef_jsdialog_type_t = 0;
+pub const JSDIALOGTYPE_CONFIRM: cef_jsdialog_type_t = 1;
+pub const JSDIALOGTYPE_PROMPT: cef_jsdialog_type_t = 2;
 pub type cef_cursor_type_t = c_int;
 pub type cef_cursor_handle_t = *mut c_void;
 pub type cef_cursor_info_t = c_void;
@@ -1388,6 +1391,19 @@ pub struct cef_request_t {
 }
 
 #[repr(C)]
+pub struct cef_auth_callback_t {
+    pub base: cef_base_ref_counted_t,
+    pub cont: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_auth_callback_t,
+            username: *const cef_string_t,
+            password: *const cef_string_t,
+        ),
+    >,
+    pub cancel: Option<unsafe extern "system" fn(self_: *mut cef_auth_callback_t)>,
+}
+
+#[repr(C)]
 pub struct cef_request_handler_t {
     pub base: cef_base_ref_counted_t,
     pub on_before_browse: Option<
@@ -1402,7 +1418,19 @@ pub struct cef_request_handler_t {
     >,
     pub on_open_urlfrom_tab: cef_unused_callback_t,
     pub get_resource_request_handler: cef_unused_callback_t,
-    pub get_auth_credentials: cef_unused_callback_t,
+    pub get_auth_credentials: Option<
+        unsafe extern "system" fn(
+            self_: *mut cef_request_handler_t,
+            browser: *mut cef_browser_t,
+            frame: *mut cef_frame_t,
+            is_proxy: c_int,
+            host: *const cef_string_t,
+            port: c_int,
+            realm: *const cef_string_t,
+            scheme: *const cef_string_t,
+            callback: *mut cef_auth_callback_t,
+        ) -> c_int,
+    >,
     pub on_certificate_error: cef_unused_callback_t,
     pub on_select_client_certificate: cef_unused_callback_t,
     pub on_render_view_ready: cef_unused_callback_t,

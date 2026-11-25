@@ -1,8 +1,8 @@
 use crate::{
-    ffi, AudioCaptureConfig, AudioCaptureStats, AudioEvent, AudioFormat, AudioPacket,
+    ffi, AudioCaptureConfig, AudioCaptureStats, AudioEvent, AudioFormat, AudioPacket, AuthRequest,
     BootstrapResult, CapturedFrame, CaptureTimestamp, ConsoleMessage, DownloadRequest, DownloadState,
-    DownloadUpdate, Error, Evaluation, FileDialogMode, FileDialogRequest, Frame, Result,
-    TEXT_INPUT_MODE_NONE,
+    DownloadUpdate, Error, Evaluation, FileDialogMode, FileDialogRequest, Frame, JsDialogKind,
+    JsDialogRequest, Result, TEXT_INPUT_MODE_NONE,
 };
 
 /// A diagnostic line on stderr that survives a closed pipe. A browser hosted
@@ -449,6 +449,10 @@ struct SharedBrowserState {
     pending_downloads: Mutex<HashMap<u32, usize>>,
     download_updates: Mutex<Vec<DownloadUpdate>>,
     reported_download_states: Mutex<HashMap<u32, (DownloadState, i32)>>,
+    js_dialog_requests: Mutex<Vec<JsDialogRequest>>,
+    pending_js_dialogs: Mutex<HashMap<u64, usize>>,
+    auth_requests: Mutex<Vec<AuthRequest>>,
+    pending_auth_requests: Mutex<HashMap<u64, usize>>,
     /// The latest decoded favicon bitmap (BGRA, premultiplied).
     favicon: Mutex<Option<Frame>>,
     favicon_url: Mutex<String>,
@@ -609,7 +613,15 @@ struct ClientHandler {
     request_handler: *mut RequestHandler,
     dialog_handler: *mut DialogHandler,
     download_handler: *mut DownloadHandler,
+    jsdialog_handler: *mut JsDialogHandler,
     audio_handler: *mut AudioHandler,
+}
+
+#[repr(C)]
+struct JsDialogHandler {
+    cef_jsdialog_handler: ffi::cef_jsdialog_handler_t,
+    ref_count: AtomicUsize,
+    state: Arc<SharedBrowserState>,
 }
 
 #[repr(C)]
@@ -2894,6 +2906,11 @@ unsafe extern "system" fn client_release(self_: *mut ffi::cef_base_ref_counted_t
                 &mut (*(*client).download_handler).cef_download_handler.base as *mut _,
             );
         }
+        if !(*client).jsdialog_handler.is_null() {
+            release_ref_counted(
+                &mut (*(*client).jsdialog_handler).cef_jsdialog_handler.base as *mut _,
+            );
+        }
         if !(*client).audio_handler.is_null() {
             release_ref_counted(&mut (*(*client).audio_handler).cef_audio_handler.base as *mut _);
         }
@@ -3212,76 +3229,169 @@ unsafe extern "system" fn client_get_download_handler(
 /// of its own, shown on screen even for a windowless browser in a hidden
 /// app, and modal to the page until someone answers it. One handler serves
 /// every browser; it holds no state.
-unsafe extern "system" fn client_get_jsdialog_handler(_self: *mut ffi::cef_client_t) -> *mut c_void {
-    static HANDLER: OnceLock<usize> = OnceLock::new();
-    *HANDLER.get_or_init(|| {
-        Box::into_raw(Box::new(ffi::cef_jsdialog_handler_t {
-            base: ffi::cef_base_ref_counted_t {
-                size: std::mem::size_of::<ffi::cef_jsdialog_handler_t>(),
-                add_ref: Some(static_add_ref),
-                release: Some(static_release),
-                has_one_ref: Some(static_has_one_ref),
-                has_at_least_one_ref: Some(static_has_at_least_one_ref),
+unsafe extern "system" fn client_get_jsdialog_handler(self_: *mut ffi::cef_client_t) -> *mut c_void {
+    let client = self_ as *mut ClientHandler;
+    let handler = (*client).jsdialog_handler;
+    if handler.is_null() {
+        return ptr::null_mut();
+    }
+    if let Some(add_ref) = (*handler).cef_jsdialog_handler.base.add_ref {
+        add_ref(&mut (*handler).cef_jsdialog_handler.base);
+    }
+    handler as *mut c_void
+}
+
+unsafe extern "system" fn jsdialog_add_ref(self_: *mut ffi::cef_base_ref_counted_t) {
+    let handler = self_ as *mut JsDialogHandler;
+    (*handler).ref_count.fetch_add(1, Ordering::Relaxed);
+}
+
+unsafe extern "system" fn jsdialog_release(self_: *mut ffi::cef_base_ref_counted_t) -> c_int {
+    let handler = self_ as *mut JsDialogHandler;
+    if (*handler).ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        drop(Box::from_raw(handler));
+        1
+    } else {
+        0
+    }
+}
+
+unsafe extern "system" fn jsdialog_has_one_ref(self_: *mut ffi::cef_base_ref_counted_t) -> c_int {
+    let handler = self_ as *mut JsDialogHandler;
+    ((*handler).ref_count.load(Ordering::Acquire) == 1) as c_int
+}
+
+unsafe extern "system" fn jsdialog_has_at_least_one_ref(
+    self_: *mut ffi::cef_base_ref_counted_t,
+) -> c_int {
+    let handler = self_ as *mut JsDialogHandler;
+    ((*handler).ref_count.load(Ordering::Acquire) >= 1) as c_int
+}
+
+impl JsDialogHandler {
+    fn allocate(state: Arc<SharedBrowserState>) -> *mut JsDialogHandler {
+        Box::into_raw(Box::new(Self {
+            cef_jsdialog_handler: ffi::cef_jsdialog_handler_t {
+                base: ffi::cef_base_ref_counted_t {
+                    size: std::mem::size_of::<ffi::cef_jsdialog_handler_t>(),
+                    add_ref: Some(jsdialog_add_ref),
+                    release: Some(jsdialog_release),
+                    has_one_ref: Some(jsdialog_has_one_ref),
+                    has_at_least_one_ref: Some(jsdialog_has_at_least_one_ref),
+                },
+                on_jsdialog: Some(jsdialog_on_jsdialog),
+                on_before_unload_dialog: Some(jsdialog_on_before_unload_dialog),
+                on_reset_dialog_state: Some(jsdialog_on_reset_dialog_state),
+                on_dialog_closed: Some(jsdialog_on_dialog_closed),
             },
-            on_jsdialog: Some(jsdialog_on_jsdialog),
-            on_before_unload_dialog: Some(jsdialog_on_before_unload_dialog),
-            on_reset_dialog_state: None,
-            on_dialog_closed: None,
-        })) as usize
-    }) as *mut c_void
+            ref_count: AtomicUsize::new(1),
+            state,
+        }))
+    }
 }
 
-/// Reference counting for an object that lives as long as the process.
-unsafe extern "system" fn static_add_ref(_self: *mut ffi::cef_base_ref_counted_t) {}
-unsafe extern "system" fn static_release(_self: *mut ffi::cef_base_ref_counted_t) -> c_int {
-    0
-}
-unsafe extern "system" fn static_has_one_ref(_self: *mut ffi::cef_base_ref_counted_t) -> c_int {
-    0
-}
-unsafe extern "system" fn static_has_at_least_one_ref(_self: *mut ffi::cef_base_ref_counted_t) -> c_int {
-    1
-}
-
-/// `alert`/`confirm`/`prompt`: suppressed, as a page sees a dismissed
-/// dialog (confirm false, prompt null). Suppressing rather than answering
-/// is what Chromium expects of an embedder that shows no dialog.
 unsafe extern "system" fn jsdialog_on_jsdialog(
-    _self: *mut ffi::cef_jsdialog_handler_t,
+    self_: *mut ffi::cef_jsdialog_handler_t,
     browser: *mut ffi::cef_browser_t,
-    _origin_url: *const ffi::cef_string_t,
+    origin_url: *const ffi::cef_string_t,
     dialog_type: ffi::cef_jsdialog_type_t,
     message_text: *const ffi::cef_string_t,
-    _default_prompt_text: *const ffi::cef_string_t,
+    default_prompt_text: *const ffi::cef_string_t,
     callback: *mut ffi::cef_jsdialog_callback_t,
     suppress_message: *mut c_int,
 ) -> c_int {
     release_param(browser);
-    release_param(callback);
-    makepad_error_log::trace!("cef", "javascript dialog {} suppressed: {}", dialog_type, cef_string_to_string(message_text));
-    if !suppress_message.is_null() {
-        *suppress_message = 1;
+    if self_.is_null() || callback.is_null() {
+        release_param(callback);
+        if !suppress_message.is_null() {
+            *suppress_message = 1;
+        }
+        return 0;
     }
-    0
+    let kind = match dialog_type {
+        ffi::JSDIALOGTYPE_ALERT => JsDialogKind::Alert,
+        ffi::JSDIALOGTYPE_CONFIRM => JsDialogKind::Confirm,
+        ffi::JSDIALOGTYPE_PROMPT => JsDialogKind::Prompt,
+        _ => {
+            release_param(callback);
+            if !suppress_message.is_null() {
+                *suppress_message = 1;
+            }
+            return 0;
+        }
+    };
+    let handler = self_ as *mut JsDialogHandler;
+    let state: &SharedBrowserState = &(*handler).state;
+    let request_id = state.next_dialog_id.fetch_add(1, Ordering::Relaxed) + 1;
+    state
+        .pending_js_dialogs
+        .lock()
+        .unwrap()
+        .insert(request_id, callback as usize);
+    state.js_dialog_requests.lock().unwrap().push(JsDialogRequest {
+        request_id,
+        kind,
+        origin_url: cef_string_to_string(origin_url),
+        message: cef_string_to_string(message_text),
+        default_prompt: cef_string_to_string(default_prompt_text),
+    });
+    state.nav_gen.fetch_add(1, Ordering::AcqRel);
+    1
 }
 
-/// "Leave this page?": answered yes at once, as if confirmed.
 unsafe extern "system" fn jsdialog_on_before_unload_dialog(
-    _self: *mut ffi::cef_jsdialog_handler_t,
+    self_: *mut ffi::cef_jsdialog_handler_t,
     browser: *mut ffi::cef_browser_t,
-    _message_text: *const ffi::cef_string_t,
+    message_text: *const ffi::cef_string_t,
     _is_reload: c_int,
     callback: *mut ffi::cef_jsdialog_callback_t,
 ) -> c_int {
     release_param(browser);
-    if callback.is_null() {
+    if self_.is_null() || callback.is_null() {
+        release_param(callback);
         return 0;
     }
-    if let Some(cont) = (*callback).cont {
-        cont(callback, 1, ptr::null());
-    }
-    release_param(callback);
+    let handler = self_ as *mut JsDialogHandler;
+    let state: &SharedBrowserState = &(*handler).state;
+    let origin_url = state.nav.lock().unwrap().url.clone();
+    let request_id = state.next_dialog_id.fetch_add(1, Ordering::Relaxed) + 1;
+    state
+        .pending_js_dialogs
+        .lock()
+        .unwrap()
+        .insert(request_id, callback as usize);
+    state.js_dialog_requests.lock().unwrap().push(JsDialogRequest {
+        request_id,
+        kind: JsDialogKind::BeforeUnload,
+        origin_url,
+        message: cef_string_to_string(message_text),
+        default_prompt: String::new(),
+    });
+    state.nav_gen.fetch_add(1, Ordering::AcqRel);
     1
+}
+
+unsafe extern "system" fn jsdialog_on_reset_dialog_state(
+    self_: *mut ffi::cef_jsdialog_handler_t,
+    browser: *mut ffi::cef_browser_t,
+) {
+    release_param(browser);
+    if !self_.is_null() {
+        let handler = self_ as *mut JsDialogHandler;
+        let state: &SharedBrowserState = &(*handler).state;
+        for (_, raw) in state.pending_js_dialogs.lock().unwrap().drain() {
+            if raw != 0 {
+                release_ref_counted(raw as *mut ffi::cef_base_ref_counted_t);
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn jsdialog_on_dialog_closed(
+    self_: *mut ffi::cef_jsdialog_handler_t,
+    browser: *mut ffi::cef_browser_t,
+) {
+    jsdialog_on_reset_dialog_state(self_, browser);
 }
 
 /// Null unless the embedder enabled capture on this browser. CEF asks each
@@ -4635,6 +4745,43 @@ unsafe extern "system" fn request_on_before_browse(
     cancel
 }
 
+unsafe extern "system" fn request_get_auth_credentials(
+    self_: *mut ffi::cef_request_handler_t,
+    browser: *mut ffi::cef_browser_t,
+    frame: *mut ffi::cef_frame_t,
+    is_proxy: c_int,
+    host: *const ffi::cef_string_t,
+    port: c_int,
+    realm: *const ffi::cef_string_t,
+    scheme: *const ffi::cef_string_t,
+    callback: *mut ffi::cef_auth_callback_t,
+) -> c_int {
+    release_param(browser);
+    release_param(frame);
+    if self_.is_null() || callback.is_null() {
+        release_param(callback);
+        return 0;
+    }
+    let handler = self_ as *mut RequestHandler;
+    let state: &SharedBrowserState = &(*handler).state;
+    let request_id = state.next_dialog_id.fetch_add(1, Ordering::Relaxed) + 1;
+    state
+        .pending_auth_requests
+        .lock()
+        .unwrap()
+        .insert(request_id, callback as usize);
+    state.auth_requests.lock().unwrap().push(AuthRequest {
+        request_id,
+        is_proxy: is_proxy != 0,
+        host: cef_string_to_string(host),
+        port,
+        realm: cef_string_to_string(realm),
+        scheme: cef_string_to_string(scheme),
+    });
+    state.nav_gen.fetch_add(1, Ordering::AcqRel);
+    1
+}
+
 impl RequestHandler {
     fn allocate(state: Arc<SharedBrowserState>) -> *mut RequestHandler {
         Box::into_raw(Box::new(Self {
@@ -4649,7 +4796,7 @@ impl RequestHandler {
                 on_before_browse: Some(request_on_before_browse),
                 on_open_urlfrom_tab: None,
                 get_resource_request_handler: None,
-                get_auth_credentials: None,
+                get_auth_credentials: Some(request_get_auth_credentials),
                 on_certificate_error: None,
                 on_select_client_certificate: None,
                 on_render_view_ready: None,
@@ -5079,6 +5226,16 @@ unsafe extern "system" fn life_span_on_before_close(
                 release_ref_counted(raw as *mut ffi::cef_base_ref_counted_t);
             }
         }
+        for (_, raw) in state.pending_js_dialogs.lock().unwrap().drain() {
+            if raw != 0 {
+                release_ref_counted(raw as *mut ffi::cef_base_ref_counted_t);
+            }
+        }
+        for (_, raw) in state.pending_auth_requests.lock().unwrap().drain() {
+            if raw != 0 {
+                release_ref_counted(raw as *mut ffi::cef_base_ref_counted_t);
+            }
+        }
     }
     if let Ok(runtime) = runtime() {
         let mut count = runtime.live_browsers.load(Ordering::Acquire);
@@ -5296,6 +5453,7 @@ impl ClientHandler {
             RequestHandler::allocate(state.clone()),
             DialogHandler::allocate(state.clone()),
             DownloadHandler::allocate(state.clone()),
+            JsDialogHandler::allocate(state.clone()),
             AudioHandler::allocate(state),
         )
     }
@@ -5308,6 +5466,7 @@ impl ClientHandler {
         request_handler: *mut RequestHandler,
         dialog_handler: *mut DialogHandler,
         download_handler: *mut DownloadHandler,
+        jsdialog_handler: *mut JsDialogHandler,
         audio_handler: *mut AudioHandler,
     ) -> *mut ClientHandler {
         Box::into_raw(Box::new(Self {
@@ -5347,6 +5506,7 @@ impl ClientHandler {
             request_handler,
             dialog_handler,
             download_handler,
+            jsdialog_handler,
             audio_handler,
         }))
     }
@@ -6058,6 +6218,95 @@ impl Browser {
                         if let Some(cont) = (*callback).cont {
                             cont(callback, &cef_path.value, 0);
                         }
+                    }
+                }
+            }
+            release_ref_counted(&mut (*callback).base);
+        })
+    }
+
+    pub fn take_js_dialog_requests(&mut self) -> Vec<JsDialogRequest> {
+        std::mem::take(&mut *self.state.js_dialog_requests.lock().unwrap())
+    }
+
+    pub fn resolve_js_dialog(&self, request_id: u64, success: bool, user_input: &str) -> Result<()> {
+        let raw = self
+            .state
+            .pending_js_dialogs
+            .lock()
+            .unwrap()
+            .remove(&request_id);
+        let Some(raw) = raw else {
+            return Ok(());
+        };
+        if raw == 0 {
+            return Ok(());
+        }
+        let user_input = user_input.to_string();
+        on_cef_thread(move || unsafe {
+            let callback = raw as *mut ffi::cef_jsdialog_callback_t;
+            if let Ok(rt) = runtime() {
+                if let Some(cont) = (*callback).cont {
+                    if let Ok(cef_input) = CefString::new(&rt.api, &user_input) {
+                        cont(callback, if success { 1 } else { 0 }, &cef_input.value);
+                    } else {
+                        cont(callback, if success { 1 } else { 0 }, ptr::null());
+                    }
+                }
+            }
+            release_ref_counted(&mut (*callback).base);
+        })
+    }
+
+    pub fn take_auth_requests(&mut self) -> Vec<AuthRequest> {
+        std::mem::take(&mut *self.state.auth_requests.lock().unwrap())
+    }
+
+    pub fn resolve_auth_request(
+        &self,
+        request_id: u64,
+        username: Option<&str>,
+        password: &str,
+    ) -> Result<()> {
+        let raw = self
+            .state
+            .pending_auth_requests
+            .lock()
+            .unwrap()
+            .remove(&request_id);
+        let Some(raw) = raw else {
+            return Ok(());
+        };
+        if raw == 0 {
+            return Ok(());
+        }
+        let username = username.map(str::to_string);
+        let password = password.to_string();
+        on_cef_thread(move || unsafe {
+            let callback = raw as *mut ffi::cef_auth_callback_t;
+            match username {
+                Some(user) => {
+                    let mut continued = false;
+                    if let Ok(rt) = runtime() {
+                        if let (Ok(cef_user), Ok(cef_pass)) = (
+                            CefString::new(&rt.api, &user),
+                            CefString::new(&rt.api, &password),
+                        ) {
+                            if let Some(cont) = (*callback).cont {
+                                cont(callback, &cef_user.value, &cef_pass.value);
+                                continued = true;
+                            }
+                        }
+                    }
+                    if !continued {
+                        if let Some(cancel) = (*callback).cancel {
+                            cancel(callback);
+                        }
+                    }
+                }
+                None => {
+                    if let Some(cancel) = (*callback).cancel {
+                        cancel(callback);
                     }
                 }
             }
