@@ -498,6 +498,22 @@ impl Browser {
         false
     }
 
+    pub fn begin_visual_pinch(&mut self, _x: f64, _y: f64) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn update_visual_pinch(&mut self, _scale: f64) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn end_visual_pinch(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn set_page_zoom(&mut self, _factor: f64) -> Result<()> {
+        Err(Error::new("CEF is not supported on this platform"))
+    }
+
     pub fn go_back(&mut self) -> Result<()> {
         Ok(())
     }

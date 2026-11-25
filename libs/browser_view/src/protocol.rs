@@ -23,6 +23,12 @@ pub enum ViewOp {
     History { delta: i32 },
     Reload,
     Stop,
+    /// Set the page's local content scale. One restores native view metrics.
+    PageZoom { factor: f64 },
+    /// A trackpad pinch centered at this point in the view.
+    BeginVisualPinch { x: f64, y: f64 },
+    UpdateVisualPinch { scale: f64 },
+    EndVisualPinch,
     /// The page takes (or loses) the keyboard.
     Focus { on: bool },
     /// A hidden page stops painting.
@@ -123,6 +129,10 @@ mod tests {
         for op in [
             ViewOp::Open { url: "https://makepad.nl/?a=\"b\"".into(), dark: true, background: 0xff102030 },
             ViewOp::Back,
+            ViewOp::PageZoom { factor: 1.4 },
+            ViewOp::BeginVisualPinch { x: 135.5, y: 48.0 },
+            ViewOp::UpdateVisualPinch { scale: 1.05 },
+            ViewOp::EndVisualPinch,
             ViewOp::Focus { on: true },
             ViewOp::Eval { id: 7, expression: "1 + 1".into() },
             ViewOp::ImeComposition { text: "かな".into() },

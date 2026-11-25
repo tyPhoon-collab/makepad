@@ -198,6 +198,10 @@ impl Page {
             ViewOp::History { delta: 0 } => Ok(()),
             ViewOp::History { delta } => browser.execute_javascript(&format!("window.history.go({delta})")),
             ViewOp::Reload => browser.reload(),
+            ViewOp::PageZoom { factor } => browser.set_page_zoom(factor),
+            ViewOp::BeginVisualPinch { x, y } => browser.begin_visual_pinch(x, y),
+            ViewOp::UpdateVisualPinch { scale } => browser.update_visual_pinch(scale),
+            ViewOp::EndVisualPinch => browser.end_visual_pinch(),
             ViewOp::Stop => browser.stop_load(),
             ViewOp::Focus { on } => {
                 if !on && std::mem::take(&mut self.composing) {

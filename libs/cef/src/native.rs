@@ -856,6 +856,14 @@ pub struct BrowserOptions {
     pub software_frames: bool,
 }
 
+struct VisualPinch {
+    center: [f64; 2],
+    axis: usize,
+    radius: f64,
+    max_radius: f64,
+    started: bool,
+}
+
 pub struct Browser {
     /// CEF owns this reference on its UI thread; the app only queues work naming it.
     browser: Arc<AtomicUsize>,
@@ -864,9 +872,32 @@ pub struct Browser {
     width: usize,
     height: usize,
     scale_factor: f32,
+    page_zoom: f64,
+    visual_pinch: Option<VisualPinch>,
     accelerated: bool,
     hidden: bool,
     audio: Option<AudioDrain>,
+}
+
+impl VisualPinch {
+    const RELEASED: ffi::cef_touch_event_type_t = 0;
+    const PRESSED: ffi::cef_touch_event_type_t = 1;
+    const MOVED: ffi::cef_touch_event_type_t = 2;
+
+    fn events(&self, type_: ffi::cef_touch_event_type_t) -> [ffi::cef_touch_event_t; 2] {
+        [-1.0, 1.0].map(|sign| {
+            let mut point = self.center;
+            point[self.axis] += sign * self.radius;
+            ffi::cef_touch_event_t {
+                id: i32::from(sign > 0.0),
+                x: point[0] as f32,
+                y: point[1] as f32,
+                pressure: 1.0,
+                type_,
+                ..Default::default()
+            }
+        })
+    }
 }
 
 /// A snapshot of the accelerated-paint statistics for reporting.
@@ -4987,6 +5018,8 @@ impl Browser {
             width: 0,
             height: 0,
             scale_factor: 0.0,
+            page_zoom: 1.0,
+            visual_pinch: None,
             accelerated,
             hidden: false,
             audio: None,
@@ -5333,6 +5366,7 @@ impl Browser {
         if self.width == width && self.height == height && !scale_changed {
             return Ok(());
         }
+        self.end_visual_pinch()?;
         self.width = width;
         self.height = height;
         self.scale_factor = scale_factor;
@@ -5347,6 +5381,112 @@ impl Browser {
             }
             if let Some(invalidate) = (*host).invalidate {
                 invalidate(host, ffi::PET_VIEW);
+            }
+            Ok(())
+        })?;
+        if self.page_zoom != 1.0 {
+            self.apply_page_zoom()?;
+        }
+        Ok(())
+    }
+
+    /// Treat the trackpad pinch as two touches around its center, so Chromium
+    /// zooms its visual viewport and still handles scrolling and hit testing.
+    pub fn begin_visual_pinch(&mut self, x: f64, y: f64) -> Result<()> {
+        self.end_visual_pinch()?;
+        if !x.is_finite() || !y.is_finite() {
+            return Ok(());
+        }
+        let dpi = f64::from(self.scale_factor);
+        let size = [self.width as f64 / dpi, self.height as f64 / dpi];
+        let mut center = [x.clamp(0.0, size[0]), y.clamp(0.0, size[1])];
+        let room = |axis: usize| center[axis].min(size[axis] - center[axis]);
+        let axis = if room(0) >= room(1) { 0 } else { 1 };
+        // Near a corner, move the synthetic center just enough to fit both points.
+        let margin = 40.0_f64.min(size[axis] / 2.0);
+        center[axis] = center[axis].clamp(margin, size[axis] - margin);
+        let max_radius = (center[axis].min(size[axis] - center[axis]) - 1.0).max(1.0);
+        self.visual_pinch = Some(VisualPinch {
+            center,
+            axis,
+            radius: (max_radius / 2.0).min(100.0),
+            max_radius,
+            started: false,
+        });
+        Ok(())
+    }
+
+    pub fn update_visual_pinch(&mut self, scale: f64) -> Result<()> {
+        let Some(pinch) = &mut self.visual_pinch else { return Ok(()) };
+        if !scale.is_finite() || scale <= 0.0 || scale == 1.0 {
+            return Ok(());
+        }
+        let pressed = (!pinch.started).then(|| pinch.events(VisualPinch::PRESSED));
+        pinch.started = true;
+        pinch.radius = (pinch.radius * scale).clamp(0.5, pinch.max_radius);
+        let moved = pinch.events(VisualPinch::MOVED);
+        self.send_pinch_touches(pressed.into_iter().flatten().chain(moved))
+    }
+
+    pub fn end_visual_pinch(&mut self) -> Result<()> {
+        if let Some(pinch) = self.visual_pinch.take().filter(|pinch| pinch.started) {
+            self.send_pinch_touches(pinch.events(VisualPinch::RELEASED))?;
+        }
+        Ok(())
+    }
+
+    fn send_pinch_touches(
+        &self,
+        events: impl IntoIterator<Item = ffi::cef_touch_event_t> + Send + 'static,
+    ) -> Result<()> {
+        self.with_host(move |host| unsafe {
+            if let Some(send) = (*host).send_touch_event {
+                for event in events {
+                    send(host, &event);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Scale and reflow one offscreen page without changing the profile's host zoom map.
+    pub fn set_page_zoom(&mut self, factor: f64) -> Result<()> {
+        if !(0.5..=2.0).contains(&factor) {
+            return Err(Error::new("page zoom factor is outside 0.5..=2.0"));
+        }
+        if self.page_zoom != factor {
+            self.page_zoom = factor;
+            self.apply_page_zoom()?;
+        }
+        Ok(())
+    }
+
+    fn apply_page_zoom(&self) -> Result<()> {
+        // Retain CEF's real backing size. Pair the smaller CSS viewport with
+        // a higher DPR and renderer scale; Chromium maps input to it itself.
+        let factor = self.page_zoom;
+        if factor == 1.0 {
+            return self.send_zoom_command("Emulation.clearDeviceMetricsOverride", "{}");
+        }
+        let dpr = f64::from(self.scale_factor) * factor;
+        let width = (self.width as f64 / dpr).round().max(1.0) as u32;
+        let height = (self.height as f64 / dpr).round().max(1.0) as u32;
+        self.send_zoom_command(
+            "Emulation.setDeviceMetricsOverride",
+            &format!(r#"{{"width":{width},"height":{height},"deviceScaleFactor":{dpr},"mobile":false,"scale":{factor},"dontSetVisibleSize":true}}"#),
+        )
+    }
+
+    fn send_zoom_command(&self, method: &str, params: &str) -> Result<()> {
+        static NEXT_ZOOM_ID: AtomicU32 = AtomicU32::new(1 << 30);
+        let id = NEXT_ZOOM_ID.fetch_add(1, Ordering::Relaxed);
+        let message = format!(r#"{{"id":{id},"method":"{method}","params":{params}}}"#);
+        self.with_host(move |host| unsafe {
+            if (*host).send_dev_tools_message.is_none_or(|send| {
+                send(host, message.as_ptr().cast(), message.len()) == 0
+            }) {
+                // A failed zoom must not close the browser.
+                eprintln!("CEF rejected the page zoom update");
             }
             Ok(())
         })
