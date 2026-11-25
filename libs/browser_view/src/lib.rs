@@ -221,6 +221,11 @@ impl BrowserViews {
     /// Open a page (the browser host starts at the next `service`). None
     /// when there is no browser host (said once).
     pub fn open(&mut self, url: &str, dark: bool, background: u32) -> Option<ViewId> {
+        self.open_with_document_script(url, dark, background, None)
+    }
+
+    /// The optional script runs before page scripts on each new document.
+    pub fn open_with_document_script(&mut self, url: &str, dark: bool, background: u32, document_script: Option<String>) -> Option<ViewId> {
         if self.unavailable.is_some() {
             return None;
         }
@@ -235,7 +240,7 @@ impl BrowserViews {
         let id = ViewId(self.next_view);
         self.next_view += 1;
         let mut state = ViewState { url: url.to_string(), loading: true, ..ViewState::default() };
-        state.queued.push(ViewOp::Open { url: url.to_string(), dark, background });
+        state.queued.push(ViewOp::Open { url: url.to_string(), dark, background, document_script });
         self.views.push(View::new(id, state));
         self.send_queued();
         Some(id)

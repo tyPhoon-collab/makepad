@@ -345,6 +345,10 @@ impl Browser {
         Ok(())
     }
 
+    pub fn add_document_start_script(&self, _source_json: &str) -> Result<DevToolsTargetRequest> {
+        Err(Error::new("CEF is unavailable on this platform"))
+    }
+
     pub fn execute_javascript(&mut self, _code: &str) -> Result<()> {
         Ok(())
     }

@@ -22,7 +22,7 @@ use makepad_app_host::{AudioRecord, AudioRingPacket, AudioRingSetup, ProducerAud
 use makepad_browser_view::cef_input;
 use makepad_browser_view::protocol::{self, ViewEvent, ViewOp};
 use makepad_cef::{AudioCaptureConfig, AudioEvent, BootstrapResult, Browser, CaptureTimestamp, DevToolsTargetRequest, FrameSink, SinkTarget};
-use makepad_widgets::makepad_platform::makepad_micro_serde::{DeJson, JsonValue};
+use makepad_widgets::makepad_platform::makepad_micro_serde::{DeJson, JsonValue, SerJson};
 use makepad_widgets::*;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -62,6 +62,8 @@ struct Page {
     size: Option<(Vec2d, f64)>,
     /// What to load once the page exists (it needs its size first).
     url: Option<String>,
+    document_script: Option<String>,
+    document_setup: Option<DevToolsTargetRequest>,
     error: Option<String>,
     shown: Option<Shown>,
     error_sent: bool,
@@ -135,6 +137,8 @@ impl Page {
             browser: None,
             size: None,
             url: None,
+            document_script: None,
+            document_setup: None,
             error: None,
             shown: None,
             error_sent: false,
@@ -171,7 +175,25 @@ impl Page {
         }
         let Some((width, height, dpi)) = self.pixels() else { return };
         let Some(url) = self.url.take() else { return };
-        match Browser::new(&url, width, height, dpi) {
+        let script = self.document_script.take();
+        let browser = if let Some(script) = script {
+            Browser::new("about:blank", width, height, dpi).and_then(|mut browser| {
+                match browser.add_document_start_script(&script.serialize_json()) {
+                    Ok(setup) => {
+                        self.document_setup = Some(setup);
+                        self.url = Some(url);
+                    }
+                    Err(error) => {
+                        eprintln!("browser host: document-start script: {error}");
+                        browser.set_url(&url)?;
+                    }
+                }
+                Ok(browser)
+            })
+        } else {
+            Browser::new(&url, width, height, dpi)
+        };
+        match browser {
             Ok(browser) => {
                 self.browser = Some(browser);
                 for op in std::mem::take(&mut self.commands) { self.command(op); }
@@ -235,6 +257,10 @@ impl Page {
 
     fn navigate(&mut self, url: &str) {
         self.composing = false;
+        if self.document_setup.is_some() {
+            self.url = Some(url.to_string());
+            return;
+        }
         match &mut self.browser {
             Some(browser) => {
                 if let Err(error) = browser.set_url(url) {
@@ -380,7 +406,7 @@ impl App {
     }
 
     fn op(&mut self, cx: &mut Cx, view: u64, op: ViewOp) {
-        if let ViewOp::Open { url, dark, background } = op {
+        if let ViewOp::Open { url, dark, background, document_script } = op {
             makepad_cef::set_background_color(background);
             makepad_cef::set_application_dark_mode(dark);
             let at = match self.pages.iter().position(|page| page.view.is_none()) {
@@ -399,6 +425,7 @@ impl App {
             page.hidden = Some(false);
             page.last_ime_caret = None;
             page.devtools_port_sent = false;
+            page.document_script = document_script;
             page.navigate(&url);
             Self::send(view, ViewEvent::Window { window_id: page.window.window_id().id() });
             return;
@@ -420,6 +447,8 @@ impl App {
             page.devtools_target_request = None;
             page.browser = None;
             page.url = None;
+            page.document_script = None;
+            page.document_setup = None;
             page.ring = None;
             page.audio = None;
             page.audio_backlog.clear();
@@ -490,6 +519,23 @@ impl App {
         makepad_cef::do_message_loop_work();
         for page in &mut self.pages {
             let Some(view) = page.view else { continue };
+            if let Some(result) = page.document_setup.as_ref().and_then(DevToolsTargetRequest::poll) {
+                page.document_setup = None;
+                if let Err(error) = result {
+                    eprintln!("browser host: document-start script: {error}");
+                }
+                if let (Some(url), Some(browser)) = (page.url.take(), &mut page.browser) {
+                    // Replace the setup document so it does not become a Back entry.
+                    // Local files must use CEF navigation: about:blank cannot load them from JS.
+                    if !(url.starts_with("https://") || url.starts_with("http://"))
+                        || browser.execute_javascript(&format!(
+                            "location.replace({})", url.serialize_json(),
+                        )).is_err()
+                    {
+                        page.navigate(&url);
+                    }
+                }
+            }
             if let Some(error) = page.browser.as_mut().and_then(Browser::take_error) {
                 page.error = Some(error);
                 page.browser = None;

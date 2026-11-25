@@ -15,7 +15,7 @@ pub const PROFILE_ENV: &str = "MAKEPAD_CEF_PROFILE_DIR";
 #[derive(Clone, Debug, PartialEq, SerJson, DeJson)]
 pub enum ViewOp {
     /// Make the view (a window of the host) and load `url`.
-    Open { url: String, dark: bool, background: u32 },
+    Open { url: String, dark: bool, background: u32, document_script: Option<String> },
     Navigate { url: String },
     Back,
     Forward,
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn ops_round_trip() {
         for op in [
-            ViewOp::Open { url: "https://makepad.nl/?a=\"b\"".into(), dark: true, background: 0xff102030 },
+            ViewOp::Open { url: "https://makepad.nl/?a=\"b\"".into(), dark: true, background: 0xff102030, document_script: Some("1+1".into()) },
             ViewOp::Back,
             ViewOp::PageZoom { factor: 1.4 },
             ViewOp::ResetZoom,

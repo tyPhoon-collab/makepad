@@ -642,10 +642,11 @@ const TARGET_INFO_MESSAGE_ID: c_int = c_int::MAX;
 struct TargetInfoObserver {
     cef_observer: ffi::cef_dev_tools_message_observer_t,
     ref_count: AtomicUsize,
+    message_id: c_int,
     reply: SyncSender<Result<String>>,
 }
 
-/// A pending page-scoped `Target.getTargetInfo` request.
+/// A pending page-scoped DevTools request.
 pub struct DevToolsTargetRequest {
     reply: Receiver<Result<String>>,
     registration: Arc<AtomicUsize>,
@@ -657,10 +658,10 @@ impl DevToolsTargetRequest {
         match self.reply.try_recv() {
             Ok(reply) => Some(reply),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Some(Err(Error::new("CEF target request ended without a response")))
+                Some(Err(Error::new("CEF DevTools request ended without a response")))
             }
             Err(_) if self.started.elapsed().as_secs() >= 3 => {
-                Some(Err(Error::new("CEF target request timed out")))
+                Some(Err(Error::new("CEF DevTools request timed out")))
             }
             Err(_) => None,
         }
@@ -688,18 +689,18 @@ unsafe extern "system" fn target_info_result(
     result_size: usize,
 ) {
     release_param(browser);
-    if message_id != TARGET_INFO_MESSAGE_ID {
+    let observer = &*self_.cast::<TargetInfoObserver>();
+    if message_id != observer.message_id {
         return;
     }
-    let observer = &*self_.cast::<TargetInfoObserver>();
     let result = if result.is_null() {
-        Err(Error::new("CEF returned no target information"))
+        Err(Error::new("CEF returned no DevTools response"))
     } else {
         let json = String::from_utf8_lossy(slice::from_raw_parts(result.cast(), result_size));
         if success != 0 {
             Ok(json.into_owned())
         } else {
-            Err(Error::new(format!("CEF target lookup failed: {json}")))
+            Err(Error::new(format!("CEF DevTools request failed: {json}")))
         }
     };
     let _ = observer.reply.try_send(result);
@@ -4727,6 +4728,13 @@ impl AppHandler {
 
 impl Browser {
     pub fn request_devtools_target(&self) -> Result<DevToolsTargetRequest> {
+        let message = format!(r#"{{"id":{TARGET_INFO_MESSAGE_ID},"method":"Target.getTargetInfo"}}"#);
+        self.request_devtools(TARGET_INFO_MESSAGE_ID, message, None)
+    }
+
+    fn request_devtools(
+        &self, message_id: c_int, message: String, before: Option<&'static str>,
+    ) -> Result<DevToolsTargetRequest> {
         let (reply, rx) = sync_channel(1);
         let request = DevToolsTargetRequest {
             reply: rx,
@@ -4757,6 +4765,7 @@ impl Browser {
                     on_dev_tools_agent_detached: None,
                 },
                 ref_count: AtomicUsize::new(1),
+                message_id,
                 reply: reply.clone(),
             }));
             let handle = add(host, &mut (*observer).cef_observer);
@@ -4765,9 +4774,10 @@ impl Browser {
                 return Ok(());
             }
             registration.store(handle as usize, Ordering::Release);
-            let message = format!(r#"{{"id":{TARGET_INFO_MESSAGE_ID},"method":"Target.getTargetInfo"}}"#);
-            if send(host, message.as_ptr().cast(), message.len()) == 0 {
-                let _ = reply.try_send(Err(Error::new("CEF rejected the DevTools target request")));
+            if before.is_some_and(|cmd| send(host, cmd.as_ptr().cast(), cmd.len()) == 0)
+                || send(host, message.as_ptr().cast(), message.len()) == 0
+            {
+                let _ = reply.try_send(Err(Error::new("CEF rejected the DevTools request")));
             }
             Ok(())
         })?;
@@ -5517,6 +5527,15 @@ impl Browser {
             (*frame).load_url.ok_or_else(|| Error::new("cef_frame_t::load_url missing"))?(frame, &url.value);
             Ok(())
         })
+    }
+
+    /// Register a JSON-encoded JavaScript string before the first navigation.
+    pub fn add_document_start_script(&self, source_json: &str) -> Result<DevToolsTargetRequest> {
+        const ID: c_int = c_int::MAX - 1;
+        let message = format!(r#"{{"id":{ID},"method":"Page.addScriptToEvaluateOnNewDocument","params":{{"source":{source_json}}}}}"#);
+        // Chromium accepts the registration without Page.enable but does not
+        // execute the registered script on navigation.
+        self.request_devtools(ID, message, Some(r#"{"id":2147483645,"method":"Page.enable"}"#))
     }
 
     /// Queues JavaScript on the browser's main frame.
