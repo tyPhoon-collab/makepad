@@ -239,6 +239,7 @@ impl Cx {
 
     /// Drains the platform ops into HAL commands. False when the app asked to quit.
     pub(crate) fn hal_handle_platform_ops(&mut self) -> bool {
+        let _phase = crate::thread::ui_phase(crate::thread::UiPhase::PlatformOps);
         self.native_layer_retire();
         while let Some(op) = self.platform_ops.pop_front() {
             match op {
@@ -276,8 +277,19 @@ impl Cx {
                     self.hal_create_window(window_id, Some((parent_window_id, position, size)));
                 }
                 CxOsOp::ResizeWindow(window_id, size) => {
+                    // the size is the app's, in layout points; the window system's are native
+                    // (they differ by a window's `dpi_override`); a position is never scaled
                     let p = self.windows[window_id].window_geom.position;
-                    self.hal.frames.w.window_geom(hal_window_id(window_id), [p.x as f32, p.y as f32, size.x as f32, size.y as f32]);
+                    let size = self.windows[window_id].layout_vec2d_to_native_points(size);
+                    // a hosted app's main window is the host's tile, whose size the host owns: it
+                    // is asked over the hosted wire (Linux's hosted transport asks from the WM's
+                    // shell, linux/wm.rs; here the HAL is in-process and keeps hosted geometry)
+                    let asks_host = cfg!(not(target_os = "linux")) && self.hal.hosted.is_some() && !self.hal_hosted_extra_window(window_id);
+                    if asks_host {
+                        Self::send_studio_message(crate::studio::AppToStudio::Custom(makepad_hal::window_controls::HostedResize { w: size.x, h: size.y }.to_json()));
+                    } else {
+                        self.hal.frames.w.window_geom(hal_window_id(window_id), [p.x as f32, p.y as f32, size.x as f32, size.y as f32]);
+                    }
                 }
                 // A hosted app's later windows are windows of their own on the host: what the
                 // app asks of them goes to the host with the window's id; its close is local
@@ -525,6 +537,12 @@ impl Cx {
                     fb.w.menu_set(items.len() as u32, &bytes);
                 }
                 CxOsOp::SetTray(tray) => {
+                    // A tray app shows itself with its tray: before it made a window, the first tray
+                    // the desktop shows is its first present (the launcher, the JIT's startup and its
+                    // first-frame deadline wait for one). A window app's stays its first frame.
+                    if self.trays.contains(&tray.id) && !self.windows.id_iter().any(|w| self.windows[w].is_created) {
+                        crate::startup_trace_first_present();
+                    }
                     // A hosted app's tray is its host's to show (the makepad WM's tray area).
                     if self.hal.hosted.is_some() {
                         Self::send_studio_message(crate::studio::AppToStudio::Relay(crate::studio::ChildRelay::SetTray(crate::tray::relay_tray(&tray))));

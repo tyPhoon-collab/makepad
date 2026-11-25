@@ -24,7 +24,7 @@ use makepad_ai_services::wire::ToolResult;
 use makepad_image_tiles::library::ItemId;
 use makepad_image_tiles::{Library, TileGrid, TileGridAction};
 #[cfg(not(target_arch = "wasm32"))]
-use makepad_widgets::makepad_platform::thread::Lane;
+use makepad_widgets::makepad_platform::thread::Class;
 use makepad_widgets::makepad_platform::thread::TaskHandle;
 use makepad_widgets::hosted_view::{HostedFace, HostedTransition};
 use makepad_widgets::*;
@@ -391,7 +391,13 @@ impl PhotosView {
         }
         match library::find(self.collection.as_deref()) {
             Some(lib) => self.open_library(cx, lib),
-            None => self.set_status(cx, library::nothing_yet()),
+            None => {
+                // (left alone, the grid tries its default root and fails on what that lacks)
+                if let Some(mut grid) = self.view.widget(cx, ids!(grid)).borrow_mut::<TileGrid>() {
+                    grid.stay_empty();
+                }
+                self.set_status(cx, library::nothing_yet());
+            }
         }
         self.applied = None;
         // The camera roll: what is there now, then a look once a second.
@@ -438,7 +444,7 @@ impl PhotosView {
             // that failed before (a phone without a frame codec yet) is tried
             // again. A library someone baked from the web keeps its failures.
             let retry_failed = root == library::home_root().join(library::DEFAULT_COLLECTION);
-            let job = pool.submit(Lane::Heavy, move || {
+            let job = pool.submit(Class::Background, move || {
                 let options = BakeOptions { fetch_threads: 2, encode_threads: 2, retry_failed };
                 let mut last_error = None;
                 let summary = bake(
@@ -665,7 +671,7 @@ impl PhotosView {
             let pool = cx.task_pool();
             let bake_pool = pool.clone();
             let done = pool
-                .submit(Lane::Heavy, move || {
+                .submit(Class::Background, move || {
                     // One picture: one fetch, one encode. The library's own
                     // failed items stay failed — an add is about this file.
                     let options = BakeOptions { fetch_threads: 1, encode_threads: 1, retry_failed: false };
@@ -827,11 +833,13 @@ impl Widget for PhotosView {
                             self.present_subject(cx);
                         }
                     }
-                    TileGridAction::Opened { error: Some(e), .. } => {
+                    TileGridAction::Opened { error: Some(_), .. } => {
                         self.pictures = 0;
                         self.selected = None;
                         self.applied = None;
-                        self.set_status(cx, format!("{e} — {}", library::how_to_bake()));
+                        // (the raw error is in the log: the grid wrote it there)
+                        let text = format!("Could not open the picture library in {}; the log says why.", self.library_root);
+                        self.set_status(cx, text);
                     }
                     TileGridAction::Clicked { item, title, link, .. } => {
                         let text = format!("#{item}  {}  {link}", title.chars().take(140).collect::<String>());

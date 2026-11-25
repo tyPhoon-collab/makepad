@@ -133,6 +133,10 @@ pub struct Cx {
     /// `redraw_id` when that drawing began: the lists its draw contexts
     /// recorded carry a higher one.
     pub(crate) drawing_start: u64,
+    /// Redraws asked during the draw event for lists it had not recorded yet: they record in
+    /// it, like the lists the frame began with (`Cx::redraw_list`). The drawing's end hands
+    /// those it never reached to the next frame.
+    pub(crate) in_draw_redraws: Vec<crate::cx_api::InDrawRedraw>,
     /// What a frame drawn again before it painted keeps of its earlier
     /// drawings (`Cx::frame_drawn_again`).
     pub(crate) redraw_keep: crate::os::cx_shared::RedrawKeep,
@@ -216,6 +220,11 @@ pub struct Cx {
     /// preserved because the source-defined defaults aren't re-asserted.
     pub pending_script_reapply: bool,
 
+    /// A design re-run left the previous module tree behind as garbage: the event loop collects
+    /// right after this beat's draw (`app_main!`), so the frame that shows the edit does not wait
+    /// for the collection (8-15 ms of every design edit in a large app, 11-04).
+    pub gc_after_draw: bool,
+
     /// When true, the next event-loop iteration will fire `Event::LiveEdit`,
     /// which re-runs `script_mod` and re-applies with `Apply::Rebake`. Use
     /// this when a primitive heap value (e.g. `mod.widgets.SAFE_INSET_PAD_TOP`)
@@ -244,6 +253,11 @@ pub struct Cx {
     /// otherwise every safe-area inset change wipes each `set_text`,
     /// `set_visible` and animator state in the tree.
     pub(crate) live_edit_apply: Apply,
+
+    /// How many live patches (`std::relax::patched`) this context has taken in: what a grab's
+    /// frame was drawn with.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) live_patches: u64,
 
     /// `WindowGeomChange` events queued up during an event dispatch.
     pub(crate) pending_window_geom_changes: Vec<WindowGeomChangeEvent>,
@@ -1042,6 +1056,7 @@ impl Cx {
             redraw_id: 1,
             drawing_id: 0,
             drawing_start: 0,
+            in_draw_redraws: Vec::new(),
             redraw_keep: Default::default(),
             uniform_gen: 1,
             event_id: 1,
@@ -1118,11 +1133,14 @@ impl Cx {
 
             display_context: Default::default(),
             pending_script_reapply: false,
+            gc_after_draw: false,
             pending_style_reload: false,
             reload_generation: 0,
             pending_live_edit_request: false,
             live_edit_errors: Vec::new(),
             live_edit_apply: Apply::Reload,
+            #[cfg(not(target_arch = "wasm32"))]
+            live_patches: 0,
             pending_window_geom_changes: Default::default(),
             clear_hover_queued: false,
 
@@ -1354,6 +1372,48 @@ impl Cx {
 
 static FIRST_PRESENT_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The first window frame's resource gate, shared with the present callback.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod first_frame_hold {
+    use std::sync::{atomic::{AtomicUsize, Ordering}, OnceLock};
+
+    struct Hold {
+        deferred_at: u64,
+        glyphs: usize,
+        pipelines: usize,
+        max_pipelines: AtomicUsize,
+    }
+
+    static HOLD: OnceLock<Hold> = OnceLock::new();
+    // None seals an unheld first frame so later windows cannot start a hold.
+    static PASSED: OnceLock<Option<u64>> = OnceLock::new();
+
+    pub(crate) fn deferred(glyphs: usize, pipelines: usize) {
+        if PASSED.get().is_some() { return; }
+        let hold = HOLD.get_or_init(|| Hold {
+            deferred_at: makepad_hal::clock_ns(),
+            glyphs,
+            pipelines,
+            max_pipelines: AtomicUsize::new(pipelines),
+        });
+        hold.max_pipelines.fetch_max(pipelines, Ordering::Relaxed);
+    }
+
+    pub(crate) fn passed() {
+        PASSED.get_or_init(|| HOLD.get().map(|_| makepad_hal::clock_ns()));
+    }
+
+    pub(super) fn summary() -> Option<(f64, usize, usize)> {
+        let passed_at = (*PASSED.get()?)?;
+        let hold = HOLD.get()?;
+        Some((
+            passed_at.saturating_sub(hold.deferred_at) as f64 / 1_000_000.0,
+            hold.max_pipelines.load(Ordering::Relaxed).max(hold.pipelines),
+            hold.glyphs,
+        ))
+    }
+}
+
 /// Whether a first frame reached the display.
 pub fn first_present_seen() -> bool {
     FIRST_PRESENT_SEEN.load(std::sync::atomic::Ordering::Acquire)
@@ -1399,27 +1459,39 @@ fn print_first_present(presented_at: f64) {
     let main_ms = std::env::var("MAKEPAD_RUN_MAIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let cache = std::env::var("MAKEPAD_RUN_CACHE_STATE").unwrap_or_else(|_| "off".to_string());
     let ahead = std::env::var("MAKEPAD_RUN_AHEAD").unwrap_or_else(|_| "balanced".to_string());
-    eprintln!("{}", first_present_line(&package, present_ms, main_ms, &cache, &ahead));
+    #[cfg(not(target_arch = "wasm32"))]
+    let hold = first_frame_hold::summary();
+    #[cfg(target_arch = "wasm32")]
+    let hold = None;
+    eprintln!("{}", first_present_line(&package, present_ms, main_ms, &cache, &ahead, hold));
 }
 
-fn first_present_line(package: &str, present_ms: f64, main_ms: f64, cache: &str, ahead: &str) -> String {
-    format!(
+/// First-present summary, optionally followed by the resource hold in ms, peak pending
+/// pipelines and initially pending glyphs. An unheld frame keeps the original format.
+fn first_present_line(package: &str, present_ms: f64, main_ms: f64, cache: &str, ahead: &str, hold: Option<(f64, usize, usize)>) -> String {
+    let mut line = format!(
         "makepad: {} first frame at {:.2} s (main at {:.2} s, cache {}, ahead {})",
         package, present_ms / 1000.0, main_ms / 1000.0, cache, ahead
-    )
+    );
+    if let Some((held_ms, pipelines, glyphs)) = hold {
+        use std::fmt::Write;
+        let _ = write!(line, ", first frame held {:.0} ms for {} pipelines, {} glyphs", held_ms, pipelines, glyphs);
+    }
+    line
 }
 
 /// A launcher that started this app with MAKEPAD_RUN_REPORT_TO=<path> (the runner app, through
-/// `makepad run --report-to`) learns that the first frame is on glass: the line `present`
-/// appended to <path>, in the loader's progress format (the launcher times it on receipt).
-/// The launcher brings the window forward then. Any thread (presented handlers run off the
-/// main thread); a single O_APPEND write.
+/// `makepad run --report-to`, or a native build it opened) learns that the first frame is on
+/// glass and which process to follow and stop: the lines `pid <pid> 0` and `present` appended to
+/// <path>, in the loader's progress format (the launcher times it on receipt). The launcher
+/// brings the window forward then. Any thread (presented handlers run off the main thread); a
+/// single O_APPEND write.
 fn report_first_present() {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(path) = std::env::var_os("MAKEPAD_RUN_REPORT_TO") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-            let _ = f.write_all(b"present\n");
+            let _ = f.write_all(format!("pid\t{}\t0\npresent\n", std::process::id()).as_bytes());
         }
     }
 }
@@ -1471,6 +1543,42 @@ pub(crate) fn relax_first_present() {
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn relax_first_present() {}
 
+/// `app_main!`'s entry: under Relax the loader starts its first frame's deadline here (a batch
+/// program that links the platform never gets here, and draws no frame). A rustc build has no
+/// such symbol.
+#[cfg(any(unix, windows))]
+#[doc(hidden)]
+pub fn relax_app_main() {
+    let hook = relax_host_symbol(c"relax_app_main");
+    if !hook.is_null() {
+        let hook = unsafe { std::mem::transmute::<*mut std::ffi::c_void, extern "C" fn()>(hook) };
+        hook();
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+#[doc(hidden)]
+pub fn relax_app_main() {}
+
+/// Before the first window frame is submitted: the loader may hold it (`makepad run` checks the
+/// app's own crates beside main, and an error there ends the run before any frame). A rustc
+/// build has no such symbol.
+#[cfg(any(unix, windows))]
+pub(crate) fn relax_before_first_frame() {
+    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ASKED.load(std::sync::atomic::Ordering::Relaxed) || ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let hook = relax_host_symbol(c"relax_before_first_frame");
+    if !hook.is_null() {
+        let hook = unsafe { std::mem::transmute::<*mut std::ffi::c_void, extern "C" fn()>(hook) };
+        hook();
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(any(unix, windows))))]
+pub(crate) fn relax_before_first_frame() {}
+
 /// The app's shutdown starts (it quits, its last window closed, a remote `/quit`): under Relax the
 /// loader marks the quit (its quit-compile accounting, no settle swap from now on) and writes the
 /// disk cache while the app shuts down -- what a termination signal does, without reporting an
@@ -1505,3 +1613,18 @@ pub(crate) fn relax_frame_done() {
 
 #[cfg(not(any(unix, windows, target_arch = "wasm32")))]
 pub(crate) fn relax_frame_done() {}
+
+/// A window frame on the glass was built with `patches` live patches (`Cx::live_patches`), under
+/// Relax: the loader's `inspect live` says so (`frame_patch`). The symbol is looked up once.
+#[cfg(any(unix, windows))]
+pub(crate) fn relax_frame_patch(patches: u64) {
+    static HOOK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let hook = *HOOK.get_or_init(|| relax_host_symbol(c"relax_frame_patch") as usize);
+    if hook != 0 {
+        let hook = unsafe { std::mem::transmute::<usize, extern "C" fn(u64)>(hook) };
+        hook(patches);
+    }
+}
+
+#[cfg(not(any(unix, windows, target_arch = "wasm32")))]
+pub(crate) fn relax_frame_patch(_patches: u64) {}

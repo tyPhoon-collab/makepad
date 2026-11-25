@@ -71,6 +71,15 @@ impl<I: Iterator, P: FnMut(&I::Item) -> bool> Iterator for Filter<I, P> {
         let (_, upper) = self.iter.size_hint();
         (0, upper)
     }
+    // as core: the predicate's result added up, no branch per item
+    fn count(self) -> usize {
+        let Filter { mut iter, mut predicate } = self;
+        let mut n = 0;
+        while let Some(x) = iter.next() {
+            n += predicate(&x) as usize;
+        }
+        n
+    }
 }
 
 impl<I: DoubleEndedIterator, P: FnMut(&I::Item) -> bool> DoubleEndedIterator for Filter<I, P> {
@@ -425,6 +434,31 @@ impl<I: Iterator> Iterator for StepBy<I> {
 }
 
 impl<I: ExactSizeIterator> ExactSizeIterator for StepBy<I> {}
+
+impl<I: ExactSizeIterator> StepBy<I> {
+    /// How many elements of `iter` to skip from the back to reach the last one this yields (core
+    /// step_by.rs next_back_index).
+    fn next_back_index(&self) -> usize {
+        let rem = self.iter.len() % (self.step_minus_one + 1);
+        if self.first_take {
+            if rem == 0 { self.step_minus_one } else { rem - 1 }
+        } else {
+            rem
+        }
+    }
+}
+
+impl<I: DoubleEndedIterator + ExactSizeIterator> DoubleEndedIterator for StepBy<I> {
+    fn next_back(&mut self) -> Option<I::Item> {
+        self.iter.nth_back(self.next_back_index())
+    }
+    fn nth_back(&mut self, n: usize) -> Option<I::Item> {
+        // an out-of-range `n` saturates: `iter.nth_back(usize::MAX)` is past the end of any
+        // exact-size iterator
+        let n = n.saturating_mul(self.step_minus_one + 1).saturating_add(self.next_back_index());
+        self.iter.nth_back(n)
+    }
+}
 
 // ---------------------------------------------------------------- Chain
 

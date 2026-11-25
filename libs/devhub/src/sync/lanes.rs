@@ -6,7 +6,9 @@
 //! a lane's makepad half and the commercial half nested in it merge in one step or not at all (a
 //! makepad half newer than its commercial code may not build). If either half is held, conflicts
 //! or fails, neither merges and the other says why (`waiting`).
-//! - No merge while a job or live job of the lane runs at its worktree.
+//! - No merge while a job or live job of the lane runs at its worktree, or while a timed lease of
+//!   the lane is queued, live, or ended in the last 15 minutes (a timed or bench series pins a
+//!   binary built from the tree). A series with longer gaps uses `devhub hold`.
 //!
 //! - Only a clean lane is touched (no uncommitted tracked changes, no merge/rebase/cherry-pick
 //!   in progress, in either half): a lane's edits are never disturbed; a dirty one is retried every
@@ -17,7 +19,7 @@
 //! - A clean merge becomes the commit "Merge work (<sha>) into <branch>" (`commit-tree`, both
 //!   parents), which the worktree then fast-forwards to (`merge --ff-only`): it either moves
 //!   whole or not at all, so a worktree is never left half merged; when the second half of a pair
-//!   refuses, the first takes the bot's own merge back (`reset --keep` to its commit).
+//!   refuses, the first takes back only the bot's own merge, with its ref locked and checked.
 //! - Held branches (`devhub hold <branch>`) are skipped.
 //! - Never a push, a force, a rebase, or a reset but of its own merge. A merge gives the branch a new sha, which the
 //!   landing train treats as a new candidate (landbatch.failed skips only the sha that failed).
@@ -27,10 +29,11 @@
 //! a lane's result is an event (`kind: lanes`) on the master's stream.
 
 use crate::proto::{self, hub_record, Sev};
+use makepad_git::{ObjectId, Reach, Repository};
 use makepad_remote::json_str;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -56,7 +59,13 @@ pub enum Outcome {
     /// not merged this round for its lane's sake: the other half is held, conflicts or failed,
     /// or a job or live job of the lane runs; retried every round
     Waiting(String),
+    /// no commits, leases or jobs in [`DORMANT_MS`]: no merge attempts (said once); its commits not
+    /// in the tip
+    Dormant(u32),
 }
+
+/// A lane with no commits, leases or jobs for this long is dormant: the bot leaves it alone.
+pub const DORMANT_MS: u64 = 24 * 3_600_000;
 
 impl Outcome {
     pub fn word(&self) -> &'static str {
@@ -69,6 +78,7 @@ impl Outcome {
             Outcome::Held(_) => "held",
             Outcome::Failed(_) => "failed",
             Outcome::Waiting(_) => "waiting",
+            Outcome::Dormant(_) => "dormant",
         }
     }
 }
@@ -86,6 +96,8 @@ pub struct Lane {
     pub base: String,
     pub outcome: Outcome,
     pub at_ms: u64,
+    /// the lane's last commit (its own, not the bot's merges), lease or job: what dormancy counts from
+    pub active_ms: u64,
 }
 
 impl Lane {
@@ -97,7 +109,7 @@ impl Lane {
             _ => ("null".into(), String::new(), String::new()),
         };
         format!(
-            "{{\"branch\":{},\"repo\":{},\"worktree\":{},\"tip\":{},\"base\":{},\"result\":\"{}\",\"merge\":{merge},\"files\":[{files}],\"why\":{},\"at_ms\":{}}}",
+            "{{\"branch\":{},\"repo\":{},\"worktree\":{},\"tip\":{},\"base\":{},\"result\":\"{}\",\"merge\":{merge},\"files\":[{files}],\"why\":{},\"at_ms\":{},\"active_ms\":{},\"ahead\":{}}}",
             json_str(&self.branch),
             json_str(&self.repo),
             json_str(&self.worktree.display().to_string()),
@@ -105,7 +117,9 @@ impl Lane {
             json_str(&self.base),
             self.outcome.word(),
             json_str(&why),
-            self.at_ms
+            self.at_ms,
+            self.active_ms,
+            if let Outcome::Dormant(n) = self.outcome { n } else { 0 }
         )
     }
 
@@ -122,9 +136,10 @@ impl Lane {
             "held" => Outcome::Held(why),
             "failed" => Outcome::Failed(why),
             "waiting" => Outcome::Waiting(why),
+            "dormant" => Outcome::Dormant(v.get("ahead").and_then(|x| x.as_u64()).unwrap_or(0) as u32),
             _ => return None,
         };
-        Some(Lane { repo: s("repo"), branch: s("branch"), worktree: PathBuf::from(s("worktree")), tip: s("tip"), base: s("base"), outcome, at_ms: v.get("at_ms").and_then(|x| x.as_u64()).unwrap_or(0) })
+        Some(Lane { repo: s("repo"), branch: s("branch"), worktree: PathBuf::from(s("worktree")), tip: s("tip"), base: s("base"), outcome, at_ms: v.get("at_ms").and_then(|x| x.as_u64()).unwrap_or(0), active_ms: v.get("active_ms").and_then(|x| x.as_u64()).unwrap_or(0) })
     }
 
     /// The one-line event text for this result.
@@ -143,6 +158,7 @@ impl Lane {
             Outcome::Waiting(w) => (Sev::Info, format!("lanes: {} ({}) not merged with {tip_name} {b}: {w}; retried next round", self.branch, self.repo)),
             Outcome::Landed => (Sev::Info, format!("lanes: {} ({}) is in {tip_name}", self.branch, self.repo)),
             Outcome::UpToDate => (Sev::Info, format!("lanes: {} ({}) holds {tip_name} {b}", self.branch, self.repo)),
+            Outcome::Dormant(n) => (Sev::Info, format!("lanes: {} ({}) dormant: no commits, leases or jobs in {} h; {n} commit(s) not in {tip_name}: no merges until it is used again (`devhub lane dormant`)", self.branch, self.repo, DORMANT_MS / 3_600_000)),
         }
     }
 }
@@ -156,10 +172,15 @@ pub struct Where {
 }
 
 /// git in `dir`: (success, stdout, stderr). Hooks off, never a prompt, the hub's env never steers it.
+/// Only a merge runs it; a round's reads go through makepad-git.
+#[track_caller]
 fn git(dir: &Path, env: &[(String, String)], args: &[&str]) -> (bool, String, String) {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::git_exec::command();
     cmd.arg("-c").arg("core.hooksPath=/dev/null").args(args).current_dir(dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    cmd.env("GIT_TERMINAL_PROMPT", "0").env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE");
+    // git reads the repository `dir` is in, as the in-process reader does: no inherited variable
+    // points it at another one (a gate's or a hook's object store)
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"] { cmd.env_remove(var); }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -169,30 +190,52 @@ fn git(dir: &Path, env: &[(String, String)], args: &[&str]) -> (bool, String, St
     }
 }
 
+/// A git lock another git process holds (the lane's own commit, an editor): normal for a moment.
+fn git_lock(err: &str) -> bool {
+    err.contains(".lock") && (err.contains("File exists") || err.contains("cannot lock ref"))
+}
+
+/// The first round a lane half's worktree is locked waits (said as info); a second in a row
+/// fails, with a warning. A lane's own `git commit` held its index.lock as a round fast-forwarded,
+/// and the warning stood alone though the next round merged 31 s later (11-06).
+const LOCKED: &str = "its git is locked (retried next round): ";
+
 fn first_err(err: &str) -> String {
     let l: Vec<&str> = err.lines().map(str::trim).filter(|l| !l.is_empty()).take(3).collect();
     proto::clean(&l.join(" | "), 300)
 }
 
-/// `worktree list --porcelain`: (path, branch, head) of every worktree on a branch.
-pub fn parse_worktrees(text: &str) -> Vec<(PathBuf, String, String)> {
-    let mut out = Vec::new();
-    for block in text.split("\n\n") {
-        let (mut path, mut head, mut branch) = (None, None, None);
-        for l in block.lines() {
-            if let Some(p) = l.strip_prefix("worktree ") {
-                path = Some(PathBuf::from(p));
-            } else if let Some(h) = l.strip_prefix("HEAD ") {
-                head = Some(h.to_string());
-            } else if let Some(b) = l.strip_prefix("branch refs/heads/") {
-                branch = Some(b.to_string());
+/// The manifests a merge wrote line by line (a `Cargo.toml` that is neither side's blob) that no
+/// longer parse, each as "<path>:<line>: <error>". A textual merge passes both sides' additions of
+/// one key (a duplicate dependency in one lane's crate, 11-03), and then no build reads
+/// the lane: the merge is a conflict instead.
+fn broken_manifests(dir: &Path, ours: &str, theirs: &str, tree: &str) -> Result<Vec<String>, String> {
+    let id = |s: &str| ObjectId::from_hex(s).map_err(|e| format!("{s}: {e}"));
+    let (ours, theirs, tree) = (id(ours)?, id(theirs)?, id(tree)?);
+    crate::gitread::with(dir, |_, repo| {
+        let e = |e: makepad_git::GitError| e.to_string();
+        let ours = repo.read_commit(&ours).map_err(e)?.tree;
+        let theirs = repo.read_commit(&theirs).map_err(e)?.tree;
+        let mut bad = Vec::new();
+        for change in repo.diff_trees(&ours, &tree).map_err(e)? {
+            let (path, oid) = match change {
+                makepad_git::TreeChange::Modified { path, new_oid, .. } => (path, new_oid),
+                makepad_git::TreeChange::Added { path, oid, .. } => (path, oid),
+                makepad_git::TreeChange::Deleted { .. } => continue,
+            };
+            if path.rsplit('/').next() != Some("Cargo.toml") || repo.entry_at(&theirs, &path).map_err(e)? == Some(oid) {
+                continue;
+            }
+            let blob = repo.read_blob(&oid).map_err(e)?;
+            let text = String::from_utf8_lossy(&blob);
+            if let Err(err) = makepad_toml_parser::parse_toml(&text) {
+                let line = text.get(..err.span.start).unwrap_or(&text).matches('\n').count() + 1;
+                bad.push(format!("{path}:{line}: {} (the merged manifest does not parse)", err.msg));
             }
         }
-        if let (Some(p), Some(h), Some(b)) = (path, head, branch) {
-            out.push((p, b, h));
-        }
-    }
-    out
+        Ok(bad)
+    })
+    .unwrap_or_else(|| Err(format!("{} is not a git repository", dir.display())))
 }
 
 /// One lane half as found this round.
@@ -200,12 +243,117 @@ struct Half {
     repo: &'static str,
     /// the repo's main checkout (plumbing runs there)
     dir: PathBuf,
+    /// its repo's [`Graph`] this round
+    graph: usize,
     wt: PathBuf,
     branch: String,
     head: String,
+    head_id: ObjectId,
     /// the tip's commit (work or main)
     base: String,
     tip_branch: &'static str,
+}
+
+fn unread_why(h: &Half, e: &makepad_git::GitError) -> String {
+    format!("its own commits do not read ({} at {}): {e}", h.branch, &h.head[..h.head.len().min(10)])
+}
+
+/// A pair with a half whose last use did not read: that half failed, the other waits for it.
+fn unread(unit: &[Half], active: &[Result<u64, String>]) -> Vec<Outcome> {
+    let failed = unit.iter().zip(active).find(|(_, a)| a.is_err()).map(|(h, _)| format!("its {} half failed ({}): the pair merges together", h.repo, h.branch)).unwrap_or_default();
+    active.iter().map(|a| match a {
+        Err(why) => Outcome::Failed(why.clone()),
+        Ok(_) => Outcome::Waiting(failed.clone()),
+    }).collect()
+}
+
+/// A lane head's own commits: those its tip (work or main) does not reach.
+#[derive(Clone, Debug)]
+struct Own {
+    /// (merge, committer time s, subject)
+    commits: Vec<(ObjectId, bool, i64, String)>,
+    /// the head holds the tip
+    holds_tip: bool,
+}
+
+/// One repo's history across rounds: what its tip reaches, and each lane head's own commits
+/// beyond it. A tip that moves forward costs only its new commits; heads keep theirs.
+#[derive(Default)]
+struct History {
+    reach: Reach,
+    /// the retired chains (`<tip>-old-*`, kept when the tip moved onto a squashed commit): what
+    /// they reach landed before; a lane's own commits stop there too
+    retired: Vec<(String, Reach)>,
+    owns: HashMap<ObjectId, Own>,
+}
+
+impl History {
+    /// The retired chains as the refs name them now (each read once: they never move).
+    fn retire(&mut self, repo: &mut Repository, refs: Vec<(String, ObjectId)>) -> Result<(), makepad_git::GitError> {
+        if refs.len() == self.retired.len() && refs.iter().all(|(n, t)| self.retired.iter().any(|(m, r)| m == n && r.tip() == Some(*t))) {
+            return Ok(());
+        }
+        let mut retired = Vec::new();
+        for (name, tip) in refs {
+            let mut r = Reach::new();
+            r.advance(repo, tip)?;
+            retired.push((name, r));
+        }
+        self.retired = retired;
+        self.owns.clear();
+        Ok(())
+    }
+
+    fn retired_holds(&self, oid: &ObjectId) -> bool {
+        self.retired.iter().any(|(_, r)| r.contains(oid))
+    }
+
+    fn advance(&mut self, repo: &mut Repository, tip: ObjectId) -> Result<(), makepad_git::GitError> {
+        let old = self.reach.tip();
+        if old == Some(tip) {
+            return Ok(());
+        }
+        self.reach.advance(repo, tip)?;
+        if old.is_some_and(|o| self.reach.contains(&o)) {
+            // forward: a head holds the new tip iff the tip was among its own commits, and loses
+            // the commits the tip now reaches
+            for own in self.owns.values_mut() {
+                own.holds_tip = own.commits.iter().any(|c| c.0 == tip);
+                own.commits.retain(|c| !self.reach.contains(&c.0));
+            }
+        } else {
+            self.owns.clear();
+        }
+        Ok(())
+    }
+
+    fn own(&mut self, repo: &mut Repository, head: ObjectId) -> Result<&Own, makepad_git::GitError> {
+        if !self.owns.contains_key(&head) {
+            let reaches: Vec<&Reach> = std::iter::once(&self.reach).chain(self.retired.iter().map(|(_, r)| r)).collect();
+            let range = Reach::range_beyond(&reaches, repo, head)?;
+            let tip = self.reach.tip();
+            let own = Own {
+                holds_tip: tip.is_some_and(|t| range.boundary.contains(&t)),
+                commits: range.commits.into_iter().map(|(o, c)| (o, c.parents.len() > 1, c.committer.timestamp, c.message.lines().next().unwrap_or("").to_string())).collect(),
+            };
+            self.owns.insert(head, own);
+        }
+        Ok(&self.owns[&head])
+    }
+}
+
+/// One repo this round: its plumbing reads and its [`History`] (taken from the bot for the round).
+struct Graph {
+    name: &'static str,
+    /// the repo's shared reader ([`crate::gitread`]), locked per question
+    repo: std::sync::Arc<Mutex<Repository>>,
+    hist: History,
+}
+
+impl Graph {
+    fn repo(&self) -> std::sync::MutexGuard<'_, Repository> {
+        self.repo.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl Half {
@@ -217,11 +365,31 @@ impl Half {
 /// What keeps a lane from being merged now (a job or live job running at its worktree), if anything.
 pub type Busy = Box<dyn Fn(&Path) -> Option<String> + Send + Sync>;
 
+/// The file monitor that says when a worktree's last read still stands (none: every check reads it).
+pub type Watch = Box<dyn Fn() -> Option<Arc<crate::monitor::Monitor>> + Send + Sync>;
+
+/// The master's lane monitor.
+fn master_watch() -> Option<Arc<crate::monitor::Monitor>> {
+    #[cfg(feature = "checkout")]
+    if let Some(ctx) = crate::orch::ctx() { return Some(ctx.monitor.clone()); }
+    None
+}
+
+/// A worktree's last uncommitted-changes read: it stands while HEAD and the index stay and no
+/// file event came in the tree since (`mark`, taken before the read).
+struct Checked {
+    head: String,
+    index: Option<(u64, Option<std::time::SystemTime>)>,
+    mark: u64,
+    dirty: Option<String>,
+}
+
 /// The master's jobs and live jobs at that worktree (none outside a master).
 fn lane_busy(wt: &Path) -> Option<String> {
     #[cfg(feature = "checkout")]
     if let Some(ctx) = crate::orch::ctx() {
         let p = wt.to_string_lossy();
+        if let Some(why) = ctx.leases.timed_series(&p) { return Some(why); }
         return ctx.store.read(|d| {
             if let Some(j) = d.jobs.iter().find(|j| !j.done() && j.repo_dir == p) {
                 return Some(format!("job {} runs at this worktree", j.id));
@@ -233,6 +401,32 @@ fn lane_busy(wt: &Path) -> Option<String> {
     None
 }
 
+/// When a lease or job of the lane (by name or worktree) was last asked or ended (0: none known).
+pub type Seen = Box<dyn Fn(&str, &Path) -> u64 + Send + Sync>;
+
+/// The master's leases (queued, live and recently ended) and jobs of the lane (0 outside a master).
+fn lane_seen(name: &str, wt: &Path) -> u64 {
+    #[cfg(feature = "checkout")]
+    if let Some(ctx) = crate::orch::ctx() {
+        let now = proto::wall_ms();
+        let at = |dir: &str| !dir.is_empty() && Path::new(dir).starts_with(wt);
+        let jobs = ctx.store.read(|d| d.jobs.iter().filter(|j| j.lane == name || at(&j.repo_dir)).map(|j| if j.done() { j.ended_ms.max(j.submitted_ms) } else { now }).max().unwrap_or(0));
+        return ctx.leases.lane_seen_ms(name, wt).max(jobs);
+    }
+    let _ = (name, wt);
+    0
+}
+
+/// The lane branches of the last round that are not in their tip yet, per repo; None before a
+/// round finished.
+static OPEN: Mutex<Option<BTreeMap<String, HashSet<String>>>> = Mutex::new(None);
+
+/// The open lane branches of `repo` (makepad | commercial) as the last round saw them: the ones a
+/// node's store keeps a pushed ref for. None until this process finished a round.
+pub fn open_branches(repo: &str) -> Option<HashSet<String>> {
+    OPEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|o| o.get(repo).cloned().unwrap_or_default())
+}
+
 pub struct Lanes {
     machine: String,
     home: PathBuf,
@@ -240,20 +434,33 @@ pub struct Lanes {
     /// extra git env (tests: an identity)
     env: Vec<(String, String)>,
     state: Mutex<BTreeMap<(String, String), Lane>>,
-    held: Mutex<BTreeMap<String, String>>,
+    store: Arc<crate::state::Store>,
     wake: (Mutex<bool>, Condvar),
     busy: Busy,
+    seen: Seen,
+    /// per repo (makepad | commercial)
+    histories: Mutex<BTreeMap<&'static str, History>>,
+    /// worktrees whose merge driver this process checked: once per worktree, never per round
+    installed: Mutex<HashSet<PathBuf>>,
+    watch: Watch,
+    /// per worktree: its last uncommitted-changes read
+    checked: Mutex<HashMap<PathBuf, Checked>>,
+    /// worktree reads (a status of every tracked file) and reads a quiet tree spared: a dirty or
+    /// waiting lane read its whole worktree every 30 s round (the master's lanes thread sat in
+    /// lstat most of the time)
+    reads: std::sync::atomic::AtomicU64,
+    spared: std::sync::atomic::AtomicU64,
 }
 
 impl Lanes {
     pub fn new(machine: &str, home: PathBuf, publish: Publish) -> Arc<Lanes> {
-        let (merges, held_list) = crate::state::Store::open_quiet(&home, machine).read(|d| (d.merges.clone(), d.held.clone()));
+        let store = crate::state::Store::open_quiet(&home, machine).expect("workflow state must open before services start");
+        let merges = store.read(|d| d.merges.clone());
         let mut state = BTreeMap::new();
         for l in merges.iter().filter_map(|v| Lane::parse(&v.to_json())) {
             state.insert((l.repo.clone(), l.branch.clone()), l);
         }
-        let held: BTreeMap<String, String> = held_list.into_iter().collect();
-        Arc::new(Lanes { machine: machine.into(), home, publish, env: Vec::new(), state: Mutex::new(state), held: Mutex::new(held), wake: (Mutex::new(false), Condvar::new()), busy: Box::new(lane_busy) })
+        Arc::new(Lanes { machine: machine.into(), home, publish, env: Vec::new(), state: Mutex::new(state), store, wake: (Mutex::new(false), Condvar::new()), busy: Box::new(lane_busy), seen: Box::new(lane_seen), histories: Mutex::new(BTreeMap::new()), installed: Mutex::new(HashSet::new()), watch: Box::new(master_watch), checked: Mutex::new(HashMap::new()), reads: Default::default(), spared: Default::default() })
     }
 
     #[cfg(test)]
@@ -265,20 +472,24 @@ impl Lanes {
     }
 
     #[cfg(test)]
+    fn with_watch(l: Arc<Lanes>, watch: Watch) -> Arc<Lanes> {
+        let mut l = Arc::try_unwrap(l).ok().unwrap();
+        l.watch = watch;
+        Arc::new(l)
+    }
+
+    #[cfg(test)]
     fn with_busy(l: Arc<Lanes>, busy: Busy) -> Arc<Lanes> {
         let mut l = Arc::try_unwrap(l).ok().unwrap();
         l.busy = busy;
         Arc::new(l)
     }
 
-    /// The master's one state document (its `merges` and `held` sections).
-    fn store(&self) -> Arc<crate::state::Store> {
-        crate::state::Store::open_quiet(&self.home, &self.machine)
-    }
-
     fn save(&self) {
-        let vals: Vec<makepad_strict_json::Value> = self.state.lock().unwrap().values().filter_map(|l| makepad_strict_json::parse_depth(l.to_json().as_bytes(), 16).ok()).collect();
-        self.store().update(|d| d.merges = vals);
+        let mut state = self.state.lock().unwrap();
+        let vals: Vec<makepad_strict_json::Value> = state.values().filter_map(|l| makepad_strict_json::parse_depth(l.to_json().as_bytes(), 16).ok()).collect();
+        if let Err(e) = self.store.update(|d| d.merges = vals) { eprintln!("devhub merge state: {e}"); return; }
+        *state = self.store.read(|d| d.merges.iter().filter_map(|v| Lane::parse(&v.to_json())).map(|l| ((l.repo.clone(), l.branch.clone()), l)).collect());
     }
 
     pub fn list(&self) -> Vec<Lane> {
@@ -286,33 +497,22 @@ impl Lanes {
     }
 
     pub fn held(&self) -> Vec<(String, String)> {
-        self.held.lock().unwrap().iter().map(|(b, w)| (b.clone(), w.clone())).collect()
+        self.store.read(|d| d.held.clone())
     }
 
     pub fn hold(&self, branch: &str, why: &str) -> Result<(), String> {
-        if !crate::sync::git::valid_branch(branch) {
-            return Err(format!("`{branch}` is not a branch name"));
-        }
-        let why = if why.trim().is_empty() { "held".to_string() } else { proto::clean(why.trim(), 200) };
-        self.held.lock().unwrap().insert(branch.to_string(), why.clone());
-        self.save_held();
+        let why = hold_in(&self.store, branch, why)?;
         (self.publish)(hub_record(&self.machine, "", 0, "lanes", Sev::Info, format!("lanes: {branch} held ({why}): the master merges nothing into it"), String::new()));
         Ok(())
     }
 
     pub fn unhold(&self, branch: &str) -> Result<(), String> {
-        if self.held.lock().unwrap().remove(branch).is_none() {
+        if !unhold_in(&self.store, branch)? {
             return Err(format!("{branch} is not held"));
         }
-        self.save_held();
         (self.publish)(hub_record(&self.machine, "", 0, "lanes", Sev::Info, format!("lanes: {branch} no longer held"), String::new()));
         self.poke();
         Ok(())
-    }
-
-    fn save_held(&self) {
-        let held: Vec<(String, String)> = self.held.lock().unwrap().iter().map(|(b, w)| (b.clone(), w.clone())).collect();
-        self.store().update(|d| d.held = held);
     }
 
     /// Wakes the loop for a round now.
@@ -331,25 +531,80 @@ impl Lanes {
     /// its makepad worktree and the commercial worktree nested in it (`<worktree>/apps/commercial`
     /// on a branch); a commercial lane worktree with no makepad lane around it is one alone.
     pub fn pass(&self, w: &Where) -> Result<Vec<Lane>, String> {
+        let mut graphs: Vec<Graph> = Vec::new();
+        let r = self.pass_in(w, &mut graphs);
+        if r.is_ok() {
+            let mut open: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+            for l in self.state.lock().unwrap().values().filter(|l| l.outcome != Outcome::Landed) {
+                open.entry(l.repo.clone()).or_default().insert(l.branch.clone());
+            }
+            *OPEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(open);
+        }
+        // the histories outlive the round (the next costs only what moved)
+        let mut hs = self.histories.lock().unwrap();
+        for g in graphs {
+            hs.insert(g.name, g.hist);
+        }
+        r
+    }
+
+    /// Its merge driver, checked once per worktree by this process.
+    fn install_once(&self, wt: &Path, root: &Path) -> Result<(), String> {
+        if self.installed.lock().unwrap().contains(wt) {
+            return Ok(());
+        }
+        crate::ci_merge::install_merge_driver(wt, root)?;
+        self.installed.lock().unwrap().insert(wt.to_path_buf());
+        Ok(())
+    }
+
+    fn pass_in(&self, w: &Where, graphs: &mut Vec<Graph>) -> Result<Vec<Lane>, String> {
+        let mut pass = crate::gitread::Pass::default();
         let mut halves: Vec<Half> = Vec::new();
+        let mut listed: HashSet<PathBuf> = HashSet::new();
         for (repo, dir, tip_branch) in [("makepad", w.repo.clone(), "work"), ("commercial", w.repo.join("apps").join("commercial"), "main")] {
-            if !dir.join(".git").exists() {
-                continue;
+            let paths = match makepad_git::repository_paths(&dir) {
+                Ok(Some(p)) => p,
+                Ok(None) => continue,
+                Err(e) => return Err(format!("{repo}: {e}")),
+            };
+            if !self.installed.lock().unwrap().contains(&dir) {
+                // the repository's commit-msg hook (all its lane worktrees share it), with the
+                // main checkout's scanner: a lane's own is gone with the lane
+                crate::private_check::install_message_check(&dir, &crate::private_check::scan_in(&w.repo))?;
             }
-            let (ok, base, err) = git(&dir, &self.env, &["rev-parse", "-q", "--verify", &format!("refs/heads/{tip_branch}^{{commit}}")]);
-            if !ok {
-                return Err(format!("{repo}: no {tip_branch}: {}", first_err(&err)));
-            }
-            let base = base.trim().to_string();
-            let (ok, list, err) = git(&dir, &self.env, &["worktree", "list", "--porcelain"]);
-            if !ok {
-                return Err(format!("{repo}: worktree list: {}", first_err(&err)));
-            }
-            for (path, branch, head) in parse_worktrees(&list) {
-                if branch.starts_with("rc-") && path.starts_with(&w.root) && path.is_dir() {
-                    halves.push(Half { repo, dir: dir.clone(), wt: path, branch, head, base: base.clone(), tip_branch });
+            self.install_once(&dir, &w.repo)?;
+            listed.insert(dir.clone());
+            let tip_ref = format!("refs/heads/{tip_branch}");
+            let base = match pass.rev(&dir, &tip_ref) { Some(b) => b, None => return Err(format!("{repo}: cannot capture {tip_branch}: {}", pass.why_not(&dir, &tip_ref))) };
+            let base_id = ObjectId::from_hex(&base).map_err(|e| e.to_string())?;
+            let shared = crate::gitread::handle(&paths.common_dir).ok_or_else(|| format!("{repo}: cannot read {}", paths.common_dir.display()))?;
+            let mut g = Graph { name: repo, repo: shared, hist: self.histories.lock().unwrap().remove(repo).unwrap_or_default() };
+            g.hist.advance(&mut g.repo.lock().unwrap_or_else(|e| e.into_inner()), base_id).map_err(|e| format!("{repo}: {tip_branch}'s history: {e}"))?;
+            let old = format!("refs/heads/{tip_branch}-old-");
+            let retired = match pass.direct_refs(&dir, &old) { Some(r) => r, None => return Err(format!("{repo}: cannot capture retired refs: {}", pass.why_not(&dir, &tip_ref))) };
+            g.hist.retire(&mut g.repo.lock().unwrap_or_else(|e| e.into_inner()), retired).map_err(|e| format!("{repo}: retired chains: {e}"))?;
+            let list = g.repo().worktree_list().map_err(|e| format!("{repo}: worktree list: {e}"))?;
+            let graph = graphs.len();
+            graphs.push(g);
+            for wt in list {
+                let (Some(branch), Some(head_id)) = (wt.branch, wt.head) else { continue };
+                let path = wt.path;
+                if !wt.main && branch.starts_with("rc-") && path.starts_with(&w.root) && path.is_dir() {
+                    let root = if repo != "commercial" { &path }
+                        else if path.ends_with("apps/commercial") { path.parent().and_then(Path::parent).unwrap_or(&w.repo) }
+                        else { &w.repo };
+                    self.install_once(&path, root)?;
+                    listed.insert(path.clone());
+                    halves.push(Half { repo, dir: dir.clone(), graph, wt: path, branch, head: head_id.to_hex(), head_id, base: base.clone(), tip_branch });
                 }
             }
+        }
+        self.installed.lock().unwrap().retain(|p| listed.contains(p));
+        self.checked.lock().unwrap().retain(|p, _| listed.contains(p));
+        let heads: HashSet<(usize, ObjectId)> = halves.iter().map(|h| (h.graph, h.head_id)).collect();
+        for (i, g) in graphs.iter_mut().enumerate() {
+            g.hist.owns.retain(|o, _| heads.contains(&(i, *o)));
         }
         // the pairs: a commercial half goes with the makepad lane it is nested in
         let mut units: Vec<Vec<Half>> = Vec::new();
@@ -367,18 +622,39 @@ impl Lanes {
 
         let mut changed = Vec::new();
         let mut seen = Vec::new();
+        let mut active_moved = false;
+        let now = proto::wall_ms();
         for unit in units {
             let prevs: Vec<Option<Lane>> = unit.iter().map(|h| self.state.lock().unwrap().get(&h.key()).cloned()).collect();
-            let outcomes = self.pair(&unit, &prevs);
-            for ((h, prev), outcome) in unit.into_iter().zip(prevs).zip(outcomes) {
+            // the lane's last use: its own newest commit (looked up when its head moved), a lease or
+            // a job of it; a pair is as active as its busier half. A half whose commits do not read
+            // has no last use this round: it fails (said, retried next round) and is never called
+            // dormant for it (a lane listed dormant is one the user may drop)
+            let active: Vec<Result<u64, String>> = unit.iter().zip(&prevs).map(|(h, p)| {
+                let name = h.branch.strip_prefix("rc-").unwrap_or(&h.branch);
+                let own = match p.as_ref().filter(|p| p.tip == h.head) {
+                    Some(p) => p.active_ms,
+                    None => self.own_commit_ms(graphs, h)?,
+                };
+                Ok(own.max(p.as_ref().map_or(0, |p| p.active_ms)).max((self.seen)(name, &h.wt)))
+            }).collect();
+            let outcomes = if active.iter().any(Result::is_err) {
+                unread(&unit, &active)
+            } else {
+                let dormant = active.iter().flatten().max().is_some_and(|a| now.saturating_sub(*a) > DORMANT_MS);
+                self.pair(&unit, &prevs, dormant, graphs, &mut pass)
+            };
+            let active: Vec<u64> = active.into_iter().zip(&prevs).map(|(a, p)| a.unwrap_or_else(|_| p.as_ref().map_or(0, |p| p.active_ms))).collect();
+            for (((h, prev), outcome), active_ms) in unit.into_iter().zip(prevs).zip(outcomes).zip(active) {
                 let key = h.key();
                 seen.push(key.clone());
                 let tip = match &outcome {
                     Outcome::Merged(c) => c.clone(),
                     _ => h.head.clone(),
                 };
-                let lane = Lane { repo: h.repo.into(), branch: h.branch, worktree: h.wt, tip, base: h.base, outcome, at_ms: proto::wall_ms() };
-                let same = prev.as_ref().is_some_and(|p| p.outcome == lane.outcome && (p.tip == lane.tip || matches!(lane.outcome, Outcome::Merged(_))) && (p.base == lane.base || matches!(lane.outcome, Outcome::Landed | Outcome::Held(_))));
+                let lane = Lane { repo: h.repo.into(), branch: h.branch, worktree: h.wt, tip, base: h.base, outcome, at_ms: now, active_ms };
+                // the same conflict against a newer tip, or a dormant lane, is said once
+                let same = prev.as_ref().is_some_and(|p| p.outcome == lane.outcome && (p.tip == lane.tip || matches!(lane.outcome, Outcome::Merged(_))) && (p.base == lane.base || matches!(lane.outcome, Outcome::Landed | Outcome::Held(_) | Outcome::Conflict(_) | Outcome::Dormant(_))));
                 if !same {
                     let (sev, line) = lane.event();
                     // a lane that just caught up after the bot's own merge says nothing new
@@ -391,16 +667,34 @@ impl Lanes {
                 } else if let Some(p) = self.state.lock().unwrap().get_mut(&key) {
                     p.tip = lane.tip;
                     p.base = lane.base;
+                    // saved when it moved by an hour (it only needs to outlive a master restart)
+                    active_moved |= lane.active_ms > p.active_ms + 3_600_000;
+                    p.active_ms = lane.active_ms;
                 }
             }
         }
         // lanes whose worktree went away
         let before = self.state.lock().unwrap().len();
         self.state.lock().unwrap().retain(|k, _| seen.contains(k));
-        if !changed.is_empty() || before != self.state.lock().unwrap().len() {
+        if !changed.is_empty() || active_moved || before != self.state.lock().unwrap().len() {
             self.save();
         }
         Ok(changed)
+    }
+
+    /// The newest commit of the half's own (not in its tip, not a merge) as wall ms; 0: it has
+    /// none. Its commits not reading is an error, never a time.
+    fn own_commit_ms(&self, graphs: &mut [Graph], h: &Half) -> Result<u64, String> {
+        let g = &mut graphs[h.graph];
+        let own = g.hist.own(&mut g.repo.lock().unwrap_or_else(|e| e.into_inner()), h.head_id).map_err(|e| unread_why(h, &e))?;
+        Ok(own.commits.iter().filter(|c| !c.1).map(|c| c.2.max(0) as u64 * 1000).max().unwrap_or(0))
+    }
+
+    /// Its commits not in the tip (merges left out).
+    fn ahead(&self, graphs: &mut [Graph], h: &Half) -> Result<u32, String> {
+        let g = &mut graphs[h.graph];
+        let own = g.hist.own(&mut g.repo.lock().unwrap_or_else(|e| e.into_inner()), h.head_id).map_err(|e| unread_why(h, &e))?;
+        Ok(own.commits.iter().filter(|c| !c.1).count() as u32)
     }
 
     /// One lane's halves, merged in one step or not at all: work into the makepad half and main
@@ -408,8 +702,24 @@ impl Lanes {
     /// build). Nothing is merged while either worktree has uncommitted tracked changes or an
     /// operation in progress, while a job or live job of the lane runs, or when either half is
     /// held, conflicts or fails: the half that would have merged says why.
-    fn pair(&self, unit: &[Half], prevs: &[Option<Lane>]) -> Vec<Outcome> {
-        let mut out: Vec<Option<Outcome>> = unit.iter().zip(prevs).map(|(h, p)| self.settled(h, p.as_ref())).collect();
+    fn pair(&self, unit: &[Half], prevs: &[Option<Lane>], dormant: bool, graphs: &mut [Graph], pass: &mut crate::gitread::Pass) -> Vec<Outcome> {
+        // a dormant lane is left alone (landed or held halves say so): no merge attempt, its count
+        // kept while its head stays; nothing is read again while neither its head nor its tip moves
+        if dormant {
+            return unit.iter().zip(prevs).map(|(h, p)| {
+                if let Some(p) = p.as_ref().filter(|p| p.tip == h.head && p.base == h.base && matches!(p.outcome, Outcome::Dormant(_))) {
+                    if !self.store.read(|d| d.held.iter().any(|(b, _)| b == &h.branch)) {
+                        return p.outcome.clone();
+                    }
+                }
+                match (self.settled(graphs, h, p.as_ref()), p) {
+                    (Some(o @ (Outcome::Landed | Outcome::Held(_) | Outcome::Failed(_))), _) => o,
+                    (_, Some(Lane { outcome: Outcome::Dormant(n), tip, .. })) if *tip == h.head => Outcome::Dormant(*n),
+                    _ => self.ahead(graphs, h).map_or_else(Outcome::Failed, Outcome::Dormant),
+                }
+            }).collect();
+        }
+        let mut out: Vec<Option<Outcome>> = unit.iter().zip(prevs).map(|(h, p)| self.settled(graphs, h, p.as_ref())).collect();
         // a lane is landed only when both halves are: a half with nothing of its own (in its tip)
         // still follows the tip while its other half holds unlanded work, so the pair stays one
         // build (stagedmx: its makepad half was called landed and never got work again)
@@ -432,6 +742,11 @@ impl Lanes {
             wait(&mut out, why);
             return out.into_iter().flatten().collect();
         }
+        // a job of the lane runs: asked first, it costs no read of the worktrees
+        if let Some(why) = (self.busy)(&unit[0].wt) {
+            wait(&mut out, why);
+            return out.into_iter().flatten().collect();
+        }
         // the lane's own work in progress is never touched, in either half
         for h in unit {
             if let Some(why) = self.dirty(h) {
@@ -440,19 +755,16 @@ impl Lanes {
                 return out.into_iter().flatten().collect();
             }
         }
-        if let Some(why) = (self.busy)(&unit[0].wt) {
-            wait(&mut out, why);
-            return out.into_iter().flatten().collect();
-        }
         // every merge computed first, nothing touched
-        let mut merges: Vec<(usize, String)> = Vec::new();
+        // (half, the commit it moves to, carried over from a retired chain)
+        let mut merges: Vec<(usize, (String, bool))> = Vec::new();
         for (i, h) in unit.iter().enumerate() {
             if out[i].is_some() {
                 continue;
             }
             // a half in its tip moves to the tip itself (a fast-forward, no merge commit)
-            let ff = follow.contains(&i) && git(&h.dir, &self.env, &["merge-base", "--is-ancestor", &h.head, &h.base]).0;
-            match if ff { Ok(h.base.clone()) } else { self.merge_commit(h) } {
+            let ff = follow.contains(&i) && graphs[h.graph].hist.reach.contains(&h.head_id);
+            match if ff { Ok((h.base.clone(), false)) } else { self.merge_commit(h, pass) } {
                 Ok(c) => merges.push((i, c)),
                 Err(o) => {
                     out[i] = Some(o.clone());
@@ -464,29 +776,32 @@ impl Lanes {
         }
         // then the worktrees move, whole or not at all: each fast-forwards to its merge (it
         // refuses if the lane committed or touched a file meanwhile); a half that refuses takes the
-        // halves already moved back to their own commits, so the pair is never half merged
+        // halves already moved back only while they still name the bot's merge. A concurrent
+        // agent commit stays put and the next pass reconciles the half-moved pair.
         let mut moved: Vec<usize> = Vec::new();
-        for (i, c) in &merges {
+        for (i, (c, carried)) in &merges {
             let h = &unit[*i];
             // A lane carried over from a retired work chain isn't a fast-forward: its tree moves
             // the same careful way (refusing over a change), then its branch.
-            let (ok, _, err) = if git(&h.wt, &self.env, &["merge-base", "--is-ancestor", &h.head, c]).0 {
+            let (ok, _, err) = if !carried {
                 git(&h.wt, &self.env, &["merge", "--ff-only", "-q", c])
             } else {
-                let moved = git(&h.wt, &self.env, &["read-tree", "-m", "-u", &h.head, c]);
-                if moved.0 { git(&h.wt, &self.env, &["update-ref", "HEAD", c, &h.head]) } else { moved }
+                move_checked(&h.wt, &self.env, &h.head, c)
             };
             if !ok {
-                let why = format!("fast-forward to the merge: {}", first_err(&err));
+                // the lane committed while the merge was computed: the next round merges its new head
+                let raced = git(&h.wt, &self.env, &["rev-parse", "HEAD"]).1.trim() != h.head;
+                let why = if raced { "the lane committed meanwhile".to_string() } else { format!("fast-forward to the merge: {}", first_err(&err)) };
+                let locked_before = prevs[*i].as_ref().is_some_and(|p| matches!(&p.outcome, Outcome::Waiting(w) if w.starts_with(LOCKED)));
                 for j in &moved {
                     let b = &unit[*j];
-                    // only the bot's own merge is taken back (`--keep`: never over a change)
-                    let (ok, _, e) = git(&b.wt, &self.env, &["reset", "-q", "--keep", &b.head]);
+                    let merge = &merges.iter().find(|(i, _)| i == j).unwrap().1.0;
+                    let (ok, _, e) = move_checked(&b.wt, &self.env, merge, &b.head);
                     if !ok {
-                        out[*j] = Some(Outcome::Failed(format!("taking its merge back after the {} half refused: {}", h.repo, first_err(&e))));
+                        out[*j] = Some(Outcome::Failed(format!("half-moved pair kept for reconciliation after the {} half refused: {}", h.repo, first_err(&e))));
                     }
                 }
-                out[*i] = Some(Outcome::Failed(why));
+                out[*i] = Some(if raced { Outcome::Waiting(why) } else if git_lock(&err) && !locked_before { Outcome::Waiting(format!("{LOCKED}{why}")) } else { Outcome::Failed(why) });
                 for (j, _) in &merges {
                     if out[*j].is_none() {
                         out[*j] = Some(Outcome::Waiting(format!("its {} half could not move: the pair merges together", h.repo)));
@@ -496,37 +811,41 @@ impl Lanes {
             }
             moved.push(*i);
         }
-        for (i, c) in merges {
+        for (i, (c, _)) in merges {
             out[i] = Some(Outcome::Merged(c));
         }
         out.into_iter().flatten().collect()
     }
 
     /// A half's result when it has nothing to merge (or is held): None when it needs the tip.
-    fn settled(&self, h: &Half, prev: Option<&Lane>) -> Option<Outcome> {
-        if let Some(why) = self.held.lock().unwrap().get(&h.branch) {
+    fn settled(&self, graphs: &mut [Graph], h: &Half, prev: Option<&Lane>) -> Option<Outcome> {
+        if let Some(why) = self.store.read(|d| d.held.iter().find(|(b, _)| b == &h.branch).map(|(_, why)| why.clone())) {
             return Some(Outcome::Held(why.clone()));
         }
-        let (dir, head, base) = (&h.dir, h.head.as_str(), h.base.as_str());
-        let anc = |a: &str, b: &str| git(dir, &self.env, &["merge-base", "--is-ancestor", a, b]).0;
-        // results that only a move of the branch or the tip changes: no git at all
-        if let Some(p) = prev.filter(|p| p.tip == head && p.base == base) {
+        // results that only a move of the branch or the tip changes: nothing read at all
+        if let Some(p) = prev.filter(|p| p.tip == h.head && p.base == h.base) {
             if matches!(p.outcome, Outcome::UpToDate | Outcome::Landed | Outcome::Conflict(_) | Outcome::Merged(_)) {
                 return Some(p.outcome.clone());
             }
         }
-        if anc(head, base) {
+        let g = &mut graphs[h.graph];
+        // in the tip, or landed on a retired chain of it (its content went into the squashed tip)
+        if g.hist.reach.contains(&h.head_id) || g.hist.retired_holds(&h.head_id) {
             return Some(Outcome::Landed);
         }
+        let own = match g.hist.own(&mut g.repo.lock().unwrap_or_else(|e| e.into_inner()), h.head_id) {
+            Ok(own) => own,
+            Err(e) => return Some(Outcome::Failed(format!("reading its history: {e}"))),
+        };
         // landed but for the bot's own merges of the tip: merging the tip in again would only add
         // another merge (and make the lane look pending) for ever
-        if only_bot_merges(dir, &self.env, head, base, h.tip_branch, &h.branch) {
+        if only_bot_merges(own.commits.iter().map(|c| c.3.as_str()), h.tip_branch, &h.branch) {
             return Some(Outcome::Landed);
         }
-        if anc(base, head) {
+        if own.holds_tip {
             // the bot's own merge, seen again: keep saying what it did
             if let Some(Outcome::Merged(c)) = prev.map(|p| &p.outcome) {
-                if c == head {
+                if *c == h.head {
                     return Some(Outcome::Merged(c.clone()));
                 }
             }
@@ -537,25 +856,51 @@ impl Lanes {
 
     /// Uncommitted tracked changes or an operation in progress in the half's worktree.
     fn dirty(&self, h: &Half) -> Option<String> {
+        let paths = match makepad_git::repository_paths(&h.wt) {
+            Ok(Some(p)) => p,
+            Ok(None) => return Some("status: no .git".into()),
+            Err(e) => return Some(format!("status: {e}")),
+        };
+        // the operations' state lives in the worktree's own git dir (`git rev-parse --git-path`)
         for op in ["MERGE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "REVERT_HEAD"] {
-            let (ok, p, _) = git(&h.wt, &self.env, &["rev-parse", "--git-path", op]);
-            if ok && h.wt.join(p.trim()).exists() {
+            if paths.git_dir.join(op).exists() {
                 return Some(format!("a {} is in progress", op.to_lowercase().replace('_', " ")));
             }
         }
-        let (ok, st, err) = git(&h.wt, &self.env, &["status", "--porcelain", "--untracked-files=no"]);
-        if !ok {
-            return Some(format!("status: {}", first_err(&err)));
+        // the last read stands while nothing moved: HEAD, the index (outside the watched tree)
+        // and every file under it (the monitor's events)
+        let index = std::fs::metadata(paths.git_dir.join("index")).ok().map(|m| (m.len(), m.modified().ok()));
+        let monitor = (self.watch)();
+        if let (Some(m), Some(c)) = (monitor.as_ref(), self.checked.lock().unwrap().get(&h.wt)) {
+            if c.head == h.head && c.index == index && m.quiet_since(&h.wt, c.mark) {
+                self.spared.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return c.dirty.clone();
+            }
         }
-        let dirty: Vec<&str> = st.lines().filter(|l| l.len() > 3).map(|l| &l[3..]).collect();
-        (!dirty.is_empty()).then(|| format!("{} uncommitted file{} ({})", dirty.len(), if dirty.len() == 1 { "" } else { "s" }, dirty.iter().take(4).copied().collect::<Vec<_>>().join(", ")))
+        let mark = monitor.as_ref().and_then(|m| m.mark(&h.wt));
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let status = crate::gitread::worktree(paths)
+            .and_then(|mut r| r.status_with_options(makepad_git::StatusOptions { skip_untracked: true, ..Default::default() }));
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => return Some(format!("status: {e}")),
+        };
+        let mut dirty: Vec<&str> = status.entries.iter().map(|e| e.path.as_str()).collect();
+        dirty.dedup();
+        let dirty = (!dirty.is_empty()).then(|| format!("{} uncommitted file{} ({})", dirty.len(), if dirty.len() == 1 { "" } else { "s" }, dirty.iter().take(4).copied().collect::<Vec<_>>().join(", ")));
+        let mut checked = self.checked.lock().unwrap();
+        match mark {
+            Some(mark) => { checked.insert(h.wt.clone(), Checked { head: h.head.clone(), index, mark, dirty: dirty.clone() }); }
+            None => { checked.remove(&h.wt); }
+        }
+        dirty
     }
 
     /// The merge of the tip into the half as a commit ("Merge work (<sha>) into <branch>", both
     /// parents), computed with plumbing only (`merge-tree --write-tree`, `commit-tree`): no
     /// worktree is touched. A conflict names its files.
-    fn merge_commit(&self, h: &Half) -> Result<String, Outcome> {
-        let retired = crate::land::retired_base(&h.dir, &h.head, &h.base);
+    fn merge_commit(&self, h: &Half, pass: &mut crate::gitread::Pass) -> Result<(String, bool), Outcome> {
+        let retired = pass.retired_base(&h.dir, &h.head, &h.base);
         let mut args = vec!["merge-tree", "--write-tree", "--name-only", "--no-messages"];
         if let Some(mb) = &retired {
             args.extend(["--merge-base", mb]);
@@ -571,6 +916,11 @@ impl Lanes {
             }
             return Err(Outcome::Conflict(files));
         }
+        match broken_manifests(&h.dir, &h.head, &h.base, &tree) {
+            Ok(bad) if !bad.is_empty() => return Err(Outcome::Conflict(bad)),
+            Ok(_) => {}
+            Err(e) => return Err(Outcome::Failed(format!("merged manifests: {e}"))),
+        }
         let msg = if retired.is_some() {
             format!("{}: carried over onto {} ({})", h.branch, h.tip_branch, &h.base[..h.base.len().min(10)])
         } else {
@@ -585,7 +935,7 @@ impl Lanes {
         if !ok || !crate::sync::git::valid_sha(&commit) {
             return Err(Outcome::Failed(format!("commit-tree: {}", first_err(&err))));
         }
-        Ok(commit)
+        Ok((commit, retired.is_some()))
     }
 
     /// The `lanes` control service: `list`, `held`, `hold <branch> [why]`, `unhold <branch>`, `now`.
@@ -595,7 +945,7 @@ impl Lanes {
         let err = |e: &str| format!("{{\"err\":{}}}", json_str(e));
         match (w.next().unwrap_or(""), w.next(), w.next()) {
             ("" | "list", None, None) => {
-                let held = self.held.lock().unwrap().clone();
+                let held: BTreeMap<_, _> = self.held().into_iter().collect();
                 out.extend(self.list().iter().map(|l| l.to_json()));
                 // held branches with no worktree (yet) are listed too
                 for (b, why) in held {
@@ -604,6 +954,7 @@ impl Lanes {
                     }
                 }
             }
+            ("dormant", None, None) => out.extend(self.list().iter().filter(|l| matches!(l.outcome, Outcome::Dormant(_))).map(|l| l.to_json())),
             ("held", None, None) => out.extend(self.held().iter().map(|(b, w)| format!("{{\"held\":{},\"why\":{}}}", json_str(b), json_str(w)))),
             ("hold", Some(b), why) => match self.hold(b, why.unwrap_or("")) {
                 Ok(()) => out.push(format!("{{\"held\":{}}}", json_str(b))),
@@ -617,7 +968,11 @@ impl Lanes {
                 self.poke();
                 out.push("{\"poked\":true}".into());
             }
-            _ => out.push(err("lanes [list] | held | hold <branch> [why] | unhold <branch> | now")),
+            ("reads", None, None) => {
+                let n = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+                out.push(format!("{{\"reads\":{},\"spared\":{}}}", n(&self.reads), n(&self.spared)));
+            }
+            _ => out.push(err("lanes [list] | dormant | held | hold <branch> [why] | unhold <branch> | now | reads")),
         }
     }
 
@@ -649,16 +1004,42 @@ impl Lanes {
     }
 }
 
-/// One lane half as (sev word, its line) for the panel and the CLI.
 /// Whether every commit `head` has beyond `base` is this bot's merge of the tip into `branch`
 /// ("Merge <tip branch> (<sha>) into <branch>"), and there is at least one: the lane's own work
 /// is all in the tip.
-pub fn only_bot_merges(dir: &Path, env: &[(String, String)], head: &str, base: &str, tip_branch: &str, branch: &str) -> bool {
-    let (ok, out, _) = git(dir, env, &["log", "--format=%s", &format!("{base}..{head}")]);
+fn only_bot_merges<'a>(mut subjects: impl Iterator<Item = &'a str>, tip_branch: &str, branch: &str) -> bool {
     let (pre, post) = (format!("Merge {tip_branch} ("), format!(") into {branch}"));
-    ok && !out.trim().is_empty() && out.lines().all(|s| s.starts_with(&pre) && s.ends_with(&post))
+    let bot = |s: &str| s.starts_with(&pre) && s.ends_with(&post);
+    subjects.next().is_some_and(bot) && subjects.all(bot)
 }
 
+/// Puts `branch` on the master's held list (the bot merges nothing into it): its why as kept.
+pub fn hold_in(store: &crate::state::Store, branch: &str, why: &str) -> Result<String, String> {
+    if !crate::sync::git::valid_branch(branch) {
+        return Err(format!("`{branch}` is not a branch name"));
+    }
+    let why = if why.trim().is_empty() { "held".to_string() } else { proto::clean(why.trim(), 200) };
+    store.update(|d| {
+        if let Some((_, held_why)) = d.held.iter_mut().find(|(b, _)| b == branch) {
+            *held_why = why.clone();
+        } else {
+            d.held.push((branch.to_string(), why.clone()));
+            d.held.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+    })?;
+    Ok(why)
+}
+
+/// Takes `branch` off the held list: false when it was not on it.
+pub fn unhold_in(store: &crate::state::Store, branch: &str) -> Result<bool, String> {
+    store.update(|d| {
+        let len = d.held.len();
+        d.held.retain(|(b, _)| b != branch);
+        len != d.held.len()
+    })
+}
+
+/// One lane half as (sev word, its line) for the panel and the CLI.
 pub fn row(lane: &Lane) -> (&'static str, String) {
     let tip_name = if lane.repo == "commercial" { "main" } else { "work" };
     let base = &lane.base[..lane.base.len().min(10)];
@@ -670,6 +1051,7 @@ pub fn row(lane: &Lane) -> (&'static str, String) {
         Outcome::Failed(w) => ("err", format!("failed: {w}")),
         Outcome::Landed => ("info", format!("in {tip_name}")),
         Outcome::UpToDate => ("info", format!("holds {tip_name} {base}")),
+        Outcome::Dormant(n) => ("info", format!("dormant: {n} commit(s) not in {tip_name}, untouched {} d", proto::wall_ms().saturating_sub(lane.active_ms) / 86_400_000)),
     };
     let ago = proto::wall_ms().saturating_sub(lane.at_ms) / 60_000;
     (sev, format!("{:<28} {:<10} {}  {:<10} {detail}  ({ago} min ago)", lane.branch, lane.repo, &lane.tip[..lane.tip.len().min(10)], lane.outcome.word()))
@@ -713,6 +1095,28 @@ pub fn render(lines: &[String]) -> String {
     out
 }
 
+/// `devhub gitexecs`: the git processes the master started (all, the last minute) and its
+/// busiest call sites.
+fn gitexecs_cli() -> i32 {
+    let lines = match crate::cli::control().and_then(|c| super::cli::ask_local(&c, "gitexecs", "gitexecs")) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("makepad devhub gitexecs: {e}");
+            return 2;
+        }
+    };
+    let Some(v) = lines.first().and_then(|l| makepad_strict_json::parse(l.as_bytes()).ok()) else {
+        eprintln!("makepad devhub gitexecs: no answer (a master from before gitexecs)");
+        return 2;
+    };
+    let n = |v: &makepad_strict_json::Value, k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    println!("git processes: {} since the master started, {} in the last minute", n(&v, "total"), n(&v, "last_minute"));
+    for s in v.get("sites").and_then(|x| x.as_arr()).into_iter().flatten() {
+        println!("  {:>8}  {}", n(s, "n"), s.get("site").and_then(|x| x.as_str()).unwrap_or(""));
+    }
+    0
+}
+
 /// `devhub prewarm`: the master's last pre-warm record per node.
 fn prewarm_cli() -> i32 {
     let lines = match crate::cli::control().and_then(|c| super::cli::ask_local(&c, "prewarm", "prewarm")) {
@@ -741,6 +1145,7 @@ pub fn cli(args: &[&str]) -> Option<i32> {
         ["unhold", b] => format!("unhold {b}"),
         ["held"] => "held".to_string(),
         ["prewarm"] => return Some(prewarm_cli()),
+        ["gitexecs"] => return Some(gitexecs_cli()),
         ["prewarm", "run", rest @ ..] => {
             let cancel_after = match rest {
                 [] => None,
@@ -802,6 +1207,42 @@ pub fn cli(args: &[&str]) -> Option<i32> {
     Some(0)
 }
 
+/// Hold the conditional HEAD update prepared while read-tree changes the index/worktree.
+/// A concurrent commit makes prepare fail before any files move. This also closes the carry
+/// path's old read-tree/update-ref gap. Git releases the ref locks on abort or pipe close.
+fn move_checked(wt: &Path, env: &[(String, String)], before: &str, after: &str) -> (bool, String, String) {
+    use std::io::{BufRead, Write};
+    let result = (|| -> Result<(), String> {
+        let mut child = crate::git_exec::command().arg("-C").arg(wt)
+            .args(["update-ref", "--stdin"]).envs(env.iter().cloned())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().map_err(|e| e.to_string())?;
+        let mut input = child.stdin.take().unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let operation = (|| -> Result<(), String> {
+            writeln!(input, "start\nupdate HEAD {after} {before}\nprepare").map_err(|e| e.to_string())?;
+            for expected in ["start: ok", "prepare: ok"] {
+                let mut line = String::new();
+                output.read_line(&mut line).map_err(|e| e.to_string())?;
+                if line.trim() != expected { return Err("HEAD changed or its ref could not be locked; files kept".into()); }
+            }
+            let (ok, _, e) = git(wt, env, &["read-tree", "-m", "-u", before, after]);
+            if !ok { return Err(first_err(&e)); }
+            writeln!(input, "commit").map_err(|e| e.to_string())?;
+            let mut line = String::new();
+            output.read_line(&mut line).map_err(|e| e.to_string())?;
+            if line.trim() != "commit: ok" { return Err("ref commit failed after tree move; half-moved pair needs reconciliation".into()); }
+            Ok(())
+        })();
+        drop(input);
+        let status = child.wait().map_err(|e| e.to_string())?;
+        operation?;
+        if !status.success() { return Err("conditional ref update failed".into()); }
+        Ok(())
+    })();
+    match result { Ok(()) => (true, String::new(), String::new()), Err(e) => (false, String::new(), e) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,8 +1266,17 @@ mod tests {
     impl Fix {
         fn new(name: &str) -> Fix {
             static N: AtomicU64 = AtomicU64::new(0);
-            let dir = std::env::temp_dir().join(format!("devhub-lanes-{name}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
-            let _ = std::fs::remove_dir_all(&dir);
+            // a directory of its own, made here and never taken over: one left by an earlier
+            // process of the same pid stays its own (a fixture that removed what it found could
+            // remove another's repository under its reads)
+            let dir = loop {
+                let dir = std::env::temp_dir().join(format!("devhub-lanes-{name}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+                match std::fs::create_dir(&dir) {
+                    Ok(()) => break dir,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("{}: {e}", dir.display()),
+                }
+            };
             let repo = dir.join("makepad");
             let root = dir.join("wt");
             std::fs::create_dir_all(&repo).unwrap();
@@ -874,9 +1324,79 @@ mod tests {
     }
 
     #[test]
-    fn worktree_porcelain() {
-        let t = "worktree /r\nHEAD 1111\nbranch refs/heads/work\n\nworktree /w/a\nHEAD 2222\nbranch refs/heads/rc-a\n\nworktree /w/d\nHEAD 3333\ndetached\n";
-        assert_eq!(parse_worktrees(t), vec![(PathBuf::from("/r"), "work".into(), "1111".into()), (PathBuf::from("/w/a"), "rc-a".into(), "2222".into())]);
+    fn safety_conditional_moves_keep_intervening_commits_and_index() {
+        let f = Fix::new("conditional");
+        let before = f.g(&f.repo, &["rev-parse", "HEAD"]);
+        f.write(&f.repo, "a.txt", "bot\n");
+        let bot = f.commit(&f.repo, "bot");
+        f.write(&f.repo, "a.txt", "agent\n");
+        let agent = f.commit(&f.repo, "agent");
+        // Rollback and carry both refuse a changed HEAD without touching its tree or index.
+        assert!(!move_checked(&f.repo, &f.env, &bot, &before).0);
+        assert!(!move_checked(&f.repo, &f.env, &before, &bot).0);
+        assert_eq!(f.g(&f.repo, &["rev-parse", "HEAD"]), agent);
+        assert_eq!(std::fs::read_to_string(f.repo.join("a.txt")).unwrap(), "agent\n");
+        assert!(f.g(&f.repo, &["status", "--porcelain"]).is_empty());
+        assert!(move_checked(&f.repo, &f.env, &agent, &bot).0);
+        assert!(f.g(&f.repo, &["status", "--porcelain"]).is_empty());
+    }
+
+    /// The merge bot's rounds over landed, dormant, dirty and up-to-date lanes read refs,
+    /// worktrees, config and history in process: no round spawns git unless it merges.
+    #[test]
+    fn rounds_spawn_no_git() {
+        let f = Fix::new("execs");
+        let mut dated = f.env.clone();
+        let old = format!("@{} +0000", proto::wall_ms() / 1000 - 3 * 86_400);
+        dated.extend([("GIT_AUTHOR_DATE".to_string(), old.clone()), ("GIT_COMMITTER_DATE".to_string(), old)]);
+        for i in 0..8 {
+            let wt = f.lane(&format!("landed{i}"));
+            f.write(&wt, &format!("l{i}.txt"), "landed\n");
+            f.commit(&wt, "lane work");
+            f.g(&f.repo, &["merge", "-q", "--no-ff", "-m", "land", &format!("rc-landed{i}")]);
+        }
+        for i in 0..8 {
+            let wt = f.lane(&format!("dormant{i}"));
+            f.write(&wt, &format!("d{i}.txt"), "old\n");
+            f.g(&wt, &["add", "-A"]);
+            let (ok, _, err) = git(&wt, &dated, &["commit", "-q", "-m", "old work"]);
+            assert!(ok, "{err}");
+        }
+        for i in 0..2 {
+            let wt = f.lane(&format!("dirty{i}"));
+            f.write(&wt, &format!("w{i}.txt"), "mine\n");
+            f.commit(&wt, "lane work");
+            f.write(&wt, "a.txt", "edited\n");
+        }
+        f.write(&f.repo, "b.txt", "moved\n");
+        f.commit(&f.repo, "work moves");
+        for i in 0..2 {
+            let wt = f.lane(&format!("fresh{i}"));
+            f.write(&wt, &format!("f{i}.txt"), "new\n");
+            f.commit(&wt, "lane work");
+        }
+        let bot = f.bot();
+        let execs = |bot: &Lanes| {
+            let before = crate::git_exec::on_this_thread();
+            bot.pass(&f.w()).unwrap();
+            crate::git_exec::on_this_thread() - before
+        };
+        let (first, idle) = (execs(&bot), execs(&bot));
+        eprintln!("git execs: first round {first}, idle round {idle} (20 lanes)");
+        let lanes: Vec<(String, Outcome, u64)> = bot.list().into_iter().map(|l| (l.branch, l.outcome, l.active_ms)).collect();
+        for (word, n) in [("landed", 8), ("dormant", 8), ("dirty", 2), ("up-to-date", 2)] {
+            assert_eq!(lanes.iter().filter(|l| l.1.word() == word).count(), n, "{lanes:?}");
+        }
+        assert_eq!((first, idle), (0, 0));
+        // the driver git itself reads, installed without it
+        let wt = f.root.join("fresh0");
+        assert_eq!(f.g(&wt, &["config", "--worktree", "--get", "merge.ci-proof.name"]), "ci.toml proofs");
+        // work moves: only the lanes that take it spawn git (the merge), the rest read nothing new
+        f.write(&f.repo, "c.txt", "again\n");
+        f.commit(&f.repo, "work moves again");
+        let moved = execs(&bot);
+        assert!(matches!(f.result(&bot, "rc-fresh0"), Outcome::Merged(_)) && matches!(f.result(&bot, "rc-landed0"), Outcome::Landed));
+        assert_eq!((execs(&bot), f.result(&bot, "rc-dirty0").word()), (0, "dirty"), "after {moved} for two merges");
     }
 
     #[test]
@@ -901,6 +1421,31 @@ mod tests {
         assert_eq!(f.g(&wt, &["status", "--porcelain"]), "");
         let (is_old, _, _) = git(&wt, &[], &["merge-base", "--is-ancestor", &lane_tip, "HEAD"]);
         assert!(!is_old);
+    }
+
+    #[test]
+    fn a_locked_worktree_waits_a_round_before_it_warns() {
+        let f = Fix::new("locked");
+        let wt = f.lane("a");
+        f.write(&wt, "lane.txt", "lane\n");
+        f.commit(&wt, "lane work");
+        f.write(&f.repo, "b.txt", "landed\n");
+        f.commit(&f.repo, "landed");
+        let lock = PathBuf::from(f.g(&wt, &["rev-parse", "--absolute-git-dir"])).join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+        let bot = f.bot();
+        let warns = || f.events.lock().unwrap().iter().filter(|(sev, _)| *sev == Sev::Warn).count();
+        bot.pass(&f.w()).unwrap();
+        assert!(matches!(f.result(&bot, "rc-a"), Outcome::Waiting(w) if w.starts_with(LOCKED)), "{:?}", bot.list());
+        assert_eq!(warns(), 0, "one round under a lane's own git is no warning");
+        bot.pass(&f.w()).unwrap();
+        assert!(matches!(f.result(&bot, "rc-a"), Outcome::Failed(w) if w.contains("index.lock")), "{:?}", bot.list());
+        assert_eq!(warns(), 1, "a second round locked warns");
+        bot.pass(&f.w()).unwrap();
+        assert_eq!(warns(), 1, "and says it once");
+        std::fs::remove_file(&lock).unwrap();
+        bot.pass(&f.w()).unwrap();
+        assert!(matches!(f.result(&bot, "rc-a"), Outcome::Merged(_)), "{:?}", bot.list());
     }
 
     #[test]
@@ -932,6 +1477,28 @@ mod tests {
         assert_eq!(f.result(&again, "rc-a"), Outcome::Merged(m));
     }
 
+    /// Both sides add one dependency in places a line merge keeps apart: the merged manifest has
+    /// the key twice, so the merge is a conflict naming file, line and key, and nothing is merged.
+    #[test]
+    fn a_merge_whose_manifest_does_not_parse_is_a_conflict() {
+        let f = Fix::new("manifest");
+        let base = "[package]\nname = \"x\"\n\n[dev-dependencies]\na = \"1\"\nb = \"1\"\nc = \"1\"\nd = \"1\"\ne = \"1\"\n";
+        f.write(&f.repo, "Cargo.toml", base);
+        f.commit(&f.repo, "manifest");
+        let wt = f.lane("m");
+        f.write(&wt, "Cargo.toml", &base.replace("a = \"1\"\n", "a = \"1\"\ndup = \"1\"\n"));
+        let lane_tip = f.commit(&wt, "lane adds dup");
+        f.write(&f.repo, "Cargo.toml", &format!("{base}dup = \"1\"\n"));
+        f.commit(&f.repo, "work adds dup");
+        let bot = f.bot();
+        bot.pass(&f.w()).unwrap();
+        let got = f.result(&bot, "rc-m");
+        assert!(matches!(&got, Outcome::Conflict(files) if files.len() == 1 && files[0].starts_with("Cargo.toml:11: duplicate key `dup`")), "{got:?}");
+        assert_eq!(f.g(&wt, &["rev-parse", "HEAD"]), lane_tip, "nothing was merged");
+        let ev = f.events.lock().unwrap().clone();
+        assert!(ev.iter().any(|(s, l)| *s == Sev::Warn && l.contains("rc-m") && l.contains("Cargo.toml:11")), "{ev:?}");
+    }
+
     #[test]
     fn a_conflict_touches_nothing_and_notifies() {
         let f = Fix::new("conflict");
@@ -953,10 +1520,67 @@ mod tests {
         // not retried (nor re-announced) until the branch or the tip moves
         assert!(bot.pass(&f.w()).unwrap().is_empty());
         assert_eq!(f.events.lock().unwrap().len(), ev.len());
+        // the same conflict against a newer tip is not said again
+        f.write(&f.repo, "b.txt", "landed\n");
+        f.commit(&f.repo, "unrelated landing");
+        bot.pass(&f.w()).unwrap();
+        assert_eq!(f.result(&bot, "rc-c"), Outcome::Conflict(vec!["a.txt".into()]));
+        assert_eq!(f.events.lock().unwrap().len(), ev.len());
         // the lane resolves by hand: its merge holds work, the bot sees it up to date
         f.g(&wt, &["merge", "-q", "work", "-X", "ours", "-m", "resolve"]);
         bot.pass(&f.w()).unwrap();
         assert_eq!(f.result(&bot, "rc-c"), Outcome::UpToDate);
+    }
+
+    /// A lane whose own commits do not read fails the round, said as a warning, and is never called
+    /// dormant for it: a lane listed dormant is one the user may drop (a read error taken for "no
+    /// commit of its own" once listed fresh lanes as dormant).
+    #[test]
+    fn a_lane_whose_commits_do_not_read_fails_and_is_never_dormant() {
+        let f = Fix::new("unread");
+        let wt = f.lane("x");
+        f.write(&wt, "x1.txt", "one\n");
+        let first = f.commit(&wt, "lane work");
+        f.write(&wt, "x2.txt", "two\n");
+        f.commit(&wt, "more lane work");
+        std::fs::remove_file(f.repo.join(".git/objects").join(&first[..2]).join(&first[2..])).unwrap();
+        let bot = f.bot();
+        bot.pass(&f.w()).unwrap();
+        match f.result(&bot, "rc-x") {
+            Outcome::Failed(why) => assert!(why.contains("its own commits do not read (rc-x at "), "{why}"),
+            o => panic!("a lane that does not read: {o:?}"),
+        }
+        let ev = f.events.lock().unwrap().clone();
+        assert!(ev.iter().any(|(s, l)| *s == Sev::Warn && l.contains("rc-x") && l.contains("do not read")), "{ev:?}");
+    }
+
+    #[test]
+    fn a_dormant_lane_is_left_alone_until_used_again() {
+        let f = Fix::new("dormant");
+        let wt = f.lane("z");
+        f.write(&wt, "lane.txt", "lane\n");
+        let old = (proto::wall_ms() / 1000 - 3 * 86_400).to_string();
+        let mut aged = f.env.clone();
+        aged.extend([("GIT_COMMITTER_DATE".to_string(), format!("@{old} +0000")), ("GIT_AUTHOR_DATE".to_string(), format!("@{old} +0000"))]);
+        git(&wt, &aged, &["add", "-A"]);
+        git(&wt, &aged, &["commit", "-q", "-m", "old lane work"]);
+        let head = f.g(&wt, &["rev-parse", "HEAD"]);
+        f.write(&f.repo, "b.txt", "landed\n");
+        f.commit(&f.repo, "landed");
+        let bot = f.bot();
+        bot.pass(&f.w()).unwrap();
+        assert_eq!(f.result(&bot, "rc-z"), Outcome::Dormant(1));
+        assert_eq!(f.g(&wt, &["rev-parse", "HEAD"]), head, "no merge into a dormant lane");
+        let n = f.events.lock().unwrap().len();
+        f.write(&f.repo, "c.txt", "again\n");
+        f.commit(&f.repo, "another landing");
+        bot.pass(&f.w()).unwrap();
+        assert_eq!(f.events.lock().unwrap().len(), n, "said once");
+        // a fresh commit wakes it: merged at once
+        f.write(&wt, "lane2.txt", "back\n");
+        f.commit(&wt, "back at it");
+        bot.pass(&f.w()).unwrap();
+        assert!(matches!(f.result(&bot, "rc-z"), Outcome::Merged(_)), "{:?}", bot.list());
     }
 
     #[test]
@@ -981,6 +1605,38 @@ mod tests {
         bot.pass(&f.w()).unwrap();
         assert!(matches!(f.result(&bot, "rc-d"), Outcome::Merged(_)), "{:?}", bot.list());
         assert!(wt.join("scratch.log").is_file());
+    }
+
+    #[test]
+    fn a_quiet_dirty_lane_is_not_read_again() {
+        let f = Fix::new("quiet");
+        let wt = f.lane("q");
+        f.write(&wt, "lane.txt", "lane\n");
+        f.commit(&wt, "lane work");
+        f.write(&f.repo, "b.txt", "landed\n");
+        f.commit(&f.repo, "landed");
+        f.write(&wt, "a.txt", "editing\n");
+        let m = crate::monitor::Monitor::start(&[f.root.clone()]);
+        assert!(m.watching(), "{:?}", m.error);
+        let m2 = m.clone();
+        let bot = Lanes::with_watch(f.bot(), Box::new(move || Some(m2.clone())));
+        let reads = |b: &Lanes| (b.reads.load(Ordering::Relaxed), b.spared.load(Ordering::Relaxed));
+        bot.pass(&f.w()).unwrap();
+        assert!(matches!(f.result(&bot, "rc-q"), Outcome::Dirty(w) if w.contains("a.txt")));
+        let first = reads(&bot);
+        // nothing moved: the round keeps its answer without reading the worktree
+        bot.pass(&f.w()).unwrap();
+        assert!(matches!(f.result(&bot, "rc-q"), Outcome::Dirty(_)));
+        assert_eq!(reads(&bot), (first.0, first.1 + 1));
+        // the edit undone is heard: the next round reads it again and merges
+        f.write(&wt, "a.txt", "one\ntwo\nthree\n");
+        for _ in 0..50 {
+            bot.pass(&f.w()).unwrap();
+            if matches!(f.result(&bot, "rc-q"), Outcome::Merged(_)) { break; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(matches!(f.result(&bot, "rc-q"), Outcome::Merged(_)), "{:?}", bot.list());
+        assert!(reads(&bot).0 > first.0);
     }
 
     #[test]

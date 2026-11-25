@@ -73,12 +73,33 @@ pub struct Hooks<'a> {
 mod unix {
     pub const SIGILL: i32 = 4;
     pub const SIGTRAP: i32 = 5;
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    pub const SIGABRT: i32 = 6;
     pub const SIGFPE: i32 = 8;
     pub const SIGSEGV: i32 = 11;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub const SIGBUS: i32 = 7;
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     pub const SIGBUS: i32 = 10;
+
+    /// Reports SIGABRT before the handler restores the default action.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    pub unsafe fn report_abort(pc: u64, fp: u64) {
+        use crate::jit::{collect_frames, cur_unit, PanicInfo};
+        let tname = crate::os::thread::name(crate::os::thread::current());
+        if cur_unit().is_null() {
+            eprintln!("makepad: SIGABRT on thread '{}' (no JIT unit)", tname);
+            return;
+        }
+        let frames = collect_frames(fp, pc, false);
+        let info = PanicInfo { kind: "abort".to_string(), message: format!("SIGABRT (abort() called) on thread '{}'", tname), site: u64::MAX, frames, fault_addr: 0, location: String::new() };
+        let unit_here = cur_unit() as usize; // the calling thread's unit; the closure runs on the owner
+        // 0 allows 2 ms for the owner to start; owner-thread calls run inline.
+        match crate::owner::call_within(crate::owner::Class::Job, 0, || (&*(unit_here as *mut crate::jit::Unit)).report(&info)) {
+            Some(r) => eprintln!("makepad: abort on thread '{}'\n  report: {}", tname, r),
+            None => eprintln!("makepad: SIGABRT on thread '{}' while the compiler is busy", tname),
+        }
+    }
 
     pub fn kind(sig: i32) -> super::Kind {
         use super::Kind;
@@ -96,7 +117,7 @@ mod unix {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::unix::{kind, SIGBUS, SIGFPE, SIGILL, SIGSEGV};
+    use super::unix::{kind, report_abort, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV};
     use super::{Action, Fault, Hooks};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -111,7 +132,7 @@ mod imp {
     }
 
     #[repr(C)]
-    struct SigAction {
+    pub(crate) struct SigAction {
         handler: usize,
         mask: [u64; 16],
         flags: i32,
@@ -139,6 +160,11 @@ mod imp {
             // the handler allocates: in the system heap, never in the faulting thread's arena (the fault may be inside its allocator)
             let _kept = crate::zone_alloc::kept();
             let gregs = uc.add(40) as *mut u64;
+            if sig == SIGABRT {
+                report_abort(*gregs.add(16), *gregs.add(10));
+                default_action(SIGABRT);
+                return;
+            }
             // MAKEPAD_RUN_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
             if sig == SIG_WATCHDOG && crate::jit::WATCH_DUMP.load(std::sync::atomic::Ordering::Relaxed) {
                 let (pc, fp) = (*gregs.add(16), *gregs.add(10));
@@ -168,30 +194,32 @@ mod imp {
     /// `this_thread_done`.
     pub fn this_thread() -> u64 {
         unsafe {
-            let stack = super::guarded_altstack(1 << 16);
-            let ss = StackT { sp: stack as *mut u8, flags: 0, pad: 0, size: 1 << 16 };
+            let stack = super::guarded_altstack();
+            let ss = StackT { sp: stack as *mut u8, flags: 0, pad: 0, size: super::ALTSTACK };
             sigaltstack(&ss, std::ptr::null_mut());
             stack
         }
     }
 
-    /// The calling thread ends: its fault stack `sp` (this_thread's) is switched off and freed,
-    /// unless something else replaced it since.
+    /// The calling thread ends: its fault stack `sp` (this_thread's) is switched off if it is still
+    /// on and given back (`free_altstack`). It can be off already: std's thread end switches off
+    /// whichever stack is on, and something else may have replaced it; either way nothing uses it.
     pub fn this_thread_done(sp: u64) {
         const SS_DISABLE: i32 = 2;
         unsafe {
             let mut old = StackT { sp: std::ptr::null_mut(), flags: 0, pad: 0, size: 0 };
-            if sigaltstack(std::ptr::null(), &mut old) != 0 || old.sp as u64 != sp || old.flags & SS_DISABLE != 0 {
+            if sigaltstack(std::ptr::null(), &mut old) != 0 {
                 return;
             }
+            let on = old.sp as u64 == sp && old.flags & SS_DISABLE == 0;
             let off = StackT { sp: std::ptr::null_mut(), flags: SS_DISABLE, pad: 0, size: 0 };
-            if sigaltstack(&off, std::ptr::null_mut()) == 0 {
-                super::free_altstack(sp, old.size);
+            if !on || sigaltstack(&off, std::ptr::null_mut()) == 0 {
+                super::free_altstack(sp);
             }
         }
     }
 
-    const OUR_SIGNALS: [i32; 5] = [SIGILL, SIGBUS, SIGFPE, SIG_WATCHDOG, SIGSEGV];
+    const OUR_SIGNALS: [i32; 6] = [SIGILL, SIGBUS, SIGFPE, SIG_WATCHDOG, SIGSEGV, SIGABRT];
     const SA_SIGINFO: i32 = 4;
     /// SA_SIGINFO | SA_ONSTACK. No SA_NODEFER: the signal stays blocked while its handler runs,
     /// so a fault inside the handler is not handled again (the kernel kills the process).
@@ -209,6 +237,15 @@ mod imp {
     /// Handlers a library of the program installed over ours (Chromium's in cef_initialize, as on
     /// macOS): (handler, flags) per signal, called for signals that are not faults in JIT code.
     static CHAINED: [[AtomicUsize; 2]; 32] = [const { [const { AtomicUsize::new(0) }; 2] }; 32];
+
+    /// A handler the ended run's program chained goes; a library's stays.
+    pub(crate) unsafe fn reset_statics() {
+        for handler in CHAINED.iter().flatten() {
+            if crate::stale::lookup(handler.load(Ordering::Relaxed) as u64).is_some() {
+                handler.store(0, Ordering::Relaxed);
+            }
+        }
+    }
 
     /// Puts our handlers back on top where the program replaced them, keeping the replacement as
     /// the next handler in the chain (the run monitor calls this every 100 ms). Without it a fault
@@ -290,7 +327,7 @@ mod imp {
     }
 
     #[repr(C)]
-    struct SigAction {
+    pub(crate) struct SigAction {
         flags: i32,
         pad: i32,
         handler: usize,
@@ -347,25 +384,27 @@ mod imp {
     /// `this_thread_done`.
     pub fn this_thread() -> u64 {
         unsafe {
-            let stack = super::guarded_altstack(1 << 16);
-            let ss = StackT { sp: stack as *mut u8, flags: 0, pad: 0, size: 1 << 16 };
+            let stack = super::guarded_altstack();
+            let ss = StackT { sp: stack as *mut u8, flags: 0, pad: 0, size: super::ALTSTACK };
             sigaltstack(&ss, std::ptr::null_mut());
             stack
         }
     }
 
-    /// The calling thread ends: its fault stack `sp` (this_thread's) is switched off and freed,
-    /// unless something else replaced it since.
+    /// The calling thread ends: its fault stack `sp` (this_thread's) is switched off if it is still
+    /// on and given back (`free_altstack`). It can be off already: std's thread end switches off
+    /// whichever stack is on, and something else may have replaced it; either way nothing uses it.
     pub fn this_thread_done(sp: u64) {
         const SS_DISABLE: i32 = 2;
         unsafe {
             let mut old = StackT { sp: std::ptr::null_mut(), flags: 0, pad: 0, size: 0 };
-            if sigaltstack(std::ptr::null(), &mut old) != 0 || old.sp as u64 != sp || old.flags & SS_DISABLE != 0 {
+            if sigaltstack(std::ptr::null(), &mut old) != 0 {
                 return;
             }
+            let on = old.sp as u64 == sp && old.flags & SS_DISABLE == 0;
             let off = StackT { sp: std::ptr::null_mut(), flags: SS_DISABLE, pad: 0, size: 0 };
-            if sigaltstack(&off, std::ptr::null_mut()) == 0 {
-                super::free_altstack(sp, old.size);
+            if !on || sigaltstack(&off, std::ptr::null_mut()) == 0 {
+                super::free_altstack(sp);
             }
         }
     }
@@ -412,6 +451,15 @@ mod imp {
     /// macOS): (handler, flags) per signal, called for signals that are not faults in JIT code.
     static CHAINED: [[AtomicUsize; 2]; 65] = [const { [const { AtomicUsize::new(0) }; 2] }; 65];
 
+    /// A handler the ended run's program chained goes; a library's stays.
+    pub(crate) unsafe fn reset_statics() {
+        for handler in CHAINED.iter().flatten() {
+            if crate::stale::lookup(handler.load(Ordering::Relaxed) as u64).is_some() {
+                handler.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Puts our handlers back on top where the program replaced them, keeping the replacement as
     /// the next handler in the chain (the run monitor calls this every 100 ms). Without it a fault
     /// in JIT code after CEF started was Chromium's (a bare core dump, no report).
@@ -453,28 +501,29 @@ mod imp {
 
 /// macOS (Apple Silicon): the Darwin arm64 ucontext; handlers a library installed over ours
 /// (Chromium's in CefInitialize) stay chained.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod imp {
-    use super::unix::{kind, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
+    use super::unix::{kind, report_abort, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
     use super::{Action, Fault, Hooks};
-    use crate::jit::{collect_frames, cur_unit, PanicInfo};
+    use crate::jit::cur_unit;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// SIGUSR1 (Darwin numbering): the hang watchdog's signal
     pub const SIG_WATCHDOG: i32 = 30;
     /// the watchdog's signal handler runs on the looping thread itself
     pub const NEEDS_HANG_TRAMP: bool = false;
-    const SIGABRT: i32 = 6;
 
     extern "C" {
         fn sigaction(sig: i32, act: *const SigAction, old: *mut SigAction) -> i32;
         fn sigaltstack(ss: *const StackT, old: *mut StackT) -> i32;
+        // macOS only: iOS has no MAP_JIT pages (no executable memory at all)
+        #[cfg(target_os = "macos")]
         fn pthread_jit_write_protect_np(enabled: i32);
     }
 
     /// Darwin `struct sigaction` (user side): handler, sa_mask (u32), sa_flags.
     #[repr(C)]
-    struct SigAction {
+    pub(crate) struct SigAction {
         handler: usize,
         mask: u32,
         flags: i32,
@@ -506,29 +555,6 @@ mod imp {
         let act = SigAction { handler: 0, mask: 0, flags: 0 };
         unsafe {
             sigaction(sig, &act, std::ptr::null_mut());
-        }
-    }
-
-    /// SIGABRT (libc abort(): malloc's heap checks, Foundation/ObjC fatal errors, an assertion in
-    /// a framework, std::process::abort) is not recoverable: report the thread and the JIT frames
-    /// that led there, then let the abort proceed (default action re-raised).
-    unsafe fn report_abort(uc: *mut u8) {
-        let mc = *(uc.add(UC_MCONTEXT) as *const *mut u8);
-        let reg = |off: usize| -> *mut u64 { mc.add(off) as *mut u64 };
-        let (pc, fp) = (*reg(SS_PC), *reg(SS_FP));
-        let tname = crate::os::thread::name(crate::os::thread::current());
-        if cur_unit().is_null() {
-            eprintln!("makepad: SIGABRT on thread '{}' (no JIT unit)", tname);
-            return;
-        }
-        let frames = collect_frames(fp, pc, false);
-        let info = PanicInfo { kind: "abort".to_string(), message: format!("SIGABRT (abort() called) on thread '{}'", tname), site: u64::MAX, frames, fault_addr: 0, location: String::new() };
-        // the report is a unit call: none when the compiler is busy (this very thread may be
-        // the one aborting inside it)
-        let unit_here = cur_unit() as usize; // the calling thread's unit (the closure runs on the owner)
-        match crate::owner::call_within(crate::owner::Class::Job, 0, || (&*(unit_here as *mut crate::jit::Unit)).report(&info)) {
-            Some(r) => eprintln!("makepad: abort on thread '{}'\n  report: {}", tname, r),
-            None => eprintln!("makepad: SIGABRT on thread '{}' while the compiler is busy", tname),
         }
     }
 
@@ -614,7 +640,9 @@ mod imp {
             // the handler allocates: in the system heap, never in the faulting thread's arena (the fault may be inside its allocator)
             let _kept = crate::zone_alloc::kept();
             if sig == SIGABRT {
-                report_abort(uc);
+                let mc = *(uc.add(UC_MCONTEXT) as *const *mut u8);
+                let reg = |off: usize| -> *mut u64 { mc.add(off) as *mut u64 };
+                report_abort(*reg(SS_PC), *reg(SS_FP));
                 // back to the default action: abort() raises again and the process ends
                 default_action(SIGABRT);
                 return;
@@ -628,7 +656,10 @@ mod imp {
             let f = Fault { kind: kind(sig), sig, pc: *reg(SS_PC), sp: *reg(SS_SP), fp: *reg(SS_FP), addr: *(info.add(SI_ADDR) as *const u64), lr: *reg(SS + 240) };
             // the program may fault while it has its own MAP_JIT pages in write mode
             // (pthread_jit_write_protect_np(0)); recovery continues in execute mode
+            #[cfg(target_os = "macos")]
             let prepare = || pthread_jit_write_protect_np(1);
+            #[cfg(not(target_os = "macos"))]
+            let prepare = || {};
             let debug = || fault_regs(uc);
             let chained = CHAINED[sig as usize][0].load(Ordering::SeqCst) > 1;
             match crate::jit::on_fault(&f, &Hooks { prepare: &prepare, chained, debug: &debug }) {
@@ -652,26 +683,28 @@ mod imp {
     /// `this_thread_done`.
     pub fn this_thread() -> u64 {
         unsafe {
-            let size = 1 << 16;
-            let stack = super::guarded_altstack(size);
-            let ss = StackT { sp: stack as *mut u8, size, flags: 0 };
+            let stack = super::guarded_altstack();
+            let ss = StackT { sp: stack as *mut u8, size: super::ALTSTACK, flags: 0 };
             sigaltstack(&ss, std::ptr::null_mut());
             stack
         }
     }
 
-    /// The calling thread ends: its fault stack `sp` (this_thread's) is switched off and freed,
-    /// unless something else replaced it since.
+    /// The calling thread ends: its fault stack `sp` (this_thread's) is switched off if it is still
+    /// on and given back (`free_altstack`). It can be off already: std's thread end switches off
+    /// whichever stack is on, and something else may have replaced it; either way nothing uses it.
     pub fn this_thread_done(sp: u64) {
         const SS_DISABLE: i32 = 4;
         unsafe {
             let mut old = StackT { sp: std::ptr::null_mut(), size: 0, flags: 0 };
-            if sigaltstack(std::ptr::null(), &mut old) != 0 || old.sp as u64 != sp || old.flags & SS_DISABLE != 0 {
+            if sigaltstack(std::ptr::null(), &mut old) != 0 {
                 return;
             }
-            let off = StackT { sp: std::ptr::null_mut(), size: 0, flags: SS_DISABLE };
-            if sigaltstack(&off, std::ptr::null_mut()) == 0 {
-                super::free_altstack(sp, old.size);
+            let on = old.sp as u64 == sp && old.flags & SS_DISABLE == 0;
+            // (Darwin checks the size first, also when switching off: ENOMEM for less than its minimum)
+            let off = StackT { sp: std::ptr::null_mut(), size: super::ALTSTACK, flags: SS_DISABLE };
+            if !on || sigaltstack(&off, std::ptr::null_mut()) == 0 {
+                super::free_altstack(sp);
             }
         }
     }
@@ -694,6 +727,15 @@ mod imp {
     /// SIGBUS, .. in CefInitialize): (handler, flags) per signal, called for signals that are not
     /// faults in JIT code -- the library keeps working, and faults in JIT code are still reported.
     static CHAINED: [[AtomicUsize; 2]; 32] = [const { [const { AtomicUsize::new(0) }; 2] }; 32];
+
+    /// A handler the ended run's program chained goes; a library's stays.
+    pub(crate) unsafe fn reset_statics() {
+        for handler in CHAINED.iter().flatten() {
+            if crate::stale::lookup(handler.load(Ordering::Relaxed) as u64).is_some() {
+                handler.store(0, Ordering::Relaxed);
+            }
+        }
+    }
 
     /// Puts our handlers back on top where the program replaced them, keeping the replacement as
     /// the next handler in the chain (the run monitor calls this every 100 ms).
@@ -781,7 +823,9 @@ mod imp {
         if trace() {
             trace_fault(rec.code, pc, chained);
         }
-        if chained && !crate::jit::in_jit_code(pc) {
+        // (the code of a run that ended and a thread of an ending run are this runtime's whatever
+        // unit is current: the normal search cannot walk their frames)
+        if chained && !crate::jit::in_jit_code(pc) && !crate::stale::in_ended_run(pc) && !crate::domain::current_is_ending() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         // the data address of an access violation / in-page error (ExceptionInformation[1]);
@@ -835,8 +879,17 @@ mod imp {
         unsafe { handle(ep, true) }
     }
 
+    /// The end of every search, on a thread's own stack and on a program stack (its last frame):
+    /// what the runtime does not resume ends the process here, with its code. The system's way on
+    /// is an error report, and with no one to answer it (no desktop, a dialog) the process stays.
     extern "system" fn unhandled(ep: *mut ExceptionPointers) -> i32 {
-        unsafe { handle(ep, false) }
+        unsafe {
+            let r = handle(ep, false);
+            if r != EXCEPTION_CONTINUE_EXECUTION {
+                TerminateProcess(GetCurrentProcess(), (*(*ep).record).code);
+            }
+            r
+        }
     }
 
     /// The stack-overflow handler runs in the thread's guaranteed stack area (64 KB).
@@ -861,6 +914,20 @@ mod imp {
     pub fn reassert() {}
 
     /// Suspends thread `t` and reads its context. MAKEPAD_RUN_COMPILE_WATCH: prints where it is. Hang
+    /// A run's end (domain.rs end_run): no signal ends a wait here. A synchronous I/O call is
+    /// cancelled, and the program's waits end by themselves (domain_threads.rs `waits`). Back in JIT
+    /// code the thread faults and ends as on unix.
+    pub fn end_interrupt(t: u64, waiting: usize) {
+        crate::domain_threads::waits::wake(waiting);
+        unsafe {
+            let h = OpenThread(THREAD_TERMINATE, 0, t as u32);
+            if h != 0 {
+                CancelSynchronousIo(h);
+                CloseHandle(h);
+            }
+        }
+    }
+
     /// watchdog: a thread running JIT code continues in jit::HANG_TRAMP as if the interrupted pc
     /// had called it (the return address pushed on its stack); there, on the thread itself, the
     /// policy decides as a watchdog signal's handler does.
@@ -892,28 +959,42 @@ mod imp {
             CloseHandle(h);
         }
     }
+
+    pub(crate) unsafe fn reset_statics() {}
 }
 
 #[cfg(not(target_os = "android"))]
 pub fn watchdog_signal() -> i32 { SIG_WATCHDOG }
 
-/// Fault stack memory: `size` bytes above one PROT_NONE guard page, so a handler that overflows
-/// its alternate stack faults on the guard (the process dies) instead of writing into whatever
-/// mapping lies below it.
+/// Fault stack memory: ALTSTACK bytes above one PROT_NONE guard page, so a handler that
+/// overflows its alternate stack faults on the guard (the process dies) instead of writing into
+/// whatever mapping lies below it. One a finished thread left (`free_altstack`), else a new one.
 #[cfg(unix)]
-fn guarded_altstack(size: usize) -> u64 {
-    let base = crate::os::mem::alloc_rw(size + ALTSTACK_GUARD);
+fn guarded_altstack() -> u64 {
+    if let Some(sp) = SPARE_ALTSTACKS.take() {
+        return sp;
+    }
+    let base = crate::os::mem::alloc_rw(ALTSTACK + ALTSTACK_GUARD);
     crate::os::mem::guard_page(base, ALTSTACK_GUARD);
     base + ALTSTACK_GUARD as u64
 }
 
 #[cfg(unix)]
+const ALTSTACK: usize = 1 << 16;
+#[cfg(unix)]
 const ALTSTACK_GUARD: usize = 16 << 10;
 
-/// Gives back what `guarded_altstack` made (`sp` above its guard, `size` bytes).
+/// Fault stacks no thread uses, for the next thread's `guarded_altstack`.
 #[cfg(unix)]
-fn free_altstack(sp: u64, size: usize) {
-    crate::os::mem::free(sp - ALTSTACK_GUARD as u64, size + ALTSTACK_GUARD);
+static SPARE_ALTSTACKS: crate::stack::Spares<u64> = crate::stack::Spares::new();
+
+/// A thread is done with what `guarded_altstack` made (`sp` above its guard): it is kept for the
+/// next thread, or unmapped when enough are kept.
+#[cfg(unix)]
+fn free_altstack(sp: u64) {
+    if let Some(sp) = SPARE_ALTSTACKS.keep(sp) {
+        crate::os::mem::free(sp - ALTSTACK_GUARD as u64, ALTSTACK + ALTSTACK_GUARD);
+    }
 }
 
 /// The calling thread's stack bounds (0, 0: unknown). Recorded in normal context;
@@ -923,7 +1004,7 @@ pub fn stack_bounds_of_self() -> (u64, u64) {
     if let Some((lo, hi)) = crate::stack::program_stack_bounds() {
         return (lo as u64, hi as u64);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     unsafe {
         extern "C" {
             fn pthread_self() -> usize;
@@ -967,9 +1048,9 @@ pub fn raw_stderr(b: &[u8]) {
     #[cfg(unix)]
     unsafe {
         extern "C" {
-            fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+            fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
         }
-        let _ = write(crate::tui::fault_fd(), b.as_ptr(), b.len());
+        let _ = write(crate::tui::fault_fd(), b.as_ptr().cast(), b.len());
     }
     #[cfg(windows)]
     {
@@ -993,4 +1074,9 @@ pub fn die_by(sig: i32) -> ! {
     }
     let _ = sig;
     std::process::abort()
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    imp::reset_statics();
 }

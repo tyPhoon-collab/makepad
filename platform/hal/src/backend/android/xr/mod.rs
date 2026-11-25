@@ -559,7 +559,7 @@ impl Targets {
 
 struct Presenter { frames: Arc<Frames>, stereo: bool }
 impl FramePresenter for Presenter {
-    fn submit(&self, _: u32, _: Id, image: Arc<Image>, presented: Box<dyn FnOnce(u64) + Send>) {
+    fn submit(&self, _: u32, _: Id, _from: u32, image: Arc<Image>, presented: Box<dyn FnOnce(u64) + Send>) {
         let slot = if self.stereo { &self.frames.stereo } else { &self.frames.panel };
         let eyes = if self.stereo { lock(&SCHEDULED_EYES).pop_front().flatten() } else { None };
         if self.stereo {
@@ -791,6 +791,7 @@ impl Chain {
     fn staging(dev: &Arc<Device>, size: [u32; 2], layers: u32, layered: bool) -> Result<Arc<Image>, String> {
         Image::new(dev.clone(), crate::session::TextureObj { format: crate::format::RGBA8, w: size[0] * if layered { 1 } else { layers }, h: size[1],
             depth: if layered { layers } else { 1 }, mips: 1, usage: crate::usage::RENDER_TARGET | crate::usage::SAMPLED, bytes: 0, imported: false, uploaded: 0, lent: None })
+            .map(|i| i.in_pool(crate::ledger::Pool::WindowCopies))
     }
 
     /// The staging image (when the chain swizzles) for a frame laid out as `frame`.

@@ -8,6 +8,12 @@
 //! Wayland shells present through EGL window surfaces; offscreen windows (hidden runs, tests) use
 //! the surfaceless platform. Images keep their top row first as on the other backends: every
 //! vertex shader of the dialect flips clip-space Y and the present blit flips it back.
+//!
+//! Every window frame renders into the window's retained image, which the surface shows a copy
+//! of. Under a badge layer of session 0's (`Gpu::badge_layer`: badges, panels and window layers
+//! the executor composes) a frame stays there; the layer's frame copies it into the window's
+//! composed image, draws the layer over it and presents that. The copies, as all GL work, are
+//! jobs of the render thread, queued ahead of the frame that reads them.
 
 pub(crate) mod egl;
 mod frame;
@@ -20,7 +26,7 @@ use super::exec::{self, Gpu, PipeStatus};
 use super::{Backend, Pixels};
 use crate::buffers::{CmdView, PipelineBlob};
 use crate::glsl::GlslPipeline;
-use crate::ledger::{Kind, LedgerEntry};
+use crate::ledger::{Charge, Kind, LedgerEntry, Pools};
 use crate::session::*;
 use crate::types::*;
 use render::{Caps, Event, Mailbox, Queue, ReadFormat, Token};
@@ -36,12 +42,10 @@ pub(crate) struct TexObj {
     /// a BGRA8 texture that is only uploaded keeps its bytes as RGBA storage, sampled swizzled
     swizzled: bool,
     queue: Queue,
-    allocated: Arc<AtomicU64>,
 }
 
 impl Drop for TexObj {
     fn drop(&mut self) {
-        self.allocated.fetch_sub(self.desc.bytes, Ordering::Relaxed);
         let key = self.key;
         self.queue.push(move |r| r.delete_texture(key));
     }
@@ -51,12 +55,10 @@ pub(crate) struct BufObj {
     key: u64,
     size: u64,
     queue: Queue,
-    allocated: Arc<AtomicU64>,
 }
 
 impl Drop for BufObj {
     fn drop(&mut self) {
-        self.allocated.fetch_sub(self.size, Ordering::Relaxed);
         let key = self.key;
         self.queue.push(move |r| r.delete_buffer(key));
     }
@@ -99,6 +101,13 @@ struct Pipe {
     epoch: u64,
     announced: bool,
 }
+/// A host window's composed image under its badge layer (`Gpu::badge_layer`): the retained image
+/// with the layer drawn over, what the window presents.
+pub(crate) struct Composed {
+    gen: u32,
+    obj: Arc<TexObj>,
+    _charge: Charge,
+}
 
 pub struct GlBackend {
     shell: Option<&'static super::linux::Shared>,
@@ -107,7 +116,8 @@ pub struct GlBackend {
     queue: Queue,
     thread: Option<std::thread::JoinHandle<()>>,
     next_key: u64,
-    allocated: Arc<AtomicU64>,
+    /// what the render thread allocates for itself (arenas, word textures, readback buffers)
+    pools: Arc<Pools>,
     tex: HashMap<(u32, u32), Tex>,
     buf: HashMap<(u32, u32), Buf>,
     pipe: HashMap<(u32, u32), Pipe>,
@@ -118,6 +128,11 @@ pub struct GlBackend {
     /// the id target of each window's newest pick frame, and the targets missing a draw
     pick_ids: HashMap<(u32, Id), Id>,
     pick_pending: HashSet<(u32, Id)>,
+    /// session 0's windows with a badge layer (by index), and the image each last presented: its
+    /// retained image with the layer over it
+    badged: HashMap<u32, Option<Composed>>,
+    /// the composed image the badge frame being encoded draws into
+    compose: Option<Arc<TexObj>>,
     mailbox: Mailbox,
     /// video, audio, MIDI, camera, dialogs (`backend/linux/media`)
     media: super::linux::media::Media,
@@ -145,15 +160,19 @@ impl GlBackend {
 
     fn with_source(wake: Arc<dyn Fn() + Send + Sync>, source: Box<dyn surface::EglSurfaceSource>, shell: Option<&'static super::linux::Shared>) -> Result<Self, String> {
         let mailbox = Mailbox::new(wake);
-        let (queue, caps, thread) = render::start(source, mailbox.clone())?;
-        let mut info = HalInfo { backend: backend_id::GL, dialect: dialect::GLSL, formats: caps.formats, msaa: 1, dpi: 1.0, flags: 0,
+        let pools = Arc::new(Pools::default());
+        let (queue, caps, thread) = render::start(source, mailbox.clone(), pools.clone())?;
+        // offscreen too: a badge layer is composed into the retained image's copy either way
+        let mut info = HalInfo { backend: backend_id::GL, dialect: dialect::GLSL, formats: caps.formats, msaa: 1, dpi: 1.0,
+            flags: info_flags::WINDOW_BADGES | info_flags::WINDOW_LAYERS,
             max_texture: caps.max_texture, max_window: [caps.max_texture; 2],
             device_kind: if caps.software { device_kind::SOFTWARE } else { device_kind::UNKNOWN }, ..Default::default() };
         info.set_device_name(&caps.renderer);
         if super::log_enabled() { eprintln!("[hal-gl] {} offscreen={} software={}", caps.renderer, shell.is_none(), caps.software); }
-        Ok(Self { shell, info, caps, queue, thread: Some(thread), next_key: 1, allocated: Arc::new(AtomicU64::new(0)),
+        Ok(Self { shell, info, caps, queue, thread: Some(thread), next_key: 1, pools,
             tex: HashMap::new(), buf: HashMap::new(), pipe: HashMap::new(), programs: HashMap::new(), win: HashMap::new(),
-            aliases: HashMap::new(), pick_ids: HashMap::new(), pick_pending: HashSet::new(), mailbox, media: Default::default() })
+            aliases: HashMap::new(), pick_ids: HashMap::new(), pick_pending: HashSet::new(), badged: HashMap::new(), compose: None,
+            mailbox, media: Default::default() })
     }
 
     /// A software rasterizer (llvmpipe): the default selection prefers hardware Vulkan and GL.
@@ -192,15 +211,13 @@ impl GlBackend {
         let key = self.key();
         let made = desc.clone();
         self.queue.push(move |r| r.create_texture(key, made, swizzled));
-        self.allocated.fetch_add(desc.bytes, Ordering::Relaxed);
-        Ok(Arc::new(TexObj { key, desc, swizzled, queue: self.queue.clone(), allocated: self.allocated.clone() }))
+        Ok(Arc::new(TexObj { key, desc, swizzled, queue: self.queue.clone() }))
     }
 
     fn new_buffer(&mut self, size: u64) -> Arc<BufObj> {
         let key = self.key();
         self.queue.push(move |r| r.create_buffer(key, size));
-        self.allocated.fetch_add(size, Ordering::Relaxed);
-        Arc::new(BufObj { key, size, queue: self.queue.clone(), allocated: self.allocated.clone() })
+        Arc::new(BufObj { key, size, queue: self.queue.clone() })
     }
 
     fn drain(&mut self, world: &mut World) {
@@ -216,6 +233,7 @@ impl GlBackend {
                     }
                     world.frame_done(sid, target, kind, frame, 0, done.time, [0.0; 2]);
                 }
+                Event::BufferLeases { req, status, leases } => world.to_session(sid, |q| q.buffer_leases(req, status, leases)),
                 Event::Readback { req, status, rect, pixels } => world.to_session(sid, |q| q.readback(req, status, rect, &pixels)),
                 Event::Pick { req, ids } => world.to_session(sid, |q| q.pick_result(req, &ids.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>())),
             }
@@ -240,17 +258,16 @@ impl GlBackend {
                 None => {}
             }
         }
-        let allocated = self.allocated.load(Ordering::Relaxed);
+        // GL has no count of a process's video memory: `device_allocated` stays unknown
         if let Some(host) = world.session_mut(HOST) {
+            let frame = host.frame;
+            host.ledger.set_pools(&self.pools, frame, crate::clock_ns());
             for ((sid, index), t) in &self.win {
                 if *sid == HOST && host.ledger.get(Kind::Window, *index).is_none_or(|r| r.gen != t.gen || r.bytes != t.obj.desc.bytes
                     || r.width != t.obj.desc.w || r.height != t.obj.desc.h) {
                     host.ledger.add(window_row(Id::new(*index, t.gen), &t.obj.desc, crate::clock_ns(), host.frame));
                 }
             }
-        }
-        for sid in world.session_ids() {
-            if let Some(s) = world.session_mut(sid) { s.ledger.device_allocated = Some(allocated); }
         }
     }
 
@@ -356,6 +373,7 @@ impl Backend for GlBackend {
         self.aliases.retain(|k, _| k.0 != sid);
         self.pick_ids.retain(|k, _| k.0 != sid);
         self.pick_pending.retain(|k| k.0 != sid);
+        if sid == HOST { self.badged.clear(); }
         self.programs.retain(|_, state| state.strong_count() > 0);
         exec::free_session(world, sid);
         if let Some(shell) = self.shell { shell.session_closed(sid); }
@@ -438,8 +456,7 @@ impl Gpu for GlBackend {
         let key = self.key();
         let made = desc.clone();
         self.queue.push(move |r| r.adopt_texture(key, name, made, owned));
-        self.allocated.fetch_add(bytes, Ordering::Relaxed);
-        let obj = Arc::new(TexObj { key, desc: desc.clone(), swizzled: false, queue: self.queue.clone(), allocated: self.allocated.clone() });
+        let obj = Arc::new(TexObj { key, desc: desc.clone(), swizzled: false, queue: self.queue.clone() });
         self.tex.insert((s.id, id.index), Tex { gen: id.gen, obj });
         Some(desc)
     }
@@ -466,6 +483,18 @@ impl Gpu for GlBackend {
     }
     fn buffer_destroy(&mut self, sid: u32, id: Id) {
         if self.buf.get(&(sid, id.index)).is_some_and(|b| b.gen <= id.gen) { self.buf.remove(&(sid, id.index)); }
+    }
+    fn buffer_readbacks(&mut self, s: &mut Session, req: u32, ranges: &[BufferReadRange]) {
+        let reads: Option<Vec<_>> = ranges.iter().map(|range| {
+            let b = self.buf.get(&(s.id, range.id.index)).filter(|b| b.gen == range.id.gen)?;
+            Some((b.obj.clone(), range.offset, range.len))
+        }).collect();
+        let Some(reads) = reads else { s.events.buffer_leases(req, readback::STALE, Vec::new()); return; };
+        let token = Token { sid: s.id, incarnation: s.font_frames.clone() };
+        self.queue.push(move |r| {
+            let ranges: Vec<_> = reads.iter().map(|(b, off, len)| (b.key, *off, *len)).collect();
+            r.read_buffers(token, req, &ranges);
+        });
     }
     fn buffer_evictable(&mut self, _sid: u32, _id: Id) {}
     fn pipeline_create(&mut self, s: &mut Session, id: Id, dialect: u32, blob: &PipelineBlob, _: Attr) -> PipeStatus {
@@ -525,9 +554,15 @@ impl Gpu for GlBackend {
     }
     fn window_closed(&mut self, sid: u32, id: Id) {
         self.win.remove(&(sid, id.index));
+        if sid == HOST { self.badged.remove(&id.index); }
         self.pick_ids.remove(&(sid, id));
         self.queue.push(move |r| r.ctx.close((sid, id)));
     }
+    fn badges(&self) -> bool { true }
+    fn badge_layer(&mut self, window: Id, on: bool) {
+        if on { self.badged.entry(window.index).or_insert(None); } else { self.badged.remove(&window.index); }
+    }
+    fn layer_copy(&mut self, s: &mut Session, window: Id, layer: Id, _now: u64) -> bool { self.copy_into_layer(s, window, layer) }
     fn window_lent(&mut self, sid: u32, id: Id, host: Id, attach: bool) {
         if let Some(shell) = self.shell { shell.lend(host, if attach { sid } else { HOST }, if attach { id } else { host }); }
         if attach {
@@ -601,12 +636,15 @@ fn video_row(s: &mut Session, id: Id, desc: &TextureObj) {
     } else {
         s.ledger.add(LedgerEntry { kind: Kind::Texture, detail: "video frame", index: id.index, gen: id.gen, bytes: desc.bytes,
             format: desc.format, width: desc.w, height: desc.h, mips: 1, attr: Attr::default(),
-            created_ns: crate::clock_ns(), created_frame: s.frame, last_used_frame: 0, last_used_ns: 0 });
+            created_ns: crate::clock_ns(), created_frame: s.frame, last_used_frame: 0, last_used_ns: 0, objects: 1, note: "" });
     }
 }
 
 fn window_row(id: Id, desc: &TextureObj, now: u64, frame: u64) -> LedgerEntry {
     LedgerEntry { kind: Kind::Window, detail: "window surface", index: id.index, gen: id.gen, bytes: desc.bytes,
         format: desc.format, width: desc.w, height: desc.h, mips: 1, attr: Attr::default(),
-        created_ns: now, created_frame: frame, last_used_frame: frame, last_used_ns: now }
+        created_ns: now, created_frame: frame, last_used_frame: frame, last_used_ns: now, objects: 1, note: WINDOW_NOTE }
 }
+
+/// The window image is counted; the EGL surface it is drawn to has buffers GL gives no size for.
+const WINDOW_NOTE: &str = "the EGL surface's buffers: the API reports no size";

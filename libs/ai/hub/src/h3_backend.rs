@@ -1643,29 +1643,6 @@ mod tests {
         assert_eq!(GenerateParams::from_request(&off).unwrap().interpolate, None);
     }
 
-    /// Off by default: the mux still gets H3's native 24 fps.
-    #[test]
-    fn no_interpolation_keeps_the_native_frame_rate() {
-        let mut backend = H3Backend::with_stubs(
-            "minimax-h3",
-            Box::new(|job: &VideoJob, _p: ProgressSink, _c: &CancelToken| Ok(stub_clip(job))),
-            Box::new(|input: &MuxInput| {
-                assert_eq!(input.fps, H3_FPS);
-                assert_eq!(input.frames_rgb8.len(), 3 * 32 * 16 * 3);
-                Ok(vec![1])
-            }),
-        );
-        let params = video_params(GenerateRequestJson {
-            model: "minimax-h3".to_string(),
-            prompt: Some("p".to_string()),
-            width: Some(32),
-            height: Some(16),
-            ..GenerateRequestJson::default()
-        });
-        let mut sink = |_: &str, _: f64| {};
-        backend.generate(&params, &mut sink, &CancelToken::new()).unwrap();
-    }
-
     /// An interpolated job on a backend whose manifest carries no
     /// [`ROLE_INTERPOLATE`] file fails loudly instead of quietly muxing
     /// 24 fps — the whole point of the request would be lost otherwise.
@@ -2033,22 +2010,22 @@ mod tests {
         // No requirements: any GPU, even unknown, passes (legacy models).
         check_gpu_requirements("legacy", None, None, &GpuInfo::default()).unwrap();
         // GPU-A-class box: q4 tier passes, nvfp4 (cap) and bf16 (vram) refuse.
-        let gpua = gpu(Some(24_564), Some(8.9));
+        let gpua = gpu(Some(24_000), Some(8.9));
         check_gpu_requirements("q4", Some(22.0), Some(8.9), &gpua).unwrap();
         assert!(check_gpu_requirements("nv4", Some(30.0), Some(12.0), &gpua).is_err());
         assert!(check_gpu_requirements("bf16", Some(90.0), None, &gpua).is_err());
         // GPU-B-class box: everything up to nvfp4 passes, bf16 refuses.
-        let gpub = gpu(Some(32_607), Some(12.0));
+        let gpub = gpu(Some(32_000), Some(12.0));
         check_gpu_requirements("q4", Some(22.0), Some(8.9), &gpub).unwrap();
         check_gpu_requirements("nv4", Some(30.0), Some(12.0), &gpub).unwrap();
         assert!(check_gpu_requirements("bf16", Some(90.0), None, &gpub).is_err());
-        // 96GB box passes bf16.
-        check_gpu_requirements("bf16", Some(90.0), Some(8.9), &gpu(Some(97_887), Some(12.0)))
+        // A 96 GB card passes bf16.
+        check_gpu_requirements("bf16", Some(90.0), Some(8.9), &gpu(Some(96_000), Some(12.0)))
             .unwrap();
         // UNKNOWN GPU with any requirement: refuse — never thrash-and-see.
         assert!(check_gpu_requirements("q4", Some(22.0), None, &GpuInfo::default()).is_err());
         assert!(check_gpu_requirements("nv4", None, Some(12.0), &GpuInfo::default()).is_err());
-        let vram_only = gpu(Some(32_607), None);
+        let vram_only = gpu(Some(32_000), None);
         assert!(check_gpu_requirements("nv4", Some(30.0), Some(12.0), &vram_only).is_err());
     }
 
@@ -2080,15 +2057,12 @@ mod tests {
         assert_eq!(snap_dim(352), 352);
     }
 
-    /// Real platform encode smoke (feature video + H3_MUX_SMOKE=1): drives the
+    /// Real platform encode smoke (feature video): drives the
     /// actual `VideoFileEncoder` (AVFoundation on macOS, Media Foundation on
     /// Windows) with a tiny synthetic clip + tone and checks we get an mp4.
     #[cfg(feature = "video")]
     #[test]
     fn real_mux_smoke() {
-        if std::env::var("H3_MUX_SMOKE").map(|v| v != "1").unwrap_or(true) {
-            return;
-        }
         let (w, h, f) = (64usize, 64usize, 24usize);
         let mut frames = Vec::with_capacity(f * h * w * 3);
         for frame in 0..f {

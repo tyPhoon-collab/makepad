@@ -1,6 +1,5 @@
 //! std::env: environment variables (behind a RwLock like real std), args, directories.
 
-use alloc::ffi::CString;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::error::Error;
@@ -14,6 +13,12 @@ use crate::sync::RwLock;
 use crate::sys;
 
 static ENV_LOCK: RwLock<()> = RwLock::new(());
+
+/// Held while an exec has the new program's environment in place (real std's env_read_lock):
+/// a set_var or remove_var waits for it.
+pub(crate) fn env_read_lock() -> crate::sync::RwLockReadGuard<'static, ()> {
+    ENV_LOCK.read().unwrap_or_else(crate::sync::PoisonError::into_inner)
+}
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum VarError {
@@ -40,6 +45,7 @@ extern "C" {
     fn relax_pm_getenv(key: *const u8, len: usize, out: *mut *const u8, out_len: *mut usize) -> i32;
 }
 
+// Build short keys on the stack like real std: no allocation for an absent variable.
 pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
     let kb = key.as_ref().as_encoded_bytes();
     let mut pm_out: *const u8 = core::ptr::null();
@@ -48,17 +54,11 @@ pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
         let bytes = unsafe { core::slice::from_raw_parts(pm_out, pm_len).to_vec() };
         return Some(OsString::from_bytes_vec(bytes));
     }
-    let key = match CString::new(kb) {
-        Ok(k) => k,
-        Err(_) => return None,
-    };
-    let _guard = ENV_LOCK.read();
-    let v = unsafe { sys::getenv(key.as_ptr()) };
-    if v.is_null() {
-        None
-    } else {
-        Some(OsString::from_bytes_vec(c_bytes(v)))
-    }
+    crate::fs::run_with_cstr(kb, &|key| {
+        let _guard = ENV_LOCK.read();
+        let v = unsafe { sys::getenv(key.as_ptr()) };
+        Ok(if v.is_null() { None } else { Some(OsString::from_bytes_vec(c_bytes(v))) })
+    }).ok().flatten()
 }
 
 pub fn var<K: AsRef<OsStr>>(key: K) -> Result<String, VarError> {
@@ -71,40 +71,37 @@ pub fn var<K: AsRef<OsStr>>(key: K) -> Result<String, VarError> {
     }
 }
 
-/// Safe to call in edition 2021 code (real std marks it `unsafe` only from edition 2024).
-pub fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
+/// Unsafe as real std's: a call needs no unsafe block before edition 2024 (`deprecated_safe_2024`).
+#[rustc_deprecated_safe_2024(audit_that = "the environment access only happens in single-threaded code")]
+pub unsafe fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
     let (key, value) = (key.as_ref(), value.as_ref());
-    let k = CString::new(key.as_encoded_bytes());
-    let v = CString::new(value.as_encoded_bytes());
-    let r = match (k, v) {
-        (Ok(k), Ok(v)) => {
+    let r = crate::fs::run_with_cstr(key.as_encoded_bytes(), &|k| {
+        crate::fs::run_with_cstr(value.as_encoded_bytes(), &|v| {
             let _guard = ENV_LOCK.write();
             if unsafe { sys::setenv(k.as_ptr(), v.as_ptr(), 1) } == 0 {
                 Ok(())
             } else {
                 Err(io::Error::last_os_error())
             }
-        }
-        _ => Err(io::const_error!(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte")),
-    };
+        })
+    });
     if let Err(e) = r {
         panic!("failed to set environment variable `{:?}` to `{:?}`: {}", key, value, e);
     }
 }
 
-pub fn remove_var<K: AsRef<OsStr>>(key: K) {
+/// Unsafe as real std's: a call needs no unsafe block before edition 2024 (`deprecated_safe_2024`).
+#[rustc_deprecated_safe_2024(audit_that = "the environment access only happens in single-threaded code")]
+pub unsafe fn remove_var<K: AsRef<OsStr>>(key: K) {
     let key = key.as_ref();
-    let r = match CString::new(key.as_encoded_bytes()) {
-        Ok(k) => {
-            let _guard = ENV_LOCK.write();
-            if unsafe { sys::unsetenv(k.as_ptr()) } == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
+    let r = crate::fs::run_with_cstr(key.as_encoded_bytes(), &|k| {
+        let _guard = ENV_LOCK.write();
+        if unsafe { sys::unsetenv(k.as_ptr()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
-        Err(_) => Err(io::const_error!(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte")),
-    };
+    });
     if let Err(e) = r {
         panic!("failed to remove environment variable `{:?}`: {}", key, e);
     }
@@ -290,11 +287,12 @@ pub fn current_dir() -> io::Result<PathBuf> {
 }
 
 pub fn set_current_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
-    let c = crate::fs::cstr(path.as_ref())?;
-    if unsafe { sys::chdir(c.as_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    crate::fs::run_path_with_cstr(path.as_ref(), &|c| {
+        if unsafe { sys::chdir(c.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })
 }
 
 pub fn current_exe() -> io::Result<PathBuf> {
@@ -302,7 +300,7 @@ pub fn current_exe() -> io::Result<PathBuf> {
     match sys::os::executable_path(&mut buf) {
         Some(n) => {
             let p = PathBuf::from(OsString::from_bytes_vec(buf[..n].to_vec()));
-            if cfg!(target_os = "macos") {
+            if cfg!(target_vendor = "apple") {
                 // real std canonicalizes _NSGetExecutablePath's result on macOS
                 crate::fs::canonicalize(&p)
             } else {
@@ -388,10 +386,10 @@ where
 pub mod consts {
     pub const ARCH: &str = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
     pub const FAMILY: &str = "unix";
-    pub const OS: &str = if cfg!(target_os = "macos") { "macos" } else if cfg!(target_os = "android") { "android" } else { "linux" };
+    pub const OS: &str = if cfg!(target_os = "macos") { "macos" } else if cfg!(target_os = "ios") { "ios" } else if cfg!(target_os = "android") { "android" } else { "linux" };
     pub const DLL_PREFIX: &str = "lib";
-    pub const DLL_SUFFIX: &str = if cfg!(target_os = "macos") { ".dylib" } else { ".so" };
-    pub const DLL_EXTENSION: &str = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    pub const DLL_SUFFIX: &str = if cfg!(target_vendor = "apple") { ".dylib" } else { ".so" };
+    pub const DLL_EXTENSION: &str = if cfg!(target_vendor = "apple") { "dylib" } else { "so" };
     pub const EXE_SUFFIX: &str = "";
     pub const EXE_EXTENSION: &str = "";
 }

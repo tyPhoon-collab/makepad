@@ -148,43 +148,40 @@ fn unrecorded_frame_reads_its_summary() {
     assert!(w.contains("UI work without spans"), "{w}");
 }
 
-/// `MKPF=<file> cargo test --release -p makepad-prof-stream --test flight -- --ignored ask_file`:
-/// answers on a recording (Q="<query>", default brief).
+/// Two lanes that wait on each other past the frame's end (a parked main thread and the lane it
+/// waits on, each woken by the other only later): the frame's critical path ends at once. It used
+/// to follow each wake back to the other lane at the same instant, without end (`pf brief` on such
+/// a recording spun for minutes).
 #[test]
-#[ignore]
-fn ask_file() {
-    let Ok(path) = std::env::var("MKPF") else { return };
-    let p = Profile::decode(&std::fs::read(path).unwrap()).unwrap();
-    let q = std::env::var("Q").unwrap_or_else(|_| "brief".into());
-    for q in q.split(';') {
-        println!("=== {q}\n{}", ask::ask(&p, q, None).text());
+fn critical_path_of_lanes_woken_by_each_other_later_ends() {
+    let mut b = ps::prelude().to_vec();
+    let start = 1_000 * MS;
+    ps::record(&mut b, ps::kind::HELLO, &ps::Hello { app: "game".into(), host: String::new(), pid: 7, build: "b".into(), device: String::new(), refresh_mhz: 60_000, flags: 1, start_mono: start }.payload());
+    let mut st = ps::Interner::default();
+    for s in ["", "main", "worker", "Draw", "lock"] {
+        st.id(s);
     }
-}
-
-/// `MKPF=<file> cargo test ... -- --ignored count_file`: segments per name and lane (what fills
-/// the rings).
-#[test]
-#[ignore]
-fn count_file() {
-    let Ok(path) = std::env::var("MKPF") else { return };
-    let p = Profile::decode(&std::fs::read(path).unwrap()).unwrap();
-    let span = (p.t_max - p.t_min) as f64 / 1e9;
-    let mut lanes: Vec<(usize, usize)> = (0..p.lanes.len()).map(|i| (i, p.lanes[i].rows.iter().map(|r| r.len()).sum::<usize>() + p.lanes[i].wakes.len())).collect();
-    lanes.sort_by(|a, b| b.1.cmp(&a.1));
-    println!("{} frames over {:.1} s", p.frames.len(), span);
-    for (i, n) in lanes.iter().take(6) {
-        let l = &p.lanes[*i];
-        let mut by: std::collections::HashMap<(u32, bool), usize> = Default::default();
-        for r in &l.rows {
-            for s in r {
-                *by.entry((s.name, s.wait)).or_default() += 1;
-            }
-        }
-        let mut v: Vec<_> = by.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
-        println!("{} ({}): {} segs+wakes ({:.0}/s), wakes {}", p.lane_name(*i), l.thread.role, n, *n as f64 / span, l.wakes.len());
-        for ((nm, w), c) in v.iter().take(12) {
-            println!("   {:>7} {}{}", c, if *w { "wait " } else { "" }, p.s(*nm));
-        }
-    }
+    ps::record(&mut b, ps::kind::STRINGS, &st.take_new().unwrap());
+    ps::record(&mut b, ps::kind::THREAD, &ps::thread_payload(1, 11, 0x100, ps::role::MAIN, 1));
+    ps::record(&mut b, ps::kind::THREAD, &ps::thread_payload(2, 12, 0x200, ps::role::OTHER, 2));
+    let t0 = start + 10 * MS;
+    let main = [
+        ps::SpanRec { kind: ps::span::BEGIN, t: t0, name: 3, a: 0 },
+        ps::SpanRec { kind: ps::span::WAIT_BEGIN, t: t0 + MS, name: 4, a: 0xa },
+        ps::SpanRec { kind: ps::span::WAIT_END, t: t0 + 100 * MS, name: 0, a: 0 },
+        ps::SpanRec { kind: ps::span::WAKE, t: t0 + 100 * MS, name: 0, a: 0xb },
+        ps::SpanRec { kind: ps::span::END, t: t0 + 101 * MS, name: 3, a: 0 },
+    ];
+    ps::record(&mut b, ps::kind::SPANS, &ps::spans_payload(1, &main));
+    let worker = [
+        ps::SpanRec { kind: ps::span::WAIT_BEGIN, t: t0 + MS, name: 4, a: 0xb },
+        ps::SpanRec { kind: ps::span::WAIT_END, t: t0 + 100 * MS, name: 0, a: 0 },
+        ps::SpanRec { kind: ps::span::WAKE, t: t0 + 100 * MS, name: 0, a: 0xa },
+    ];
+    ps::record(&mut b, ps::kind::SPANS, &ps::spans_payload(2, &worker));
+    let p = Profile::decode(&b).unwrap();
+    let main = p.main_lane().unwrap();
+    let path = p.critical_path(main, t0, t0 + 50 * MS);
+    assert!(path.len() <= 4, "{} steps", path.len());
+    assert!(path.iter().any(|s| s.wait.is_some() && s.ended_by.is_none() && s.t1 == t0 + 50 * MS), "the wait still running at the end is the path's last step");
 }

@@ -72,6 +72,14 @@ const RESERVE: usize = N * CHUNK;
 const NONE: usize = usize::MAX;
 // Compatible with 4/16/64 KB OS pages and Windows allocation granularity.
 const PAGE: usize = 64 << 10;
+/// What a small chunk commits at first (a slot of any class fits). Windows charges a committed page
+/// whether or not it is ever touched, and a thread has one chunk per size class it has used: a
+/// program's threads hold many chunks they barely touch. A chunk carved past this commits the rest
+/// at once: at most one more call per chunk. Elsewhere only touched pages count, so a chunk commits
+/// whole.
+const FIRST_COMMIT: usize = if cfg!(windows) { 1 << MAX_SHIFT } else { CHUNK };
+// A warm chunk was never carved past its first commit, so it serves any class as it is.
+const _: () = assert!(WARM_TOUCHED_MAX <= FIRST_COMMIT);
 
 /// Slow-path event counts (relaxed; the fast paths count nothing): contended lock acquisitions,
 /// scheduler yields while waiting, commits, decommits, partial-list pushes and pops.
@@ -226,29 +234,29 @@ fn thread_pointer() -> usize {
 /// thread-local destructors have started) takes the cold path, which reads `DOMAIN` the ordinary
 /// way and fills the slot. `SLOT_GUARD`'s destructor clears the slot in the thread's thread-local
 /// destructor round, before the thread-local storage it points into is released.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 static DOMAIN_KEY: AtomicUsize = AtomicUsize::new(0);
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 extern "C" {
     fn pthread_key_create(key: *mut usize, dtor: Option<extern "C" fn(*mut u8)>) -> i32;
     fn pthread_getspecific(key: usize) -> *mut u8;
     fn pthread_setspecific(key: usize, v: *const u8) -> i32;
 }
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 struct SlotGuard;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         unsafe { pthread_setspecific(DOMAIN_KEY.load(Ordering::Relaxed), std::ptr::null()) };
     }
 }
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 thread_local! {
     static SLOT_GUARD: SlotGuard = const { SlotGuard };
 }
 /// The calling thread's TSD slot `key` (macOS: tpidrro_el0 is the slot array, its low 3 bits the
 /// cpu number).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 #[inline(always)]
 fn tsd_slot(key: usize) -> usize {
     let v: usize;
@@ -262,7 +270,7 @@ fn tsd_slot(key: usize) -> usize {
 pub fn bind_program_tls() {
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(relax)))]
     DOMAIN_OFFSET.store((domain_tls() as *const DomainTls as usize).wrapping_sub(thread_pointer()), Ordering::Relaxed);
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| unsafe {
@@ -288,12 +296,12 @@ fn program_tls() -> Option<&'static DomainTls> {
     unsafe {
         Some(&*(thread_pointer().wrapping_add(DOMAIN_OFFSET.load(Ordering::Relaxed)) as *const DomainTls))
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
     {
         let p = tsd_slot(DOMAIN_KEY.load(Ordering::Relaxed));
         if p == 0 { None } else { Some(unsafe { &*(p as *const DomainTls) }) }
     }
-    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64", not(relax)), all(target_os = "macos", target_arch = "aarch64"))))]
+    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64", not(relax)), all(target_vendor = "apple", target_arch = "aarch64"))))]
     Some(domain_tls())
 }
 /// The thread's `DomainTls`, read the ordinary way; fills the fast paths' TSD slot (macOS arm64)
@@ -301,7 +309,7 @@ fn program_tls() -> Option<&'static DomainTls> {
 #[inline(always)]
 fn program_tls_fill() -> &'static DomainTls {
     let t = domain_tls();
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
     if SLOT_GUARD.try_with(|_| ()).is_ok() {
         unsafe { pthread_setspecific(DOMAIN_KEY.load(Ordering::Relaxed), t as *const DomainTls as *const u8) };
     }
@@ -354,7 +362,8 @@ impl Drop for ScratchGuard {
 // That recurses when used under a global allocator. These locks never allocate or park.
 struct Mutex<T> {
     held: AtomicBool,
-    id: usize,
+    /// the contention event's label (an atomic: the static arenas set theirs at their first use)
+    id: AtomicUsize,
     value: UnsafeCell<T>,
 }
 unsafe impl<T: Send> Sync for Mutex<T> {}
@@ -365,7 +374,7 @@ impl<T> Mutex<T> {
     const fn with_id(value: T, id: usize) -> Self {
         Self {
             held: AtomicBool::new(false),
-            id,
+            id: AtomicUsize::new(id),
             value: UnsafeCell::new(value),
         }
     }
@@ -398,7 +407,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
             return MutexGuard(m, PhantomData);
         }
         if spins == 0 {
-            event(m.id);
+            event(m.id.load(Ordering::Relaxed));
         }
         std::hint::spin_loop();
         spins += 1;
@@ -476,6 +485,8 @@ struct Owned {
     live: AtomicUsize,
     /// The arena's trim epoch this chunk's owner last looked at (`owned_tick`)
     trim_seen: usize,
+    /// How far the bump may go without committing more (`State::committed`)
+    limit: usize,
 }
 /// Compiler arena: a chunk is attached to at most one thread, the one that has it as its current
 /// chunk for the class (`remote != NONE` while attached). That thread allocates and frees its own
@@ -493,7 +504,6 @@ struct Chunk {
     /// lock may read it: the owner's thread-local record outlives its attached chunks (a thread
     /// hands every chunk back before its thread-locals go, DomainExitGuard).
     owner_quiet: AtomicUsize,
-    _line: [usize; 1],
     remote: AtomicUsize, // NONE: detached (and closes publication during handoff)
     remote_bytes: AtomicUsize,
     live: AtomicUsize,
@@ -525,6 +535,9 @@ struct State {
     /// A large block handed out from the warm large list: its pages hold old bytes, so
     /// `alloc_zeroed` writes the zeros the pool's decommitted runs would have given.
     dirty: bool,
+    /// The live blocks this chunk had when, detached, it last gave its whole free granules back
+    /// (`trim_detached`; usize::MAX: not since it was last handed back).
+    trim_live: usize,
 }
 
 // A buddy free-chunk list supports both single chunks and contiguous large mappings.
@@ -536,18 +549,6 @@ struct Pool {
     order: [u8; N],
 }
 impl Pool {
-    const fn new() -> Self {
-        let mut heads = [NONE; MAX_ORDER + 1];
-        heads[MAX_ORDER] = 0;
-        let mut order = [u8::MAX; N];
-        order[0] = MAX_ORDER as u8;
-        Self {
-            heads,
-            next: [NONE; N],
-            prev: [NONE; N],
-            order,
-        }
-    }
     fn remove(&mut self, i: usize, order: usize) {
         let (prev, next) = (self.prev[i], self.next[i]);
         if prev == NONE {
@@ -636,10 +637,10 @@ const GRANULE: usize = 4 << 10;
 #[cfg(not(target_arch = "x86_64"))]
 const GRANULE: usize = 16 << 10;
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 mod os {
     use std::ffi::c_void;
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     const ANON: i32 = 0x1000;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     const ANON: i32 = 0x20;
@@ -700,7 +701,7 @@ mod os {
         // Linux: MAP_FIXED_NOREPLACE; macOS has none: the hint, kept only when it was honoured
         #[cfg(any(target_os = "linux", target_os = "android"))]
         const FLAGS: i32 = 2 | ANON | 0x100000;
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         const FLAGS: i32 = 2 | ANON;
         let p = mmap(at as *mut c_void, size, 0, FLAGS, -1, 0);
         if p as isize == -1 {
@@ -716,7 +717,35 @@ mod os {
     pub unsafe fn unreserve(base: usize, size: usize) {
         munmap(base as *mut c_void, size);
     }
+    /// Resident bytes of `[at, at + size)` (diagnostics only). macOS: the pages the task's footprint
+    /// counts, present and not reusable: a page given back with MADV_FREE_REUSABLE (`release`) stays
+    /// present until the kernel takes it, and mincore counted it (the devhub panel's old chunks:
+    /// 319 MB "resident" for 2 MB live).
+    #[cfg(target_vendor = "apple")]
+    pub unsafe fn resident(at: usize, size: usize) -> usize {
+        extern "C" {
+            static mach_task_self_: u32;
+            fn mach_vm_page_range_query(task: u32, address: u64, size: u64, dispositions: u64, count: *mut u64) -> i32;
+        }
+        const P: usize = 16 << 10;
+        // VM_PAGE_QUERY_PAGE_PRESENT, VM_PAGE_QUERY_PAGE_REUSABLE
+        const PRESENT: i32 = 0x1;
+        const REUSABLE: i32 = 0x800;
+        let mut v = [0i32; 512];
+        let (mut n, mut off) = (0, 0);
+        while off < size {
+            let len = (size - off).min(512 * P);
+            let mut count = ((len + P - 1) / P) as u64;
+            if mach_vm_page_range_query(mach_task_self_, (at + off) as u64, len as u64, v.as_mut_ptr() as u64, &mut count) != 0 {
+                return n;
+            }
+            n += v[..(count as usize).min(512)].iter().filter(|&&d| d & PRESENT != 0 && d & REUSABLE == 0).count() * P;
+            off += len;
+        }
+        n
+    }
     /// Resident bytes of `[at, at + size)` (mincore; diagnostics only).
+    #[cfg(not(target_vendor = "apple"))]
     pub unsafe fn resident(at: usize, size: usize) -> usize {
         extern "C" {
             fn mincore(addr: *mut c_void, len: usize, vec: *mut u8) -> i32;
@@ -729,23 +758,16 @@ mod os {
             if mincore((at + off) as *mut c_void, len, v.as_mut_ptr()) != 0 {
                 return n;
             }
-            let pages = (len + page_size() - 1) / page_size();
-            n += v[..pages.min(512)].iter().filter(|&&b| b & 1 != 0).count() * page_size();
+            n += v[..(len + P - 1) / P].iter().filter(|&&b| b & 1 != 0).count() * P;
             off += len;
         }
         n
-    }
-    fn page_size() -> usize {
-        #[cfg(target_os = "macos")]
-        return 16 << 10;
-        #[cfg(not(target_os = "macos"))]
-        return 4 << 10;
     }
     pub unsafe fn commit(p: *mut u8, size: usize) -> bool {
         if mprotect(p.cast(), size, 1 | 2) != 0 {
             return false;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         {
             madvise(p.cast(), size, 8);
         } // MADV_FREE_REUSE, balances FREE_REUSABLE
@@ -756,18 +778,18 @@ mod os {
     /// replaced by a fresh PROT_NONE mapping, which also drops its pages at once).
     /// Returns the pages to the OS and keeps the mapping readable and writable.
     pub unsafe fn release(p: *mut u8, size: usize) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         const ADVICE: i32 = 7; // MADV_FREE_REUSABLE
         #[cfg(any(target_os = "linux", target_os = "android"))]
         const ADVICE: i32 = 4; // MADV_DONTNEED
         madvise(p.cast(), size, ADVICE) == 0
     }
     pub unsafe fn decommit(p: *mut u8, size: usize, zero: bool) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         const ADVICE: i32 = 7; // MADV_FREE_REUSABLE: removed from task footprint now
         #[cfg(any(target_os = "linux", target_os = "android"))]
         const ADVICE: i32 = 4; // MADV_DONTNEED
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         if zero {
             // MAP_PRIVATE | MAP_ANON | MAP_FIXED
             return mmap(p.cast(), size, 0, 2 | ANON | 0x10, -1, 0) as usize == p as usize;
@@ -784,12 +806,27 @@ mod os {
 
 #[cfg(windows)]
 mod os {
-    use relax_session::win32::{MemoryBasicInformation, VirtualAlloc, VirtualFree, VirtualQuery};
+    use relax_session::win32::{DiscardVirtualMemory, GetCurrentProcess, K32QueryWorkingSetEx, MemoryBasicInformation, VirtualAlloc, VirtualFree, VirtualQuery, WorkingSetExInformation};
     pub unsafe fn no_huge_pages(_base: usize, _size: usize) {}
     pub const THP: bool = false;
     pub unsafe fn huge_pages(_base: usize, _size: usize, _on: bool) {}
-    pub unsafe fn resident(_at: usize, _size: usize) -> usize {
-        0
+    /// Resident bytes of `[at, at + size)`: the pages in the working set (diagnostics only).
+    pub unsafe fn resident(at: usize, size: usize) -> usize {
+        const P: usize = 4096;
+        let mut v = [WorkingSetExInformation { addr: std::ptr::null_mut(), attributes: 0 }; 512];
+        let (mut n, mut off) = (0, 0);
+        while off < size {
+            let pages = ((size - off + P - 1) / P).min(512);
+            for (i, e) in v[..pages].iter_mut().enumerate() {
+                e.addr = (at + off + i * P) as *mut u8;
+            }
+            if K32QueryWorkingSetEx(GetCurrentProcess(), v.as_mut_ptr(), (pages * std::mem::size_of::<WorkingSetExInformation>()) as u32) == 0 {
+                return n;
+            }
+            n += v[..pages].iter().filter(|e| e.attributes & 1 != 0).count() * P;
+            off += pages * P;
+        }
+        n
     }
     pub unsafe fn reserve(size: usize, align: usize, _label: &'static std::ffi::CStr) -> usize {
         let raw = VirtualAlloc(std::ptr::null_mut(), size + align, 0x2000, 1) as usize;
@@ -812,8 +849,9 @@ mod os {
     pub unsafe fn commit(p: *mut u8, size: usize) -> bool {
         !VirtualAlloc(p.cast(), size, 0x1000, 4).is_null()
     }
+    /// The pages leave the working set now (MEM_RESET only marks them, for later); still committed.
     pub unsafe fn release(p: *mut u8, size: usize) -> bool {
-        !VirtualAlloc(p.cast(), size, 0x80000, 4).is_null() // MEM_RESET
+        DiscardVirtualMemory(p, size) == 0
     }
     pub unsafe fn decommit(p: *mut u8, size: usize, _zero: bool) -> bool {
         VirtualFree(p.cast(), size, 0x4000) != 0
@@ -849,73 +887,29 @@ pub struct Arena {
     /// it, so the free pages of a thread's current chunks are released by the thread.
     trim_epoch: AtomicUsize,
 }
-static DEFAULT: Arena = Arena::new();
+// all zero: in the binary's zero-fill section, not 7 MB of initialised data in it (iOS); `init`
+// sets what is not zero at the first use (`init_zeroed`), as `create` does for a domain arena.
+// SAFETY: every field has a valid all-zero representation (create relies on it too).
+static DEFAULT: Arena = unsafe { std::mem::zeroed() };
 impl Arena {
-    const fn new() -> Self {
-        Self {
-            dynamic: false,
-            id: 0,
-            base: AtomicUsize::new(0),
-            init: Mutex::new(false),
-            committed: AtomicUsize::new(0),
-            chunks: AtomicUsize::new(0),
-            warm: Mutex::with_id(
-                Warm {
-                    runs: [(0, 0); WARM_MAX],
-                    len: 0,
-                    bytes: 0,
-                },
-                2,
-            ),
-            warm_large: Mutex::with_id(
-                WarmLarge {
-                    runs: [(0, 0, 0); WARM_LARGE_MAX],
-                    len: 0,
-                    bytes: 0,
-                },
-                2,
-            ),
-            headers: [const {
-                Chunk {
-                    account: AtomicUsize::new(0),
-                    owned: UnsafeCell::new(Owned { free: 0, bump: AtomicUsize::new(0), stride: 0, live: AtomicUsize::new(0), trim_seen: 0 }),
-                    owner_quiet: AtomicUsize::new(0),
-                    _line: [0; 1],
-                    remote: AtomicUsize::new(NONE),
-                    remote_bytes: AtomicUsize::new(0),
-                    live: AtomicUsize::new(0),
-                    in_part: AtomicBool::new(false),
-                    huge: AtomicBool::new(false),
-                    old: AtomicBool::new(false),
-                    state: Mutex::new(State {
-                        released: true,
-                        generation: 0,
-                        free: 0,
-                        bump: 0,
-                        stride: 0,
-                        class: 0,
-                        attached: false,
-                        committed: 0,
-                        run: 0,
-                        order: 0,
-                        bytes: 0,
-                        dirty: false,
-                    }),
-                }
-            }; N],
-            pool: Mutex::with_id(Pool::new(), 1),
-            partial: Mutex::with_id(
-                Partial {
-                    heads: [0; CLASSES],
-                    next: [0; N],
-                    prev: [0; N],
-                    class: [0; N],
-                },
-                3,
-            ),
-            live_bits: AtomicUsize::new(0),
-            trim_epoch: AtomicUsize::new(0),
+    /// The fields of an all-zero arena that are not zero: free-list and pool links (NONE), the
+    /// chunks released, the pool's one whole-reservation run, the locks' event labels.
+    unsafe fn init_zeroed(&self) {
+        for h in &self.headers {
+            h.remote.store(NONE, Ordering::Relaxed);
+            (*h.state.value.get()).released = true;
         }
+        let pool = &mut *self.pool.value.get();
+        pool.heads.fill(NONE);
+        pool.heads[MAX_ORDER] = 0;
+        pool.next.fill(NONE);
+        pool.prev.fill(NONE);
+        pool.order.fill(u8::MAX);
+        pool.order[0] = MAX_ORDER as u8;
+        self.pool.id.store(1, Ordering::Relaxed);
+        self.warm.id.store(2, Ordering::Relaxed);
+        self.warm_large.id.store(2, Ordering::Relaxed);
+        self.partial.id.store(3, Ordering::Relaxed);
     }
 
     pub fn create() -> Option<Box<Self>> {
@@ -929,17 +923,7 @@ impl Arena {
             let a = &mut *p;
             a.dynamic = true;
             a.id = NEXT_ARENA_ID.fetch_add(1, Ordering::Relaxed);
-            for h in &a.headers {
-                h.remote.store(NONE, Ordering::Relaxed);
-                (*h.state.value.get()).released = true;
-            }
-            let pool = &mut *a.pool.value.get();
-            pool.heads.fill(NONE);
-            pool.heads[MAX_ORDER] = 0;
-            pool.next.fill(NONE);
-            pool.prev.fill(NONE);
-            pool.order.fill(u8::MAX);
-            pool.order[0] = MAX_ORDER as u8;
+            a.init_zeroed();
             if heap_check_on() {
                 a.live_bits.store(os_bits_map(), Ordering::Relaxed);
             }
@@ -1051,7 +1035,7 @@ impl Arena {
     /// and the remote list opens. Called with the chunk's lock held.
     unsafe fn attach(&self, h: &Chunk, s: &State) {
         // (a chunk taken from the lists had its free pages released there: no trim before the next epoch)
-        *h.owned.get() = Owned { free: s.free, bump: AtomicUsize::new(s.bump), stride: s.stride, live: AtomicUsize::new(h.live.load(Ordering::Relaxed)), trim_seen: self.trim_epoch.load(Ordering::Relaxed) };
+        *h.owned.get() = Owned { free: s.free, bump: AtomicUsize::new(s.bump), stride: s.stride, live: AtomicUsize::new(h.live.load(Ordering::Relaxed)), limit: s.committed, trim_seen: self.trim_epoch.load(Ordering::Relaxed) };
         if self.dynamic {
             let q = DOMAIN.try_with(|t| &t.quiet as *const AtomicU8 as usize).unwrap_or(0);
             h.owner_quiet.store(q, Ordering::Relaxed);
@@ -1079,6 +1063,7 @@ impl Arena {
         s.bump = o.bump.load(Ordering::Relaxed);
         h.live.store(o.live.load(Ordering::Relaxed), Ordering::Relaxed);
         s.attached = false;
+        s.trim_live = usize::MAX;
         if o.live.load(Ordering::Relaxed) == 0 {
             self.release_empty(index, s);
         } else if s.free != 0 || s.bump + s.stride <= CHUNK {
@@ -1151,6 +1136,22 @@ impl Arena {
         let chunk = self.base.load(Ordering::Relaxed) + index * CHUNK;
         if let Some(head) = self.drop_free_granules(index, chunk, o.stride, bump, o.free) {
             o.free = head;
+        }
+    }
+    /// A detached chunk `index` of a program heap (its lock held, `live` blocks) that a free left
+    /// sparse, its live blocks filling under a quarter of what it carved, gives its whole free
+    /// granules back at once, and again each time its live blocks halve: a chunk emptied by a
+    /// burst of frees is walked a few times, not at every free. They went back only on a trim,
+    /// which a program at rest gets only when something compiles (Fab kept them through hours of
+    /// edits).
+    unsafe fn trim_detached(&self, index: usize, s: &mut State, live: usize) {
+        if s.stride == 0 || s.committed == 0 || s.bump < OWNED_TRIM_MIN || live * s.stride * 4 >= s.bump || live * 2 > s.trim_live {
+            return;
+        }
+        s.trim_live = live;
+        let chunk = self.base.load(Ordering::Relaxed) + index * CHUNK;
+        if let Some(head) = self.drop_free_granules(index, chunk, s.stride, s.bump, s.free) {
+            s.free = head;
         }
     }
     /// The monitor (`densify`, chunk `index` attached, its lock held) settles a current chunk whose
@@ -1255,6 +1256,10 @@ impl Arena {
             let mut tried = lock(&self.init);
             if !*tried {
                 *tried = true;
+                // the static arena's non-zero state (a domain arena's was set by `create`)
+                if !self.dynamic {
+                    unsafe { self.init_zeroed() };
+                }
                 let base = unsafe {
                     if WEB_AT != 0 {
                         os::reserve_at(WEB_AT, RESERVE, LABEL)
@@ -1363,16 +1368,18 @@ impl Arena {
             os::huge_pages(address, len, false);
         }
     }
-    /// Domain heaps (Linux with transparent huge pages): a program heap's chunks are reserved
-    /// without huge pages, and only dense ones get them. A thread keeps a current chunk per size
-    /// class, so a program with 37 threads held 1212 chunks with 166 MB carved (Scope); with huge
-    /// pages everywhere, khugepaged turned every one of them into 2 MB resident (2-2.4 GB for 100
-    /// MB in use), while huge pages are worth having on dense heap data (Sandbox race UI-thread
-    /// CPU). Each pass marks for huge pages, and collapses at once: a thread's current chunk carved
-    /// at least half way, another small chunk at least half full of live blocks, a large block of a
-    /// whole 2 MB or more. A marked chunk no thread allocates in that fell under 1/8 live loses its
-    /// mark (the trim's page release then shrinks it). At most `budget` collapses per pass.
-    /// Returns the collapses done.
+    /// Domain heaps, once a second on every platform: the next trim epoch starts (each thread
+    /// settles its current chunks again, `owned_tick`) and the current chunks of threads blocked in
+    /// a wait are settled for them (`settle_for_waiting_owner`). With transparent huge pages
+    /// (Linux), a program heap's chunks are reserved without huge pages, and only dense ones get
+    /// them. A thread keeps a current chunk per size class, so a program with 37 threads held 1212
+    /// chunks with 166 MB carved (Scope); with huge pages everywhere, khugepaged turned every one of
+    /// them into 2 MB resident (2-2.4 GB for 100 MB in use), while huge pages are worth having on
+    /// dense heap data (Sandbox race UI-thread CPU). Each pass marks for huge pages, and collapses
+    /// at once: a thread's current chunk carved at least half way, another small chunk at least
+    /// half full of live blocks, a large block of a whole 2 MB or more. A marked chunk no thread
+    /// allocates in that fell under 1/8 live loses its mark (the trim's page release then shrinks
+    /// it). At most `budget` collapses per pass. Returns the collapses done.
     pub fn densify(&self, budget: usize) -> usize {
         let base = self.base.load(Ordering::Relaxed);
         if !self.dynamic || base == 0 {
@@ -1433,22 +1440,35 @@ impl Arena {
     /// unlisted (full)], columns [chunks, touched bytes, live slot bytes, resident bytes]; then
     /// [large runs, committed, resident]; then [sparse chunks (live slots under 1/8 of touched),
     /// their resident bytes]; then [chunks committed before the last `mark_old`, their live slot
-    /// bytes, their resident bytes] (`memory`'s arena states).
+    /// bytes, their resident bytes]; then the free granules and the requested bytes of attached
+    /// chunks; then the requested bytes of the large blocks (`memory`'s arena states).
     /// Does block `p` (of this arena) lie in a chunk marked old (`mark_old`)?
     pub fn is_old(&self, p: *const u8) -> bool {
         let base = self.base.load(Ordering::Relaxed);
         let off = (p as usize).wrapping_sub(base);
         base != 0 && off < RESERVE && self.headers[off / CHUNK].old.load(Ordering::Relaxed)
     }
-    /// Every committed chunk is old from now on (`states`' last row; a settle rebuild calls it).
+    /// Every committed chunk is old from now on (`states`' last row; a settle rebuild calls it,
+    /// before it drops the cold state). Old chunks drain: they leave the list of chunks with free
+    /// slots and never join it again, so what is allocated from now on packs into fresh chunks
+    /// instead of filling the holes between the cold state's blocks, and an old chunk is released
+    /// once its last block goes. (Filled holes kept every page of every cold chunk resident: 39 MB
+    /// live held 841 MB on 16 KB pages.) The threads hand their current chunks back at their next
+    /// slow path, so those drain too.
     pub fn mark_old(&self) {
-        for h in self.headers.iter() {
+        for (index, h) in self.headers.iter().enumerate() {
             let s = lock(&h.state);
             h.old.store(s.committed != 0, Ordering::Relaxed);
+            if s.committed != 0 && h.in_part.load(Ordering::Relaxed) {
+                lock(&self.partial).unlink(index, &self.headers);
+            }
+        }
+        if COMPILER && !self.dynamic {
+            HAND_BACK.fetch_add(1, Ordering::Relaxed);
         }
     }
-    pub fn states(&self) -> [usize; 28] {
-        let mut c = [0usize; 28];
+    pub fn states(&self) -> [usize; 29] {
+        let mut c = [0usize; 29];
         let base = self.base.load(Ordering::Relaxed);
         if base == 0 {
             return c;
@@ -1463,6 +1483,10 @@ impl Arena {
                 c[16] += 1;
                 c[17] += s.committed;
                 c[18] += res;
+                // the requested bytes of the live large block (a warm run: none)
+                if !s.released {
+                    c[28] += h.account.load(Ordering::Relaxed).wrapping_sub(h.remote_bytes.load(Ordering::Relaxed)) as isize as usize;
+                }
                 continue;
             }
             let (row, bump, live) = if s.released {
@@ -1543,6 +1567,10 @@ impl Arena {
         bytes
     }
     fn partial_push(&self, i: usize, class: usize) {
+        // an old chunk drains (`mark_old`): its free slots are never handed out again
+        if self.headers[i].old.load(Ordering::Relaxed) {
+            return;
+        }
         let mut p = lock(&self.partial);
         // a chunk that emptied meanwhile is on its way to the pool: never list it
         if p.class[i] != 0 || self.headers[i].live.load(Ordering::Relaxed) == 0 {
@@ -1575,7 +1603,7 @@ impl Arena {
     unsafe fn from_partial(&self, i: usize, stride: usize, class: usize, accounted: usize, attach: bool) -> *mut u8 {
         let h = &self.headers[i];
         let mut s = lock(&h.state);
-        if s.stride != stride || s.committed != CHUNK || s.released || s.attached {
+        if s.stride != stride || s.committed == 0 || s.released || s.attached {
             return null_mut(); // reused for something else since it was listed
         }
         let p = if s.free != 0 {
@@ -1583,6 +1611,9 @@ impl Arena {
             s.free = *(p as *const usize);
             p
         } else if s.bump + s.stride <= CHUNK {
+            if s.bump + s.stride > s.committed && !self.commit_rest(i, &mut s) {
+                return null_mut();
+            }
             let p = (self.base.load(Ordering::Relaxed) + i * CHUNK + s.bump) as *mut u8;
             s.bump += s.stride;
             p
@@ -1631,6 +1662,9 @@ impl Arena {
             s.free = *(p as *const usize);
             p
         } else if s.bump + s.stride <= CHUNK {
+            if s.bump + s.stride > s.committed && !self.commit_rest(c.index, &mut s) {
+                return null_mut();
+            }
             let p = (self.base.load(Ordering::Relaxed) + c.index * CHUNK + s.bump) as *mut u8;
             s.bump += s.stride;
             p
@@ -1655,7 +1689,7 @@ impl Arena {
             p
         } else {
             let b = o.bump.load(Ordering::Relaxed);
-            if b + o.stride > CHUNK || h.remote.load(Ordering::Relaxed) != 0 {
+            if b + o.stride > o.limit || h.remote.load(Ordering::Relaxed) != 0 {
                 return self.pop_owned_slow(index, class, accounted);
             }
             o.bump.store(b + o.stride, Ordering::Relaxed);
@@ -1664,6 +1698,30 @@ impl Arena {
         o.live.store(o.live.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
         h.account.store(h.account.load(Ordering::Relaxed).wrapping_add(accounted), Ordering::Relaxed);
         p as *mut u8
+    }
+    /// Small chunk `index` (its lock held) commits the rest of itself. False: the OS refused.
+    #[cold]
+    #[inline(never)]
+    unsafe fn commit_rest(&self, index: usize, s: &mut State) -> bool {
+        let at = self.base.load(Ordering::Relaxed) + index * CHUNK + s.committed;
+        if !os::commit(at as *mut u8, CHUNK - s.committed) {
+            return false;
+        }
+        event(E_COMMIT);
+        self.committed.fetch_add(CHUNK - s.committed, Ordering::Relaxed);
+        s.committed = CHUNK;
+        true
+    }
+    /// The owner's next carve from its chunk `index` is committed. False: the OS refused (the chunk
+    /// goes back, and the alloc takes the path that reports it).
+    unsafe fn commit_owned(&self, index: usize, h: &Chunk, o: &mut Owned) -> bool {
+        if o.bump.load(Ordering::Relaxed) + o.stride <= o.limit {
+            return true;
+        }
+        let mut s = lock(&h.state);
+        let ok = self.commit_rest(index, &mut s);
+        o.limit = s.committed;
+        ok
     }
     /// `pop_owned` with an empty owned list: the blocks other threads freed first, then the bump;
     /// a full chunk goes back (later frees into it make it listable) and the thread moves on.
@@ -1683,7 +1741,7 @@ impl Arena {
         let p = if p != 0 {
             o.free = *(p as *const usize);
             p
-        } else if o.bump.load(Ordering::Relaxed) + o.stride <= CHUNK {
+        } else if o.bump.load(Ordering::Relaxed) + o.stride <= CHUNK && self.commit_owned(index, h, o) {
             let b = o.bump.load(Ordering::Relaxed);
             o.bump.store(b + o.stride, Ordering::Relaxed);
             self.base.load(Ordering::Relaxed) + index * CHUNK + b
@@ -1732,7 +1790,7 @@ impl Arena {
                     o.free = *(p as *const usize);
                 } else {
                     let b = o.bump.load(Ordering::Relaxed);
-                    if b + o.stride > CHUNK || h.remote.load(Ordering::Relaxed) != 0 {
+                    if b + o.stride > o.limit || h.remote.load(Ordering::Relaxed) != 0 {
                         return alloc_in_slow(size, l.align(), self);
                     }
                     o.bump.store(b + o.stride, Ordering::Relaxed);
@@ -1803,14 +1861,14 @@ impl Arena {
         }
         #[cfg(unix)]
         extern "C" {
-            fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+            fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
         }
         // (stderr without allocation; Windows has no C `write` to link against)
         #[cfg(windows)]
-        unsafe fn write(_fd: i32, buf: *const u8, n: usize) -> isize {
+        unsafe fn write(_fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize {
             use relax_session::win32::{GetStdHandle, WriteFile};
             let mut done = 0u32;
-            WriteFile(GetStdHandle(-12i32 as u32), buf, n as u32, &mut done, std::ptr::null_mut());
+            WriteFile(GetStdHandle(-12i32 as u32), buf.cast(), n as u32, &mut done, std::ptr::null_mut());
             done as isize
         }
         let mut b = [0u8; 900];
@@ -1896,7 +1954,7 @@ impl Arena {
             }
         }
         put(b"\n");
-        unsafe { write(2, b.as_ptr(), k) };
+        unsafe { write(2, b.as_ptr().cast(), k) };
     }
     /// A trim ran since this thread last handed its current chunks back (compiler arena).
     #[inline]
@@ -1926,7 +1984,7 @@ impl Arena {
             }
         }
         let committed = if small {
-            CHUNK
+            FIRST_COMMIT
         } else {
             match l.size().checked_add(PAGE - 1) {
                 Some(n) => n & !(PAGE - 1),
@@ -1975,8 +2033,16 @@ impl Arena {
             }
             { self.alloc_failed(5, l); return null_mut(); }
         }
-        // a warm large run keeps what it had committed beyond this block (resize_in_place trims it)
-        let committed = committed.max(kept);
+        // A warm large run gives back what it had committed beyond this block. Kept, it stayed
+        // with a block that is never resized (an `Arc<[T]>` made from a Vec) for the block's whole
+        // life: Fab's program heap held 5.1 GB committed for 4.3 GB of large blocks.
+        let committed = if kept > committed && os::decommit((address + committed) as *mut u8, kept - committed, COMPILER) {
+            self.committed.fetch_sub(kept - committed, Ordering::Relaxed);
+            self.chunks.fetch_sub((kept + CHUNK - 1) / CHUNK - (committed + CHUNK - 1) / CHUNK, Ordering::Relaxed);
+            committed
+        } else {
+            committed.max(kept)
+        };
         let h = &self.headers[index];
         let generation;
         {
@@ -1995,6 +2061,7 @@ impl Arena {
                 order,
                 bytes: 0,
                 dirty: warm_large.is_some(),
+                trim_live: usize::MAX,
             };
             h.live.store(1, Ordering::Relaxed);
             h.old.store(false, Ordering::Relaxed);
@@ -2194,7 +2261,8 @@ impl Arena {
         } else {
             s.bytes -= l.size();
         }
-        if h.live.fetch_sub(1, Ordering::Relaxed) != 1 {
+        let live = h.live.fetch_sub(1, Ordering::Relaxed) - 1;
+        if live != 0 {
             *(p as *mut usize) = s.free;
             s.free = p as usize;
             if COMPILER
@@ -2203,6 +2271,9 @@ impl Arena {
                 && !h.in_part.load(Ordering::Relaxed)
             {
                 self.partial_push(index, s.class);
+            }
+            if COMPILER && self.dynamic && !s.attached {
+                self.trim_detached(index, &mut s, live);
             }
             return;
         }
@@ -2213,7 +2284,7 @@ impl Arena {
         s.released = true;
         // Released chunks cannot be reached through an old current slot, even while their
         // pages stay warm; only a new generation may allocate from them.
-        if s.stride != 0 && s.committed == CHUNK && s.order == 0 && s.bump <= WARM_TOUCHED_MAX {
+        if s.stride != 0 && s.committed != 0 && s.order == 0 && s.bump <= WARM_TOUCHED_MAX {
             let touched = s.bump;
             drop(s);
             if self.warm_put(index, touched) {
@@ -2350,7 +2421,7 @@ impl Arena {
         for index in 0..N {
             let h = &self.headers[index];
             let mut s = lock(&h.state);
-            if (COMPILER && s.attached) || s.stride == 0 || s.committed != CHUNK || h.live.load(Ordering::Relaxed) == 0 || s.free == 0 {
+            if (COMPILER && s.attached) || s.stride == 0 || s.committed == 0 || h.live.load(Ordering::Relaxed) == 0 || s.free == 0 {
                 continue;
             }
             let chunk = base + index * CHUNK;
@@ -2456,11 +2527,21 @@ pub fn heap_check_on() -> bool {
             #[cfg(unix)]
             let on = unsafe {
                 extern "C" {
-                    fn getenv(name: *const u8) -> *const u8;
+                    fn getenv(name: *const core::ffi::c_char) -> *mut core::ffi::c_char;
                 }
                 !getenv(c"MAKEPAD_RUN_HEAP_CHECK".as_ptr().cast()).is_null()
             };
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            let on = unsafe {
+                use relax_session::win32::{GetEnvironmentVariableW, GetLastError, SetLastError};
+                // Presence enables the check, including an empty value, just like getenv.
+                // Stay allocation-free: this is called while creating an allocator.
+                let name = b"MAKEPAD_RUN_HEAP_CHECK\0".map(u16::from);
+                let mut value = 0u16;
+                SetLastError(0);
+                GetEnvironmentVariableW(name.as_ptr(), &mut value, 1) != 0 || GetLastError() == 0
+            };
+            #[cfg(not(any(unix, windows)))]
             let on = false;
             HEAP_CHECK.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
@@ -2471,7 +2552,7 @@ pub fn heap_check_on() -> bool {
 /// The live-bit map of one program heap: RESERVE / 16 bits, mapped readable and writable (the OS
 /// backs only the pages that are touched). 0 when the mapping is refused (the check stays off).
 fn os_bits_map() -> usize {
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
     unsafe {
         let b = os::reserve(RESERVE / 128, GRANULE, c"makepad-run heap check");
         if b != 0 && !os::commit(b as *mut u8, RESERVE / 128) {
@@ -2480,11 +2561,11 @@ fn os_bits_map() -> usize {
         }
         b
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows)))]
     0
 }
 
-/// A MAKEPAD_RUN_HEAP_CHECK failure: one line with `write(2)` (no allocation: this runs inside
+/// A MAKEPAD_RUN_HEAP_CHECK failure: one line on stderr (no allocation: this runs inside
 /// the allocator, under its locks), then abort.
 #[cold]
 #[inline(never)]
@@ -2528,11 +2609,17 @@ fn heap_check_fail(what: &[u8], p: usize, index: usize, stride: usize) -> ! {
     #[cfg(unix)]
     unsafe {
         extern "C" {
-            fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+            fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
             fn abort() -> !;
         }
-        write(2, buf.as_ptr(), n);
+        write(2, buf.as_ptr().cast(), n);
         abort();
+    }
+    #[cfg(windows)]
+    unsafe {
+        use relax_session::win32::{GetStdHandle, WriteFile};
+        let mut done = 0u32;
+        WriteFile(GetStdHandle(-12i32 as u32), buf.as_ptr(), n as u32, &mut done, std::ptr::null_mut());
     }
     #[cfg(not(unix))]
     {
@@ -2713,7 +2800,7 @@ pub fn detail() -> (usize, usize, usize, usize) {
 pub fn census() -> [usize; 11] {
     DEFAULT.census()
 }
-pub fn states() -> [usize; 28] {
+pub fn states() -> [usize; 29] {
     DEFAULT.states()
 }
 pub fn mark_old() {

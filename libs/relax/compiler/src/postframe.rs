@@ -34,6 +34,11 @@ static SUMMARY_DONE: AtomicBool = AtomicBool::new(false);
 /// request was queued behind when they ended (ns)
 static SERVED: [AtomicU64; crate::owner::CLASSES] = [const { AtomicU64::new(0) }; crate::owner::CLASSES];
 static SERVED_BLOCKING: [AtomicU64; crate::owner::CLASSES] = [const { AtomicU64::new(0) }; crate::owner::CLASSES];
+/// the main thread's compiles before the first present (the cold start's critical path): [count,
+/// wall, typeck ahead, owner queue, front, back, finish, in-flight wait, cpu front, cpu opt, cpu
+/// codegen] (ns), and per way satisfied (jit::MAIN_HOW_NAMES) the count
+static BEFORE: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static BEFORE_HOW: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 // ------------------------------------------------------------ readiness (the warm-up veil)
 
@@ -45,9 +50,8 @@ static UI_WAIT_START: AtomicU64 = AtomicU64::new(0);
 static UI_WAIT_END: AtomicU64 = AtomicU64::new(0);
 /// ns the UI thread spent in (outermost) JIT waits so far
 static UI_WAIT_SUM: AtomicU64 = AtomicU64::new(0);
-/// builds ahead (speculative / prepared) finished after the first present, and running now
+/// builds ahead (speculative / prepared) finished after the first present
 pub(crate) static AHEAD_DONE: AtomicU64 = AtomicU64::new(0);
-pub(crate) static AHEAD_RUNNING: AtomicU64 = AtomicU64::new(0);
 
 // ------------------------------------------------------------ UI blocks (the JIT ring's rule)
 
@@ -184,23 +188,23 @@ pub fn ui_idle_ns() -> u64 {
 }
 
 /// Functions built ahead since the first present, and those still queued or building (the
-/// speculative / prepare queue; a queue being changed right now reads as 1 more).
+/// speculative / prepare queue).
 pub fn ahead_progress() -> (u64, u64) {
-    (AHEAD_DONE.load(Relaxed), crate::jit::ahead_queued() + AHEAD_RUNNING.load(Relaxed))
+    (AHEAD_DONE.load(Relaxed), crate::jit::ahead_queued() + crate::jit::ahead_running())
 }
 
 /// The JIT's work: what is queued and running now, and what it has finished so far (monotonic,
 /// so two looks give the work rate). For the run's JIT ring and makepad inspect `jit`: a look,
-/// not a measurement (two queue locks, each alone; the rest atomics).
+/// not a measurement (queue counters and running slots).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Activity {
     /// O3 builds queued, and running now (with the slot of one)
     pub o3: u64,
     pub o3_running: u64,
     pub o3_slot: Option<u32>,
-    /// O2 builds and verified O1 rebuilds queued; the O2 worker builds one now
+    /// O2 builds and verified O1 rebuilds queued; builds running now
     pub o2: u64,
-    pub o2_running: bool,
+    pub o2_running: u64,
     /// functions queued or building ahead now, and of them building
     pub ahead: u64,
     pub ahead_running: u64,
@@ -228,12 +232,12 @@ impl Activity {
 
     /// Something is being built right now.
     pub fn running(&self) -> bool {
-        self.o3_running > 0 || self.o2_running || self.ahead_running > 0 || self.ui_waiting || self.settling
+        self.o3_running > 0 || self.o2_running > 0 || self.ahead_running > 0 || self.ui_waiting || self.settling
     }
 
     /// Builds waiting or running, all queues.
     pub fn pending(&self) -> u64 {
-        self.ahead + self.o2 + self.o3 + self.o3_running
+        self.ahead + self.o2 + self.o2_running + self.o3 + self.o3_running
     }
 
     /// Builds finished out of the queues (ahead, O2, O3): with `pending`, the queues' progress.
@@ -264,8 +268,8 @@ impl Activity {
             }
         } else if self.ahead_running > 0 {
             "building ahead".into()
-        } else if self.o2_running {
-            "O2 build".into()
+        } else if self.o2_running > 0 {
+            format!("{} O2 builds", self.o2_running)
         } else {
             String::new()
         }
@@ -274,7 +278,7 @@ impl Activity {
 
 /// A fn's path for one line: its last two segments without generics (`<T as Tr>::f` -> `T::f`),
 /// a trailing ` [..]` note kept, at most 40 chars.
-fn short_fn(name: &str) -> String {
+pub(crate) fn short_fn(name: &str) -> String {
     let (name, note) = match name.find(" [") {
         Some(i) => (&name[..i], &name[i..]),
         None => (name, ""),
@@ -335,16 +339,23 @@ mod tests {
     }
 }
 
+/// ns the UI thread has spent in JIT waits so far, its open one included (atomics only: why-hung
+/// reads it while threads may hold the queue locks `activity` takes).
+pub fn ui_wait_ns() -> u64 {
+    let mut ns = UI_WAIT_SUM.load(Relaxed);
+    if UI_WAITING.load(Relaxed) > 0 {
+        ns += wall_ns().saturating_sub(UI_WAIT_START.load(Relaxed));
+    }
+    ns
+}
+
 /// What the JIT is doing now and has done so far.
 pub fn activity() -> Activity {
     let ui_waiting = UI_WAITING.load(Relaxed) > 0;
-    let mut ui_wait_ns = UI_WAIT_SUM.load(Relaxed);
-    if ui_waiting {
-        ui_wait_ns += wall_ns().saturating_sub(UI_WAIT_START.load(Relaxed));
-    }
+    let ui_wait_ns = ui_wait_ns();
     let (o3, o3_running, o3_slot) = crate::jit::o3_counts();
     let (o2, o2_running, o2_done) = crate::jit::o2_counts();
-    let ahead_running = AHEAD_RUNNING.load(Relaxed);
+    let ahead_running = crate::jit::ahead_running();
     Activity {
         o3,
         o3_running,
@@ -417,7 +428,23 @@ pub(crate) static LOG_KEY: std::sync::Mutex<String> = std::sync::Mutex::new(Stri
 pub(crate) fn main_compile(name: &str, r: &MainCompile) {
     let fp = present_ns();
     let key = if log_on() { std::mem::take(&mut *LOG_KEY.lock().unwrap()) } else { String::new() };
-    if fp == 0 || r.start < fp || crate::jit::QUIT_SEEN.load(Relaxed) {
+    if fp == 0 || r.start < fp {
+        if fp == 0 {
+            BEFORE[0].fetch_add(1, Relaxed);
+            BEFORE[1].fetch_add(r.end.saturating_sub(r.start), Relaxed);
+            for (a, &ns) in r.ns.iter().enumerate() {
+                BEFORE[a + 2].fetch_add(ns, Relaxed);
+            }
+            for (a, &ns) in r.cpu.iter().enumerate() {
+                BEFORE[a + 8].fetch_add(ns, Relaxed);
+            }
+            if let Some(h) = BEFORE_HOW.get(r.how as usize) {
+                h.fetch_add(1, Relaxed);
+            }
+        }
+        return;
+    }
+    if crate::jit::QUIT_SEEN.load(Relaxed) {
         return;
     }
     let dt = r.end.saturating_sub(r.start);
@@ -470,6 +497,31 @@ pub(crate) fn main_compile(name: &str, r: &MainCompile) {
 }
 
 /// A main-thread owner request ended after the present (owner::request): waited `w` ns from `t0`.
+/// The cold start's critical path at the first present (one line): the main thread's compiles
+/// before it, where their wall went, its owner requests and what the owner thread was busy with.
+pub(crate) fn before_present_line(main_ns: u64) -> String {
+    let b = |i: usize| BEFORE[i].load(Relaxed) as f64 / 1e6;
+    let m = |i: usize| crate::owner::MAIN_ACC[i].load(Relaxed);
+    let how: Vec<String> = crate::jit::MAIN_HOW_NAMES.iter().enumerate().filter(|(i, _)| BEFORE_HOW[*i].load(Relaxed) > 0).map(|(i, n)| format!("{} {}", n, BEFORE_HOW[i].load(Relaxed))).collect();
+    let busy = |i: usize| crate::owner::BUSY_NS[i].load(Relaxed) as f64 / 1e6;
+    format!(
+        "makepad-run before the first present: main {:.0} ms after its start, {} main-thread compiles ({}) {:.0} ms wall: typeck ahead {:.0}, owner queue {:.0}, front {:.0}, back {:.0}, finish {:.0}, in-flight {:.0} ms; cpu front {:.0}, opt {:.0}, codegen {:.0} ms; main's owner requests {} waited {:.0} ms (queue {:.0}, wake {:.0}); owner busy: job {:.0}, publish {:.0}, program {:.0} ms",
+        main_ns as f64 / 1e6, BEFORE[0].load(Relaxed), how.join(", "), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9), b(10),
+        m(0), m(1) as f64 / 1e6, m(2) as f64 / 1e6, m(3) as f64 / 1e6, busy(0), busy(1), busy(2)
+    ) + &{
+        let a = |i: usize| crate::jit::AHEAD_STATS[i].load(Relaxed);
+        let w = |i: usize| crate::jit::MAIN_AHEAD_WAIT[i].load(Relaxed);
+        format!("; checks ahead: {} bodies ({} taken), cpu callers {:.0} ms, helpers {:.0} ms, main waited for a helper's check {}x {:.0} ms, main waited for a helper's lowering {}x {:.0} ms, main's cpu in them {:.0} ms of which lowering its slots {:.0} ms; lowered ahead {} ({} taken) {:.0} ms; looked ahead {} bodies",
+            a(0), a(1), a(3) as f64 / 1e6, a(4) as f64 / 1e6, w(0), w(1) as f64 / 1e6, w(4), w(5) as f64 / 1e6, w(3) as f64 / 1e6, w(2) as f64 / 1e6, a(5), a(6), a(7) as f64 / 1e6, crate::jit::LOOK_QUEUED.load(Relaxed))
+    } + &{
+        let o = |r: usize, i: usize| crate::jit::OWNER_LOWERS[r][i].load(Relaxed);
+        format!("; owner's own lowerings: of bodies checked ahead {} ({:.0} ms), by const eval {} ({:.0} ms), checked on the owner {} ({:.0} ms), closures {} ({:.0} ms), requests' own slots checked ahead {} ({:.0} ms); main's lowerings ahead of its slots by result: {}",
+            o(0, 0), o(0, 1) as f64 / 1e6, o(1, 0), o(1, 1) as f64 / 1e6, o(2, 0), o(2, 1) as f64 / 1e6, o(3, 0), o(3, 1) as f64 / 1e6, o(4, 0), o(4, 1) as f64 / 1e6,
+            crate::jit::MAIN_LOWER_WHY.iter().enumerate().filter(|(_, n)| n.load(Relaxed) > 0).map(|(i, n)| format!("af{} {}", i, n.load(Relaxed))).collect::<Vec<_>>().join(", "))
+    } + &format!("; bodies type-checked {} ({} of them by the app check, before main or beside it: {} crates, {:.0} ms)",
+        crate::type_queries::BODIES_CHECKED.load(Relaxed), crate::check::RUN_CHECK[1].load(Relaxed), crate::check::RUN_CHECK[0].load(Relaxed), crate::check::RUN_CHECK[2].load(Relaxed) as f64 / 1e6)
+}
+
 pub(crate) fn main_owner_wait(t0: u64, w: u64) {
     if in_window(t0) {
         OWNER[0].fetch_add(1, Relaxed);
@@ -541,6 +593,16 @@ pub fn image_window_open() -> bool {
     fp == 0 || FRAMES_AFTER_PRESENT.load(Relaxed) == 0 && wall_ns() < fp + IMAGE_WINDOW_NS
 }
 
+/// The live patches the newest window frame on the glass was built with (makepad-platform calls
+/// the loader symbol `relax_frame_patch` before `relax_frame_done`): `inspect live`'s
+/// `frame_patch`, which devhub's "→ frame" of a live edit waits for. A frame count says nothing
+/// about the edit in an app that animates.
+pub static FRAME_PATCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) extern "C" fn relax_frame_patch(patches: u64) {
+    FRAME_PATCH.fetch_max(patches, Relaxed);
+}
+
 /// The program presented a frame (makepad-platform calls the loader symbol `relax_frame_done`
 /// after each frame the HAL finished; on the thread that handles the HAL's events).
 pub(crate) extern "C" fn relax_frame_done() {
@@ -562,7 +624,6 @@ pub(crate) extern "C" fn relax_frame_done() {
     }
     episode_end();
     let compiled = MAIN_COMPILE_NS.load(Relaxed);
-    static COMPILED_AT_LAST: AtomicU64 = AtomicU64::new(0);
     let compiled_before = COMPILED_AT_LAST.swap(compiled, Relaxed);
     if fp == 0 || last < fp || crate::jit::QUIT_SEEN.load(Relaxed) {
         return;
@@ -598,11 +659,13 @@ fn served(a: &[AtomicU64; crate::owner::CLASSES]) -> String {
     (0..crate::owner::CLASSES).map(|c| format!("{} {:.0}", crate::owner::CLASS_NAMES[c], ms(a[c].load(Relaxed)))).collect::<Vec<_>>().join(", ")
 }
 
+static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+
+static LAST_AT: AtomicU64 = AtomicU64::new(0);
+
 /// A burst of the ahead helpers ended (jit::ahead_helper): their work since the present, when it
 /// changed since the last report.
 pub(crate) fn ahead_over() {
-    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
-    static LAST_AT: AtomicU64 = AtomicU64::new(0);
     let fp = present_ns();
     let n = crate::jit::AHEAD_STATS[0].load(Relaxed);
     let now = wall_ns();
@@ -652,4 +715,43 @@ pub fn summary() -> String {
         served(&SERVED),
         served(&SERVED_BLOCKING)
     )
+}
+
+/// The compile time the last frame saw.
+static COMPILED_AT_LAST: AtomicU64 = AtomicU64::new(0);
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&COMPILES, [const { AtomicU64::new(0) }; 9]);
+    reset(&OWNER, [const { AtomicU64::new(0) }; 2]);
+    reset(&RT, [const { AtomicU64::new(0) }; 2]);
+    reset(&GAPS, [const { AtomicU64::new(0) }; 4]);
+    reset(&MAIN_COMPILE_NS, AtomicU64::new(0));
+    reset(&LAST_FRAME, AtomicU64::new(0));
+    reset(&LOGGED, AtomicU64::new(0));
+    reset(&HOW, [const { [const { AtomicU64::new(0) }; 2] }; 7]);
+    reset(&SUMMARY_DONE, AtomicBool::new(false));
+    reset(&SERVED, [const { AtomicU64::new(0) }; crate::owner::CLASSES]);
+    reset(&SERVED_BLOCKING, [const { AtomicU64::new(0) }; crate::owner::CLASSES]);
+    reset(&BEFORE, [const { AtomicU64::new(0) }; 11]);
+    reset(&BEFORE_HOW, [const { AtomicU64::new(0) }; 7]);
+    reset(&UI_WAITING, AtomicU64::new(0));
+    reset(&UI_WAIT_START, AtomicU64::new(0));
+    reset(&UI_WAIT_END, AtomicU64::new(0));
+    reset(&UI_WAIT_SUM, AtomicU64::new(0));
+    reset(&AHEAD_DONE, AtomicU64::new(0));
+    reset(&EP_SUM, AtomicU64::new(0));
+    reset(&EP_SHOWN, AtomicBool::new(false));
+    reset(&EP_MAX, AtomicU64::new(0));
+    reset(&EP_ALL, AtomicU64::new(0));
+    reset(&EP_BLOCKS, AtomicU64::new(0));
+    reset(&EP_BLOCKED_AT, AtomicU64::new(0));
+    reset(&LOG_KEY, std::sync::Mutex::new(String::new()));
+    reset(&FRAMES, AtomicU64::new(0));
+    reset(&FRAMES_AFTER_PRESENT, AtomicU64::new(0));
+    reset(&FRAME_PATCH, AtomicU64::new(0));
+    reset(&COMPILED_AT_LAST, AtomicU64::new(0));
+    reset(&LAST, AtomicU64::new(u64::MAX));
+    reset(&LAST_AT, AtomicU64::new(0));
 }

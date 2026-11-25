@@ -1,12 +1,14 @@
 //! Native GLES coverage (Linux, EGL's surfaceless platform). The cases of tests/vulkan.rs and
 //! tests/d3d11.rs: passes and draws into a texture and an offscreen window, exact readback, a
-//! sampled BGRA8 upload, the ledger of a closing session, resize, and the pick variant's ids.
+//! sampled BGRA8 upload, the ledger of a closing session, resize, and the pick variant's ids;
+//! and session 0's window layer over a lent window (the executor's badge layer).
 //! The fixtures follow the GLSL dialect's contract (shader_ir_glsl): packed geometry attributes,
 //! the clip-space Y flip under `mp_clip_y_flip`, `mp_pick` = (draw id, twin mask).
 #![cfg(target_os = "linux")]
 
 use makepad_hal::glsl::{Attribute, GlslPipeline, Texture};
 use makepad_hal::ledger::Kind;
+use makepad_hal::session::HOST;
 use makepad_hal::spirv::SpirvSampler;
 use makepad_hal::*;
 use std::time::{Duration, Instant};
@@ -63,16 +65,12 @@ layout(location = 0) out vec4 color;
 void main() { color = texture(tex_image, uv); }
 ";
 
-fn open() -> Option<(std::sync::Arc<Hal>, HalInfo)> {
+fn open() -> (std::sync::Arc<Hal>, HalInfo) {
     let hal = Hal::new();
     let info = hal.open(&OpenReq { backend: backend_id::GL, flags: open_flags::OFFSCREEN_WINDOWS, ..Default::default() });
-    if info.backend == backend_id::NONE {
-        eprintln!("SKIP GLES: no EGL surfaceless GLES 3 context on this machine");
-        return None;
-    }
-    assert_eq!(info.backend, backend_id::GL);
+    assert_eq!(info.backend, backend_id::GL, "GLES HAL initialization failed");
     assert_eq!(info.dialect, dialect::GLSL);
-    Some((hal, info))
+    (hal, info)
 }
 
 fn until(hal: &Hal, sid: u32, mut accept: impl FnMut(HalEvent<'_>) -> bool) {
@@ -192,7 +190,7 @@ fn pixels(hal: &Hal, sid: u32, req: u32) -> Vec<u8> {
 
 #[test]
 fn offscreen_two_passes_three_draws() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     resources(&hal, info.session);
     rendered(&hal, info.session, TEX, target::TEXTURE, [32, 32], 1);
     let mut w = CmdWriter::new(info.session);
@@ -211,7 +209,7 @@ fn offscreen_two_passes_three_draws() {
 
 #[test]
 fn cleared_target_readback_is_exact() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     let mut w = CmdWriter::new(info.session);
     w.texture_create(TEX, usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 7, 5, [1, 1], Attr::default());
     w.frame_begin(1, FrameMeta::default());
@@ -230,7 +228,7 @@ fn cleared_target_readback_is_exact() {
 /// as the same colours, top row first; a BGRA8 render target reads back as RGBA too.
 #[test]
 fn sampled_bgra_upload_round_trips() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     let sid = info.session;
     let mut w = CmdWriter::new(sid);
     // BGRA bytes of red, green / blue, white
@@ -282,7 +280,7 @@ fn ledger(hal: &Hal, sid: u32) -> Vec<(Kind, u32, u32, u64)> {
 
 #[test]
 fn session_close_frees_exactly_its_ledger() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     let other = hal.open(&OpenReq { backend: backend_id::GL, flags: open_flags::OFFSCREEN_WINDOWS, ..Default::default() }).session;
     resources(&hal, info.session);
     resources(&hal, other);
@@ -301,7 +299,7 @@ fn session_close_frees_exactly_its_ledger() {
 
 #[test]
 fn offscreen_window_resize_keeps_resources() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     resources(&hal, info.session);
     let mut w = CmdWriter::new(info.session);
     w.window_create(WINDOW, window_kind::NORMAL, Id::NONE, [0.0, 0.0, 32.0, 32.0], false);
@@ -327,7 +325,7 @@ fn offscreen_window_resize_keeps_resources() {
 
 #[test]
 fn pick_frame_answers_the_draw_id() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     let sid = info.session;
     resources(&hal, sid);
     let mut w = CmdWriter::new(sid);
@@ -363,7 +361,7 @@ fn pick_frame_answers_the_draw_id() {
 /// event) is adopted by name and sampled after the app's fence.
 #[test]
 fn adopted_app_texture_is_sampled_after_its_fence() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     let sid = info.session;
     let mut share = None;
     until(&hal, sid, |e| match e {
@@ -433,7 +431,7 @@ fn adopted_app_texture_is_sampled_after_its_fence() {
 /// the pass drew nothing every frame (Scope's Glass look on a node; GLES too).
 #[test]
 fn a_pass_a_pixel_larger_than_its_target_still_draws() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     let sid = info.session;
     resources(&hal, sid);
     let before = hal.with_world(|w| w.session(sid).unwrap().stats);
@@ -456,5 +454,93 @@ fn a_pass_a_pixel_larger_than_its_target_still_draws() {
     // the clear in the top corners, the triangle's base along the bottom
     for x in [0, 31] { assert_eq!(&image[x * 4..][..4], &[17, 34, 51, 255]); }
     for x in [6, 16, 26] { assert_eq!(&image[(29 * 32 + x) * 4..][..4], &[255; 4], "x {x}"); }
+    assert!(hal.close(sid));
+}
+
+/// Session 0's window layer over a window lent to an app (`makepad run`'s load screen over the
+/// app), composed by the executor through the window's badge layer: the app's frames stay in the
+/// window's retained image, the layer's texture takes the newest one before session 0's next
+/// frame, which samples it, and the window shows session 0's frame; once the layer goes the window
+/// shows the app's own frame again.
+#[test]
+fn a_window_layer_samples_the_apps_newest_frame_and_goes() {
+    const LAYER: Id = Id::new(20, 1);
+    const APP_WINDOW: Id = Id::new(7, 1);
+    let hal = Hal::new();
+    let req = OpenReq { backend: backend_id::GL, flags: open_flags::OFFSCREEN_WINDOWS | open_flags::RETAIN_WINDOWS, ..Default::default() };
+    let info = hal.open_host(&req);
+    assert_eq!(info.backend, backend_id::GL, "GLES HAL initialization failed");
+    assert_ne!(info.flags & info_flags::WINDOW_LAYERS, 0);
+    let mut w = CmdWriter::new(HOST);
+    w.window_create(WINDOW, window_kind::NORMAL, Id::NONE, [0.0, 0.0, 32.0, 32.0], false);
+    w.texture_create(LAYER, usage::RENDER_TARGET | usage::SAMPLED, format::BGRA8, 32, 32, [1, 1], Attr::default());
+    let quad = floats(&[-1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0]);
+    w.buffer_create(QUAD, buffer_kind::VERTEX, quad.len() as u64, Attr::default());
+    w.buffer_update(QUAD, 0, &quad);
+    let indices: Vec<u8> = [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect();
+    w.buffer_create(QUAD_INDEX, buffer_kind::INDEX, indices.len() as u64, Attr::default());
+    w.buffer_update(QUAD_INDEX, 0, &indices);
+    let nearest = SpirvSampler { filter: 0, address: 1, compare: false, pixel: false };
+    let blob = CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, ..Default::default() },
+        &payload(SAMPLED_VERTEX_GLSL, SAMPLED_GLSL, vec![Texture { name: "tex_image".into(), shape: 0, sampler: nearest }], false),
+        &[NONE, NONE, NONE, NONE, NONE, 1], &LAYOUT);
+    w.pipeline_create(SAMPLED_PIPE, dialect::GLSL, Attr::default(), &blob);
+    hal.submit(&w.buf());
+    until(&hal, HOST, |e| matches!(e, HalEvent::PipelineReady { pipeline } if pipeline == SAMPLED_PIPE));
+    // the app adopts the window and draws its triangle (base along the bottom) on black
+    let sid = hal.open(&OpenReq { app_key: 99, ..req }).session;
+    assert_ne!(sid, HOST);
+    resources(&hal, sid);
+    let app_frame = |serial: u64| {
+        let mut w = CmdWriter::new(sid);
+        if serial == 11 { w.window_create(APP_WINDOW, window_kind::NORMAL, Id::NONE, [0.0; 4], true); }
+        w.frame_begin(serial, FrameMeta::default());
+        w.pass(pass(Id::NONE, 32, 32, [0.0, 0.0, 0.0, 1.0]));
+        w.draw(draw());
+        w.frame_end(APP_WINDOW, target::WINDOW);
+        hal.submit(&w.buf());
+        frame_done(&hal, sid, serial);
+    };
+    app_frame(11);
+    let shown = |req: u32| {
+        let mut w = CmdWriter::new(HOST);
+        w.snapshot(WINDOW, req);
+        hal.submit(&w.buf());
+        pixels(&hal, HOST, req)
+    };
+    let at = |image: &[u8], x: usize, y: usize| image[(y * 32 + x) * 4..][..4].to_vec();
+    assert_eq!(at(&shown(1), 26, 27), [255; 4], "the app's frame shows");
+    // the layer comes on; the app draws under it
+    w.clear();
+    w.window_overlay(WINDOW, true, [0.0, 0.0, 32.0, 32.0], LAYER, false);
+    hal.submit(&w.buf());
+    app_frame(12);
+    // session 0's frame: blue, the layer texture (the app's frame) over its left half
+    w.clear();
+    w.frame_begin(101, FrameMeta::default());
+    w.pass(pass(Id::NONE, 32, 32, [0.0, 0.0, 1.0, 1.0]));
+    let tex = w.put_ids(&[LAYER]);
+    w.draw(Draw { pipeline: SAMPLED_PIPE, vb: QUAD, ib: QUAD_INDEX, index: [0, 6], inst: Inst::inline(Slice::EMPTY, 1), tex,
+        scissor: [0.0, 0.0, 16.0, 32.0], ..Default::default() });
+    w.frame_end(WINDOW, target::WINDOW);
+    hal.submit(&w.buf());
+    frame_done(&hal, HOST, 101);
+    let image = shown(2);
+    assert_eq!(at(&image, 5, 27), [255; 4], "the app's frame, sampled from the layer texture");
+    assert_eq!(at(&image, 5, 2), [0, 0, 0, 255]);
+    assert_eq!(at(&image, 26, 27), [0, 0, 255, 255], "session 0's frame covers the app's");
+    assert_eq!(at(&image, 26, 2), [0, 0, 255, 255]);
+    // the layer goes: the app's frame again, never session 0's
+    w.clear();
+    w.window_overlay(WINDOW, false, [0.0; 4], Id::NONE, false);
+    hal.submit(&w.buf());
+    app_frame(13);
+    let image = shown(3);
+    assert_eq!(at(&image, 26, 27), [255; 4]);
+    assert_eq!(at(&image, 26, 2), [0, 0, 0, 255]);
+    hal.with_world(|w| {
+        assert_eq!(w.session(HOST).unwrap().stats.bad_args, 0);
+        assert_eq!(w.session(sid).unwrap().stats.bad_args, 0);
+    });
     assert!(hal.close(sid));
 }

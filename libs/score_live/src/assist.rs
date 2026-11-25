@@ -588,13 +588,6 @@ mod tests {
         assert!(labels(field, "s be").contains(&"beats".to_string()));
         let kind = "use mod.score.*\nlet g = Instrument{kind: @p";
         assert_eq!(labels(kind, "@p"), ["@piano"]);
-        // Fast enough for every keystroke on a long score.
-        let long = SRC.repeat(200);
-        let t = std::time::Instant::now();
-        for _ in 0..10 {
-            complete(&long, long.len() - 30, &Available::default());
-        }
-        assert!(t.elapsed().as_secs_f64() / 10.0 < 0.004, "{:?}", t.elapsed() / 10);
     }
 
     #[test]

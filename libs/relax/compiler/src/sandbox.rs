@@ -165,7 +165,7 @@ unsafe fn mprotect(_addr: *mut u8, _len: usize, _prot: i32) -> i32 {
 const MAP_ANON_PRIV: i32 = 0;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const MAP_ANON_PRIV: i32 = 0x22 | 0x4000; // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAP_ANON_PRIV: i32 = 0x1002;
 
 fn map_rw(addr: u64, len: u64) -> bool {
@@ -598,7 +598,7 @@ pub fn free_arena(a: &Arc<Arena>) {
 fn retire_window(at: u64, len: u64) -> bool {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     const MAP_FIXED_NORESERVE: i32 = 0x10 | 0x4000;
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     const MAP_FIXED_NORESERVE: i32 = 0x10 | 0x40;
     #[cfg(windows)]
     const MAP_FIXED_NORESERVE: i32 = 0;
@@ -1750,6 +1750,11 @@ fn add_fuel(f: &mut Func, words: VReg, site: Sym, panic_site: Sym, pos0: u64, co
     }
 }
 
+fn sandbox_dump() -> Option<&'static str> {
+    static VALUE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    VALUE.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_SANDBOX_DUMP").ok())).as_deref()
+}
+
 /// The code of a twin (on the owner thread): the base slot's RIR, transformed.
 pub unsafe fn twin_rir(up: *mut Unit, id: u32, base: u32) -> Result<Func, String> {
     if base == u32::MAX {
@@ -1769,8 +1774,8 @@ pub unsafe fn twin_rir(up: *mut Unit, id: u32, base: u32) -> Result<Func, String
     let mut f = jit::sandbox_source_rir(up, base)?;
     transform(up, &mut f, id)?;
     // MAKEPAD_RUN_SANDBOX_DUMP=<substring>: the transformed RIR of matching twins
-    if let Ok(pat) = std::env::var("MAKEPAD_RUN_SANDBOX_DUMP") {
-        if f.name.contains(&pat) {
+    if let Some(pat) = sandbox_dump() {
+        if f.name.contains(pat) {
             eprintln!("sandbox twin {} ({} insts):\n{}", f.name, relax_codegen::opt::inst_count(&f), f.dump());
         }
     }
@@ -1797,7 +1802,10 @@ pub fn stats() -> (usize, usize, usize) {
     g.as_ref().map_or((0, 0, 0), |s| (s.ro.len(), s.rw.len(), s.arenas.len()))
 }
 
-/// Heap bytes a module's arena has handed out.
-pub fn heap_used(a: &Arena) -> u64 {
-    a.heap.lock().unwrap_or_else(|e| e.into_inner()).used
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&SB, Mutex::new(None));
+    reset(&TLS_OFF, std::sync::atomic::AtomicU32::new(0));
+    reset(&ARENAS, [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; MAX_MODULES]);
 }

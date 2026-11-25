@@ -658,23 +658,69 @@ pub fn keep_sources() -> bool {
 /// it; read, never changed): texture samples, transcendental calls, loops, size. One line, e.g.
 /// `samples 9, transcendentals 14 (pow 5, sin 2, sqrt 5, exp 2), loops 0, 412 lines`.
 pub fn source_stats(source: &str) -> String {
-    let count = |pat: &str| source.matches(pat).count();
-    let samples = count(".sample(") + count(".sample_compare(") + count(".read(") + count("texture(") + count("texelFetch(");
-    let mut tr: Vec<(&str, usize)> = ["pow(", "exp(", "exp2(", "log(", "log2(", "sin(", "cos(", "tan(", "sqrt(", "rsqrt(", "inversesqrt(", "atan(", "atan2(", "acos(", "asin("]
-        .iter()
-        .map(|p| (p.trim_end_matches('('), count(&format!(" {p}")) + count(&format!("({p}")) + count(&format!("::{p}")) + count(&format!(",{p}"))))
-        .filter(|x| x.1 > 0)
-        .collect();
+    use std::fmt::Write;
+
+    let mut tr = [("pow", 0usize), ("exp", 0), ("exp2", 0), ("log", 0), ("log2", 0), ("sin", 0), ("cos", 0), ("tan", 0), ("sqrt", 0), ("rsqrt", 0), ("inversesqrt", 0), ("atan", 0), ("atan2", 0), ("acos", 0), ("asin", 0)];
+    // Only the '(' prefix can overlap itself: `(sqrt(sqrt(` shares a parenthesis.
+    // Each pattern's matches advance independently, including the other three prefixes.
+    let mut paren_end = [0usize; 15];
+    let (mut samples, mut loops, mut branches, mut lines) = (0usize, 0usize, 0usize, 0usize);
+    let bytes = source.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        let tail = &bytes[i..];
+        match b {
+            b'.' => samples += (tail.starts_with(b".sample(") || tail.starts_with(b".sample_compare(") || tail.starts_with(b".read(")) as usize,
+            b't' => samples += (tail.starts_with(b"texture(") || tail.starts_with(b"texelFetch(")) as usize,
+            b'f' => loops += (tail.starts_with(b"for (") || tail.starts_with(b"for(")) as usize,
+            b'w' => loops += (tail.starts_with(b"while (") || tail.starts_with(b"while(")) as usize,
+            b'i' => branches += (tail.starts_with(b"if (") || tail.starts_with(b"if(")) as usize,
+            b'\n' => lines += 1,
+            _ => {}
+        }
+        let call = match b {
+            b' ' | b'(' | b',' => &tail[1..],
+            b':' if tail.get(1) == Some(&b':') => &tail[2..],
+            _ => continue,
+        };
+        let k = match call.first() {
+            Some(b'p') if call.starts_with(b"pow(") => 0,
+            Some(b'e') if call.starts_with(b"exp(") => 1,
+            Some(b'e') if call.starts_with(b"exp2(") => 2,
+            Some(b'l') if call.starts_with(b"log(") => 3,
+            Some(b'l') if call.starts_with(b"log2(") => 4,
+            Some(b's') if call.starts_with(b"sin(") => 5,
+            Some(b'c') if call.starts_with(b"cos(") => 6,
+            Some(b't') if call.starts_with(b"tan(") => 7,
+            Some(b's') if call.starts_with(b"sqrt(") => 8,
+            Some(b'r') if call.starts_with(b"rsqrt(") => 9,
+            Some(b'i') if call.starts_with(b"inversesqrt(") => 10,
+            Some(b'a') if call.starts_with(b"atan(") => 11,
+            Some(b'a') if call.starts_with(b"atan2(") => 12,
+            Some(b'a') if call.starts_with(b"acos(") => 13,
+            Some(b'a') if call.starts_with(b"asin(") => 14,
+            _ => continue,
+        };
+        if b == b'(' {
+            if i < paren_end[k] {
+                continue;
+            }
+            paren_end[k] = i + tr[k].0.len() + 2;
+        }
+        tr[k].1 += 1;
+    }
+    lines += (!bytes.is_empty() && bytes.last() != Some(&b'\n')) as usize;
     tr.sort_by(|a, b| b.1.cmp(&a.1));
     let total: usize = tr.iter().map(|x| x.1).sum();
-    let loops = count("for (") + count("for(") + count("while (") + count("while(");
-    let branches = count("if (") + count("if(");
-    let list = tr.iter().take(4).map(|(n, c)| format!("{n} {c}")).collect::<Vec<_>>().join(", ");
-    format!(
-        "samples {samples}, transcendentals {total}{}, branches {branches}, loops {loops}, {} lines",
-        if list.is_empty() { String::new() } else { format!(" ({list})") },
-        source.lines().count()
-    )
+    let mut out = format!("samples {samples}, transcendentals {total}");
+    for (k, (name, count)) in tr.iter().take(4).take_while(|x| x.1 > 0).enumerate() {
+        out.push_str(if k == 0 { " (" } else { ", " });
+        let _ = write!(out, "{name} {count}");
+    }
+    if total != 0 {
+        out.push(')');
+    }
+    let _ = write!(out, ", branches {branches}, loops {loops}, {lines} lines");
+    out
 }
 
 // ------------------------------------------------------------------ the stream
@@ -878,6 +924,43 @@ fn sessions() -> Vec<(u32, usize)> {
     v
 }
 
+/// (`hal::end_run`) The recording and its subscribers go with the run; the device's facts stay.
+pub(crate) fn end_run() {
+    REC.store(false, Ordering::Relaxed);
+    let state = crate::lock(&STATE).take();
+    let stopped = crate::lock(&STOPPED).take();
+    crate::lock(&SHOWN_IDS).clear();
+    let subs = std::mem::take(&mut *crate::lock(&SUBS));
+    drop((state, stopped, subs));
+}
+
+/// Session `sid` ended (it exits, or relaunches empty under the same id): its frames, the ones
+/// still on the GPU and the backend names it gave leave the recording. The default session
+/// (the busiest) and an app's own readout follow the sessions that draw now, never a closed one.
+pub fn session_closed(sid: u32) {
+    let mut g = lock();
+    let Some(st) = g.as_mut() else { return };
+    st.rings.remove(&sid);
+    st.names.retain(|k, _| k.0 != sid);
+    st.building.remove(&sid);
+    let building: Vec<(u32, FrameKey)> = st.building.iter().map(|(s, i)| (*s, st.open[*i].key)).collect();
+    st.open.retain(|o| o.key.sid != sid);
+    st.building = building.into_iter().filter_map(|(s, k)| st.find(k).map(|i| (s, i))).collect();
+}
+
+/// An app's own readout (`GpuProfQuery` of session `sid`): the first query starts a recording
+/// kept `keep_s` seconds; later ones answer with that session's frames (None while it has none).
+pub fn app_query(sid: u32, keep_s: u32) -> Option<Recording> {
+    if !recording() {
+        start(StartOptions { keep_s: keep_s as u64, split_every: 0, ..Default::default() });
+        return None;
+    }
+    let g = lock();
+    let st = g.as_ref()?;
+    st.rings.get(&sid).filter(|r| !r.frames.is_empty())?;
+    Some(st.snapshot(sid))
+}
+
 /// The recording of session `sid` (default: the one with the most frames).
 pub fn recording_of(sid: Option<u32>) -> Option<Recording> {
     let sid = sid.or_else(|| sessions().first().map(|s| s.0))?;
@@ -1007,6 +1090,10 @@ pub fn dispatch(req: &makepad_remote::Req, out: &mut makepad_remote::Out) -> boo
     if req.cmd != "gpu" || req.pos.first().map(String::as_str) != Some("prof") {
         return false;
     }
+    let words = format!("gpu prof {}", req.pos.get(1).map(String::as_str).unwrap_or(""));
+    if let Some(params) = makepad_remote::params::inspect(&words) {
+        if let Err(e) = req.validate_params(params) { out.err(&e); return true; }
+    }
     match answer(req) {
         Ok(a) if req.get("as") == Some("md") => {
             for l in query::markdown(&a) {
@@ -1025,4 +1112,108 @@ pub fn dispatch(req: &makepad_remote::Req, out: &mut makepad_remote::Out) -> boo
         Err(e) => out.err(&e),
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    fn source_stats_reference(source: &str) -> String {
+        let count = |pat: &str| source.matches(pat).count();
+        let samples = count(".sample(") + count(".sample_compare(") + count(".read(") + count("texture(") + count("texelFetch(");
+        let mut tr: Vec<(&str, usize)> = ["pow(", "exp(", "exp2(", "log(", "log2(", "sin(", "cos(", "tan(", "sqrt(", "rsqrt(", "inversesqrt(", "atan(", "atan2(", "acos(", "asin("]
+            .iter()
+            .map(|p| (p.trim_end_matches('('), count(&format!(" {p}")) + count(&format!("({p}")) + count(&format!("::{p}")) + count(&format!(",{p}"))))
+            .filter(|x| x.1 > 0)
+            .collect();
+        tr.sort_by(|a, b| b.1.cmp(&a.1));
+        let total: usize = tr.iter().map(|x| x.1).sum();
+        let loops = count("for (") + count("for(") + count("while (") + count("while(");
+        let branches = count("if (") + count("if(");
+        let list = tr.iter().take(4).map(|(n, c)| format!("{n} {c}")).collect::<Vec<_>>().join(", ");
+        format!(
+            "samples {samples}, transcendentals {total}{}, branches {branches}, loops {loops}, {} lines",
+            if list.is_empty() { String::new() } else { format!(" ({list})") },
+            source.lines().count()
+        )
+    }
+
+    /// A relaunch closes the app's session: the app's readout and the busiest default follow the
+    /// session that draws now (before, the readout stayed on the closed one).
+    #[test]
+    fn closed_session_leaves_the_recording() {
+        use super::*;
+        // session ids no other test draws with
+        const OLD: u32 = 0x7e57_0001;
+        const NEW: u32 = 0x7e57_0002;
+        // one drawn frame whose pipeline 7 the backend names `shader`; `timed`: its GPU answer
+        // is still to come
+        let frame = |sid: u32, shader: &str, timed: bool| {
+            let key = submit_begin(sid).expect("recording");
+            with_frame(key, |b| {
+                b.pass("main", 0, 1, 1, "", 0);
+                b.cached((sid, 0, 7), || shader.to_string());
+                b.expect(timed as usize);
+            });
+            submit_end(Some(key));
+            key
+        };
+        let frames = |sid: u32| app_query(sid, 20).map_or(0, |r| r.frames.len());
+        let name = |sid: u32| lock().as_ref().and_then(|st| st.names.get(&(sid, 0, 7)).map(|id| st.interner.strings[*id as usize].clone()));
+        start(StartOptions { keep_s: 20, split_every: 0, ..Default::default() });
+        for _ in 0..3 {
+            frame(OLD, "old", false);
+        }
+        frame(NEW, "new", false);
+        let in_flight = frame(OLD, "old", true);
+        assert_eq!((frames(OLD), frames(NEW)), (3, 1));
+        assert_eq!(sessions().iter().find(|s| s.0 == OLD || s.0 == NEW).map(|s| s.0), Some(OLD));
+        session_closed(OLD);
+        // the closed session's frame the GPU answers late does not join the recording either
+        gpu_pass(in_flight, 0, PassGpu::default());
+        assert_eq!((frames(OLD), frames(NEW)), (0, 1));
+        assert!(sessions().iter().all(|s| s.0 != OLD), "a closed session stays the busiest default");
+        // relaunched under the same id: its own frames only, its pipelines named afresh
+        frame(OLD, "relaunched", false);
+        assert_eq!((frames(OLD), frames(NEW)), (1, 1));
+        assert_eq!(name(OLD).as_deref(), Some("relaunched"));
+        assert_eq!(name(NEW).as_deref(), Some("new"));
+        stop();
+    }
+
+    #[test]
+    fn source_stats_matches_reference() {
+        let check = |s: &str| assert_eq!(super::source_stats(s), source_stats_reference(s), "{s:?}");
+        for s in [
+            "", "\n", "\n\n", "\r", "\r\n", "x\r\ny\r", "x\n", "λ\u{2028}雪\n",
+            "fragment float4 shade(texture2d<float> tex, sampler smp) {\n    float x = metal::sqrt(4.0) + rsqrt(4.0);\n    if (x > 0.0) return tex.sample(smp, float2(x));\n    return tex.read(uint2(0));\n}\n",
+            "void main() {\nfor(int i=0; i<2; i++) { float v = exp2(1.0) + exp(1.0); }\nfor (int j=0; j<2; j++) while(false) {}\nwhile (false) if(true) {}\ncolor = texture(tex, uv) + texelFetch(tex, ivec2(0), 0);\n}\n",
+            "sqrt( rsqrt( inversesqrt( exp( exp2( (sqrt(rsqrt(inversesqrt(,sqrt(,rsqrt(,inversesqrt(",
+            "(sqrt(sqrt(sqrt(sqrt( (sin(sin( (exp(exp( (exp2(exp2(",
+            " asin( acos( atan2( atan( inversesqrt( rsqrt( sqrt( tan( cos( sin( log2( log( exp2( exp( pow(",
+            "pow(\nsin(\tcos( xpow( ::pow( :::pow(,pow( (pow( pow(",
+            ".sample(.sample_compare(.read(texture(texelFetch(for(for (while(while (if(if (",
+        ] {
+            check(s);
+        }
+        for p in ["pow(", "exp(", "exp2(", "log(", "log2(", "sin(", "cos(", "tan(", "sqrt(", "rsqrt(", "inversesqrt(", "atan(", "atan2(", "acos(", "asin("] {
+            for prefix in [" ", "(", "::", ","] {
+                let pat = format!("{prefix}{p}");
+                // All proper prefix/suffix matches: only the parenthesis can be shared.
+                for n in 1..pat.len() {
+                    assert_eq!(pat.as_bytes()[..n] == pat.as_bytes()[pat.len() - n..], prefix == "(" && n == 1, "{pat:?}");
+                }
+                check(&pat);
+                check(&format!("{pat}{pat}"));
+                check(&format!("{pat}{p}{p}{p}"));
+                check(&format!("λ{pat}x\r\n雪{pat}"));
+            }
+        }
+        for pat in [".sample(", ".sample_compare(", ".read(", "texture(", "texelFetch(", "for (", "for(", "while (", "while(", "if (", "if("] {
+            for n in 1..pat.len() {
+                assert_ne!(pat.as_bytes()[..n], pat.as_bytes()[pat.len() - n..], "{pat:?}");
+            }
+            check(pat);
+            check(&format!("{pat}{pat}"));
+            check(&format!("{pat}x\n{pat}"));
+        }
+    }
 }

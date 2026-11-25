@@ -437,6 +437,14 @@ pub trait Widget: WidgetNode {
     /// redraws and reordering; the builder supplies the wire id and routes actions to this widget.
     fn semantics_parts(&self, _cx: &Cx, _out: &mut Vec<(u64, Option<u64>, a11y_tree::Node)>) {}
 
+    /// The area part `key` (of [`Widget::semantics_parts`]) drew as, when it drew as one of its
+    /// own (a list's row): the builder then takes its bounds from that area once the frame's
+    /// turtles finish, clipped by every clip it drew under, and reports it offscreen when
+    /// nothing of it shows. Empty (the default): the part's node carries its own bounds.
+    fn semantics_part_area(&self, _key: u64) -> Area {
+        Area::Empty
+    }
+
     fn handle_action(
         &mut self,
         _cx: &mut Cx,
@@ -1357,6 +1365,7 @@ impl WidgetRef {
             cx.enter_nesting_depth();
             let text_owner = if cx.text_runs.is_some() { cx.enter_text_owner(inner.widget.widget_uid().0) } else { 0 };
             let draw_owner = if cx.draw_owners.is_some() { cx.enter_draw_owner(inner.widget.widget_uid().0) } else { 0 };
+            let timed = crate::draw_times::enter(cx, inner.widget.widget_uid());
             if cx.sploded_active() {
                 let uid = inner.widget.widget_uid();
                 let depth = cx.nesting_depth;
@@ -1372,6 +1381,9 @@ impl WidgetRef {
             }
             if cx.draw_owners.is_some() {
                 cx.exit_draw_owner(draw_owner);
+            }
+            if let Some(timed) = timed {
+                crate::draw_times::exit(timed);
             }
             cx.exit_nesting_depth();
             if let Some(nd) = step {
@@ -1392,6 +1404,7 @@ impl WidgetRef {
             cx.enter_nesting_depth();
             let text_owner = if cx.text_runs.is_some() { cx.enter_text_owner(inner.widget.widget_uid().0) } else { 0 };
             let draw_owner = if cx.draw_owners.is_some() { cx.enter_draw_owner(inner.widget.widget_uid().0) } else { 0 };
+            let timed = crate::draw_times::enter(cx, inner.widget.widget_uid());
             if cx.sploded_active() {
                 let uid = inner.widget.widget_uid();
                 let depth = cx.nesting_depth;
@@ -1407,6 +1420,9 @@ impl WidgetRef {
             }
             if cx.draw_owners.is_some() {
                 cx.exit_draw_owner(draw_owner);
+            }
+            if let Some(timed) = timed {
+                crate::draw_times::exit(timed);
             }
             cx.exit_nesting_depth();
         }
@@ -1435,6 +1451,7 @@ impl WidgetRef {
             cx.enter_nesting_depth();
             let text_owner = if cx.text_runs.is_some() { cx.enter_text_owner(inner.widget.widget_uid().0) } else { 0 };
             let draw_owner = if cx.draw_owners.is_some() { cx.enter_draw_owner(inner.widget.widget_uid().0) } else { 0 };
+            let timed = crate::draw_times::enter(cx, inner.widget.widget_uid());
             if cx.sploded_active() {
                 let uid = inner.widget.widget_uid();
                 let depth = cx.nesting_depth;
@@ -1448,6 +1465,9 @@ impl WidgetRef {
             }
             if cx.draw_owners.is_some() {
                 cx.exit_draw_owner(draw_owner);
+            }
+            if let Some(timed) = timed {
+                crate::draw_times::exit(timed);
             }
             cx.exit_nesting_depth();
             if let Some(nd) = step {
@@ -1465,6 +1485,7 @@ impl WidgetRef {
             cx.enter_nesting_depth();
             let text_owner = if cx.text_runs.is_some() { cx.enter_text_owner(inner.widget.widget_uid().0) } else { 0 };
             let draw_owner = if cx.draw_owners.is_some() { cx.enter_draw_owner(inner.widget.widget_uid().0) } else { 0 };
+            let timed = crate::draw_times::enter(cx, inner.widget.widget_uid());
             if cx.sploded_active() {
                 let uid = inner.widget.widget_uid();
                 let depth = cx.nesting_depth;
@@ -1476,6 +1497,9 @@ impl WidgetRef {
             }
             if cx.draw_owners.is_some() {
                 cx.exit_draw_owner(draw_owner);
+            }
+            if let Some(timed) = timed {
+                crate::draw_times::exit(timed);
             }
             cx.exit_nesting_depth();
             if let Some(nd) = step {
@@ -2492,12 +2516,26 @@ fn semantic_draw(widget: &mut (dyn Widget + 'static), source: Option<&ScriptObje
     let needs_metadata = node.id.is_none();
     node.states.remove(a11y_tree::States::HIDDEN);
     widget.semantics(cx, &mut node);
+    crate::semantics::text_origin(widget, cx, token, &node);
     if needs_metadata {
-        let registry = cx.components.get::<WidgetRegistry>();
-        if let Some((info, _)) = registry.map.get(&widget.script_type_id()) {
-            node.class = crate::widget_tree::live_id_token(info.name);
+        {
+            let registry = cx.components.get::<WidgetRegistry>();
+            if let Some((info, _)) = registry.map.get(&widget.script_type_id()) {
+                node.class = crate::widget_tree::live_id_token(info.name);
+            }
         }
-        node.path = cx.widget_tree().semantic_path(widget.widget_uid(), WidgetUid(cx.a11y.window_root(token)));
+    }
+    // A widget made inside its parent's draw is not in the widget tree's graph yet: its path
+    // is named once a frame has drawn (CxA11y::path_unknown), or by itself on a later draw.
+    if needs_metadata || cx.a11y.path_pending(token) {
+        let path = cx.widget_tree().semantic_path(widget.widget_uid(), WidgetUid(cx.a11y.window_root(token)));
+        match path {
+            Ok(path) => node.path = path,
+            Err(part) => {
+                node.path = part;
+                cx.a11y.path_unknown(token);
+            }
+        }
     }
     if let Some(rect) = makepad_platform::a11y::snapshot_rect(&widget.area(), cx) {
         node.bounds = makepad_platform::a11y::semantic_rect(rect);
@@ -2509,7 +2547,7 @@ fn semantic_draw(widget: &mut (dyn Widget + 'static), source: Option<&ScriptObje
     let mut parts = Vec::new();
     widget.semantics_parts(cx, &mut parts);
     for (key, parent, part) in parts {
-        cx.a11y.set_part(token, key, parent, part, || WidgetUid::new().0);
+        cx.a11y.set_part(token, key, parent, part, widget.semantics_part_area(key), || WidgetUid::new().0);
     }
     cx.a11y.end_node(token, node, widget.area());
     step

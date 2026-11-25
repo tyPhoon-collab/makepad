@@ -44,17 +44,29 @@ pub struct Range {
 /// A borrowed run of memory: `len` is in BYTES. The pointer is valid for the duration of the
 /// call that receives it (`hal_submit`), never longer: the HAL copies whatever it keeps before
 /// that call returns. Nothing may be stored from it.
+///
+/// Safe code gets one only from the writer, whose own memory it points into
+/// ([`CmdWriter::keep`](crate::buffers::CmdWriter::keep), the upload commands, `CmdWriter::buf`);
+/// a Slice over the caller's memory is [`Slice::of`] / [`Slice::from_bytes`], which are unsafe:
+/// that memory must outlive the submit.
 #[relax_api(plain)]
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Slice {
-    pub ptr: *const u8,
-    pub len: usize,
+    pub(crate) ptr: *const u8,
+    pub(crate) len: usize,
 }
 
 impl Default for Slice {
     fn default() -> Slice {
         Slice::EMPTY
+    }
+}
+
+/// The length only: the address says nothing and differs between a copy and its source.
+impl std::fmt::Debug for Slice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Slice").field("len", &self.len).finish()
     }
 }
 
@@ -70,17 +82,46 @@ unsafe impl Plain for u64 {}
 unsafe impl Plain for u32 {}
 unsafe impl Plain for f32 {}
 
+/// A number: [`Plain`] without padding, so every byte of it is initialized and it may be copied
+/// as its bytes ([`CmdWriter::keep`](crate::buffers::CmdWriter::keep)).
+///
+/// # Safety
+/// `Self` must be `Plain` and have no padding bytes.
+pub unsafe trait Scalar: Plain {}
+
+unsafe impl Scalar for u8 {}
+unsafe impl Scalar for u64 {}
+unsafe impl Scalar for u32 {}
+unsafe impl Scalar for f32 {}
+
 impl Slice {
     pub const EMPTY: Slice = Slice { ptr: std::ptr::null(), len: 0 };
 
-    /// Borrows `b`; the result is only meaningful while `b` is.
-    pub fn from_bytes(b: &[u8]) -> Slice {
+    /// Borrows `b` without copying it.
+    ///
+    /// # Safety
+    /// `b` must stay alive and unchanged until the batch carrying the Slice has been submitted
+    /// (`hal_submit` returned). [`CmdWriter::keep`](crate::buffers::CmdWriter::keep) is the safe
+    /// form: it copies.
+    pub unsafe fn from_bytes(b: &[u8]) -> Slice {
         Slice { ptr: b.as_ptr(), len: b.len() }
     }
 
-    /// Borrows the elements of `v` (len in bytes).
-    pub fn of<T: Plain>(v: &[T]) -> Slice {
+    /// Borrows the elements of `v` (len in bytes) without copying them.
+    ///
+    /// # Safety
+    /// As [`Slice::from_bytes`].
+    pub unsafe fn of<T: Plain>(v: &[T]) -> Slice {
         Slice { ptr: v.as_ptr() as *const u8, len: std::mem::size_of_val(v) }
+    }
+
+    /// Length in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     /// The borrowed bytes.
@@ -131,19 +172,27 @@ pub struct Attr {
 /// One batch of commands per loop turn. All slices are borrowed for the `hal_submit` call
 /// only. `cmds` is `[Cmd]`, `frames` is `[FramePacket]`, `arena` holds every `Range` the commands
 /// and packets name (8-aligned, so typed arrays in it can be read in place).
+/// Construct a batch with [`crate::buffers::CmdWriter::buf`].
 #[relax_api(plain)]
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct CmdBuf {
-    pub session: u32,
-    pub cmds: Slice,
-    pub arena: Slice,
-    pub frames: Slice,
+    pub(crate) session: u32,
+    pub(crate) cmds: Slice,
+    pub(crate) arena: Slice,
+    pub(crate) frames: Slice,
     /// `[Pass]` and `[Draw]` of every frame in `frames` (element ranges, see [`FramePacket`])
-    pub passes: Slice,
-    pub draws: Slice,
+    pub(crate) passes: Slice,
+    pub(crate) draws: Slice,
     /// `[Layer]` of every frame, addressed by `FramePacket::layers`.
-    pub layers: Slice,
+    pub(crate) layers: Slice,
+}
+
+impl CmdBuf {
+    /// Whether this batch submits any frames.
+    pub fn has_frames(&self) -> bool {
+        !self.frames.is_empty()
+    }
 }
 
 /// One fire-and-forget command. `a` is decoded per `tag` by the generated constructors and
@@ -152,11 +201,11 @@ pub struct CmdBuf {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Cmd {
-    pub tag: u16,
-    pub flags: u16,
-    pub id: Id,
-    pub a: [u64; 4],
-    pub data: Range,
+    pub(crate) tag: u16,
+    pub(crate) flags: u16,
+    pub(crate) id: Id,
+    pub(crate) a: [u64; 4],
+    pub(crate) data: Range,
 }
 
 unsafe impl Plain for Cmd {}
@@ -247,10 +296,15 @@ pub mod info_flags {
     /// both eyes side by side, and the app hands the result on; the XR window only paces them
     /// (its `XrFrame`s and `FrameReady`s), it is never presented.
     pub const XR_OFFSCREEN: u32 = 2048;
+    pub const COMPUTE: u32 = 4096;
+    pub const DRAW_STORAGE_BUFFERS: u32 = 8192;
+    /// The backend replaces a lost device: `DeviceReset` follows `DeviceLost`. Without it a lost
+    /// device stays lost for the rest of the session.
+    pub const DEVICE_RESET: u32 = 16384;
 
     #[test]
     fn the_flags_are_distinct_bits() {
-        let all = [PRIVILEGED, EMBEDDED, DISPLAY_CLOCK, GPU_TIMESTAMPS, CLIENT_CHROME, DIRECT_DISPLAY, WINDOW_LAYERS, WINDOW_BADGES, WM_HOSTED, XR, MULTIVIEW, XR_OFFSCREEN];
+        let all = [PRIVILEGED, EMBEDDED, DISPLAY_CLOCK, GPU_TIMESTAMPS, CLIENT_CHROME, DIRECT_DISPLAY, WINDOW_LAYERS, WINDOW_BADGES, WM_HOSTED, XR, MULTIVIEW, XR_OFFSCREEN, COMPUTE, DRAW_STORAGE_BUFFERS, DEVICE_RESET];
         for (i, a) in all.iter().enumerate() {
             assert!(a.is_power_of_two());
             assert!(all[i + 1..].iter().all(|b| a & b == 0), "flag {a} shares a bit");
@@ -383,6 +437,10 @@ pub struct HalInfo {
     pub flags: u32,
     /// bit per [`format`]
     pub formats: u64,
+    /// Writable storage-image formats, one bit per `format`.
+    pub storage_formats: u64,
+    pub max_workgroup_size: [u32; 3],
+    pub max_workgroup_invocations: u32,
     /// The sample counts a pass may ask for ([`Pass::samples`]): bit n set = 2^n samples per
     /// pixel (1: single sampling only, no MSAA).
     pub msaa: u32,
@@ -560,6 +618,7 @@ pub mod usage {
     /// a layered texture that is a 2D array even with six square colour layers (otherwise those
     /// are a cube: [`crate::session::TextureObj::is_cube`])
     pub const ARRAY: u16 = 16;
+    pub const STORAGE: u16 = 32;
 }
 
 /// Buffer kinds (`BufferCreate` flags).
@@ -568,6 +627,10 @@ pub mod buffer_kind {
     pub const VERTEX: u16 = 1;
     pub const INDEX: u16 = 2;
     pub const UNIFORM: u16 = 3;
+    pub const STORAGE: u16 = 4;
+    pub const KIND_MASK: u16 = 255;
+    pub const INDIRECT: u16 = 1 << 8;
+    pub const READBACK: u16 = 1 << 9;
 }
 
 /// `Pass::load` values.
@@ -851,6 +914,8 @@ pub mod selection_handles {
 
 /// `Frame` target kinds.
 pub mod target {
+    /// A packet containing only compute passes, without a presentation target.
+    pub const COMPUTE: u32 = 2;
     pub const WINDOW: u32 = 0;
     pub const TEXTURE: u32 = 1;
     /// Or-ed into `kind`: the frame is a pick frame. Its draws name pick-variant pipelines
@@ -907,6 +972,12 @@ pub mod lifecycle {
     pub const SURFACE_AVAILABLE: u32 = 9;
 }
 
+/// One range of a grouped buffer read, in request order.
+#[relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BufferReadRange { pub id: Id, pub offset: u64, pub len: u64 }
+
 /// `Readback` event status.
 pub mod readback {
     pub const OK: u32 = 0;
@@ -921,6 +992,7 @@ pub mod readback {
     pub const FAILED: u32 = 4;
     /// A pick replay skipped a pending pipeline or sampled an incomplete pick target. Retry it.
     pub const INCOMPLETE: u32 = 5;
+    pub const DEVICE_LOST: u32 = 6;
 }
 
 /// One element of `DragStart` / `DragMove` item arrays.
@@ -1089,6 +1161,9 @@ pub struct XrDepth {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Pass {
+    /// `pass_kind`; dispatches are byte ranges in the command arena.
+    pub kind: u32,
+    pub dispatches: Range,
     pub color: [Id; 4],
     pub depth: Id,
     /// per colour attachment, then depth: [`pass_load`]
@@ -1156,6 +1231,8 @@ impl Inst {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Draw {
+    /// Storage ids in reflection order, encoded like `tex`.
+    pub storage_buffers: Range,
     pub pipeline: Id,
     pub vb: Id,
     pub ib: Id,
@@ -1199,6 +1276,8 @@ impl Draw {
     pub const WIREFRAME: u32 = 16;
     /// This draw never occludes input to native content below it.
     pub const INPUT_TRANSPARENT: u32 = 32;
+    /// Strict greater-than depth comparison (otherwise less-equal).
+    pub const DEPTH_GREATER: u32 = 64;
 }
 
 unsafe impl Plain for Draw {}
@@ -1285,6 +1364,21 @@ pub fn clock_ns() -> u64 {
     crate::clock::raw_ns()
 }
 
+/// A window of `points` at `dpi` in whole pixels: round(points × dpi), at least one.
+///
+/// The one points-to-pixels conversion of a window: a WM makes a window's shared images this
+/// size, the HAL's window shell and a session's embedded window take it as the window's pixels,
+/// and the boot screen and an app's frames size the window's pass to it. The size and dpi are
+/// taken at f32 first, as they reach an app (`HalEvent::Geom` carries an f32 dpi, a session keeps
+/// f32 geometry), so every side makes the same pixels from the numbers it has. A frame a pixel
+/// larger than its window's shared images is drawn offscreen and never shown: the boot screen's
+/// f32 points × dpi made 1352 × 789 frames for the WM's 1352 × 788 images of a tile at 2.43, and
+/// the app behind it never started.
+pub fn window_pixels(points: [f64; 2], dpi: f64) -> [u32; 2] {
+    let dpi = dpi as f32 as f64;
+    points.map(|p| (p as f32 as f64 * dpi).round().max(1.0) as u32)
+}
+
 /// One window's / target's frame. `passes` and `draws` are ELEMENT ranges into the CmdBuf's
 /// `[Pass]` / `[Draw]` arrays (typed arrays of their own, not the byte arena: they hold padding
 /// and need alignment); `Pass::draws` is an element range into the same draw array.
@@ -1308,6 +1402,12 @@ unsafe impl Plain for FramePacket {}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PipelineDesc {
+    /// Reflected read-only draw buffers (wire `StorageBinding` records).
+    pub storage_buffers: Range,
+    /// Reflected Vulkan draw push-constant size (zero on text targets).
+    pub storage_push_size: u32,
+    /// Empty for draws; otherwise one wire `ComputeDesc`.
+    pub compute: Range,
     pub code: Range,
     /// `[u32]` binding table
     pub bindings: Range,
@@ -1365,4 +1465,92 @@ pub mod domain_stop {
     pub const QUIT: u32 = 0;
     /// free the session now
     pub const KILL: u32 = 1;
+}
+
+/// Pass kind: one ordered stream of drawing and compute work.
+pub mod pass_kind {
+    pub const DRAW: u32 = 0;
+    pub const COMPUTE: u32 = 1;
+}
+
+/// Native binding of one storage buffer, in reflection order.
+#[relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageBinding {
+    pub index: u32,
+    pub offset: u32,
+    /// Zero: read-only (HLSL t register); one: writable (HLSL u register).
+    pub writable: u32,
+}
+
+#[relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageImageBinding {
+    pub index: u32,
+    pub format: u32,
+}
+
+/// Native binding of one sampled 2D texture a kernel reads, in reflection order: a Metal
+/// texture index, an HLSL t register or a Vulkan binding.
+#[relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SampledImageBinding {
+    pub index: u32,
+}
+
+/// One sampler a kernel's samples use, i its place: HLSL register s<i>, Vulkan binding
+/// (storage images + sampled textures + i); Metal declares its own in the kernel, so the
+/// backend ignores these.
+#[relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComputeSamplerDesc {
+    /// 0 nearest, 1 linear
+    pub filter: u32,
+    /// 0 repeat, 1 clamp to edge, 2 clamp to zero, 3 mirrored repeat
+    pub address: u32,
+}
+
+/// Kernel ABI; ranges point into the pipeline blob, never into host pointers.
+#[relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComputeDesc {
+    pub buffers: Range,
+    pub textures: Range,
+    pub push_size: u32,
+    /// The parameter block's Metal buffer index, HLSL b register or Vulkan storage-buffer
+    /// binding (params up to 4096 bytes); `u32::MAX`: Vulkan push constants (up to 128).
+    pub param_binding: u32,
+    pub param_binding_size: u32,
+    /// `u32::MAX` when absent.
+    pub group_count_offset: u32,
+    pub workgroup: [u32; 3],
+    pub precise_math: u32,
+    /// `[SampledImageBinding]` and `[ComputeSamplerDesc]` records (empty when the kernel
+    /// samples nothing).
+    pub sampled: Range,
+    pub samplers: Range,
+}
+
+/// One dispatch. All ranges are byte ranges in the command arena; buffer and
+/// texture ids inside those ranges are wire Id records, in reflection order.
+#[relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dispatch {
+    pub pipeline: Id,
+    /// Optional timestamp label (zero disables the per-dispatch sample).
+    pub timer: StrId,
+    pub groups: [u32; 3],
+    pub indirect_buffer: Id,
+    pub indirect_offset: u64,
+    pub params: Range,
+    pub buffers: Range,
+    pub textures: Range,
+    /// the sampled textures (any 2D texture, never one of `textures`), in reflection order
+    pub sampled: Range,
 }

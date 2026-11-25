@@ -22,7 +22,7 @@ fn union(a: Bounds, b: Bounds) -> Bounds {
     (std::array::from_fn(|i| a.0[i].min(b.0[i])), std::array::from_fn(|i| a.1[i].max(b.1[i])))
 }
 
-fn grow(b: Bounds, r: f64) -> Bounds {
+pub(crate) fn grow(b: Bounds, r: f64) -> Bounds {
     (b.0.map(|x| x - r), b.1.map(|x| x + r))
 }
 
@@ -66,7 +66,7 @@ pub fn fold_reach(blend: f64, n: usize) -> f64 {
     }
 }
 
-fn rot(deg: P3) -> [[f64; 3]; 3] {
+pub(crate) fn rot(deg: P3) -> [[f64; 3]; 3] {
     let (sx, cx) = deg[0].to_radians().sin_cos();
     let (sy, cy) = deg[1].to_radians().sin_cos();
     let (sz, cz) = deg[2].to_radians().sin_cos();
@@ -78,7 +78,7 @@ fn rot(deg: P3) -> [[f64; 3]; 3] {
 }
 
 /// `p` of a transform's inner node into the outer frame.
-fn out_of(at: P3, rotate: P3, scale: f64) -> impl Fn(P3) -> P3 {
+pub(crate) fn out_of(at: P3, rotate: P3, scale: f64) -> impl Fn(P3) -> P3 {
     let r = rot(rotate);
     move |q: P3| std::array::from_fn(|i| (0..3).map(|k| r[i][k] * q[k] * scale).sum::<f64>() + at[i])
 }
@@ -92,46 +92,183 @@ fn into(at: P3, rotate: P3, scale: f64) -> impl Fn(P3) -> P3 {
     }
 }
 
-/// A box holding the node's solid, or `None` when it has none.
+/// A box holding the node's solid, or `None` when it has none. It holds by construction, from
+/// each node's own formula (see [`reach`]): a blend's sag, a shell's or a rounding's growth, a
+/// warp's stretch and a sculpt's raised tubes included.
 pub fn node_bounds(n: &SdfNode) -> Option<Bounds> {
+    reach(n, 0.0, false).map(|(b, m)| grow(b, m))
+}
+
+/// [`node_bounds`] narrowed where the tree proves more, at more cost (a two-operand blend asks
+/// its operands three times, so nested blends multiply): a two-operand blend sags only where both
+/// operands come within its reach, so a side one operand alone holds keeps that operand's; a
+/// difference by a box (an exact one, unturned) that spans a side of what it cuts moves that side
+/// to the box (a cut foot is flat on the cutter's face).
+pub fn tight_bounds(n: &SdfNode) -> Option<Bounds> {
+    reach(n, 0.0, true).map(|(b, m)| grow(b, m))
+}
+
+fn aabb((b, m): (Bounds, f64)) -> Bounds {
+    grow(b, m)
+}
+
+pub(crate) fn meet(a: &Bounds, b: &Bounds) -> Option<Bounds> {
+    let lo: P3 = std::array::from_fn(|k| a.0[k].max(b.0[k]));
+    let hi: P3 = std::array::from_fn(|k| a.1[k].min(b.1[k]));
+    (0..3).all(|k| lo[k] <= hi[k]).then_some((lo, hi))
+}
+
+/// The box of an exact box node (sharp corners, under unturned frames): None for any other.
+fn exact_box(n: &SdfNode) -> Option<Bounds> {
+    match n {
+        SdfNode::Box { size, radius } if *radius == 0.0 => Some(around(size.map(|s| s * 0.5))),
+        SdfNode::Transform { at, rotate, scale, of } if *rotate == [0.0; 3] && *scale > 0.0 => {
+            exact_box(of).map(|(lo, hi)| (std::array::from_fn(|k| lo[k] * scale + at[k]), std::array::from_fn(|k| hi[k] * scale + at[k])))
+        }
+        SdfNode::Id { of, .. } | SdfNode::Material { of, .. } | SdfNode::Bone { of, .. } => exact_box(of),
+        _ => None,
+    }
+}
+
+/// `b` less what box `cut` takes when it spans `b` across two axes and covers one end of the
+/// third (a cut that would take all of `b` leaves it). It spans past `b`'s faces, so all it takes
+/// is inside it, none on its faces.
+fn cut_by(mut b: Bounds, cut: &Bounds) -> Bounds {
+    for i in 0..3 {
+        let spans = (0..3).filter(|&j| j != i).all(|j| cut.0[j] < b.0[j] && cut.1[j] > b.1[j]);
+        if !spans {
+            continue;
+        }
+        if cut.0[i] < b.0[i] && cut.1[i] > b.0[i] && cut.1[i] < b.1[i] {
+            b.0[i] = cut.1[i];
+        } else if cut.1[i] > b.1[i] && cut.0[i] < b.1[i] && cut.0[i] > b.0[i] {
+            b.1[i] = cut.0[i];
+        }
+    }
+    b
+}
+
+/// Where a node's value is at most `delta` (`delta = 0`: its solid): every such point lies within
+/// `m` of the box `b` (`Some((b, m))`), or anywhere (`None`). A blend's operands are asked for
+/// its sag on top of the blend's own `delta`, a shell's and a rounding's operand for its
+/// thickness on top; a scaled frame divides it, a warp multiplies it by its Lipschitz bound.
+/// The margin `m` is a ball's, so it turns with its box: a distance's level set at `delta` is its
+/// solid grown by `delta` in every direction. A field that is no distance (an ellipsoid's bound,
+/// a warp, a texture) folds its growth into its box. A kernel's value counts as a distance
+/// outside its declared box. `tight`: [`tight_bounds`]'s rules too.
+fn reach(n: &SdfNode, delta: f64, tight: bool) -> Option<(Bounds, f64)> {
+    let delta = delta.max(0.0);
     Some(match n {
-        SdfNode::Sphere { radius } => around([*radius; 3]),
-        SdfNode::Box { size, .. } => around(size.map(|s| s * 0.5)),
+        SdfNode::Sphere { radius } => (around([*radius; 3]), delta),
+        SdfNode::Box { size, .. } => (around(size.map(|s| s * 0.5)), delta),
         SdfNode::Cylinder { radius, top_radius, height } => {
             let r = radius.max(*top_radius);
-            around([r, height * 0.5, r])
+            (around([r, height * 0.5, r]), delta)
         }
-        SdfNode::Torus { radius, tube } => around([radius + tube, *tube, radius + tube]),
-        SdfNode::Capsule { a, b, radius } => grow(union((*a, *a), (*b, *b)), *radius),
-        SdfNode::Ellipsoid { radii } => around(*radii),
-        SdfNode::Kernel(k) => return k.bounds,
+        SdfNode::Torus { radius, tube } => (around([radius + tube, *tube, radius + tube]), delta),
+        SdfNode::Capsule { a, b, radius } => (grow(union((*a, *a), (*b, *b)), *radius), delta),
+        // k0 (k0 - 1) / k1 with k1 <= k0 / min(r): at most `delta` only where
+        // k0 <= 1 + delta / min(r), the ellipsoid scaled by that
+        SdfNode::Ellipsoid { radii } => {
+            let rmin = radii.iter().fold(f64::INFINITY, |a, &r| a.min(r.abs())).max(1e-12);
+            (around(radii.map(|r| r.abs() * (1.0 + delta / rmin))), 0.0)
+        }
+        SdfNode::Kernel(k) => (k.bounds?, delta),
         SdfNode::Gyroid { .. } => return None,
-        SdfNode::Mesh(m) => (m.min.map(|x| x as f64), m.max.map(|x| x as f64)),
-        SdfNode::Links(l) => (l.min, l.max),
-        SdfNode::Combine { op, blend, of } => {
-            let b = match op {
-                // Each of the n - 1 smooth steps sags at most a blend reach.
-                SdfOp::Union => {
-                    let b = of.iter().map(node_bounds).try_fold(None, |acc: Option<Bounds>, b| b.map(|b| Some(acc.map_or(b, |a| union(a, b)))))?.expect("a combine has operands");
-                    grow(b, blend_reach(*blend) * of.len().saturating_sub(1) as f64)
+        SdfNode::Mesh(m) => ((m.min.map(|x| x as f64), m.max.map(|x| x as f64)), delta),
+        SdfNode::Links(l) => ((l.min, l.max), delta),
+        SdfNode::Combine { op, blend, of } => match op {
+            // Each of the n - 1 smooth steps sags at most a blend reach below the least operand.
+            SdfOp::Union => {
+                let d = delta + blend_reach(*blend) * of.len().saturating_sub(1) as f64;
+                let all = of.iter().map(|c| reach(c, d, tight)).try_fold(None, |acc: Option<(Bounds, f64)>, r| r.map(|(b, m)| Some(acc.map_or((b, m), |(a, k)| (union(a, b), k.max(m))))))?.expect("a combine has operands");
+                if !(tight && of.len() == 2 && *blend > 0.0) {
+                    all
+                } else {
+                    // smin(a, b) <= delta with both over it only where they differ by under the
+                    // blend and the less is under delta + blend / 4: both under delta + 5/4 blend
+                    let far = delta + 1.25 * blend;
+                    let (x, y) = (&of[0], &of[1]);
+                    let alone = union(aabb(reach(x, delta, tight)?), aabb(reach(y, delta, tight)?));
+                    let both = meet(&aabb(reach(x, far, tight)?), &aabb(reach(y, far, tight)?));
+                    let sag = both.map_or(alone, |b| union(alone, b));
+                    match meet(&aabb(all), &sag) {
+                        Some(b) => (b, 0.0),
+                        None => all,
+                    }
                 }
-                // Inside the first operand; an intersection inside any bounded
-                // one (a smooth max never lies below the hard one).
-                SdfOp::Difference => node_bounds(&of[0])?,
-                SdfOp::Intersection => of.iter().filter_map(node_bounds).reduce(|a, b| (std::array::from_fn(|i| a.0[i].max(b.0[i])), std::array::from_fn(|i| a.1[i].min(b.1[i]))))?,
-            };
-            b
+            }
+            // A smooth max never lies below the hard one: inside the first operand; an
+            // intersection inside every bounded one. A cutter is at least `delta` deep only
+            // inside its box shrunk by `delta`, which the cut leaves out.
+            SdfOp::Difference => {
+                let first = reach(&of[0], delta, tight)?;
+                let cuts: Vec<Bounds> = if tight { of[1..].iter().filter_map(exact_box).map(|b| grow(b, -delta)).collect() } else { Vec::new() };
+                if cuts.is_empty() {
+                    first
+                } else {
+                    (cuts.iter().fold(aabb(first), |b, c| cut_by(b, c)), 0.0)
+                }
+            }
+            SdfOp::Intersection => (of.iter().filter_map(|c| reach(c, delta, tight)).map(aabb).reduce(|a, b| (std::array::from_fn(|i| a.0[i].max(b.0[i])), std::array::from_fn(|i| a.1[i].min(b.1[i]))))?, 0.0),
+        },
+        SdfNode::Shell { thickness, of } => reach(of, thickness.abs() + delta, tight)?,
+        SdfNode::Round { radius, of } => reach(of, radius + delta, tight)?,
+        SdfNode::Transform { at, rotate, scale, of } => {
+            let (b, m) = reach(of, delta / scale, tight)?;
+            (map_bounds(&b, out_of(*at, *rotate, *scale)), m * scale)
         }
-        SdfNode::Shell { thickness, of } => grow(node_bounds(of)?, *thickness),
-        SdfNode::Round { radius, of } => grow(node_bounds(of)?, *radius),
-        SdfNode::Transform { at, rotate, scale, of } => map_bounds(&node_bounds(of)?, out_of(*at, *rotate, *scale)),
-        SdfNode::Material { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Id { of, .. } => node_bounds(of)?,
+        SdfNode::Material { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Id { of, .. } => reach(of, delta, tight)?,
         SdfNode::Instance { places, of } => {
-            let b = node_bounds(of)?;
-            places.iter().map(|pl| map_bounds(&b, |q| pl.out_of(q))).reduce(union)?
+            // one reach per scale the copies use (most share one)
+            let mut by_scale: Vec<(f64, (Bounds, f64))> = Vec::new();
+            let mut out: Option<(Bounds, f64)> = None;
+            for pl in places {
+                let (b, m) = match by_scale.iter().find(|(s, _)| *s == pl.scale) {
+                    Some((_, r)) => *r,
+                    None => {
+                        let r = reach(of, delta / pl.scale, tight)?;
+                        by_scale.push((pl.scale, r));
+                        r
+                    }
+                };
+                let placed = (map_bounds(&b, |q| pl.out_of(q)), m * pl.scale);
+                out = Some(out.map_or(placed, |(a, k)| (union(a, placed.0), k.max(placed.1))));
+            }
+            out?
         }
-        SdfNode::Deform { deform, of, .. } => deform_bounds(deform, &node_bounds(of)?),
+        SdfNode::Deform { deform, lipschitz, of } => (deform_bounds(deform, &aabb(reach(of, delta * lipschitz, tight)?)), 0.0),
+        SdfNode::Texture { tex, of } => (crate::texture::texture_bounds(tex, aabb(reach(of, delta * tex.lipschitz, tight)?)), 0.0),
+        // Raised tubes add to the solid (lowered ones only take away): where a raise changes
+        // the solid its tube is under its blend (its capsule's box grown by its reach). The
+        // brick floor bounds the value by at least a brick.
+        SdfNode::Sculpt { strokes, of } => {
+            let base = reach(of, delta, tight)?;
+            match strokes.raised_bounds() {
+                Some(_) if delta >= crate::strokes::BRICK => return None,
+                Some(s) => (union(base.0, s), base.1.max(delta)),
+                None => base,
+            }
+        }
     })
+}
+
+/// A sculpt culled to `region`: `of` culled there, then each shape stroke that reaches it, in
+/// order, as a Combine of `of` so far and the stroke's tube (the sharp union of its capsules
+/// there). `None`: no solid reaches the region.
+pub fn sculpt_in(strokes: &crate::strokes::Strokes, of: &SdfNode, region: &Bounds) -> Option<SdfNode> {
+    let mut node = cull(of, region);
+    for (t, caps) in strokes.shape_near(region.0, region.1) {
+        let mut tube: Vec<SdfNode> = caps.into_iter().map(|(a, b)| SdfNode::Capsule { a, b, radius: t.radius }).collect();
+        let tube = if tube.len() == 1 { tube.pop().unwrap() } else { SdfNode::Combine { op: SdfOp::Union, blend: 0.0, of: tube } };
+        node = match (node, t.raise) {
+            (Some(n), true) => Some(SdfNode::Combine { op: SdfOp::Union, blend: t.blend, of: vec![n, tube] }),
+            (None, true) => Some(tube),
+            (Some(n), false) => Some(SdfNode::Combine { op: SdfOp::Difference, blend: t.blend, of: vec![n, tube] }),
+            (None, false) => None,
+        };
+    }
+    node
 }
 
 /// A box holding a warped node whose own box is `b`.
@@ -219,9 +356,52 @@ pub fn cull(n: &SdfNode, region: &Bounds) -> Option<SdfNode> {
             }
             SdfNode::Instance { places: kept, of: of.clone() }
         }
+        SdfNode::Sculpt { strokes, of } => sculpt_in(strokes, of, region)?,
+        // The source exact where the texture reads it: its displacement and gradient samples.
+        SdfNode::Texture { tex, of } => SdfNode::Texture { tex: tex.clone(), of: Box::new(cull(of, &grow(*region, tex.reach()))?) },
+        // A gridded kernel with the piece of its grid the region reads.
+        SdfNode::Kernel(k) => SdfNode::Kernel(k.cropped(region)),
         // A warp's preimage of a box is no box: kept whole.
         leaf => leaf.clone(),
     })
+}
+
+/// [`cull`] keeps the same operands, copies and cutters of `n` in region `a` as in region `b`:
+/// each of its decisions comes out the same for both, so both culls are the same node. Nothing
+/// is built. A sculpt's strokes are not compared (false).
+pub fn culls_alike(n: &SdfNode, a: &Bounds, b: &Bounds) -> bool {
+    let nb = node_bounds(n);
+    let reach = |r: &Bounds| nb.map_or(true, |nb| overlaps(&nb, r));
+    let kept = reach(a);
+    if kept != reach(b) {
+        return false;
+    }
+    if !kept {
+        return true;
+    }
+    match n {
+        SdfNode::Combine { blend, of, .. } => {
+            let r = fold_reach(*blend, of.len());
+            let (na, nb) = (grow(*a, r), grow(*b, r));
+            of.iter().all(|c| culls_alike(c, &na, &nb))
+        }
+        SdfNode::Shell { thickness: r, of } | SdfNode::Round { radius: r, of } => culls_alike(of, &grow(*a, *r), &grow(*b, *r)),
+        SdfNode::Transform { at, rotate, scale, of } => {
+            culls_alike(of, &map_bounds(a, into(*at, *rotate, *scale)), &map_bounds(b, into(*at, *rotate, *scale)))
+        }
+        SdfNode::Material { of, .. } | SdfNode::Id { of, .. } | SdfNode::Bone { of, .. } => culls_alike(of, a, b),
+        SdfNode::Instance { places, of } => {
+            let ob = node_bounds(of);
+            places.iter().all(|pl| {
+                let near = |r: &Bounds| ob.map_or(true, |ob| overlaps(&map_bounds(&ob, |q| pl.out_of(q)), r));
+                near(a) == near(b)
+            })
+        }
+        SdfNode::Sculpt { .. } => false,
+        SdfNode::Texture { tex, of } => culls_alike(of, &grow(*a, tex.reach()), &grow(*b, tex.reach())),
+        SdfNode::Kernel(k) => k.splash.as_ref().and_then(|s| s.grid()).map_or(true, |g| g.crops_alike(a, b)),
+        _ => true,
+    }
 }
 
 /// Structural equality, kernels by their key.
@@ -249,8 +429,17 @@ pub fn same(a: &SdfNode, b: &SdfNode) -> bool {
         (Bone { id: i1, rest: r1, of: x }, Bone { id: i2, rest: r2, of: y }) => i1 == i2 && r1 == r2 && same(x, y),
         (Instance { places: p1, of: x }, Instance { places: p2, of: y }) => p1 == p2 && same(x, y),
         (Deform { deform: d1, lipschitz: l1, of: x }, Deform { deform: d2, lipschitz: l2, of: y }) => d1 == d2 && l1 == l2 && same(x, y),
+        (Sculpt { strokes: s1, of: x }, Sculpt { strokes: s2, of: y }) => s1.shape_key() == s2.shape_key() && same(x, y),
+        (Texture { tex: t1, of: x }, Texture { tex: t2, of: y }) => t1.same(t2) && same(x, y),
         _ => false,
     }
+}
+
+/// Where two stroke logs on the same field can differ: the moved strokes' boxes, grown by
+/// the widest blend.
+fn strokes_changed(sa: &crate::strokes::Strokes, sb: &crate::strokes::Strokes) -> Option<Bounds> {
+    let k = sa.applied().chain(sb.applied()).filter_map(|(_, s)| s.tube()).map(|t| t.blend).fold(0.0, f64::max);
+    sa.changed_boxes(sb, false).into_iter().map(|b| grow(b, k)).reduce(union)
 }
 
 /// Where the surface of `new` can differ from the surface of `old`: the
@@ -286,6 +475,13 @@ pub fn changed(old: &SdfNode, new: &SdfNode) -> Option<Bounds> {
         // A slot change is a material change on the same surface.
         (SdfNode::Material { of: a, .. }, SdfNode::Material { of: b, .. }) | (SdfNode::Id { of: a, .. }, SdfNode::Id { of: b, .. }) => changed(a, b).unwrap_or_else(whole),
         (SdfNode::Bone { id: ia, rest: ra, of: a }, SdfNode::Bone { id: ib, rest: rb, of: b }) if ia == ib && ra == rb => changed(a, b)?,
+        // The source's change, as far as the texture reads it.
+        (SdfNode::Texture { tex: ta, of: a }, SdfNode::Texture { tex: tb, of: b }) if ta.same(tb) => grow(changed(a, b)?, ta.reach()),
+        // Only where the strokes moved (one drawn, one undone).
+        (SdfNode::Sculpt { strokes: sa, of: a }, SdfNode::Sculpt { strokes: sb, of: b }) if same(a, b) => strokes_changed(sa, sb)?,
+        // The first stroke (or the last one undone): only where it reaches.
+        (a, SdfNode::Sculpt { strokes, of: b }) if same(a, b) => strokes_changed(&crate::strokes::Strokes::new(), strokes)?,
+        (SdfNode::Sculpt { strokes, of: a }, b) if same(a, b) => strokes_changed(strokes, &crate::strokes::Strokes::new())?,
         (SdfNode::Instance { places: pa, of: a }, SdfNode::Instance { places: pb, of: b }) if same(a, b) => {
             // Only the moved, added or removed copies.
             let ob = node_bounds(a).unwrap_or(everywhere);
@@ -304,6 +500,18 @@ mod tests {
 
     fn at(p: P3, of: SdfNode) -> SdfNode {
         SdfNode::Transform { at: p, rotate: [0.0; 3], scale: 1.0, of: Box::new(of) }
+    }
+
+    /// A one-point stroke culls to a dab on the solid: its capsule has no length.
+    #[test]
+    fn a_one_point_stroke_culls_to_a_dab() {
+        let mut strokes = crate::strokes::Strokes::new();
+        strokes.push(crate::strokes::StrokeOp::Raise, 2.0, 1.0, &[[10.0, 0.0, 0.0]]);
+        let node = sculpt_in(&strokes, &SdfNode::Sphere { radius: 10.0 }, &([-20.0; 3], [20.0; 3])).expect("the solid");
+        let d = |x: f64| distance(&node, Vec3d::new(x, 0.0, 0.0));
+        assert!(d(0.0) < -9.0, "inside the solid: {}", d(0.0));
+        assert!(d(10.0) < 0.0, "the dab holds the stroke's point: {}", d(10.0));
+        assert!(d(30.0) > 15.0, "far off: {}", d(30.0));
     }
 
     /// A blended union, a shell and a cut: a small vase.
@@ -337,15 +545,29 @@ mod tests {
         p.x >= b.0[0] && p.x <= b.1[0] && p.y >= b.0[1] && p.y <= b.1[1] && p.z >= b.0[2] && p.z <= b.1[2]
     }
 
+    /// Both boxes hold the solid: the vase, and the vase with a flat foot cut by a box and a lip
+    /// blended on (the tight box keeps the foot on the cutter's face).
     #[test]
     fn bounds_hold_the_solid() {
-        let n = vase(4.0);
-        let b = node_bounds(&n).unwrap();
-        for p in grid(&grow(b, 10.0), 40) {
-            if distance(&n, p) <= 0.0 {
-                assert!(inside(&b, p), "{p:?} outside {b:?}");
+        let footed = SdfNode::Combine {
+            op: SdfOp::Union,
+            blend: 1.5,
+            of: vec![
+                SdfNode::Combine { op: SdfOp::Difference, blend: 0.0, of: vec![vase(4.0), at([0.0, -5.0, 0.0], SdfNode::Box { size: [40.0, 10.0, 40.0], radius: 0.0 })] },
+                at([0.0, 41.0, 0.0], SdfNode::Torus { radius: 5.0, tube: 1.0 }),
+            ],
+        };
+        for n in [vase(4.0), footed.clone()] {
+            for b in [node_bounds(&n).unwrap(), tight_bounds(&n).unwrap()] {
+                for p in grid(&grow(b, 10.0), 40) {
+                    if distance(&n, p) <= 0.0 {
+                        assert!(inside(&b, p), "{p:?} outside {b:?}");
+                    }
+                }
             }
         }
+        let (loose, tight) = (node_bounds(&footed).unwrap(), tight_bounds(&footed).unwrap());
+        assert!(tight.0[1] == 0.0 && loose.0[1] < -0.3, "the foot: {} tight, {} loose", tight.0[1], loose.0[1]);
     }
 
     #[test]
@@ -390,6 +612,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Brick-sized regions that [`culls_alike`] calls alike cull to the same node, over a vase
+    /// beside a row of copies; neighbours inside one solid's reach are alike, ones across a
+    /// copy's edge are not.
+    #[test]
+    fn alike_regions_cull_the_same() {
+        use crate::shape::SdfPlace;
+        let place = |x: f64| SdfPlace { at: [x, 4.0, 30.0], ..SdfPlace::IDENTITY };
+        let n = SdfNode::Combine { op: SdfOp::Union, blend: 0.0, of: vec![
+            vase(4.0),
+            SdfNode::Instance { places: vec![place(-12.0), place(0.0), place(12.0)], of: Box::new(SdfNode::Sphere { radius: 3.0 }) },
+        ] };
+        let cell = |i: i32, j: i32, k: i32| -> Bounds {
+            let lo = [i as f64 * 4.0, j as f64 * 4.0, k as f64 * 4.0];
+            (lo, [lo[0] + 4.0, lo[1] + 4.0, lo[2] + 4.0])
+        };
+        let (mut alike, mut differ) = (0, 0);
+        for i in -5..5 {
+            for j in -1..12 {
+                for k in -4..10 {
+                    let (a, b) = (cell(i, j, k), cell(i + 1, j, k));
+                    if !culls_alike(&n, &a, &b) {
+                        differ += 1;
+                        continue;
+                    }
+                    alike += 1;
+                    match (cull(&n, &a), cull(&n, &b)) {
+                        (None, None) => {}
+                        (Some(x), Some(y)) => assert!(same(&x, &y), "{a:?} and {b:?} cull apart"),
+                        (x, y) => panic!("{a:?} and {b:?}: {} and {}", x.is_some(), y.is_some()),
+                    }
+                }
+            }
+        }
+        assert!(alike > 0 && differ > 0, "alike {alike}, differ {differ}");
     }
 
     #[test]

@@ -388,7 +388,7 @@ mod imp {
         });
         let index = if is_collection {
             let name = postscript_name?;
-            let data = makepad_shared_bytes::SharedBytes::from_file_mmap_or_read(&path).ok()?;
+            let data = makepad_shared_bytes::HostBuf::from_file_mmap_or_read(&path).ok()?;
             super::collection_index_of(data.as_slice(), name)?
         } else {
             0
@@ -881,30 +881,5 @@ mod tests {
         assert_eq!(fallback_script('あ'), fallback_script('カ'));
         assert_eq!(fallback_script('क'), Script::Devanagari);
         assert_eq!(fallback_script('ি'), Script::Bengali);
-    }
-
-    /// Print installed Apple faces without requiring a particular OS font set.
-    #[cfg(target_vendor = "apple")]
-    #[test]
-    fn apple_family_lookup() {
-        let regular = find_family("Helvetica", 400, false);
-        let bold = find_family("Helvetica", 700, false);
-        let system = find_family(SYSTEM_UI_FAMILY, 400, false);
-        println!("Helvetica 400: {regular:?}");
-        println!("Helvetica 700: {bold:?}");
-        println!("system-ui: {system:?}");
-        if std::path::Path::new("/System/Library/Fonts/Helvetica.ttc").exists() {
-            assert!(regular.as_ref().is_some_and(|font| font.path.exists()));
-        }
-    }
-
-    /// The OS answers for each script the samples use, where it has a font
-    /// (printed, so a node's report shows what it found).
-    #[test]
-    fn os_fallback_for_sample_scripts() {
-        for sample in ["हिन्दी", "العربية", "ภาษาไทย", "ひらがな", "한국어", "中文"] {
-            let found = fallback_candidates(sample, false);
-            println!("{sample}: {found:?}");
-        }
     }
 }

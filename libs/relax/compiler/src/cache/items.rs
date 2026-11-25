@@ -188,11 +188,52 @@ fn digest_into(pf: &ParsedFile, mut text: Option<&mut Vec<u8>>) -> FileDigest {
     let mut free: Vec<(u128, Vec<u8>)> = Vec::new();
     let mut ordered: Vec<(u128, Vec<u8>)> = Vec::new();
     let mut segs: Vec<(u32, u32)> = ast.root_attrs.iter().filter_map(attr_span).collect();
-    ordered.push(piece(&mut segs, want_text));
-    for &i in ast.root_items.iter() {
+    let mut item_segs: Vec<Vec<(u32, u32)>> = ast.root_items.iter().map(|&i| {
         let it = ast.item(i);
-        let mut segs: Vec<(u32, u32)> = ast.list(it.attrs).iter().filter_map(attr_span).collect();
-        segs.push((it.lo, it.hi));
+        let mut s: Vec<(u32, u32)> = ast.list(it.attrs).iter().filter_map(attr_span).collect();
+        s.push((it.lo, it.hi));
+        s
+    }).collect();
+    // Expansions of macros called inside an interface item (e.g. `include_str!` in a `const`,
+    // or an item macro inside an `impl`/`mod`) sit past `it.hi` in `pf.src`: attach them to
+    // their owning root item unless the call site lies inside a body hole.
+    if !pf.exp_map.is_empty() && (!item_segs.is_empty() || !segs.is_empty()) {
+        let mut root_ranges: Vec<(u32, u32, usize)> = ast.root_items.iter().enumerate().map(|(idx, &i)| {
+            let it = ast.item(i);
+            let rlo = item_segs[idx].iter().map(|s| s.0).min().unwrap_or(it.lo);
+            (rlo, it.hi, idx)
+        }).collect();
+        root_ranges.sort_unstable();
+        for (elo, ehi, cpos) in pf.exp_map.iter() {
+            if elo >= ehi { continue; }
+            let mut pos = cpos;
+            for _ in 0..4096 {
+                let hk = by_pos.partition_point(|x| x.1 <= pos);
+                if hk < by_pos.len() && by_pos[hk].0 <= pos {
+                    break;
+                }
+                let rk = root_ranges.partition_point(|x| x.1 <= pos);
+                if rk < root_ranges.len() && root_ranges[rk].0 <= pos {
+                    let (rlo, rhi, idx) = root_ranges[rk];
+                    if elo < rlo || ehi > rhi {
+                        item_segs[idx].push((elo, ehi));
+                    }
+                    break;
+                }
+                if segs.iter().any(|&(alo, ahi)| alo <= pos && pos < ahi) {
+                    segs.push((elo, ehi));
+                    break;
+                }
+                match pf.exp_map.floor(pos) {
+                    Some((_, (_, rhi, next))) if pos <= rhi && next != pos => pos = next,
+                    _ => break,
+                }
+            }
+        }
+    }
+    ordered.push(piece(&mut segs, want_text));
+    for (&i, mut segs) in ast.root_items.iter().zip(item_segs) {
+        let it = ast.item(i);
         let p = piece(&mut segs, want_text);
         if matches!(it.kind, ItemKind::MacroRules(_) | ItemKind::Mac(_)) { ordered.push(p) } else { free.push(p) }
     }
@@ -224,6 +265,22 @@ pub(crate) fn body_hash(pf: &ParsedFile, d: &FileDigest, item: ItemId) -> Option
     let mut h = Sip128::new();
     h.str("body");
     h.write(&pf.src[lo as usize..hi as usize]);
+    if !pf.exp_map.is_empty() {
+        let mut regions: Vec<(u32, u32, u32)> = pf.exp_map.iter().map(|(a, b, c)| (c, a, b)).collect();
+        regions.sort_unstable();
+        let mut exp = super::deps::region_closure(&regions, &[(lo, hi)]);
+        if !exp.is_empty() {
+            exp.sort_unstable();
+            h.u8(0xfd);
+            for (ea, eb) in exp {
+                if ea < eb && (eb as usize) <= pf.src.len() {
+                    h.u32(eb - ea);
+                    h.write(&pf.src[ea as usize..eb as usize]);
+                    h.u8(0xfc);
+                }
+            }
+        }
+    }
     // items the body defines are identified by their file offset (stable::def_ident: TypeId,
     // folded into this code): the body's place is part of its code then
     if d.nested_in.iter().any(|x| x.1 == item.0) {
@@ -318,6 +375,12 @@ pub(crate) fn crate_ifaces(prog: &crate::program::Program, fps: &[u128], digests
 /// `crate_ifaces` when the first crates' interfaces are `known` (a partial collected restore keeps
 /// them): only the other crates' files need digests.
 pub(crate) fn crate_ifaces_from(prog: &crate::program::Program, fps: &[u128], digests: &[Option<std::sync::Arc<FileDigest>>], known: &[u128]) -> Vec<u128> {
+    crate_ifaces_keeping(prog, fps, digests, &[], &|c| known.get(c).copied())
+}
+
+/// `crate_ifaces` with the interfaces `known` gives kept: only the other crates' files need digests.
+/// `added`: the files of modules live edits added (Program::edit_added_files), after the boot's.
+pub(crate) fn crate_ifaces_keeping(prog: &crate::program::Program, fps: &[u128], digests: &[Option<std::sync::Arc<FileDigest>>], added: &[u32], known: &dyn Fn(usize) -> Option<u128>) -> Vec<u128> {
     let nc = prog.crates.len();
     let mut per: Vec<Sip128> = (0..nc)
         .map(|c| {
@@ -330,11 +393,13 @@ pub(crate) fn crate_ifaces_from(prog: &crate::program::Program, fps: &[u128], di
             h
         })
         .collect();
-    // the boot's files only: a program restored with the files the lazy selection skipped
-    // loaded keeps the interfaces (and code keys) of the boot that recorded its code
-    for (i, d) in digests.iter().enumerate().take(prog.boot_files) {
+    // the boot's files (a program restored with the files the lazy selection skipped loaded keeps
+    // the interfaces, and code keys, of the boot that recorded its code), and those of the
+    // modules live edits added: they are the edited text's
+    let added = added.iter().map(|&f| f as usize).filter(|&f| f >= prog.boot_files);
+    for i in (0..prog.boot_files.min(digests.len())).chain(added) {
         if prog.front_macro_fragments.contains(&i) { continue; }
-        let (Some(&c), Some(d)) = (prog.file_crate.get(i), d.as_ref()) else { continue };
+        let (Some(&c), Some(d)) = (prog.file_crate.get(i), digests.get(i).and_then(|d| d.as_ref())) else { continue };
         if let Some(h) = per.get_mut(c as usize) {
             h.str(prog.file_paths.get(i).map_or("", |p| p.as_str()));
             h.u128(d.iface);
@@ -342,7 +407,9 @@ pub(crate) fn crate_ifaces_from(prog: &crate::program::Program, fps: &[u128], di
     }
     let mut out = vec![0u128; nc];
     let mut done = vec![false; nc];
-    for (c, &k) in known.iter().enumerate().take(nc) { out[c] = k; done[c] = true; }
+    for c in 0..nc {
+        if let Some(k) = known(c) { out[c] = k; done[c] = true; }
+    }
     fn go(c: usize, prog: &crate::program::Program, per: &[Sip128], out: &mut Vec<u128>, done: &mut Vec<bool>, depth: u32) -> u128 {
         if done[c] || depth > 512 {
             return out[c];

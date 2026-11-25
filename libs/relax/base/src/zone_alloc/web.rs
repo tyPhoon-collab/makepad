@@ -6,7 +6,7 @@ use std::ffi::c_void;
 
 #[cfg(target_os = "linux")]
 pub const BASE: usize = 0;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub const BASE: usize = 0x3000_0000_0000;
 pub const ARENA_OFFSET: usize = 0x8000_0000;
 const PAGE: usize = 65536;
@@ -24,7 +24,7 @@ pub fn activate() -> bool {
     if end.is_some() { return true; }
     #[cfg(target_os = "linux")]
     const FLAGS: i32 = 0x22 | 0x100000;
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     const FLAGS: i32 = 0x1002;
     let at = BASE + ARENA_OFFSET;
     let len = END - ARENA_OFFSET;
@@ -65,4 +65,10 @@ pub fn memory_grow(delta: usize) -> usize {
 pub fn stats() -> (usize, usize) {
     let end = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or(ARENA_OFFSET);
     (end - ARENA_OFFSET, 0)
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&MEMORY, Mutex::new(None));
 }

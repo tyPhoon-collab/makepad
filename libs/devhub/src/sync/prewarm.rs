@@ -43,7 +43,7 @@ pub struct Board {
 
 impl Board {
     pub fn new(home: PathBuf) -> Board {
-        let store = crate::state::Store::open_quiet(&home, "");
+        let store = crate::state::Store::open_quiet(&home, "").expect("workflow state must open before services start");
         let mut last = BTreeMap::new();
         for v in store.read(|d| d.prewarm.clone()) {
             let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -64,7 +64,7 @@ impl Board {
             l.insert(r.machine.clone(), (r.sev.as_str().to_string(), r.line.clone(), r.at_ms));
             l.iter().filter_map(|(n, (s, line, at))| makepad_strict_json::parse(Self::json(n, s, line, *at).as_bytes()).ok()).collect::<Vec<_>>()
         };
-        self.store.update(|d| d.prewarm = text);
+        self.store.update(|d| d.prewarm = text).unwrap_or_else(|e| { eprintln!("devhub state: {e}"); Default::default() });
     }
 
     fn json(node: &str, sev: &str, line: &str, at: u64) -> String {
@@ -102,16 +102,16 @@ mod board_tests {
         let _ = std::fs::remove_dir_all(&home);
         let b = Board::new(home.clone());
         let rec = |node: &str, kind: &str, line: &str| proto::hub_record(node, "", 0, kind, Sev::Info, line.into(), String::new());
-        b.see(&rec("101", "prewarm", "prewarm: started at a/b"));
-        b.see(&rec("101", "sync", "sync: not a prewarm"));
-        b.see(&rec("101", "prewarm", "prewarm: done at a/b in 90 s"));
-        b.see(&rec("107", "prewarm", "prewarm: cancelled after 3 s at a/b (lease L7 (x)): 1 of 12 steps done"));
+        b.see(&rec("node-a", "prewarm", "prewarm: started at a/b"));
+        b.see(&rec("node-a", "sync", "sync: not a prewarm"));
+        b.see(&rec("node-a", "prewarm", "prewarm: done at a/b in 90 s"));
+        b.see(&rec("node-b", "prewarm", "prewarm: cancelled after 3 s at a/b (lease L7 (x)): 1 of 12 steps done"));
         let b = Board::new(home.clone());
         let mut out = Vec::new();
         b.serve(&mut out);
         let r = rows(&out);
         assert_eq!(r.len(), 2);
-        assert!(r[0].1.starts_with("101      done at a/b in 90 s"), "{r:?}");
+        assert!(r[0].1.starts_with("node-a   done at a/b in 90 s"), "{r:?}");
         assert!(r[1].1.contains("cancelled") && r[1].1.contains("L7"));
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -241,9 +241,28 @@ mod node {
         cmd
     }
 
+    /// The sockets of the JITs announced in `registry` (their discovery files) that run in the
+    /// process group `leader` leads: a step's JIT under its `cargo run`. Read without
+    /// `discovery::apps`, which deletes the files of ended processes (the crash watch needs them).
+    fn group_sockets(registry: &Path, leader: u32, hold: &crate::os::Hold) -> Vec<String> {
+        let Ok(dir) = std::fs::read_dir(registry) else { return Vec::new() };
+        dir.flatten().filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let pid = name.strip_prefix("makepad-remote-")?.strip_suffix(".json")?.parse::<u32>().ok()?;
+            if !crate::os::in_group(pid, leader, hold) { return None; }
+            let app = makepad_remote::discovery::parse(&std::fs::read_to_string(e.path()).ok()?)?;
+            (!app.socket.is_empty()).then_some(app.socket)
+        }).collect()
+    }
+
     /// Runs one step in its own process group, logging to `log`; Ok(true) when it did its job,
     /// Err on cancel or failure.
     fn run_step(step: &Step, log: &Path, cancel: &AtomicBool) -> Result<(), String> {
+        run_step_in(step, log, cancel, &makepad_remote::discovery::registry_dir())
+    }
+
+    /// [`run_step`] with the JITs announcing themselves in `registry`.
+    fn run_step_in(step: &Step, log: &Path, cancel: &AtomicBool, registry: &Path) -> Result<(), String> {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new().create(true).append(true).open(log).map_err(|e| format!("{}: {e}", log.display()))?;
         let _ = writeln!(file, "== {} {}: {}", step.app, step.what, step.argv.join(" "));
@@ -255,10 +274,15 @@ mod node {
         if cancel.load(Ordering::Acquire) {
             return Err("cancelled".into());
         }
-        let (mut child, hold) = crate::os::lease_spawn(&mut cmd).map_err(|e| format!("{} {}: {e}", step.app, step.what))?;
+        let (mut child, hold) = crate::os::lease_spawn(&mut cmd, None).map_err(|e| format!("{} {}: {e}", step.app, step.what))?;
         let pid = child.id();
         let t0 = Instant::now();
         let stop = |child: &mut std::process::Child| {
+            // what it started ends by this stop, not by a crash: said before the TERM, while
+            // their discovery files still name their sockets
+            for socket in group_sockets(registry, pid, &hold) {
+                crate::lease::exec::note_stopped("by prewarm", Path::new(&socket));
+            }
             crate::os::signal_group(pid, false, &hold);
             let end = Instant::now() + TERM_GRACE;
             loop {
@@ -368,7 +392,7 @@ mod node {
                 f2.store(true, Ordering::Release);
             }
             println!("[{:>4} s] {}", t0.elapsed().as_secs(), r.line);
-        }), proto::default_machine_name(), Arc::new(run_step));
+        }), makepad_devhub_conf::default_machine_name(), Arc::new(run_step));
         if let Some(s) = cancel_after {
             let end = t0 + Duration::from_secs(s);
             while pw.running() && Instant::now() < end {
@@ -408,20 +432,45 @@ mod node {
 
         #[test]
         fn the_plan_is_check_then_present_per_app_through_cargo_run() {
-            let steps = plan(Path::new("/t"), Path::new("/s"));
+            let root = Path::new("/t");
+            let scratch = Path::new("/s");
+            let steps = plan(root, scratch);
+            let manifest = root.join("Cargo.toml").display().to_string();
+            let report = scratch.join("calculator.report").display().to_string();
             assert_eq!(steps.len(), 2 * SMOKE.len());
             assert_eq!(steps.iter().map(|s| s.app.as_str()).collect::<Vec<_>>().chunks(2).map(|c| c[0]).collect::<Vec<_>>(), vec!["stage", "scope", "fab", "sandbox", "synth", "calculator"]);
-            let head = ["run", "--profile", "host", "-q", "--manifest-path", "/t/Cargo.toml", "-p", "makepad-run", "--bin", "makepad", "--"];
+            let head = ["run", "--profile", "host", "-q", "--manifest-path", &manifest, "-p", "makepad-run", "--bin", "makepad", "--"];
             for (i, s) in steps.iter().enumerate() {
                 assert_eq!(&s.argv[..head.len()], head);
                 assert_eq!(s.what, if i % 2 == 0 { "check" } else { "present" });
                 assert_eq!(s.report.is_some(), s.what == "present");
             }
             assert_eq!(steps[0].argv[head.len()..], ["check", "makepad-stage"]);
-            assert_eq!(steps[0].dir, Path::new("/t/apps/commercial"));
+            assert_eq!(steps[0].dir, root.join("apps/commercial"));
             let calc = steps.last().unwrap();
-            assert_eq!(calc.argv[head.len()..], ["run", "--report-to", "/s/calculator.report", "makepad-app-calculator", "--no-default-features", "--features", "standalone", "--", "--remote"]);
+            assert_eq!(calc.argv[head.len()..], ["run", "--report-to", &report, "makepad-app-calculator", "--no-default-features", "--features", "standalone", "--", "--remote"]);
             assert!(calc.env.contains(&("MAKEPAD_HIDE_WINDOWS".into(), "1".into())) && calc.env.contains(&("SANDBOX_MUTE".into(), "1".into())));
+        }
+
+        /// A present step's JIT, stopped once it presented, ended by that stop: the node's crash
+        /// watch reads it as stopped by prewarm, not as a crash (each landing's prewarm of stage
+        /// "crashed" on three boxes, 11-04). Its socket is the one its discovery file names.
+        #[cfg(unix)]
+        #[test]
+        fn a_prewarm_stop_is_no_crash() {
+            let base = std::env::temp_dir().join(format!("devhub-prewarm-stop-{}", std::process::id()));
+            let registry = base.join("registry");
+            std::fs::create_dir_all(&registry).unwrap();
+            let (report, socket) = (base.join("app.report"), base.join("app.sock"));
+            // the JIT: announces itself in the registry, reports present, and runs on
+            let script = format!(
+                "printf '{{\"pid\":%s,\"app\":\"makepad-app\",\"socket\":\"{}\",\"started_ms\":1,\"caps\":[]}}\\n' $$ > {}/makepad-remote-$$.json; echo present > {}; exec sleep 60",
+                socket.display(), registry.display(), report.display());
+            let step = Step { app: "app".into(), what: "present", program: "sh".into(), dir: base.clone(), argv: vec!["-c".into(), script], env: Vec::new(), report: Some(report) };
+            run_step_in(&step, &base.join("log"), &AtomicBool::new(false), &registry).unwrap();
+            assert_eq!(crate::lease::exec::stopped_with(0, None, &socket.display().to_string()).as_deref(), Some("by prewarm"), "{}", std::fs::read_to_string(base.join("log")).unwrap_or_default());
+            assert_eq!(crate::lease::exec::stopped_with(0, None, &base.join("other.sock").display().to_string()), None, "only what it stopped");
+            let _ = std::fs::remove_dir_all(&base);
         }
 
         /// A lease preempts at once: the running step sees the cancel, the thread is joined before

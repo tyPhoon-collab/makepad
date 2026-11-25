@@ -33,13 +33,37 @@ pub struct SdfKernel {
     /// A box holding the solid in the kernel's own frame (the document's
     /// declared bounds); `None`: unbounded.
     pub bounds: Option<crate::bounds::Bounds>,
+    /// The grid whose read `field` is and nothing more ([`SdfKernel::grid_read`]): its solid is
+    /// known from its samples, without reading the field.
+    pub solid: Option<Arc<crate::SdfGrid>>,
 }
 
 impl SdfKernel {
     /// A Splash field as a kernel node, its solid inside `bounds`.
     pub fn splash(field: crate::SdfSplashExpr, bounds: Option<crate::bounds::Bounds>) -> SdfKernel {
         let field = Arc::new(field);
-        SdfKernel { key: field.key(), field: field.clone(), splash: Some(field), bounds }
+        SdfKernel { key: field.key(), field: field.clone(), splash: Some(field), bounds, solid: None }
+    }
+
+    /// A Splash field that is its grid's read and nothing more (`sdf_grid3(p)`), read inside
+    /// `within`: its bounds are the box of the grid's solid there.
+    pub fn grid_read(field: crate::SdfSplashExpr, within: crate::bounds::Bounds) -> SdfKernel {
+        let grid = field.grid().expect("a field that reads a grid").clone();
+        let centre: crate::shape::P3 = std::array::from_fn(|k| 0.5 * (within.0[k] + within.1[k]));
+        let bounds = grid.solid_box().and_then(|b| crate::bounds::meet(&b, &within)).unwrap_or((centre, centre));
+        SdfKernel { solid: Some(grid), ..SdfKernel::splash(field, Some(bounds)) }
+    }
+
+    /// The kernel as points in `region` (its frame) read it: a gridded field with the piece of
+    /// its grid they read, any other the same.
+    pub fn cropped(&self, region: &crate::bounds::Bounds) -> SdfKernel {
+        let Some(s) = &self.splash else { return self.clone() };
+        let Some(g) = s.grid() else { return self.clone() };
+        let piece = g.crop(region);
+        if piece.hash() == g.hash() {
+            return self.clone();
+        }
+        SdfKernel { solid: self.solid.clone(), ..SdfKernel::splash(s.with_grid(piece), self.bounds) }
     }
 }
 
@@ -92,6 +116,15 @@ pub enum SdfNode {
     /// The picking id of one source part: the low 32 bits of the sha256 of
     /// its source id (`bolts[2]`, `left.body`), see [`part_id`].
     Id { id: u32, of: Box<SdfNode> },
+    /// `of` sculpted by the shape strokes of a strokes log in `of`'s frame
+    /// ([`crate::strokes`]): each applied one in order, its tube smooth-unioned
+    /// (raise) or smooth-subtracted (lower, crease). A point reads only the
+    /// strokes indexed to its brick; culled to a region it is the plain
+    /// Combines of the capsules there ([`crate::bounds::cull`]), so the engines
+    /// draw it with the nodes they have.
+    Sculpt { strokes: Arc<crate::strokes::Strokes>, of: Box<SdfNode> },
+    /// `of` displaced by a pattern ([`crate::texture`]): a knurl, a hex grip, noise.
+    Texture { tex: Arc<crate::texture::SdfTexture>, of: Box<SdfNode> },
 }
 
 /// A rigid placement with a uniform scale: scaled, then turned by the unit
@@ -155,7 +188,7 @@ pub enum SdfDeform {
 }
 
 /// The smallest taper scale used: a taper that reaches zero is clamped here.
-const TAPER_MIN: f64 = 1e-3;
+pub const TAPER_MIN: f64 = 1e-3;
 
 impl SdfDeform {
     /// A bound on how much the warp stretches distances over a node with
@@ -202,6 +235,22 @@ impl SdfDeform {
 }
 
 impl SdfNode {
+    /// Whether a run so far of a program under this node, for any reader, had a `while` or `loop`
+    /// reach the language's stop ([`crate::SdfSplashExpr::stopped`]): its value there is what the
+    /// loop had by then.
+    pub fn loop_stopped(&self) -> bool {
+        use SdfNode::*;
+        let kernel = |k: &SdfKernel| k.splash.as_ref().is_some_and(|s| s.stopped());
+        match self {
+            Sphere { .. } | Box { .. } | Cylinder { .. } | Torus { .. } | Capsule { .. } | Ellipsoid { .. } | Gyroid { .. } | Mesh(_) | Links(_) => false,
+            Kernel(k) => kernel(k),
+            Combine { of, .. } => of.iter().any(SdfNode::loop_stopped),
+            Material { within, of, .. } => of.loop_stopped() || within.as_deref().is_some_and(SdfNode::loop_stopped),
+            Texture { tex, of } => kernel(&tex.kernel) || of.loop_stopped(),
+            Shell { of, .. } | Round { of, .. } | Transform { of, .. } | Instance { of, .. } | Bone { of, .. } | Deform { of, .. } | Id { of, .. } | Sculpt { of, .. } => of.loop_stopped(),
+        }
+    }
+
     /// `of` warped by `deform`, with its Lipschitz bound.
     pub fn deform(deform: SdfDeform, of: SdfNode) -> SdfNode {
         let lipschitz = deform.lipschitz(crate::bounds::node_bounds(&of).as_ref());
@@ -428,6 +477,28 @@ impl Out {
                 self.u8(18);
                 l.key().iter().for_each(|b| self.u8(*b));
             }
+            SdfNode::Sculpt { strokes, of } => {
+                self.u8(19);
+                self.u64(strokes.shape_key());
+                self.node(of);
+            }
+            SdfNode::Texture { tex, of } => {
+                self.u8(20);
+                self.u64(tex.kernel.key);
+                match tex.project {
+                    crate::texture::TexProject::Axis(a) => self.u8(a),
+                    crate::texture::TexProject::Triplanar => self.u8(3),
+                }
+                for v in [tex.kscale, tex.depth, tex.lipschitz, tex.step] {
+                    self.f(v);
+                }
+                for m in [tex.top, tex.bottom] {
+                    let (lo, hi) = m.unwrap_or((2.0, 2.0));
+                    self.f(lo);
+                    self.f(hi);
+                }
+                self.node(of);
+            }
         }
     }
 }
@@ -449,18 +520,155 @@ impl SdfShape {
 
     /// The shape as a field.
     pub fn field(&self) -> Arc<dyn Sdf3 + Send + Sync> {
-        Arc::new(Eval(self.root.clone()))
+        Arc::new(Compiled::new(&self.root))
+    }
+
+    /// This shape sculpted by a strokes log's shape strokes (in its own frame): its solid under
+    /// one [`SdfNode::Sculpt`] of `strokes` (a sculpt at its root takes the new log in place of
+    /// its own), its box grown by the raised tubes. A shape sculpted by a log, then by that log
+    /// with strokes added, equals the unsculpted shape sculpted by the longer log, key included.
+    pub fn sculpted(self, strokes: Arc<crate::strokes::Strokes>) -> SdfShape {
+        let of = match self.root {
+            SdfNode::Sculpt { of, .. } => of,
+            root => Box::new(root),
+        };
+        let (mut min, mut max) = (self.min, self.max);
+        if let Some((lo, hi)) = strokes.raised_bounds() {
+            for k in 0..3 {
+                min[k] = min[k].min(lo[k]);
+                max[k] = max[k].max(hi[k]);
+            }
+        }
+        SdfShape { root: SdfNode::Sculpt { strokes, of }, min, max, materials: self.materials }
     }
 }
 
-struct Eval(SdfNode);
+/// The field evaluator owns its matrices. The public tree remains editable and its
+/// canonical encoding unchanged; constructing another field compiles its current tree.
+/// Batched kernels keep their vectorized path.
+pub(crate) enum Compiled {
+    Leaf(SdfNode),
+    Combine(SdfOp, f64, Vec<Compiled>),
+    Shell(f64, Box<Compiled>),
+    Round(f64, Box<Compiled>),
+    Transform { at: P3, rotation: [[f64; 3]; 3], scale: f64, of: Box<Compiled> },
+    Instance(Vec<SdfPlace>, Box<Compiled>),
+    Deform(SdfDeform, f64, Box<Compiled>),
+    Sculpt(Arc<crate::strokes::Strokes>, Box<Compiled>),
+    Texture(Arc<crate::texture::SdfTexture>, Box<Compiled>),
+}
 
-impl Sdf3 for Eval {
-    fn distance(&self, p: Vec3d) -> f64 {
-        distance(&self.0, p)
+impl Compiled {
+    pub(crate) fn new(node: &SdfNode) -> Self {
+        match node {
+            SdfNode::Combine { op, blend, of } => Self::Combine(*op, *blend, of.iter().map(Self::new).collect()),
+            SdfNode::Shell { thickness, of } => Self::Shell(*thickness, Box::new(Self::new(of))),
+            SdfNode::Round { radius, of } => Self::Round(*radius, Box::new(Self::new(of))),
+            SdfNode::Transform { at, rotate, scale, of } => Self::Transform { at: *at, rotation: rot(*rotate), scale: *scale, of: Box::new(Self::new(of)) },
+            SdfNode::Material { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Id { of, .. } => Self::new(of),
+            SdfNode::Instance { places, of } => Self::Instance(places.clone(), Box::new(Self::new(of))),
+            SdfNode::Deform { deform, lipschitz, of } => Self::Deform(*deform, *lipschitz, Box::new(Self::new(of))),
+            SdfNode::Sculpt { strokes, of } => Self::Sculpt(strokes.clone(), Box::new(Self::new(of))),
+            SdfNode::Texture { tex, of } => Self::Texture(tex.clone(), Box::new(Self::new(of))),
+            SdfNode::Sphere { .. } | SdfNode::Box { .. } | SdfNode::Cylinder { .. }
+            | SdfNode::Torus { .. } | SdfNode::Capsule { .. } | SdfNode::Ellipsoid { .. }
+            | SdfNode::Gyroid { .. } | SdfNode::Kernel(_) | SdfNode::Mesh(_) | SdfNode::Links(_) => Self::Leaf(node.clone()),
+        }
     }
+}
+
+impl Sdf3 for Compiled {
+    fn distance(&self, p: Vec3d) -> f64 {
+        match self {
+            Self::Leaf(node) => distance(node, p),
+            Self::Combine(op, blend, of) => {
+                let mut d = of[0].distance(p);
+                for child in &of[1..] {
+                    let e = child.distance(p);
+                    d = match op {
+                        SdfOp::Union => smin(d, e, *blend),
+                        SdfOp::Intersection => -smin(-d, -e, *blend),
+                        SdfOp::Difference => -smin(-d, e, *blend),
+                    };
+                }
+                d
+            }
+            Self::Shell(thickness, of) => of.distance(p).abs() - thickness,
+            Self::Round(radius, of) => of.distance(p) - radius,
+            Self::Transform { at, rotation: r, scale, of } => {
+                // Keep the subtraction, transpose multiply, reciprocal and distance scale
+                // in precisely the order used by transform_into and distance.
+                let d = p - Vec3d::new(at[0], at[1], at[2]);
+                let q = Vec3d::new(r[0][0] * d.x + r[1][0] * d.y + r[2][0] * d.z, r[0][1] * d.x + r[1][1] * d.y + r[2][1] * d.z, r[0][2] * d.x + r[1][2] * d.y + r[2][2] * d.z) * (1.0 / scale);
+                of.distance(q) * scale
+            }
+            Self::Instance(places, of) => places.iter().map(|pl| of.distance(v3(pl.into([p.x, p.y, p.z]))) * pl.scale).fold(f64::INFINITY, f64::min),
+            Self::Deform(deform, lipschitz, of) => of.distance(deform.warp(p)) / lipschitz,
+            Self::Sculpt(strokes, of) => strokes.sculpt([p.x, p.y, p.z], of.distance(p), smin),
+            Self::Texture(tex, of) => tex.eval(p, |q| of.distance(q)),
+        }
+    }
+
     fn distance_many(&self, ps: &[Vec3d], out: &mut [f64]) {
-        distance_many(&self.0, ps, out)
+        match self {
+            Self::Leaf(n) => distance_many(n, ps, out),
+            Self::Combine(op, blend, of) => {
+                of[0].distance_many(ps, out);
+                let mut e = vec![0.0; ps.len()];
+                for c in &of[1..] {
+                    c.distance_many(ps, &mut e);
+                    for (d, x) in out.iter_mut().zip(&e) {
+                        *d = match op {
+                            SdfOp::Union => smin(*d, *x, *blend),
+                            SdfOp::Intersection => -smin(-*d, -*x, *blend),
+                            SdfOp::Difference => -smin(-*d, *x, *blend),
+                        };
+                    }
+                }
+            }
+            Self::Shell(thickness, of) => {
+                of.distance_many(ps, out);
+                out.iter_mut().for_each(|d| *d = d.abs() - thickness);
+            }
+            Self::Round(radius, of) => {
+                of.distance_many(ps, out);
+                out.iter_mut().for_each(|d| *d -= radius);
+            }
+            Self::Transform { at, rotation: r, scale, of } => {
+                let q: Vec<Vec3d> = ps
+                    .iter()
+                    .map(|p| {
+                        let d = *p - Vec3d::new(at[0], at[1], at[2]);
+                        Vec3d::new(r[0][0] * d.x + r[1][0] * d.y + r[2][0] * d.z, r[0][1] * d.x + r[1][1] * d.y + r[2][1] * d.z, r[0][2] * d.x + r[1][2] * d.y + r[2][2] * d.z) * (1.0 / scale)
+                    })
+                    .collect();
+                of.distance_many(&q, out);
+                out.iter_mut().for_each(|d| *d *= scale);
+            }
+            Self::Instance(places, of) => {
+                out.iter_mut().for_each(|d| *d = f64::INFINITY);
+                let mut e = vec![0.0; ps.len()];
+                for pl in places {
+                    let q: Vec<Vec3d> = ps.iter().map(|p| v3(pl.into([p.x, p.y, p.z]))).collect();
+                    of.distance_many(&q, &mut e);
+                    for (d, x) in out.iter_mut().zip(&e) {
+                        *d = d.min(x * pl.scale);
+                    }
+                }
+            }
+            Self::Deform(deform, lipschitz, of) => {
+                let q: Vec<Vec3d> = ps.iter().map(|p| deform.warp(*p)).collect();
+                of.distance_many(&q, out);
+                out.iter_mut().for_each(|d| *d /= lipschitz);
+            }
+            Self::Sculpt(strokes, of) => {
+                of.distance_many(ps, out);
+                for (p, d) in ps.iter().zip(out.iter_mut()) {
+                    *d = strokes.sculpt([p.x, p.y, p.z], *d, smin);
+                }
+            }
+            Self::Texture(tex, of) => tex.eval_many(ps, out, |q, o| of.distance_many(q, o)),
+        }
     }
 }
 
@@ -519,6 +727,13 @@ pub fn distance_many(n: &SdfNode, ps: &[Vec3d], out: &mut [f64]) {
             distance_many(of, &q, out);
             out.iter_mut().for_each(|d| *d /= lipschitz);
         }
+        SdfNode::Sculpt { strokes, of } => {
+            distance_many(of, ps, out);
+            for (p, d) in ps.iter().zip(out.iter_mut()) {
+                *d = strokes.sculpt([p.x, p.y, p.z], *d, smin);
+            }
+        }
+        SdfNode::Texture { tex, of } => tex.eval_many(ps, out, |q, o| distance_many(of, q, o)),
         other => {
             for (p, o) in ps.iter().zip(out.iter_mut()) {
                 *o = distance(other, *p);
@@ -606,6 +821,11 @@ fn id_in(n: &SdfNode, p: Vec3d, inherit: Option<u32>) -> (f64, Option<u32>) {
             let (d, i) = id_in(of, deform.warp(p), inherit);
             (d / lipschitz, i)
         }
+        SdfNode::Sculpt { strokes, of } => {
+            let (d, i) = id_in(of, p, inherit);
+            (strokes.sculpt([p.x, p.y, p.z], d, smin), i)
+        }
+        SdfNode::Texture { tex, of } => (tex.eval(p, |q| distance(of, q)), id_in(of, p, inherit).1),
         SdfNode::Material { of, .. } | SdfNode::Bone { of, .. } => id_in(of, p, inherit),
         leaf => (distance(leaf, p), inherit),
     }
@@ -666,6 +886,11 @@ fn slot_in(n: &SdfNode, p: Vec3d, inherit: u8) -> (f64, u8) {
             let (d, s) = slot_in(of, deform.warp(p), inherit);
             (d / lipschitz, s)
         }
+        SdfNode::Sculpt { strokes, of } => {
+            let (d, s) = slot_in(of, p, inherit);
+            (strokes.sculpt([p.x, p.y, p.z], d, smin), s)
+        }
+        SdfNode::Texture { tex, of } => (tex.eval(p, |q| distance(of, q)), slot_in(of, p, inherit).1),
         SdfNode::Bone { of, .. } | SdfNode::Id { of, .. } => slot_in(of, p, inherit),
         SdfNode::Links(l) => {
             let (d, s) = l.distance_slot(p);
@@ -675,11 +900,18 @@ fn slot_in(n: &SdfNode, p: Vec3d, inherit: u8) -> (f64, u8) {
     }
 }
 
-fn transform_into(at: P3, rotate: P3, scale: f64, p: Vec3d) -> Vec3d {
+/// A point of the outer frame into a [`SdfNode::Transform`] (rotation in degrees).
+pub fn transform_into(at: P3, rotate: P3, scale: f64, p: Vec3d) -> Vec3d {
     let r = rot(rotate);
     let d = p - Vec3d::new(at[0], at[1], at[2]);
     // The inverse rotation is the transpose.
     Vec3d::new(r[0][0] * d.x + r[1][0] * d.y + r[2][0] * d.z, r[0][1] * d.x + r[1][1] * d.y + r[2][1] * d.z, r[0][2] * d.x + r[1][2] * d.y + r[2][2] * d.z) * (1.0 / scale)
+}
+
+/// A point of a [`SdfNode::Transform`]'s frame into its parent's: [`transform_into`] undone.
+pub fn transform_out_of(at: P3, rotate: P3, scale: f64, q: P3) -> P3 {
+    let r = rot(rotate);
+    std::array::from_fn(|i| (r[i][0] * q[0] + r[i][1] * q[1] + r[i][2] * q[2]) * scale + at[i])
 }
 
 fn smin(a: f64, b: f64, k: f64) -> f64 {
@@ -738,10 +970,7 @@ pub fn distance(n: &SdfNode, p: Vec3d) -> f64 {
             (q * q + p.y * p.y).sqrt() - tube
         }
         SdfNode::Capsule { a, b, radius } => {
-            let (a, b) = (Vec3d::new(a[0], a[1], a[2]), Vec3d::new(b[0], b[1], b[2]));
-            let (pa, ba) = (p - a, b - a);
-            let h = (pa.dot(ba) / ba.dot(ba)).clamp(0.0, 1.0);
-            (pa - ba * h).length() - radius
+            crate::strokes::capsule([p.x, p.y, p.z], *a, *b) - radius
         }
         SdfNode::Ellipsoid { radii: r } => {
             let k0 = Vec3d::new(p.x / r[0], p.y / r[1], p.z / r[2]).length();
@@ -774,6 +1003,8 @@ pub fn distance(n: &SdfNode, p: Vec3d) -> f64 {
         SdfNode::Material { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Id { of, .. } => distance(of, p),
         SdfNode::Instance { places, of } => places.iter().map(|pl| distance(of, v3(pl.into([p.x, p.y, p.z]))) * pl.scale).fold(f64::INFINITY, f64::min),
         SdfNode::Deform { deform, lipschitz, of } => distance(of, deform.warp(p)) / lipschitz,
+        SdfNode::Sculpt { strokes, of } => strokes.sculpt([p.x, p.y, p.z], distance(of, p), smin),
+        SdfNode::Texture { tex, of } => tex.eval(p, |q| distance(of, q)),
     }
 }
 
@@ -784,6 +1015,20 @@ mod tests {
 
     fn ball(r: f64, at: P3) -> SdfNode {
         SdfNode::Transform { at, rotate: [0.0; 3], scale: 1.0, of: Box::new(SdfNode::Sphere { radius: r }) }
+    }
+
+    /// A capsule with no length is the sphere at its point, anywhere, in `distance` and `distance_many`.
+    #[test]
+    fn a_capsule_with_no_length_is_a_sphere() {
+        let at = [1.0, 2.0, 3.0];
+        let (capsule, sphere) = (SdfNode::Capsule { a: at, b: at, radius: 1.5 }, ball(1.5, at));
+        let ps = lattice(&([-4.0; 3], [6.0; 3]), 5);
+        let mut many = vec![0.0; ps.len()];
+        distance_many(&capsule, &ps, &mut many);
+        for (p, m) in ps.iter().zip(&many) {
+            let want = distance(&sphere, *p);
+            assert_eq!((distance(&capsule, *p), *m), (want, want), "at {p:?}");
+        }
     }
 
     /// Points on a lattice through `b`, grown a little.
@@ -810,6 +1055,121 @@ mod tests {
             SdfNode::deform(SdfDeform::Mirror { axis: 0 }, ball(3.0, [4.0, 1.0, 0.0])),
             SdfNode::Material { slot: 2, within: None, of: Box::new(SdfNode::Bone { id: 7, rest: SdfPlace::IDENTITY, of: Box::new(SdfNode::Id { id: part_id("arm"), of: Box::new(bar) }) }) },
         ]
+    }
+
+    // An exhaustive match makes adding a node a compile error until its fixture is considered.
+    fn variant(n: &SdfNode) -> usize {
+        match n {
+            SdfNode::Sphere { .. } => 0, SdfNode::Box { .. } => 1,
+            SdfNode::Cylinder { .. } => 2, SdfNode::Torus { .. } => 3,
+            SdfNode::Capsule { .. } => 4, SdfNode::Ellipsoid { .. } => 5,
+            SdfNode::Gyroid { .. } => 6, SdfNode::Combine { .. } => 7,
+            SdfNode::Shell { .. } => 8, SdfNode::Round { .. } => 9,
+            SdfNode::Transform { .. } => 10, SdfNode::Kernel(_) => 11,
+            SdfNode::Mesh(_) => 12, SdfNode::Links(_) => 13,
+            SdfNode::Material { .. } => 14, SdfNode::Instance { .. } => 15,
+            SdfNode::Bone { .. } => 16, SdfNode::Deform { .. } => 17,
+            SdfNode::Id { .. } => 18, SdfNode::Sculpt { .. } => 19,
+            SdfNode::Texture { .. } => 20,
+        }
+    }
+
+    fn compiled_fixtures() -> Vec<SdfNode> {
+        use crate::{links::{LinkLoop, Links}, mesh_field::{MeshData, MeshField}, strokes::{StrokeOp, Strokes}, texture::{SdfTexture, TexProject}};
+        let sphere = SdfNode::Sphere { radius: 2.0 };
+        let child = || Box::new(ball(2.0, [0.2, -0.3, 0.4]));
+        // A real leaf kernel, with independently exercised scalar and batch dispatch.
+        let kernel = SdfKernel { key: 1, field: Arc::new(Compiled::Leaf(sphere.clone())), splash: None, bounds: None, solid: None };
+        let mut strokes = Strokes::new();
+        strokes.push(StrokeOp::Raise, 0.8, 0.6, &[[1.5, -1.0, 0.0], [1.5, 1.0, 0.0]]);
+        strokes.push(StrokeOp::Lower, 0.5, 0.7, &[[0.0, 1.8, -1.0], [0.0, 1.8, 1.0]]);
+        let mut out = vec![
+            sphere, SdfNode::Box { size: [3.0, 4.0, 2.0], radius: 0.2 },
+            SdfNode::Cylinder { radius: 1.0, top_radius: 0.7, height: 3.0 },
+            SdfNode::Cylinder { radius: 1.0, top_radius: 1.0, height: 3.0 },
+            SdfNode::Torus { radius: 2.0, tube: 0.6 },
+            SdfNode::Capsule { a: [-1.0, 0.0, 0.0], b: [1.0, 2.0, 0.0], radius: 0.7 },
+            SdfNode::Ellipsoid { radii: [1.5, 2.0, 0.7] },
+            SdfNode::Gyroid { period: 3.0, wall: 0.3 },
+            SdfNode::Combine { op: SdfOp::Union, blend: 0.4, of: vec![*child(), ball(1.5, [1.0, 0.0, 0.0])] },
+            SdfNode::Shell { thickness: 0.3, of: child() },
+            SdfNode::Round { radius: 0.3, of: child() },
+            *child(), SdfNode::Kernel(kernel.clone()),
+            SdfNode::Mesh(Arc::new(MeshField::new(MeshData {
+                positions: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]],
+                triangles: vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+            }))),
+            SdfNode::Links(Arc::new(Links::new(vec![LinkLoop { pts: vec![[-1.0, 0.0, -1.0], [1.0, 0.0, -1.0], [1.0, 0.0, 1.0], [-1.0, 0.0, 1.0]], slot: 1 }], 0.3, None))),
+            SdfNode::Material { slot: 2, within: Some(Box::new(SdfNode::Sphere { radius: 1.0 })), of: child() },
+            SdfNode::Instance { places: vec![SdfPlace::IDENTITY, SdfPlace { at: [1.0, 0.0, 0.0], rotate: quat_from_degrees([10.0, 30.0, -5.0]), scale: 0.7 }], of: child() },
+            SdfNode::Bone { id: 2, rest: SdfPlace { at: [2.0; 3], ..SdfPlace::IDENTITY }, of: child() },
+            SdfNode::deform(SdfDeform::Twist { rate: 0.2 }, *child()),
+            SdfNode::Id { id: 3, of: child() },
+            SdfNode::Sculpt { strokes: Arc::new(strokes), of: child() },
+        ];
+        for project in [TexProject::Axis(0), TexProject::Triplanar] {
+            out.push(SdfNode::Texture { tex: Arc::new(SdfTexture::new(kernel.clone(), project, 0.8, 0.2, 0.01, Some((-0.5, 0.5)), Some((-0.3, 0.7)), 1.0, 0.2)), of: child() });
+        }
+        let mut covered = [false; 21];
+        for n in &out { covered[variant(n)] = true; }
+        assert!(covered.into_iter().all(|v| v), "every node needs an independent fixture");
+        out
+    }
+
+    fn assert_compiled_bits(root: SdfNode, points: &[Vec3d]) {
+        let field = Compiled::new(&root);
+        let old = Compiled::Leaf(root.clone());
+        let mut batch = vec![0.0; points.len()];
+        let mut reference = vec![0.0; points.len()];
+        field.distance_many(points, &mut batch);
+        distance_many(&root, points, &mut reference);
+        for ((&p, a), b) in points.iter().zip(batch).zip(reference) {
+            assert_eq!(a.to_bits(), b.to_bits(), "variant {} batch at {p:?}", variant(&root));
+            assert_eq!(field.distance(p).to_bits(), distance(&root, p).to_bits(), "variant {} scalar at {p:?}", variant(&root));
+            let (a, b) = (field.normal(p), old.normal(p));
+            assert_eq!([a.x.to_bits(), a.y.to_bits(), a.z.to_bits()], [b.x.to_bits(), b.y.to_bits(), b.z.to_bits()], "variant {} normal at {p:?}", variant(&root));
+        }
+    }
+
+    #[test]
+    fn compiled_transforms_preserve_every_distance_bit() {
+        // Test each node alone so a combine cannot hide a changed operand's distance.
+        let small = lattice(&([-2.5; 3], [2.5; 3]), 5);
+        for root in compiled_fixtures() {
+            assert_compiled_bits(root.clone(), &small);
+            for scale in [0.7, -1.5] {
+                assert_compiled_bits(SdfNode::Transform { at: [0.2, -0.4, 0.1], rotate: [31.0, -57.0, 109.0], scale, of: Box::new(root.clone()) }, &small);
+            }
+        }
+        let wrap = |of, rotate, scale| SdfNode::Transform { at: [1.25, -3.7, 0.125], rotate, scale, of: Box::new(of) };
+        let points = lattice(&([-17.0; 3], [19.0; 3]), 9);
+        for op in [SdfOp::Union, SdfOp::Difference, SdfOp::Intersection] {
+            for blend in [0.0, 1.3] {
+                for scale in [0.125, 1.0, 2.7, -1.5] {
+                    let mut children = nodes();
+                    children.push(SdfNode::Cylinder { radius: 3.0, top_radius: 1.25, height: 7.0 });
+                    children.push(SdfNode::Shell { thickness: 0.3, of: Box::new(SdfNode::Round { radius: 0.15, of: Box::new(SdfNode::Torus { radius: 4.0, tube: 0.8 }) }) });
+                    let root = wrap(SdfNode::Combine {
+                        op, blend,
+                        of: children.into_iter().enumerate().map(|(i, n)| wrap(wrap(n, [30.0, -50.0, 110.0], 0.7), [i as f64 * 17.3, -90.0, 0.01], scale)).collect(),
+                    }, [-21.25, 68.75, 180.0], 1.125);
+                    let shape = SdfShape { root, min: [-20.0; 3], max: [20.0; 3], materials: Vec::new() };
+                    let field = shape.field();
+                    let old = Compiled::Leaf(shape.root.clone());
+                    let mut batch = vec![0.0; points.len()];
+                    let mut reference = vec![0.0; points.len()];
+                    field.distance_many(&points, &mut batch);
+                    distance_many(&shape.root, &points, &mut reference);
+                    assert_eq!(batch.iter().map(|d| d.to_bits()).collect::<Vec<_>>(), reference.iter().map(|d| d.to_bits()).collect::<Vec<_>>(), "batch distance bits");
+                    for &p in &points {
+                        assert_eq!(field.distance(p).to_bits(), distance(&shape.root, p).to_bits(), "{op:?}, blend {blend}, scale {scale}, point {p:?}");
+                        let a = field.normal(p);
+                        let b = old.normal(p);
+                        assert_eq!([a.x.to_bits(), a.y.to_bits(), a.z.to_bits()], [b.x.to_bits(), b.y.to_bits(), b.z.to_bits()], "normal at {p:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -221,6 +221,11 @@ hal_commands! {
     PipelineDestroy = 60, pipeline_destroy { id: obj };
     /// Retained instance data the HAL may drop under pressure (-> `BufferEvicted`).
     BufferEvictable = 61, buffer_evictable { id: obj };
+    /// Copy ordered buffer ranges asynchronously; one BufferLeases event answers the request.
+    BufferReadbacks = 62, buffer_readbacks { req: u32, ranges: rng };
+    /// A frame draws the pipeline while the HAL still compiles it: its compile goes ahead of
+    /// those no frame draws.
+    PipelineWanted = 63, pipeline_wanted { id: obj };
 
     // ---- frames
     /// Render `packet` (index into `CmdBuf::frames`) to `target`; `kind` is `target::*`.
@@ -328,8 +333,6 @@ hal_commands! {
     // ---- direct display (only the session owning the desktop window)
     /// Set the primary/source connector (UTF-8). Answered by `DirectDisplayResult`.
     DirectDisplaySource = 133, direct_display_source { req: u64, name: rng };
-    /// Connector names in desktop order (`buffers::pack_strs`). Answered by `DirectDisplayResult`.
-    DirectDisplayOrder = 134, direct_display_order { req: u64, count: u32, names: rng };
     /// Two strings: connector and mode (empty = automatic). Answered by `DirectDisplayResult`.
     DirectDisplayMode = 135, direct_display_mode { req: u64, args: rng };
     /// Mouse or touchpad speed in hundredths; the host clamps it to the native preference range.
@@ -368,9 +371,9 @@ hal_commands! {
     /// A system haptic (`media::haptic_kind::*`), the shell's click or tick feedback. Android only;
     /// the other backends ignore it.
     Haptic = 143, haptic { kind: u32 };
-    /// The arrangement (`direct::DisplayArrangement`): mirror every direct output, optimised for
-    /// the named connector (UTF-8), or empty = extended desktop. Answered by `DirectDisplayResult`.
-    DirectDisplayArrangement = 144, direct_display_arrangement { req: u64, name: rng };
+    /// The arrangement (`direct::DisplayArrangement::text`, UTF-8): the screens left to right, each
+    /// the outputs it shows, and the outputs that are off. Answered by `DirectDisplayResult`.
+    DirectDisplayArrangement = 144, direct_display_arrangement { req: u64, text: rng };
     /// The pacing setting (`direct::DisplayPacing`), packed strings: `auto`, `slowest`,
     /// `fastest` or `screen <name>`.
     DirectDisplayPacing = 145, direct_display_pacing { req: u64, args: rng };
@@ -433,4 +436,6 @@ hal_commands! {
     /// Keeps the display at its fastest refresh rate for about another second, for content that
     /// keeps moving on its own, like a fling (input already does this). Android; elsewhere nothing.
     FrameRateBoost = 165, frame_rate_boost {};
+    /// Ask device clients to release reclaimable memory for foreground work.
+    GpuReclaim = 166, gpu_reclaim { bytes: u64 };
 }

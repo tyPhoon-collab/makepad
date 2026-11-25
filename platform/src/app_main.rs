@@ -176,6 +176,11 @@ pub fn is_window_manager() -> bool {
     WINDOW_MANAGER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Whether this app is a service that outlives the window manager ([`set_outlives_window_manager`]).
+pub fn outlives_window_manager() -> bool {
+    OUTLIVES_WINDOW_MANAGER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static HAL_WINDOW_MANAGER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -217,8 +222,9 @@ pub fn admitted_by_window_manager() -> Option<WmAdmission> {
 /// Linux: a UI process looks for a makepad window manager before any display server. Unless
 /// the launch forced a backend (`--linux-backend=`, a backend token in `MAKEPAD`), its host
 /// launched it, it runs hidden or headless, or it is a window manager itself, a live WM that
-/// speaks this build's hosted wire adopts it: its windows become WM windows over the same
-/// hosted path as the apps the WM launches. Otherwise the HAL picks Wayland, then X11.
+/// speaks a common hosted-protocol version adopts it: its windows become WM windows over the
+/// same hosted path as the apps the WM launches. An incompatible WM stops discovery; with no
+/// live WM the HAL picks Wayland, then X11.
 /// Under Relax the HAL shell does this for the whole `makepad run` process.
 pub fn discover_window_manager(crate_name: &'static str) {
     // The name this process gives a WM that hosts it (also the HAL's own WM shell and its
@@ -614,10 +620,19 @@ macro_rules! _app_main_event_closure {
                     cx.live_edit_capture_begin();
                     cx.reload_generation += 1;
                     cx.with_vm(|vm| {
-                        let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
+                        // MAKEPAD_TRACE=design: what a design re-run costs, by part
+                        let t0 = $crate::Cx::time_now();
+                        // The app's modules, then what was registered outside them and
+                        // kept for the pass (script/reload.rs).
+                        let value = vm.with_reload(|vm| {
+                            let value = <$app as AppMain>::script_mod(vm);
+                            $crate::script::reload::ScriptVmReload::run_kept_for_reload(vm);
+                            value
+                        });
                         if let Some(obj) = value.as_object() {
                             app_value = Some(vm.heap_mut().new_object_ref(obj));
                         }
+                        let t1 = $crate::Cx::time_now();
                         <$app as $crate::ScriptApply>::script_apply(
                             app,
                             vm,
@@ -625,15 +640,16 @@ macro_rules! _app_main_event_closure {
                             &mut $crate::Scope::empty(),
                             value,
                         );
-                        // A module run leaves the whole previous module tree
-                        // behind it, and the collector is paced by growth, so
-                        // one rebuild is never enough to make it run: the
-                        // garbage sat until the heap had doubled. A rebuild is
-                        // the one allocation spike whose size is known in
-                        // advance; collect on the way out, now that the app
-                        // value is held and the tree has been applied.
-                        vm.gc();
+                        let t2 = $crate::Cx::time_now();
+                        $crate::trace!("design", "re-run: script_mod {:.1} ms, apply {:.1} ms", (t1 - t0) * 1e3, (t2 - t1) * 1e3);
                     });
+                    // A module run leaves the whole previous module tree
+                    // behind it, and the collector is paced by growth, so one
+                    // rebuild is never enough to make it run: the garbage sat
+                    // until the heap had doubled. A rebuild is the one
+                    // allocation spike whose size is known in advance: the
+                    // loop collects right after this beat's draw.
+                    cx.gc_after_draw = true;
                     cx.live_edit_capture_end();
                 }
             }
@@ -751,7 +767,11 @@ macro_rules! app_main {
     ( $app:ident, configure: $configure:expr ) => {
         #[cfg(target_arch = "wasm32")]
         $crate::app_main!(@impl $app, $crate::FontSet::Latin, $crate::FontSet::Latin, $crate::LATIN_FONT_ASSET_PACKAGE_MANIFEST, [], $configure);
-        #[cfg(not(target_arch = "wasm32"))]
+        // iOS and tvOS draw CJK, emoji and the other scripts with the OS's fonts: an app bundle
+        // there carries the Latin faces alone
+        #[cfg(any(target_os = "ios", target_os = "tvos"))]
+        $crate::app_main!(@impl $app, $crate::FontSet::System, $crate::FontSet::Latin, $crate::SYSTEM_FONT_ASSET_MANIFEST, [], $configure);
+        #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "tvos")))]
         $crate::app_main!(@impl $app, $crate::FontSet::International, $crate::FontSet::Latin, $crate::INTERNATIONAL_FONT_ASSET_MANIFEST, [], $configure);
     };
     ( $app:ident, font_assets: [$($asset:expr),* $(,)?] ) => {
@@ -760,7 +780,11 @@ macro_rules! app_main {
     ( $app:ident, font_assets: [$($asset:expr),* $(,)?], configure: $configure:expr ) => {
         #[cfg(target_arch = "wasm32")]
         $crate::app_main!(@impl $app, $crate::FontSet::Latin, $crate::FontSet::Latin, $crate::LATIN_FONT_ASSET_PACKAGE_MANIFEST, [$($asset),*], $configure);
-        #[cfg(not(target_arch = "wasm32"))]
+        // iOS and tvOS draw CJK, emoji and the other scripts with the OS's fonts: an app bundle
+        // there carries the Latin faces alone
+        #[cfg(any(target_os = "ios", target_os = "tvos"))]
+        $crate::app_main!(@impl $app, $crate::FontSet::System, $crate::FontSet::Latin, $crate::SYSTEM_FONT_ASSET_MANIFEST, [$($asset),*], $configure);
+        #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "tvos")))]
         $crate::app_main!(@impl $app, $crate::FontSet::International, $crate::FontSet::Latin, $crate::INTERNATIONAL_FONT_ASSET_MANIFEST, [$($asset),*], $configure);
     };
     ( $app:ident, font_set: Latin ) => {
@@ -850,6 +874,11 @@ macro_rules! app_main {
 
         #[cfg(not(target_arch = "wasm32"))]
         pub fn app_main() {
+            // the packager reads this section from the linked binary: `#[used]` is no GC root on
+            // COFF outside MSVC, so GNU ld drops a section nothing references
+            #[cfg(all(windows, target_env = "gnu"))]
+            let _ = ::core::hint::black_box(&MAKEPAD_FONT_ASSETS_V1);
+            $crate::relax_app_main();
             $crate::attach_parent_console();
             Cx::init_log();
             // MAKEPAD_NET_AUDIT=1: log every socket from the first instruction on

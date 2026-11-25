@@ -3,15 +3,14 @@
 //! ParsedFile::part publishes it), into the run's image store (cache/front_run.rs), and from
 //! then on read through the mapping -- clean file pages instead of heap. Warm runs map the same
 //! images (crate stores refer to them) and read them through the same functions (restore,
-//! apply_part). MAKEPAD_RUN_FRONT=0 disables front images; MAKEPAD_RUN_FRONT_VERIFY=1 compares every
-//! section with the parse it replaces.
+//! apply_part). MAKEPAD_RUN_FRONT_VERIFY=1 compares every section with the parse it replaces.
 
 use crate::arena::Arena;
 use crate::image::{Reader, Writer};
 use crate::packed::PackedToks;
 use crate::parser::ParsedFile;
 use crate::source::SourceRegistry;
-use crate::origin_table::{Table, Regions, Maps, Origins};
+use crate::origin_table::{Table, Regions, Rules, Maps, Origins};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const S_SRC: u32 = 1;
@@ -22,13 +21,17 @@ const S_RULES_EXP: u32 = 5;
 const S_BODY_ORIGIN: u32 = 6;
 const S_TOKEN_ORIGINS: u32 = 7;
 const S_SOURCES: u32 = 8;
+/// `Ast::gated_syntax` as (index in `GATED_SYNTAX`, position) pairs, after the tree's arrays
+const S_GATED: u32 = 9;
+/// `ParsedFile::pm_editions`, after the gated syntax
+const S_PM_EDITIONS: u32 = 10;
 /// tree arrays: 100 + index in AST_ARRAYS order
 const S_AST: u32 = 100;
 
 /// The tree's arrays (every Ast arena), in section order.
 macro_rules! ast_arrays {
     ($m:ident) => {
-        $m!(exprs: Expr, pats: Pat, tys: Ty, blocks: Block, root_attrs: Attr, root_items: ItemId, mac_args: MacArgs, path_segs: PathSeg, stmts: Stmt, expr_lists: ExprId, pat_lists: PatId, ty_lists: TyId, field_exprs: FieldExpr, arms: Arm, closure_params: ClosureParam, field_pats: FieldPat, qselfs: QSelf, generic_args: GenericArgs, fn_ptrs: FnPtr, generic_arg_lists: GenericArg, bounds: Bound, generic_params: GenericParam, ident_lists: Ident, attrs: Attr, asm_ops: AsmOp, items: Item, fn_sigs: FnSig, params: Param, field_defs: FieldDef, variants: Variant, use_trees: UseTree, item_lists: ItemId, where_preds: WherePred, method_calls: MethodCallRow, for_exprs: ForRow, closure_exprs: ClosureRow, struct_exprs: StructRow, mac_calls: MacCall, while_exprs: WhileRow, let_stmts: LetStmt, attrs_stmts: AttrsStmt, use_items: UseItem, struct_items: StructItem, union_items: UnionItem, enum_items: EnumItem, alias_items: TypeAliasItem, trait_items: TraitItem, trait_alias_items: TraitAliasItem, impl_items: ImplItem, foreign_mods: ForeignModItem, vis_paths: Path)
+        $m!(exprs: Expr, pats: Pat, tys: Ty, blocks: Block, root_attrs: Attr, root_items: ItemId, mac_args: MacArgs, path_segs: PathSeg, stmts: Stmt, expr_lists: ExprId, pat_lists: PatId, ty_lists: TyId, field_exprs: FieldExpr, arms: Arm, closure_params: ClosureParam, field_pats: FieldPat, qselfs: QSelf, generic_args: GenericArgs, fn_ptrs: FnPtr, generic_arg_lists: GenericArg, bounds: Bound, generic_params: GenericParam, ident_lists: Ident, attrs: Attr, asm_ops: AsmOp, items: Item, fn_sigs: FnSig, params: Param, field_defs: FieldDef, variants: Variant, use_trees: UseTree, item_lists: ItemId, where_preds: WherePred, method_calls: MethodCallRow, for_exprs: ForRow, closure_exprs: ClosureRow, struct_exprs: StructRow, mac_calls: MacCall, while_exprs: WhileRow, let_stmts: LetStmt, attrs_stmts: AttrsStmt, use_items: UseItem, struct_items: StructItem, union_items: UnionItem, enum_items: EnumItem, stmt_attrs: AttrsStmt, alias_items: TypeAliasItem, trait_items: TraitItem, trait_alias_items: TraitAliasItem, impl_items: ImplItem, foreign_mods: ForeignModItem, vis_paths: Path)
     };
 }
 
@@ -45,11 +48,6 @@ fn mismatch(path: &str, section: &str) -> bool {
         eprintln!("makepad-run front mismatch: {} {}", path, section);
     }
     false
-}
-
-pub fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_FRONT").map_or(true, |v| v != "0"))
 }
 
 pub fn verify() -> bool {
@@ -82,13 +80,19 @@ pub fn image(pf: &ParsedFile) -> Writer<'_> {
     }
     ast_arrays!(put);
     let _ = k;
+    let gated: Vec<u32> = a.gated_syntax.iter().flat_map(|&(f, pos)| {
+        let i = crate::ast::GATED_SYNTAX.iter().position(|g| *g == f).expect("a gated syntax feature of GATED_SYNTAX");
+        [i as u32, pos]
+    }).collect();
+    w.add_owned(S_GATED, &gated);
+    w.add(S_PM_EDITIONS, pf.pm_editions.bytes());
     w
 }
 
 /// Heap capacity retired by the main image (parts are accounted separately).
 pub fn heap_bytes(pf: &ParsedFile) -> usize {
     let mut n = pf.src.heap_bytes() + pf.toks.heap_bytes() + pf.exp_map.heap_bytes()
-        + pf.tok_origin.heap_bytes() + pf.token_origins.heap_bytes() + pf.rules_exp.heap_bytes() + pf.body_origin.heap_bytes();
+        + pf.tok_origin.heap_bytes() + pf.token_origins.heap_bytes() + pf.rules_exp.heap_bytes() + pf.body_origin.heap_bytes() + pf.pm_editions.heap_bytes();
     macro_rules! count { ($($f:ident: $t:ident),*) => { $( n += pf.ast.$f.heap_bytes(); )* }; }
     ast_arrays!(count);
     n
@@ -111,7 +115,7 @@ pub fn apply(path: &str, pf: &mut ParsedFile, img: &'static [u8]) -> bool {
     let Some(toks) = PackedToks::mapped(read!(u32, 1, S_TOKS, "toks")) else { return mismatch(path, "toks") };
     let Some(em) = Table::<Regions>::mapped(read!(u8, 2, S_EXP_MAP, "exp_map")) else { return mismatch(path, "exp_map") };
     let Some(to) = Table::<Maps>::mapped(read!(u8, 3, S_TOK_ORIGIN, "tok_origin")) else { return mismatch(path, "tok_origin") };
-    let Some(re) = Table::<Regions>::mapped(read!(u8, 4, S_RULES_EXP, "rules_exp")) else { return mismatch(path, "rules_exp") };
+    let Some(re) = Table::<Rules>::mapped(read!(u8, 4, S_RULES_EXP, "rules_exp")) else { return mismatch(path, "rules_exp") };
     let Some(bo) = Table::<Maps>::mapped(read!(u8, 5, S_BODY_ORIGIN, "body_origin")) else { return mismatch(path, "body_origin") };
     let origins = read!(u8, 6, S_TOKEN_ORIGINS, "token_origins");
     let sources = read!(u8, 7, S_SOURCES, "sources");
@@ -147,14 +151,16 @@ pub fn apply(path: &str, pf: &mut ParsedFile, img: &'static [u8]) -> bool {
         };
     }
     let got = ast_arrays!(get);
-    let _ = k;
-    let mut before = pf.src.heap_bytes() + pf.toks.heap_bytes() + pf.exp_map.heap_bytes() + pf.tok_origin.heap_bytes() + pf.token_origins.heap_bytes() + pf.rules_exp.heap_bytes() + pf.body_origin.heap_bytes();
+    let Some(pe) = r.slice::<u8>(9 + k, S_PM_EDITIONS).and_then(Table::<Regions>::mapped) else { return mismatch(path, "pm_editions") };
+    check!(pe, pf.pm_editions, pe == pf.pm_editions, "pm_editions");
+    let mut before = pf.src.heap_bytes() + pf.toks.heap_bytes() + pf.exp_map.heap_bytes() + pf.tok_origin.heap_bytes() + pf.token_origins.heap_bytes() + pf.rules_exp.heap_bytes() + pf.body_origin.heap_bytes() + pf.pm_editions.heap_bytes();
     pf.src = Arena::Mapped(src);
     pf.toks = toks;
     pf.exp_map = em;
     pf.tok_origin = to;
     pf.rules_exp = re;
     pf.body_origin = bo;
+    pf.pm_editions = pe;
     pf.token_origins = origins;
     let a = &mut pf.ast;
     macro_rules! set {
@@ -181,6 +187,7 @@ const P_TOKEN_ORIGINS: u32 = 206;
 const P_SOURCES: u32 = 207;
 const P_RULES_EXP: u32 = 208;
 const P_BODY_ORIGIN: u32 = 209;
+const P_PM_EDITIONS: u32 = 210;
 const P_AST: u32 = 300;
 
 pub static PARTS_MAPPED: AtomicU64 = AtomicU64::new(0);
@@ -225,6 +232,7 @@ pub fn part_image<'a>(pf: &'a ParsedFile, fp: &'a crate::parser::FilePart, a: &'
     // its macro_rules expansions (hygiene), after the tree
     w.add(P_RULES_EXP, fp.rules_exp.bytes());
     w.add(P_BODY_ORIGIN, fp.body_origin.bytes());
+    w.add(P_PM_EDITIONS, fp.pm_editions.bytes());
     Some(w)
 }
 
@@ -259,13 +267,14 @@ fn part_from_image(path: &str, ends: [u32; crate::ast::ARENAS], (src, toks, rule
         };
     }
     ast_arrays!(get);
-    let (Some(rules_exp), Some(body_origin)) = (r.slice::<u8>(8 + k, P_RULES_EXP).and_then(Table::<Regions>::mapped), r.slice::<u8>(9 + k, P_BODY_ORIGIN).and_then(Table::<Maps>::mapped)) else {
+    let (Some(rules_exp), Some(body_origin), Some(pm_editions)) = (r.slice::<u8>(8 + k, P_RULES_EXP).and_then(Table::<Rules>::mapped), r.slice::<u8>(9 + k, P_BODY_ORIGIN).and_then(Table::<Maps>::mapped),
+        r.slice::<u8>(10 + k, P_PM_EDITIONS).and_then(Table::<Regions>::mapped)) else {
         mismatch(path, "part.rules");
         return None;
     };
     let fp = crate::parser::FilePart {
         src_base: src as u32, tok_base: toks as u32, rules_base: rules as u32,
-        rules_exp, body_origin, next: Default::default(),
+        rules_exp, body_origin, pm_editions, next: Default::default(),
         ext: Arena::Mapped(ext),
         toks: ptoks,
         exp_map: em,
@@ -283,10 +292,10 @@ fn same_part(a: &crate::parser::FilePart, aa: &crate::ast::Ast, b: &crate::parse
     let v = verify();
     let mut s = aa.base == ba.base && a.bodies.iter().eq(b.bodies.iter()) && a.ext.len() == b.ext.len() && a.toks.len() == b.toks.len()
         && a.exp_map.len() == b.exp_map.len() && a.tok_origin.len() == b.tok_origin.len() && a.token_origins.len() == b.token_origins.len()
-        && a.rules_exp.len() == b.rules_exp.len() && a.body_origin.len() == b.body_origin.len();
+        && a.rules_exp.len() == b.rules_exp.len() && a.body_origin.len() == b.body_origin.len() && a.pm_editions.len() == b.pm_editions.len();
     if v {
         s = s && a.ext[..] == b.ext[..] && a.toks.words() == b.toks.words() && a.exp_map == b.exp_map && a.tok_origin == b.tok_origin && a.token_origins == b.token_origins
-            && a.rules_exp == b.rules_exp && a.body_origin == b.body_origin;
+            && a.rules_exp == b.rules_exp && a.body_origin == b.body_origin && a.pm_editions == b.pm_editions;
     }
     macro_rules! cmp {
         ($($f:ident: $t:ident),*) => {
@@ -478,7 +487,9 @@ fn restore_inner(meta: &mut crate::crate_image::FileMeta, img: &'static [u8], ce
     let mut k = 0usize;
     macro_rules! get { ($($f:ident: $t:ident),*) => { $(ast.$f=Arena::Mapped(r.slice::<$t>(8+k,S_AST+k as u32)?);k+=1;)* }; }
     ast_arrays!(get);
-    let _ = k;
+    // the gated syntax, which `makepad check` reports (E0658) from the restored tree too
+    let gated = r.slice::<u32>(8 + k, S_GATED)?;
+    ast.gated_syntax = gated.chunks_exact(2).map(|p| Some((*crate::ast::GATED_SYNTAX.get(p[0] as usize)?, p[1]))).collect::<Option<_>>()?;
     let mut sources = None;
     let origins = restore_origins(r.slice(6, S_TOKEN_ORIGINS)?, r.slice(7, S_SOURCES)?, &mut sources, certified)?;
     if meta.token_input {
@@ -499,6 +510,7 @@ fn restore_inner(meta: &mut crate::crate_image::FileMeta, img: &'static [u8], ce
         tok_origin: Table::mapped(r.slice(3, S_TOK_ORIGIN)?)?,
         rules_exp: Table::mapped(r.slice(4, S_RULES_EXP)?)?,
         body_origin: Table::mapped(r.slice(5, S_BODY_ORIGIN)?)?,
+        pm_editions: Table::mapped(r.slice(9 + k, S_PM_EDITIONS)?)?,
         line_starts: Default::default(),
         part: Default::default(),
         impl_heads: Default::default(),
@@ -507,11 +519,15 @@ fn restore_inner(meta: &mut crate::crate_image::FileMeta, img: &'static [u8], ce
     })
 }
 
-pub fn verify_file(image: &ParsedFile, fresh: &ParsedFile) {
-    let a = &image.ast;
-    let b = &fresh.ast;
+fn verify_ast(a: &crate::ast::Ast, b: &crate::ast::Ast) {
+    assert_eq!(a.base, b.base, "front AST base");
+    assert_eq!(a.gated_syntax, b.gated_syntax, "front AST gated syntax");
     macro_rules! cmp { ($($f:ident: $t:ident),*) => { $(assert_eq!(format!("{:?}",&a.$f[..]),format!("{:?}",&b.$f[..]),"front AST {}",stringify!($f));)* }; }
     ast_arrays!(cmp);
+}
+
+pub fn verify_file(image: &ParsedFile, fresh: &ParsedFile) {
+    verify_ast(&image.ast, &fresh.ast);
     assert_eq!(&image.src[..], &fresh.src[..], "front source");
     assert_eq!(image.toks.words(), fresh.toks.words(), "front tokens");
     assert_eq!(image.exp_map, fresh.exp_map);
@@ -519,8 +535,27 @@ pub fn verify_file(image: &ParsedFile, fresh: &ParsedFile) {
     assert!(same_origins(image, &image.token_origins, fresh, &fresh.token_origins), "front token origins");
     assert_eq!(image.rules_exp, fresh.rules_exp);
     assert_eq!(image.body_origin, fresh.body_origin);
+    assert_eq!(image.pm_editions, fresh.pm_editions);
     assert_eq!((image.edition, image.src_len, image.token_input), (fresh.edition, fresh.src_len, fresh.token_input));
     assert_eq!(crate::crate_image::encode(&image.lazy), crate::crate_image::encode(&fresh.lazy));
+    // Some callers compare main images before either side has demanded bodies.
+    if let (Some(ip), Some(fp)) = (image.part.get(), fresh.part.get()) {
+        let mut a = image.ast.part.get().expect("front part AST").as_ref();
+        while let Some(next) = a.part.get() { a = next; }
+        let mut b = fresh.ast.part.get().expect("front part AST").as_ref();
+        while let Some(next) = b.part.get() { b = next; }
+        verify_ast(a, b);
+        assert_eq!((ip.src_base, ip.tok_base, ip.rules_base), (fp.src_base, fp.tok_base, fp.rules_base), "front part base");
+        assert!(ip.bodies.iter().eq(fp.bodies.iter()), "front part bodies");
+        assert_eq!(&ip.ext[..], &fp.ext[..], "front part source");
+        assert_eq!(ip.toks.words(), fp.toks.words(), "front part tokens");
+        assert_eq!(ip.exp_map, fp.exp_map);
+        assert_eq!(ip.tok_origin, fp.tok_origin);
+        assert!(same_origins(image, &ip.token_origins, fresh, &fp.token_origins), "front part token origins");
+        assert_eq!(ip.rules_exp, fp.rules_exp);
+        assert_eq!(ip.body_origin, fp.body_origin);
+        assert_eq!(ip.pm_editions, fp.pm_editions);
+    }
 }
 
 #[cfg(test)]
@@ -579,6 +614,30 @@ mod tests {
         assert_eq!(loc.source.path(), "/fake/image-import.rs");
         assert_eq!((loc.span.lo, loc.span.hi), (span.lo, span.hi));
         assert_eq!(loc.source.bytes(), source.as_bytes());
+    }
+
+    /// agree.sh's warm rerun: `makepad check` reported E0658 for `pub a: u32 = 7` only cold.
+    /// A file restored from its front image had no gated syntax (the parser's record, not one of
+    /// the tree's arrays), so the warm check found nothing to gate.
+    #[test]
+    fn a_restored_file_keeps_the_gated_syntax_of_its_parse() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let cfg = crate::cfg::CfgSet::host(sess, &[]);
+        let path = "gated.rs";
+        let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new("test", path, "test", &cfg));
+        let table = std::sync::Arc::new(crate::macros::MacroTable::default());
+        let (mut f, used) = crate::parser::parse_owned_ctx(sess,
+            b"pub struct S { pub a: u32 = 7 }\npub fn f() -> u32 { let x = #[allow(unused)] 3; x }\n".to_vec(), None, 2021,
+            Some(crate::macros::MacroScope::new(table)), "test", Some(ctx), false,
+        ).unwrap();
+        let prep = crate::program::prepare_file(&mut f, &cfg);
+        let gates: Vec<&str> = f.ast.gated_syntax.iter().map(|g| g.0).collect();
+        assert_eq!(gates, ["default_field_values", "stmt_expr_attributes"]);
+        let metadata = crate::crate_image::file_meta(path, "test", &f, &used.unwrap(), &prep, false);
+        let mut meta = crate::crate_image::decode(&metadata).unwrap();
+        let restored = restore(&mut meta, image(encode(&f))).unwrap();
+        assert_eq!(restored.ast.gated_syntax, f.ast.gated_syntax);
+        verify_file(&restored, &f);
     }
 
     fn lazy_file(sess: &std::sync::Arc<crate::Session>) -> (ParsedFile, crate::cfg::CfgSet) {
@@ -652,4 +711,16 @@ mod tests {
         assert_eq!(before, format!("{:?}", a.exprs));
         assert!(!fp.toks.is_mapped());
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&MAPPED_FILES, AtomicU64::new(0));
+    reset(&MAPPED_BYTES, AtomicU64::new(0));
+    reset(&RECORDED_FILES, AtomicU64::new(0));
+    reset(&RECORDED_BYTES, AtomicU64::new(0));
+    reset(&MISMATCHED, AtomicU64::new(0));
+    reset(&PARTS_MAPPED, AtomicU64::new(0));
+    reset(&PARTS_RECORDED, AtomicU64::new(0));
 }

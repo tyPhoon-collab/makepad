@@ -10,8 +10,8 @@ use crate::{
 };
 use std::sync::Arc;
 
-// Demand certificates belong to the graph; crate records keep only their own selection.
-pub const VERSION: u32 = 22;
+// Macro definitions record the invocation position that orders a generated definition.
+pub const VERSION: u32 = 25;
 
 pub(crate) mod strings;
 
@@ -203,15 +203,15 @@ fields!(MTok, kind, text, pos);
 impl Codec for MacroDef {
     fn put(&self, w: &mut Vec<u8>) {
         self.name.put(w); self.krate.put(w); self.exported.put(w); self.arms.put(w);
-        self.builtin.put(w); self.def_file.put(w); self.def_pos.put(w); self.def_mod.put(w);
+        self.builtin.put(w); self.def_file.put(w); self.def_pos.put(w); self.scope_pos.put(w); self.def_mod.put(w); self.edition.put(w);
     }
     fn get(r: &mut Decode<'_>) -> Option<Self> {
         Some(Self { name: Codec::get(r)?, krate: Codec::get(r)?, exported: Codec::get(r)?, arms: Codec::get(r)?,
-            builtin: Codec::get(r)?, def_file: Codec::get(r)?, def_pos: Codec::get(r)?, def_mod: Codec::get(r)?, input: None })
+            builtin: Codec::get(r)?, def_file: Codec::get(r)?, def_pos: Codec::get(r)?, scope_pos: Codec::get(r)?, def_mod: Codec::get(r)?, edition: Codec::get(r)?, input: None })
     }
 }
 fields!(UseItem, module, path, bind, is_pub);
-fields!(ModItem, pos, end, macro_use);
+fields!(ModItem, pos, end, macro_use, is_pub);
 fields!(LazyCtx, krate, path, module_path, mods, s2_fmt);
 /// Option<Box<LazyCtx>>'s encoding
 impl Codec for crate::parser::FileLazy {
@@ -243,22 +243,8 @@ impl Codec for crate::lexer::T {
     }
     fn get(r: &mut Decode<'_>) -> Option<Self> {
         let n = u8::get(r)?;
-        // Authored demand scans also contain the append-only declarative/GPU
-        // tokens. The original Rust-only codec silently rejected every such
-        // crate's persisted outline before it could be reused.
-        if n > Self::Interp as u8 {
-            return Some(match n {
-                n if n == Self::Colour as u8 => Self::Colour,
-                n if n == Self::Duration as u8 => Self::Duration,
-                n if n == Self::AtId as u8 => Self::AtId,
-                n if n == Self::ColonEq as u8 => Self::ColonEq,
-                n if n == Self::PlusColon as u8 => Self::PlusColon,
-                n if n == Self::Comment as u8 => Self::Comment,
-                n if n == Self::DocComment as u8 => Self::DocComment,
-                n if n == Self::Apostrophe as u8 => Self::Apostrophe,
-                n if n == Self::OtherPunct as u8 => Self::OtherPunct,
-                _ => return None,
-            });
+        if n > Self::DocComment as u8 {
+            return None;
         }
         Some(unsafe { std::mem::transmute::<u8, Self>(n) })
     }
@@ -685,7 +671,7 @@ pub struct GraphRecipe {
     /// the same crates in any load order (each crate's recipe with its dependencies by name):
     /// the key of the graph's last load order (cache.rs load_order)
     pub set: u128,
-    pub crates: Vec<(String, String)>,
+    pub crates: Vec<crate::preload::CrateKey>,
     /// a reordered load's base graph (cache.rs load_order): the graph store its retained demand
     /// parts are read from when this graph is recorded
     pub base: Option<u128>,
@@ -724,7 +710,7 @@ impl GraphRecipe {
         s.u8(crate::parser::lazy_auto() as u8);
         s.u32(set.len() as u32);
         for k in set { s.u128(k); }
-        Self { identity: h.finish128(), set: s.finish128(), crates: crates.iter().map(|c| (c.name.clone(), c.root.clone())).collect(), base: None }
+        Self { identity: h.finish128(), set: s.finish128(), crates: crates.iter().map(|c| c.key()).collect(), base: None }
     }
 }
 
@@ -732,7 +718,7 @@ impl GraphRecipe {
 /// ASTs stay in per-file images in the named crate stores; no name index is needed.
 pub struct GraphImage {
     pub identity: u128,
-    pub crates: Vec<((String, String), u128)>,
+    pub crates: Vec<(crate::preload::CrateKey, u128)>,
     pub inputs: Vec<(String, u128)>,
     /// per input (same order): the stat the recorded hash was taken under; None when the input
     /// has none (virtual) or changed too close to `recorded_ns` to trust a stat ("racy")

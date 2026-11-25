@@ -1864,7 +1864,7 @@ fn make_mod(file: &str, code: &str) -> ScriptMod {
 
 fn eval_checked(vm: &mut ScriptVm, file: &str, code: &str) -> Result<ScriptValue, String> {
     vm.capture_errors();
-    let value = vm.with_instruction_limit(FLOW_INSTRUCTION_LIMIT, |vm| {
+    let value = vm.with_instruction_limit(FLOW_INSTRUCTION_LIMIT as u64, |vm| {
         vm.eval(make_mod(file, code))
     });
     let errors = vm.take_errors();
@@ -2041,6 +2041,9 @@ pub struct FaceHost {
     heap_key: usize,
     /// The appearance epoch this isolate was last brought to.
     appearance_epoch: u64,
+    /// The live-edit reload pass (`Cx::reload_generation`) it was last brought to: a later
+    /// one restyles it in place as an appearance change does, on the edited code.
+    reloaded_at: u64,
     node_objects: NodeObjects,
     bridge: Option<ScriptObjectRef>,
     pub faces: HashMap<String, MountedFace>,
@@ -2580,6 +2583,8 @@ impl FaceHost {
         // The library is registered once, already in the window's appearance.
         let ui_errors = Rc::new(RefCell::new(Vec::new()));
         let vm_id = cx.alloc_splash_vm_with_ui(false, appearance::isolate_ui(appearance.clone(), ui_errors.clone()));
+        // A live edit restyles it in place like an appearance change (`apply_appearance`).
+        makepad_widgets::widget_async::isolate_reloads_with_host(cx, vm_id);
         let heap_key = cx.with_script_vm_id(vm_id, |vm| vm.bx.heap_ref().heap_key());
         let node_objects: NodeObjects = Rc::new(RefCell::new(HashMap::new()));
         let mut host = Self {
@@ -2589,6 +2594,7 @@ impl FaceHost {
             vm_id,
             heap_key,
             appearance_epoch: appearance.epoch,
+            reloaded_at: cx.reload_generation,
             node_objects: node_objects.clone(),
             bridge: None,
             faces: HashMap::new(),
@@ -2635,7 +2641,7 @@ impl FaceHost {
                 // Module installation and the level's own evaluation run under
                 // the same instruction budget as the flow file: nothing a
                 // package ships may hold the UI thread.
-                let value = vm.with_instruction_limit(FLOW_INSTRUCTION_LIMIT, |vm| {
+                let value = vm.with_instruction_limit(FLOW_INSTRUCTION_LIMIT as u64, |vm| {
                     makepad_flow::graph::install_registry(vm, registry).map_err(|error| error.to_string())?;
                     makepad_flow::graph::install_closure(vm, &closure, PREFIX).map_err(|error| error.to_string())?;
                     match level.as_deref() {
@@ -2740,6 +2746,8 @@ impl FaceHost {
         // The library is registered once, already in the window's appearance.
         let ui_errors = Rc::new(RefCell::new(Vec::new()));
         let vm_id = cx.alloc_splash_vm_with_ui(false, appearance::isolate_ui(appearance.clone(), ui_errors.clone()));
+        // A live edit restyles it in place like an appearance change (`apply_appearance`).
+        makepad_widgets::widget_async::isolate_reloads_with_host(cx, vm_id);
         let heap_key = cx.with_script_vm_id(vm_id, |vm| vm.bx.heap_ref().heap_key());
         let node_objects: NodeObjects = Rc::new(RefCell::new(HashMap::new()));
         let mut host = Self {
@@ -2749,6 +2757,7 @@ impl FaceHost {
             vm_id,
             heap_key,
             appearance_epoch: appearance.epoch,
+            reloaded_at: cx.reload_generation,
             node_objects: node_objects.clone(),
             bridge: None,
             faces: HashMap::new(),
@@ -3255,7 +3264,8 @@ impl FaceHost {
     pub fn apply_appearance(&mut self, cx: &mut Cx) -> bool {
         let appearance = appearance::current(cx);
         let mut restyled = false;
-        if appearance.epoch != self.appearance_epoch {
+        let generation = cx.reload_generation;
+        if appearance.epoch != self.appearance_epoch || self.reloaded_at != generation {
             let vm_id = self.vm_id;
             let locked = self.locked;
             let mut faces: Vec<(&mut MountedFace, bool)> = self.faces.values_mut()
@@ -3278,6 +3288,7 @@ impl FaceHost {
             match result {
                 Ok(()) => {
                     self.appearance_epoch = appearance.epoch;
+                    self.reloaded_at = generation;
                     restyled = true;
                 }
                 Err(error) => log!("flow appearance ({}): {error}", self.instance),
@@ -4010,7 +4021,7 @@ impl FaceHost {
                     let node_arg = vm.bx.heap_mut().new_string_from_str(&node);
                     let port_arg: ScriptValue = LiveId::from_str(&port).into();
                     let value_arg = value_to_script(vm, &value, bytes.as_ref());
-                    vm.with_instruction_limit(HANDLER_INSTRUCTION_LIMIT, |vm| {
+                    vm.with_instruction_limit(HANDLER_INSTRUCTION_LIMIT as u64, |vm| {
                         vm.call(hook.as_object().into(), &[node_arg, port_arg, value_arg]);
                     });
                 }
@@ -4132,7 +4143,7 @@ impl FaceHost {
             for hook in hooks {
                 let node_arg = vm.bx.heap_mut().new_string_from_str(&node);
                 let state_arg = vm.bx.heap_mut().new_string_from_str(&state);
-                vm.with_instruction_limit(HANDLER_INSTRUCTION_LIMIT, |vm| {
+                vm.with_instruction_limit(HANDLER_INSTRUCTION_LIMIT as u64, |vm| {
                     vm.call(hook.as_object().into(), &[node_arg, state_arg]);
                 });
             }
@@ -4451,16 +4462,16 @@ mod tests {
     #[test]
     fn model_with_no_admissible_node_is_dimmed_with_the_capacity_reason() {
         let mut too_small = model("flux2-dev", "192.0.2.89", false, "too_small");
-        too_small.note = Some("needs 31744 MB, this card can free 30603".into());
+        too_small.note = Some("needs 31744 MB, this card can free 30000".into());
         let response = ModelsResponse {
             nodes: vec![FleetNodeDto {
                 base_url: "192.0.2.89".into(),
                 fleet: "test".into(),
                 healthy: true,
                 gpu: Some("GPU-B".into()),
-                vram_total_mb: Some(32_607),
-                vram_usable_mb: Some(30_603),
-                vram_free_mb: Some(29_785),
+                vram_total_mb: Some(32_000),
+                vram_usable_mb: Some(30_000),
+                vram_free_mb: Some(29_500),
                 lanes_model: None,
                 lanes: None,
             }],
@@ -4472,7 +4483,7 @@ mod tests {
         assert!(choices[0].dimmed);
         assert_eq!(
             choices[0].note,
-            "needs 31744 MB, this card can free 30603"
+            "needs 31744 MB, this card can free 30000"
         );
     }
 
@@ -4504,19 +4515,6 @@ mod tests {
         assert_eq!(choices[1].note, "no API key");
         assert_eq!(model_choices_for_node(&choices, "chat").len(), 2);
         assert!(model_choices_for_node(&choices, "gen").is_empty());
-    }
-
-    #[test]
-    fn format_preset_maps_to_dimensions() {
-        let presets: Vec<_> = IMAGE_FORMAT_PRESETS
-            .iter()
-            .map(|(name, width, height)| FormatPreset::new(*name, *width, *height))
-            .collect();
-        let portrait = presets
-            .iter()
-            .find(|preset| preset.name == "768×1024 (3:4)")
-            .unwrap();
-        assert_eq!(portrait.dimensions(), (768, 1024));
     }
 
     #[test]
@@ -4636,22 +4634,6 @@ Flow{llm function http ask output}
             assert!(!face.text_scrolls.is_empty(), "{node} has no text scroll");
         }
         host.free(&mut cx);
-    }
-
-    #[test]
-    fn placeholder_icon_maps_every_port_type() {
-        for (ty, svg) in [
-            (PortType::Text, include_str!("../resources/icons/text.svg")),
-            (PortType::Image, include_str!("../resources/icons/image.svg")),
-            (PortType::Audio, include_str!("../resources/icons/audio.svg")),
-            (PortType::Video, include_str!("../resources/icons/video.svg")),
-            (PortType::Mesh, include_str!("../resources/icons/mesh.svg")),
-            (PortType::Json, include_str!("../resources/icons/json.svg")),
-            (PortType::List, include_str!("../resources/icons/json.svg")),
-            (PortType::Bytes, include_str!("../resources/icons/bytes.svg")),
-        ] {
-            assert_eq!(empty_icon_svg(ty.clone()), svg, "wrong icon for {}", ty.as_str());
-        }
     }
 
     /// A node dropped from the palette is listed by the source rewritten

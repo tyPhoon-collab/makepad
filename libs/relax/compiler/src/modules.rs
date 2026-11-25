@@ -29,6 +29,11 @@ static MODULES: relax_session::sync::Mutex<Vec<Module>> = relax_session::sync::M
 static MODULE_CRATES: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
 static ANY_MODULE_CRATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+fn module_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_MODULE_TRACE").is_some())
+}
+
 fn note_module_crate(krate: u32) {
     let mut v = MODULE_CRATES.lock().unwrap_or_else(|e| e.into_inner());
     if !v.contains(&krate) {
@@ -230,7 +235,7 @@ pub(crate) struct Added {
 /// the declarations are collected whatever the diagnostics.
 pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool, domain: Option<crate::domain::DomainId>) -> Result<Added, Vec<String>> {
     let u = &mut *up;
-    let tr = std::env::var_os("MAKEPAD_RUN_MODULE_TRACE").is_some();
+    let tr = module_trace();
     let mut marks: Vec<(&str, std::time::Instant)> = vec![("", std::time::Instant::now())];
     let d0 = u.prog.defs.len();
     let i0 = u.prog.imports.len();
@@ -343,9 +348,9 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
         }
     }
     let cfg = crate::program_cfg(sess, &[]);
-    let tr = std::env::var_os("MAKEPAD_RUN_MODULE_TRACE").is_some();
+    let tr = module_trace();
     let mut marks: Vec<(&str, std::time::Instant)> = vec![("", std::time::Instant::now())];
-    let added = add_crates(up, &[NewCrate { name: name.to_string(), path: path.to_string(), edition: 2021, cfg, deps: dep_list, proc_macro: false }], false, None)?;
+    let added = add_crates(up, &[NewCrate { name: crate::crates::own_crate_name(name.to_string()), path: path.to_string(), edition: 2021, cfg, deps: dep_list, proc_macro: false }], false, None)?;
     let u = &mut *up;
     let Added { crates, defs, d0, e0, f0, mut errs } = added;
     let krate = crates[0];
@@ -900,7 +905,7 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
         return Err(fail(up, &defs, e));
     }
     // MAKEPAD_RUN_MODULE_TRACE=1: where a load's time goes
-    if std::env::var_os("MAKEPAD_RUN_MODULE_TRACE").is_some() {
+    if module_trace() {
         eprintln!(
             "makepad-run module: {} loaded in {:.2} ms: front {:.2} (parse, resolve, typeck, check), wrapper {:.2}, compile {:.2} ({} slots)",
             name,
@@ -982,6 +987,7 @@ pub(crate) fn stream_applied(h: u64, file: u32) {
 }
 
 pub extern "C" fn __relax_module_load_stream(name: *const u8, nlen: usize, path: *const u8, plen: usize, src: *const u8, slen: usize, deps: *const u8, dlen: usize) -> u64 {
+    let _kept = crate::zone_alloc::kept();
     let up = jit::current_unit();
     if up.is_null() { set_error("no running unit".to_string()); return 0; }
     let session = unsafe { crate::jit::unit_session(up) };
@@ -993,6 +999,7 @@ pub extern "C" fn __relax_module_load_stream(name: *const u8, nlen: usize, path:
 
 /// 0 applied, 1 incomplete, 2 needs reload, 3 pending, 4 invalid handle.
 pub extern "C" fn __relax_module_stream(h: u64, src: *const u8, slen: usize, kept: *mut usize) -> u32 {
+    let _kept = crate::zone_alloc::kept();
     if stream_target(h).is_none() {
         set_error("the module was unloaded".to_string());
         return 4;
@@ -1020,6 +1027,7 @@ pub extern "C" fn __relax_module_load(name: *const u8, nlen: usize, path: *const
 /// As __relax_module_load, from source text (`slen` != usize::MAX): `path` then only names the
 /// module in errors and positions (embedded presets, user and AI edits held in memory).
 pub extern "C" fn __relax_module_load_src(name: *const u8, nlen: usize, path: *const u8, plen: usize, src: *const u8, slen: usize, deps: *const u8, dlen: usize) -> u64 {
+    let _kept = crate::zone_alloc::kept();
     // an internal error of Relax's never unwinds into the program (this is an extern "C" entry)
     match std::panic::catch_unwind(|| load_src_inner(name, nlen, path, plen, src, slen, deps, dlen)) {
         Ok(h) => h,
@@ -1107,6 +1115,7 @@ fn load_src_inner(name: *const u8, nlen: usize, path: *const u8, plen: usize, sr
 /// The callable address of export `name` checked against the fn-pointer type `ty`
 /// (type_name); 0 with an error otherwise.
 pub extern "C" fn __relax_module_get(h: u64, name: *const u8, nlen: usize, ty: *const u8, tlen: usize) -> u64 {
+    let _kept = crate::zone_alloc::kept();
     let (name, ty) = unsafe { (String::from_utf8_lossy(bytes(name, nlen)).into_owned(), String::from_utf8_lossy(bytes(ty, tlen)).into_owned()) };
     let mut ms = MODULES.lock().unwrap_or_else(|e| e.into_inner());
     let (idx, m) = match unhandle(h).and_then(|(i, g)| ms.get_mut(i).filter(|m| m.gen == g && m.alive).map(|m| (i, m))) {
@@ -1141,6 +1150,7 @@ pub extern "C" fn __relax_module_get(h: u64, name: *const u8, nlen: usize, ty: *
 /// in __relax_module_error); 2 the edit needs a fresh load (layout or item-set change: unload,
 /// then load the new text); 3 unloaded handle.
 pub extern "C" fn __relax_module_replace(h: u64, src: *const u8, slen: usize) -> u32 {
+    let _kept = crate::zone_alloc::kept();
     let src = unsafe { bytes(src, slen).to_vec() };
     let up = jit::current_unit();
     let Some(o) = (unsafe { crate::reload::finish_module_stream(up, h, src) }) else {
@@ -1164,6 +1174,7 @@ pub extern "C" fn __relax_module_replace(h: u64, src: *const u8, slen: usize) ->
 /// Unloads a module: its names leave the program (code stays mapped for frames and stored
 /// fn pointers still in it). Later uses of the handle fail.
 pub extern "C" fn __relax_module_unload(h: u64) {
+    let _kept = crate::zone_alloc::kept();
     crate::reload::forget_module_stream(jit::current_unit(), h);
     let module_crate;
     let module_name;
@@ -1289,6 +1300,7 @@ thread_local! {
 static NEXT_HOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub extern "C" fn __relax_host_new(h: u64, ptr: u64, ty: *const u8, len: usize) -> u64 {
+    let _kept = crate::zone_alloc::kept();
     let Some(a) = arena_for(h) else { return 0; };
     let id = NEXT_HOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if id == 0 { return 0; }
@@ -1390,4 +1402,12 @@ pub fn symbol(name: &[u8]) -> Option<usize> {
         b"__relax_sb_stats" => __relax_sb_stats as *const () as usize,
         _ => return crate::reload::restart_symbol(name),
     })
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&MODULES, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&MODULE_CRATES, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&ANY_MODULE_CRATE, std::sync::atomic::AtomicBool::new(false));
 }

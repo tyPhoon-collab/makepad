@@ -148,6 +148,9 @@ pub enum IrIo {
     /// The fragment depth output (one f32 global; the entry writes it to the
     /// FragDepth builtin).
     FragmentDepth,
+    /// The fragment's position (one vec4 global; the fragment entry sets it from the position
+    /// builtin before the fragment function runs, `ShaderIoKind::FragmentPosition`).
+    FragmentPosition,
     Texture(TextureType),
     /// A compute kernel's device buffer (`shader.buffer` / `buffer_rw`): a
     /// runtime-sized array reached by its device address (writable when
@@ -160,6 +163,7 @@ pub enum IrIo {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum IrGlobalKind {
     Io(IrIo),
+    StorageTexture(crate::shader_ir_compute::StorageTextureFormat),
     /// `self.vertex_pos`: the clip position the vertex stage writes.
     VertexPosition,
     /// `_mp_iter`: the invocation's shared loop-pass counter
@@ -182,6 +186,8 @@ pub enum IrGlobalKind {
     ScopeUniformBlock,
     /// GL: the host's clip-space Y flip for bottom-up render targets.
     ClipYFlip,
+    /// GL: the host's row origin for `fragment_position()` (vec2: y = x + y * gl_FragCoord.y).
+    FragYOrigin,
     /// HLSL: the draw's first instance. `SV_InstanceID` starts at zero for every draw, so the
     /// host passes the first instance (`StartInstanceLocation` is not seen by the shader) in a
     /// constant buffer at b13; an unbound buffer reads zero.
@@ -359,6 +365,11 @@ pub enum Builtin {
     Dot4U8,
     /// `atomic_add(buffer[i], v)`: returns the old value (u32 / i32).
     AtomicAdd,
+    /// `atomic_min(buffer[i], v)` / `atomic_max(buffer[i], v)`: returns the old value (u32 / i32).
+    AtomicMin,
+    AtomicMax,
+    /// Write-only 2D storage image: image, uint2 coordinate, scalar/vec4 texel.
+    StorageTextureWrite,
     /// Compute-only operations; load/store's first argument is a place.
     CooperativeLoad,
     CooperativeStore,
@@ -367,6 +378,24 @@ pub enum Builtin {
 }
 
 impl Builtin {
+    /// Safe to evaluate where the program skips it: no memory access, no effect, nothing
+    /// that depends on which lanes run it. (No wildcard: a new builtin decides here.)
+    pub fn speculatable(self) -> bool {
+        use Builtin::*;
+        match self {
+            Abs | Acos | Acosh | Asin | Asinh | Atan | Atanh | Atan2 | Ceil | Clamp | Cos | Cosh | Cross
+            | Degrees | Distance | Dot | Exp | Exp2 | Floor | Fma | Fract | Inverse | InverseSqrt | Length
+            | Log | Log2 | Max | Min | Mix | FMod | Normalize | Pow | Radians | Round | Sign | Sin | Sinh
+            | Smoothstep | Sqrt | Step | Tan | Tanh | Trunc | Dpdx | Dpdy | Unpack2f16 | Unpack4u8
+            | Unpack2x16Float | Unpack2x16Unorm | Unpack2x16Snorm | Unpack4x8Unorm | Unpack4x8Snorm
+            | GlobalId | LocalId | GroupId | GroupCount | LocalIndex | SubgroupSize | SubgroupLane
+            | SubgroupId | PackHalf2 | ExtractBits | Dot4U8 => true,
+            Barrier | SubgroupAdd | SubgroupMin | SubgroupMax | SubgroupShuffle | SubgroupShuffleXor
+            | SubgroupFirst | AtomicAdd | AtomicMin | AtomicMax | StorageTextureWrite | CooperativeLoad
+            | CooperativeStore | CooperativeMulAdd | CooperativeScale => false,
+        }
+    }
+
     pub fn from_name(name: LiveId) -> Option<Builtin> {
         use makepad_live_id::id;
         Some(match name {
@@ -437,6 +466,8 @@ impl Builtin {
             id!(extract_bits) => Builtin::ExtractBits,
             id!(dot4_u8) => Builtin::Dot4U8,
             id!(atomic_add) => Builtin::AtomicAdd,
+            id!(atomic_min) => Builtin::AtomicMin,
+            id!(atomic_max) => Builtin::AtomicMax,
             id!(coopmat_load) => Builtin::CooperativeLoad,
             id!(coopmat_store) => Builtin::CooperativeStore,
             id!(coopmat_mul_add) => Builtin::CooperativeMulAdd,
@@ -688,6 +719,46 @@ impl IrFunction {
 
     pub fn ty_of(&self, e: ExprId) -> TyId {
         self.exprs[e as usize].ty
+    }
+
+    /// Expressions safe to evaluate even when a scalar logical guard skips them,
+    /// so a logical op keeps its plain (eager, branch-free) form: arithmetic,
+    /// comparisons, math builtins, uniform reads and filtered samples. What can
+    /// fault or has effects is guarded: an indexed read, a texel fetch, a call,
+    /// an atomic, barrier or cross-lane op, an integer division by a variable.
+    pub fn trivially_pure(&self, e: ExprId) -> bool {
+        let pure = |e: ExprId| e == NO_EXPR || self.trivially_pure(e);
+        match &self.exprs[e as usize].kind {
+            ExprKind::Lit(_) | ExprKind::Local(_) | ExprKind::Param(_) | ExprKind::Global(_)
+            | ExprKind::PassMatrix(_) | ExprKind::InstanceIndex | ExprKind::InstanceTexWord(_)
+            | ExprKind::EntryIn(_) | ExprKind::EntryOut(_) => true,
+            ExprKind::Field(a, _) | ExprKind::Swizzle(a, _, _) | ExprKind::Deref(a) | ExprKind::TexSize(a)
+            | ExprKind::Unary(_, a) | ExprKind::Convert(a) | ExprKind::Bitcast(a) => pure(*a),
+            ExprKind::Binary(BinOp::Div | BinOp::Rem, a, b) => pure(*a) && pure(*b) && self.defined_divisor(*b),
+            ExprKind::Binary(_, a, b) => pure(*a) && pure(*b),
+            ExprKind::Select(a, b, c) | ExprKind::DepthClip(a, b, c) => pure(*a) && pure(*b) && pure(*c),
+            ExprKind::Construct(args) => args.iter().all(|a| pure(*a)),
+            ExprKind::Builtin(op, args) => op.speculatable() && args.iter().all(|a| pure(*a)),
+            // A sampler clamps or wraps; implicit derivatives also want it outside divergent flow.
+            ExprKind::Sample(s) => [s.coord, s.lod, s.dx, s.dy, s.reference].into_iter().all(pure),
+            _ => false,
+        }
+    }
+
+    /// A divisor no value of which makes the division undefined: a float, or a nonzero literal.
+    fn defined_divisor(&self, b: ExprId) -> bool {
+        let ex = &self.exprs[b as usize];
+        matches!(ex.ty, TY_F32 | TY_F16 | TY_AFLOAT) || match ex.kind {
+            ExprKind::Lit(IrLit::I32(v)) => v != 0,
+            ExprKind::Lit(IrLit::U32(v)) => v != 0,
+            ExprKind::Lit(IrLit::AbstractInt(v)) => v != 0,
+            ExprKind::Lit(IrLit::F32(_) | IrLit::F16(_) | IrLit::AbstractFloat(_)) => true,
+            _ => false,
+        }
+    }
+
+    pub fn needs_short_circuit(&self, e: ExprId) -> bool {
+        matches!(self.exprs[e as usize], Expr { ty: TY_BOOL, kind: ExprKind::Binary(BinOp::LogicAnd | BinOp::LogicOr, _, b) } if !self.trivially_pure(b))
     }
 }
 

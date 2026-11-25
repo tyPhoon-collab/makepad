@@ -17,7 +17,7 @@ pub fn cmd_counters(req: &Req, out: &mut Out) {
     out.always("more: asm top vs=rustc ev=cycles  asm <fn> ev=instructions  prof threads=main");
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn g(x: f64) -> String {
     if x >= 1e9 {
         format!("{:.2} G", x / 1e9)
@@ -37,7 +37,7 @@ mod imp {
 
     extern "C" {
         fn syscall(n: i64, ...) -> i64;
-        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+        fn read(fd: i32, buf: *mut core::ffi::c_void, n: usize) -> isize;
         fn close(fd: i32) -> i32;
     }
 
@@ -62,7 +62,7 @@ mod imp {
     /// The count, scaled by enabled / running time (multiplexed counters).
     fn value(fd: i32) -> Option<f64> {
         let mut b = [0u64; 3];
-        let r = unsafe { read(fd, b.as_mut_ptr() as *mut u8, 24) };
+        let r = unsafe { read(fd, b.as_mut_ptr().cast(), 24) };
         if r != 24 || b[2] == 0 {
             return None;
         }
@@ -81,7 +81,7 @@ mod imp {
             out.always("no hardware counters for this process (perf_event_paranoid > 2, or no PMU in this VM); CPU time only: prof, why-slow");
             return;
         }
-        std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+        crate::run_threads::sleep(std::time::Duration::from_secs_f64(secs));
         let mut rows: Vec<(f64, String)> = Vec::new();
         let mut tot = [0f64; 4];
         for (k, v) in &fds {
@@ -136,7 +136,7 @@ mod imp {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod imp {
     use super::{g, Out};
 
@@ -159,7 +159,7 @@ mod imp {
             out.always("no counters: proc_pid_rusage failed");
             return;
         };
-        std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+        crate::run_threads::sleep(std::time::Duration::from_secs_f64(secs));
         let Some(b) = sample() else {
             out.always("no counters: proc_pid_rusage failed");
             return;
@@ -175,7 +175,7 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 mod imp {
     use super::Out;
     pub fn run(_secs: f64, _n: usize, out: &mut Out) {

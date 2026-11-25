@@ -291,7 +291,7 @@ mod tests {
             }
             let unit = reg.units.len();
             reg.units.push(UnitInfo { name: name.into(), src_path: root.join(name).join("src/lib.rs").to_string_lossy().into_owned(), edition: 2021,
-                features: Vec::new(), deps: if unit == 0 { Vec::new() } else { vec![(unit - 1, reg.units[unit - 1].name.clone())] }, proc_macro: unit == 2, registry: false, cfgs: Vec::new(), env: Vec::new() });
+                features: Vec::new(), deps: if unit == 0 { Vec::new() } else { vec![(unit - 1, reg.units[unit - 1].name.clone())] }, proc_macro: unit == 2, harness: false, registry: false, cfgs: Vec::new(), env: Vec::new() });
         }
         reg.units[2].deps.push((0, "makepad_micro_proc_macro".into()));
         assert!(checked(&reg).is_ok());
@@ -347,4 +347,11 @@ mod tests {
         std::fs::remove_file(&added).unwrap();
         assert!(checked(&reg).is_ok());
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&SOURCE_READS, std::sync::atomic::AtomicUsize::new(0));
+    reset(&GRAPH, std::sync::RwLock::new(None));
 }

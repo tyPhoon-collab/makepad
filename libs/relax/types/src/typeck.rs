@@ -149,6 +149,8 @@ pub struct Body {
     /// every struct field the body names, resolved: (ADT, field index) -- a live layout edit's
     /// dependents (reload.rs: the fns using a removed or renamed field, not its name)
     pub field_uses: ThinVec<(DefId, u32)>,
+    /// every struct a `..base` of the body takes fields of without naming them (reload.rs, too)
+    pub struct_updates: ThinVec<DefId>,
     /// every `.await` of the body: (the enclosing coroutine's expression, the awaited operand's
     /// type, position) -- the by-value edges of async recursion (E0733)
     pub awaits: ThinVec<(u32, TyId, u32)>,
@@ -246,6 +248,7 @@ impl Body {
             hidden_types: SideTable::new(),
             field_idx: SideTable::new(),
             field_uses: ThinVec::new(),
+            struct_updates: ThinVec::new(),
             awaits: ThinVec::new(),
             dependencies: ThinVec::new(),
             ov_index: SideTable::new(),
@@ -334,7 +337,7 @@ impl Body {
             field_idx, ov_index, mutable_index, std_index, for_next, for_into, call_traits, legacy_args,
             pat_derefs, pat_bind_ref, pat_discriminant_reads, try_branch, try_from_residual, fmt_named, closure_locals,
             closure_expected_kinds, closure_sigs, inline_const_types, struct_defaults,
-            args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, awaits, dependencies, locals, param_pats, closures, errors);
+            args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, struct_updates, awaits, dependencies, locals, param_pats, closures, errors);
     }
 
     /// Memory report (MAKEPAD_RUN_MEM_REPORT): per table (entries, heap bytes incl. nested vectors),
@@ -372,7 +375,7 @@ impl Body {
         n += self.legacy_args.values().map(v).sum::<usize>() + self.closure_locals.values().map(v).sum::<usize>() + self.struct_defaults.values().map(v).sum::<usize>();
         n += self.min_captures.values().map(|c| v(&c.captures) + v(&c.fake_reads) + v(&c.errors) + c.captures.iter().map(|x| v(&x.place.projections)).sum::<usize>() + c.fake_reads.iter().map(|x| v(&x.0.projections)).sum::<usize>()).sum::<usize>();
         n += (self.args.len() + self.expr_ty.len() + self.pat_ty.len()) * 4 + self.expr_typed.len() + self.pat_typed.len();
-        n += grown(&self.field_uses) + grown(&self.dependencies) + grown(&self.locals) + grown(&self.param_pats) + grown(&self.closures) + grown(&self.errors) + grown(&self.deferred_misses);
+        n += grown(&self.field_uses) + grown(&self.struct_updates) + grown(&self.dependencies) + grown(&self.locals) + grown(&self.param_pats) + grown(&self.closures) + grown(&self.errors) + grown(&self.deferred_misses);
         n += self.errors.iter().map(|e| e.capacity()).sum::<usize>();
         n
     }
@@ -410,6 +413,7 @@ impl Body {
         add("struct_defaults", self.struct_defaults.len(), m(&self.struct_defaults) + self.struct_defaults.values().map(v).sum::<usize>());
         add("min_captures", self.min_captures.len(), m(&self.min_captures) + self.min_captures.values().map(|c| v(&c.captures) + v(&c.fake_reads) + v(&c.errors) + c.captures.iter().map(|x| v(&x.place.projections)).sum::<usize>() + c.fake_reads.iter().map(|x| v(&x.0.projections)).sum::<usize>()).sum::<usize>());
         add("field_uses", self.field_uses.len(), t(&self.field_uses));
+        add("struct_updates", self.struct_updates.len(), t(&self.struct_updates));
         add("dependencies", self.dependencies.len(), t(&self.dependencies));
         add("locals", self.locals.len(), t(&self.locals));
         add("param_pats", self.param_pats.len(), t(&self.param_pats));
@@ -534,6 +538,9 @@ pub struct Fcx<'a> {
     forced_autoref: Option<u8>,
     /// the expected type of the method call being checked (check_method's expectation)
     method_expected: Option<TyId>,
+    /// where the name of the method being probed is written (its span's edition decides
+    /// `#[rustc_skip_during_method_dispatch]`, probe.rs:2018-2035); u32::MAX: no method name
+    method_name_lo: u32,
     /// coercions to a `dyn` pointer whose source pointee was still open: (expr, actual,
     /// expected, pos), decided in `finish`
     deferred_dyn: Vec<(ExprId, TyId, TyId, u32)>,
@@ -552,7 +559,14 @@ pub struct Fcx<'a> {
 /// as rustc_codegen_ssa::mir::FunctionCx::monomorphize does. Analysis consumers
 /// requesting fully normalized tables use instantiate_body instead.
 pub fn codegen_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> std::sync::Arc<Body> {
-    try_codegen_body(prog, tcx, def, args).expect("failed to normalize body for codegen")
+    try_codegen_body(prog, tcx, def, args).unwrap_or_else(|| no_codegen_body(prog, tcx, def, args))
+}
+
+/// The instance names itself: an ICE (a live edit's above all) says which body did not normalize.
+#[cold]
+fn no_codegen_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> ! {
+    let args: Vec<String> = args.iter().map(|&t| type_name(prog, tcx, t)).collect();
+    panic!("failed to normalize body for codegen: NoSolution: {} [{}]", prog.def_path(def), args.join(", "))
 }
 
 /// codegen_body for a caller that has a fallback: an instance whose types do not normalize
@@ -580,8 +594,10 @@ pub fn checked_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def:
 }
 
 pub fn instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
-    try_instantiate_body(cx, prog, tcx, def, args).expect("failed to normalize body for codegen")
+    try_instantiate_body(cx, prog, tcx, def, args).unwrap_or_else(|_| no_codegen_body(prog, tcx, def, args))
 }
+
+static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// rustc_middle/src/ty/normalize_erasing_regions.rs:172-186: normalization failure
 /// is a result for consumers that cannot require a fully monomorphic instance.
@@ -589,7 +605,6 @@ pub(crate) fn try_instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, 
     // Diagnostic only: sample one in N calls, including queries outside JIT scopes.
     // Keep this off for timing runs; symbolizing a backtrace is deliberately expensive.
     static SAMPLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sample = *SAMPLE.get_or_init(|| std::env::var("MAKEPAD_RUN_TYPECK_BACKTRACE").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
     if sample != 0 && CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % sample == 0 {
         let trace = format!("makepad-run typeck-backtrace: {} def={} args={:?} origin={} time={}\n{}\nmakepad-run typeck-backtrace-end\n",
@@ -611,7 +626,7 @@ pub(crate) fn try_instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, 
             }
         }));
     let _cost_typeck = relax_codegen::fncost::phase(1);
-    let cost_start = if relax_codegen::fncost::enabled() { (relax_codegen::fncost::mono(), relax_backend::cpu_ns()) } else { (0, 0) };
+    let cost_start = if relax_codegen::fncost::enabled() { (relax_codegen::fncost::mono(), relax_session::clock::cpu_ns()) } else { (0, 0) };
     let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck);
     let body = tcx.typeck(prog, def);
     // Analysis uses the supplied environment; codegen supplies a monomorphic one.
@@ -630,7 +645,7 @@ pub(crate) fn check_fn(prog: &Program, tcx: &Tcx, def: DefId) -> Body {
     let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
     static ST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let st = *ST.get_or_init(|| std::env::var("MAKEPAD_RUN_TYSTATS").is_ok());
-    let t0 = if st { relax_backend::cpu_ns() } else { 0 };
+    let t0 = if st { relax_session::clock::cpu_ns() } else { 0 };
     thread_local! { static NEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
     let child0 = if st { NEST.with(|c| c.get()) } else { 0 };
     let _warm = relax_codegen::warm::enabled().then(|| relax_codegen::warm::Scope::body(def.0, &args.iter().map(|t| t.0).collect::<Vec<_>>(), crate::clock::TYS_ORIGIN.with(|o| o.get()) == "gandalf", || {
@@ -639,7 +654,7 @@ pub(crate) fn check_fn(prog: &Program, tcx: &Tcx, def: DefId) -> Body {
     }));
     let b = check_fn_body(&cx, prog, tcx, def, &args);
     if st {
-        let incl = relax_backend::cpu_ns() - t0;
+        let incl = relax_session::clock::cpu_ns() - t0;
         let excl = incl.saturating_sub(NEST.with(|c| c.get()) - child0);
         NEST.with(|c| c.set(child0 + incl));
         eprintln!("TYS\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{:.0}", def.0, args.len(), incl, b.expr_ty.len(), prog.def_path(def), args.iter().map(|a| a.0).collect::<Vec<u32>>(), crate::clock::TYS_ORIGIN.with(|o| o.get()),
@@ -732,6 +747,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             hidden_types: SideTable::new(),
             field_idx: SideTable::new(),
             field_uses: ThinVec::new(),
+            struct_updates: ThinVec::new(),
             awaits: ThinVec::new(),
             dependencies: ThinVec::new(),
             ov_index: SideTable::new(),
@@ -811,6 +827,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         stalled_coroutine_goals: Vec::new(),
         forced_autoref: None,
         method_expected: None,
+        method_name_lo: u32::MAX,
     };
     fcx.init_body_regions();
     let penv = tcx.param_env_id(prog, def);
@@ -836,7 +853,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
     if d.kind == DefKind::AnonConst {
         // rustc_hir_typeck/src/lib.rs: check the anonymous constant's own body.
         let init = crate::const_eval::const_body(prog, def).expect("anonymous const body");
-        let ct = tcx.tys.subst(tcx.type_of(prog, def).expect("anonymous const type"), args);
+        let ct = tcx.tys.subst(tcx.type_of(prog, def).unwrap_or_else(|e| panic!("anonymous const type of `{}`: {e:?} (its holder never fed it)", prog.def_path(def))), args);
         // hir_typeck lib.rs:194-206: normalized, well formed and Sized (SizedConstOrStatic)
         let ct = fcx.norm(ct);
         fcx.register_wf(ct, ast.expr(init).lo);
@@ -1047,7 +1064,7 @@ impl<'a> Fcx<'a> {
         let obligations = self.fulfillment_cx.pending_obligations();
         self.fulfillment_cx = self.suspended_fulfillment.pop().expect("open snapshot");
         self.infcx.commit_from(snapshot.inference);
-        for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, obligation); }
+        for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, self.prog, obligation); }
     }
 
     fn fresh(&mut self, kind: u8) -> TyId {
@@ -1078,7 +1095,7 @@ impl<'a> Fcx<'a> {
             let at = self.infcx.at(self.prog, self.param_env.clone());
             let (ty, goals) = if use_lub { at.lub(b, a)? } else { (b, at.sub(a, b)?) };
             let mut engine = crate::next_solver::fulfill::FulfillmentCtxt::new(&self.infcx);
-            for goal in goals { engine.register_predicate_obligation(&self.infcx, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: self.last_lo, body_id: self.b.def } }); }
+            for goal in goals { engine.register_predicate_obligation(&self.infcx, self.prog, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: self.last_lo, body_id: self.b.def } }); }
             if !engine.try_evaluate_obligations(&self.infcx, self.prog).is_empty() { return Err(crate::infer::relate::TypeError::Mismatch); }
             // coercion.rs:164-211,1034-1055: only fn-item/pointer coercions
             // force the extra leak check; other relations keep their own checks.
@@ -1086,7 +1103,7 @@ impl<'a> Fcx<'a> {
             Ok((ty, engine.pending_obligations()))
         });
         match result {
-            Ok((ty, obligations)) => { for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, obligation); } Some(ty) },
+            Ok((ty, obligations)) => { for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, self.prog, obligation); } Some(ty) },
             Err(_) => None,
         }
     }
@@ -2882,19 +2899,21 @@ impl<'a> Fcx<'a> {
     /// The type a struct literal / struct pattern path names: explicit generic args
     /// (`S::<u16> { .. }`) and type aliases (`type S4<U> = S3<U, char>; S4::<u8> { .. }`) fix
     /// args; the rest are fresh (rustc instantiates the path's type, alias substituted).
-    /// `T::A { a, b }` / `Self::Out { .. }`: a struct named through an associated type of a
-    /// param (rustc resolves the path as a type, then takes its ADT and args).
+    /// `T::A { a, b }`, `Self::Out { .. }` or a type alias to a projection: resolve the
+    /// written path as a type, normalize it, then take its ADT and arguments.
     fn assoc_struct_path(&mut self, path: &Path) -> Option<TyId> {
         let n = path.segs.len();
-        if n < 2 || path.has_qself() {
+        if n == 0 || path.has_qself() {
             return None;
         }
         let s0 = self.ast().segs(path.segs)[0].clone();
-        if s0.kind() != SegKind::SelfType && !self.env.names.contains(&self.sym(s0.name)) {
-            return None;
-        }
-        if let Some(d) = self.tcx.resolve_type_path_def(self.prog, self.file, self.module, path) {
-            if matches!(self.prog.def(d).kind, DefKind::Struct | DefKind::Union | DefKind::Variant | DefKind::TypeAlias) {
+        let resolved = self.tcx.resolve_type_path_def(self.prog, self.file, self.module, path);
+        let alias = resolved.is_some_and(|d| self.prog.def(d).kind == DefKind::TypeAlias);
+        if !alias {
+            if n < 2 || (s0.kind() != SegKind::SelfType && !self.env.names.contains(&self.sym(s0.name))) {
+                return None;
+            }
+            if resolved.is_some_and(|d| matches!(self.prog.def(d).kind, DefKind::Struct | DefKind::Union | DefKind::Variant)) {
                 return None;
             }
         }
@@ -3060,7 +3079,9 @@ impl<'a> Fcx<'a> {
                 continue;
             }
             let cname = crate::parser::derive::default_const_name(&ty_name, variant.as_deref(), &fname);
-            match self.prog.syms.get(&cname).and_then(|s| self.prog.lookup_in_scope(scope, s, false)) {
+            // rustc: `#[rust(expr)]` is no declared default for a bare `..`.
+            match self.prog.syms.get(&cname).and_then(|s| self.prog.lookup_in_scope(scope, s, false))
+                .filter(|&cd| !crate::mir::transform::const_check::is_live_default(self.prog, cd)) {
                 Some(cd) => out.push((i as u32, cd)),
                 // rustc: E0063 missing field (a bare `..` fills only fields with a default value)
                 None => self.err(lo, format!("E0063: missing field `{}` in initializer of `{}`; `..` fills only fields declared with a default value (`{}: T = value`){}", fname, ty_name, fname, if adt.n_generics > 0 { "; default values of generic types are not supported yet" } else { "" })),
@@ -3216,6 +3237,12 @@ impl<'a> Fcx<'a> {
                     let t = self.tcx.alias_ty(&self.cx.with_infcx(&self.infcx), prog, d);
                     if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(t) {
                         return Res::Def(*ad);
+                    }
+                    // an alias to a projection (`type Made = <() as Make>::Out;`), normalized
+                    if let Some(t) = self.assoc_struct_path(path) {
+                        if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(t) {
+                            return Res::Def(*ad);
+                        }
                     }
                 }
             }
@@ -4259,7 +4286,7 @@ impl<'a> Fcx<'a> {
             // `D: DerefMut<Target = DrawVars>`)
             // (an opaque type derefs through its item bounds: `impl Deref<Target = Path>`,
             // rustc autoderef.rs overloaded_deref_ty selects the bound's candidate)
-            TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) => {
+            TyKind::Dyn(..) | TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) => {
                 let td = self.tcx.lang_items.get(crate::lang_items::LangItem::Deref)?;
                 let dt = self.infcx.deeply_resolve_ignoring_regions(t);
                 match self.select_trait(td, dt, &[]) {
@@ -4292,16 +4319,54 @@ impl<'a> Fcx<'a> {
         }
     }
 
+    /// A call with the wrong number of arguments (fn_ctxt/checks.rs check_argument_types): each
+    /// argument is checked with its position's input as a hint only, and nothing is demanded of
+    /// it: report_arg_errors reports the call once, as E0061, not an E0308 per shifted argument.
+    /// Their types, for [`Self::arg_count_help`].
+    fn check_args_of_wrong_count(&mut self, params: &[TyId], args: &[ExprId]) -> Vec<TyId> {
+        let mut given = vec![self.tcx.tys.error; args.len()];
+        for check_closures in [false, true] {
+            if check_closures {
+                self.select_before_closures();
+            }
+            for (i, a) in args.iter().enumerate() {
+                if matches!(self.ast().expr(*a).kind, ExprKind::Closure { .. }) == check_closures {
+                    let hint = params.get(i).map(|&p| self.normalize_signature(p));
+                    given[i] = self.check_expr(*a, hint);
+                }
+            }
+        }
+        given
+    }
+
     /// Help for E0061 (too few / too many arguments): which parameters are missing, by name and
     /// type (matched against the given arguments' types in order: the first parameter each
     /// argument fits), or which arguments are extra.
-    fn arg_count_help(&mut self, callee: Option<DefId>, params: &[TyId], args: &[ExprId], skip: usize) -> String {
+    fn arg_count_help(&mut self, callee: Option<DefId>, params: &[TyId], given: &[TyId], skip: usize) -> String {
         let names = callee.map(|d| self.param_names(d)).unwrap_or_default();
         let name_of = |i: usize| names.get(i + skip).cloned().unwrap_or_else(|| format!("#{}", i + 1));
-        if args.len() > params.len() {
-            return format!(" -- remove the extra argument{}", if args.len() - params.len() == 1 { "" } else { "s" });
+        if given.len() > params.len() {
+            return format!(" -- remove the extra argument{}", if given.len() - params.len() == 1 { "" } else { "s" });
         }
-        let missing: Vec<usize> = (args.len()..params.len()).collect();
+        let mut filled = vec![false; params.len()];
+        let mut next = 0;
+        for &t in given {
+            for j in next..params.len() {
+                let (snap, dyns) = (self.start_snapshot(), self.deferred_dyn.len());
+                let formal = self.normalize_signature(params[j]);
+                let fits = self.try_coerce(t, formal, None);
+                self.rollback_to(snap);
+                self.deferred_dyn.truncate(dyns);
+                if fits {
+                    filled[j] = true;
+                    next = j + 1;
+                    break;
+                }
+            }
+        }
+        // (an argument that fits no parameter leaves one more open: the last ones are the missing)
+        let open: Vec<usize> = (0..params.len()).filter(|&j| !filled[j]).collect();
+        let missing = &open[open.len() - (params.len() - given.len())..];
         let list: Vec<String> = missing.iter().map(|&i| format!("`{}: {}`", name_of(i), self.ty_str(params[i]))).collect();
         match list.len() {
             0 => String::new(),
@@ -4921,8 +4986,31 @@ impl<'a> Fcx<'a> {
         let ast = self.ast();
         let margs = ast.mac_arg(m.args);
         let Some(spec) = margs.asm else { return self.tcx.tys.error };
-        for op in ast.list(spec.ops) {
+        let mut diverge = spec.options & ASM_NORETURN != 0;
+        let ops = ast.list(spec.ops);
+        // rustc_ast_lowering asm.rs: `asm_goto_with_outputs`
+        if let Some(label) = ops.iter().find(|op| op.dir == AsmDir::Label) {
+            let outputs = ops.iter().any(|op| matches!(op.dir, AsmDir::Out | AsmDir::LateOut | AsmDir::InOut | AsmDir::InLateOut) && op.output.is_some());
+            if outputs && !self.prog.crates[self.prog.def(self.b.def).krate as usize].features(self.prog).has("asm_goto_with_outputs") {
+                let at = label.input.map_or(self.last_lo, |x| ast.expr(x).lo);
+                self.err(at, "E0658: using both label and output operands for inline assembly is unstable".into());
+            }
+        }
+        for op in ops {
             match op.dir {
+                // rustc check_expr_asm: a label block has unit type or diverges; its divergence is
+                // not the asm's unless every path out of it diverges
+                AsmDir::Label => {
+                    let Some(x) = op.input else { continue };
+                    let previous = self.diverges;
+                    let unit = self.tcx.tys.unit;
+                    let t = self.check_expr(x, Some(unit));
+                    if self.shallow(t) != self.tcx.tys.never {
+                        self.coerce_or_unify(t, unit, Some(x), ast.expr(x).lo);
+                        diverge = false;
+                    }
+                    self.diverges = previous;
+                }
                 AsmDir::Sym | AsmDir::Const => {
                     if let Some(x) = op.input {
                         self.check_expr(x, None);
@@ -4943,11 +5031,7 @@ impl<'a> Fcx<'a> {
                 }
             }
         }
-        if spec.options & ASM_NORETURN != 0 {
-            self.tcx.tys.never
-        } else {
-            self.tcx.tys.unit
-        }
+        if diverge { self.tcx.tys.never } else { self.tcx.tys.unit }
     }
 
     pub fn check_expr(&mut self, e: ExprId, expected: Option<TyId>) -> TyId {
@@ -4956,7 +5040,7 @@ impl<'a> Fcx<'a> {
             self.file, self.prog.files[self.file as usize].ast.expr(e).lo, self.b.def, "typeck-expression")));
         let save_div = self.diverges;
         self.diverges = false;
-        let t = self.check_expr_inner(e, expected);
+        let t = crate::stack::ensure_sufficient_stack(|| self.check_expr_inner(e, expected));
         let ts = self.shallow(t);
         if ts == self.tcx.tys.never {
             self.diverges = true;
@@ -5504,8 +5588,12 @@ impl<'a> Fcx<'a> {
                 self.tcx.tys.never
             }
             ExprKind::Return(x) => {
+                // expr.rs check_expr_return: outside a fn body there is no return type; the value
+                // is still type-checked (#86188), against nothing
                 if self.in_const && self.closure_depth.is_empty() {
                     self.err(lo, "E0572: return statement outside of function body".to_string());
+                    if let Some(v) = x.get() { self.check_expr(v, None); }
+                    return self.tcx.tys.never;
                 }
                 let rt = *self.ret_stack.last().unwrap();
                 match &x.get() {
@@ -5660,10 +5748,12 @@ impl<'a> Fcx<'a> {
                     // field access autoderef never goes through a raw pointer (Autoderef without include_raw_pointers)
                     if matches!(self.tcx.tys.kind(cur), TyKind::Ptr(..)) { break; }
                     match self.tcx.tys.kind(cur).clone() {
+                        // expr.rs check_expr_field: a tuple without that field is no match (E0609 below)
                         TyKind::Tuple(v) => {
+                            let Some(&field) = self.tcx.tys.list(v).get(*idx as usize) else { break };
                             self.b.field_idx.insert(e.0, (derefs as u32, *idx));
                             self.set_operand_derefs(e.0, derefs);
-                            return self.tcx.tys.list(v).get(*idx as usize).copied().unwrap_or(error);
+                            return field;
                         }
                         TyKind::Adt(d, args, regions) => {
                             let adt = self.tcx.adts.get(&d);
@@ -5673,6 +5763,12 @@ impl<'a> Fcx<'a> {
                                         if self.field_visible(d, f) {
                                             self.b.field_idx.insert(e.0, (derefs as u32, *idx));
                                             self.set_operand_derefs(e.0, derefs);
+                                            // as check_field: the struct whose field this is, also
+                                            // when an overloaded deref (`Pin<&mut S>`, `Arc<S>`) reached it
+                                            if !self.b.field_uses.contains(&(d, *idx)) {
+                                                self.b.field_uses.push((d, *idx));
+                                                self.b.dependencies.push(d);
+                                            }
                                             return self.instantiate_field_type(f.ty, adt.region_params, regions, self.tcx.tys.list(args));
                                         }
                                     }
@@ -5948,6 +6044,9 @@ impl<'a> Fcx<'a> {
                     // the fields taken from the base must be visible too (rustc_hir_typeck
                     // check_expr_struct_fields: private fields of a functional update)
                     if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(self.shallow(adt_ty)).clone() {
+                        if !self.b.struct_updates.contains(&ad) {
+                            self.b.struct_updates.push(ad);
+                        }
                         if let Some(n) = self.tcx.adts.get(&ad).and_then(|a| a.variants.get(vi as usize)).map(|v| v.fields.len()) {
                             for fi in 0..n as u32 {
                                 if !given.contains(&fi) {
@@ -5997,7 +6096,7 @@ impl<'a> Fcx<'a> {
             }
             ExprKind::Closure(row) => { let crate::ast::ClosureRow { params, ret, body, .. } = self.ast().row(*row); self.check_closure(e, self.ast().list(*params), *ret, *body, expected) }
             ExprKind::Mac(m) => self.check_mac(e, self.ast().row(*m), expected, lo),
-            ExprKind::Try(x) => self.check_try(e, *x, lo),
+            ExprKind::Try(x) => self.check_try(e, *x, expected, lo),
             ExprKind::Async(mode, b) => self.check_async_block(e, *mode, *b),
             ExprKind::Await(x) => {
                 let out = self.check_await(*x, lo);
@@ -6103,7 +6202,7 @@ impl<'a> Fcx<'a> {
     /// rustc_ast_lowering/src/expr.rs:1945-2033 @8d1a764: call Try::branch,
     /// match the ControlFlow lang-item variants, and return FromResidual on Break.
     /// The typed AST records the two desugared calls for its lowering consumers.
-    fn check_try(&mut self, e: ExprId, x: ExprId, lo: u32) -> TyId {
+    fn check_try(&mut self, e: ExprId, x: ExprId, expected: Option<TyId>, lo: u32) -> TyId {
         use crate::lang_items::LangItem;
         let t = self.check_expr(x, None);
         let Some(branch) = self.tcx.lang_items.get(LangItem::TryTraitBranch) else {
@@ -6140,6 +6239,29 @@ impl<'a> Fcx<'a> {
         self.b.dependencies.push(from_residual);
         self.b.try_branch.insert(e.0, (branch, self.tcx.tys.mk_list(&[t]), flow));
         self.b.try_from_residual.insert(e.0, (from_residual, self.tcx.tys.mk_list(&[ret, residual])));
+        // rustc checks the desugared match's Continue arm against the expected
+        // type. Feed that constraint back before operator lookup or fallback,
+        // as in `let n: i64 = -text.parse()?`.
+        // Only as a hint: relax hands a binary operator's left operand the
+        // operator's expected type, which rustc does not (op.rs
+        // check_overloaded_binop), so `v.first()? ^ 1` with `&u8: BitXor<u8>`
+        // must keep its `&u8`. A coercion that fails leaves no trace; the
+        // enclosing coercion site reports a real mismatch. As for match arms,
+        // an unresolved, unit or unsized expectation constrains nothing.
+        // One that holds keeps its inference only: the `?`'s type stays the
+        // Continue value's, and the enclosing site adjusts it. An adjustment
+        // left on the `?` would have a later match arm (whose hint is the
+        // earlier arms' type) skip CoerceMany's coercion of it to theirs
+        // (`Some(v) => v, None => args.next()?`: `&String` to `&str`).
+        if let Some(expected) = expected {
+            let s = self.shallow(expected);
+            if !matches!(self.tcx.tys.kind(s), TyKind::Infer(_) | TyKind::Error) && s != self.tcx.tys.unit && !self.is_unsized_ty(s) {
+                let saved = self.save_value_adjustments(e.0);
+                if self.try_coerce_inner(output, expected, Some(e), lo, false).is_some() {
+                    self.restore_value_adjustments(e.0, saved);
+                }
+            }
+        }
         output
     }
 
@@ -6237,6 +6359,21 @@ impl<'a> Fcx<'a> {
         }
     }
 
+    /// The hint a binary operator's left operand gets: the operator's expected type, which
+    /// rustc does not pass on (op.rs check_overloaded_binop checks the operand with none). A
+    /// `match`, an `if` or a block coerces its value to an expected type, so it gets none: in
+    /// `(if c { &a } else { &b }) * 2` the arms stay `&u16` and `&u16: Mul<u16>` applies.
+    fn operand_hint(&self, a: ExprId, hint: Option<TyId>) -> Option<TyId> {
+        let mut x = a;
+        loop {
+            match self.ast().expr(x).kind {
+                ExprKind::Paren(i) => x = i,
+                ExprKind::Match(..) | ExprKind::If(..) | ExprKind::Block(..) | ExprKind::Unsafe(_) => return None,
+                _ => return hint,
+            }
+        }
+    }
+
     fn check_binary(&mut self, e: ExprId, op: BinOp, a: ExprId, b: ExprId, expected: Option<TyId>, lo: u32) -> TyId {
         let bool_ = self.tcx.tys.bool_;
         match op {
@@ -6257,12 +6394,12 @@ impl<'a> Fcx<'a> {
                 // non-primitive operands compare through PartialEq / PartialOrd (`v == w` on
                 // Vecs calls Vec's eq, `s == "x"` with s: String uses PartialEq<&str>)
                 let sa = self.shallow(ta);
-                // (`&str` orders through str's PartialOrd: only its equality is built in)
-                let ordering = !matches!(op, BinOp::Eq | BinOp::Ne);
+                // References to scalar primitives retain the built-in path.
+                // String slices compare through their potentially heterogeneous traits.
                 let prim_ref = match self.tcx.tys.kind(sa).clone() {
                     TyKind::Ref(_, i, _) => {
                         let i = self.shallow(i);
-                        self.is_numeric(i) || matches!(self.tcx.tys.kind(i), TyKind::Bool | TyKind::Char | TyKind::FnPtr(..)) || (!ordering && matches!(self.tcx.tys.kind(i), TyKind::Str))
+                        self.is_numeric(i) || matches!(self.tcx.tys.kind(i), TyKind::Bool | TyKind::Char | TyKind::FnPtr(..))
                     }
                     _ => false,
                 };
@@ -6284,6 +6421,16 @@ impl<'a> Fcx<'a> {
                     }
                 }
                 let tb = self.check_expr(b, Some(ta));
+                // A scalar left operand can implement a comparison against a local
+                // non-scalar right operand (for example `impl PartialEq<Code> for u16`).
+                // Built-in scalar comparison requires scalar operands on both sides.
+                let sb = self.shallow(tb);
+                if matches!(self.tcx.tys.kind(sa), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char)
+                    && !matches!(self.tcx.tys.kind(sb), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Infer(_) | TyKind::Never | TyKind::Error) {
+                    if let Some(r) = self.check_cmp_trait(e, op, sa, b, lo, Some(tb)) {
+                        return r;
+                    }
+                }
                 // `&str != String`, `&u8 == u8`: not the built-in comparison of equal types but
                 // `<&str as PartialEq<String>>` (rustc op.rs: an operator trait lookup with the
                 // operand types as written)
@@ -6319,7 +6466,8 @@ impl<'a> Fcx<'a> {
                 bool_
             }
             BinOp::Shl | BinOp::Shr => {
-                let ta = self.check_expr(a, expected);
+                let hint = self.operand_hint(a, expected);
+                let ta = self.check_expr(a, hint);
                 // `&x >> k` on primitives: core's forward-ref Shl/Shr impls, Output = the
                 // primitive (rustc op.rs: only primitive operands are built in); a non-primitive
                 // left operand is an operator trait call
@@ -6348,7 +6496,7 @@ impl<'a> Fcx<'a> {
                     }
                     None => None,
                 };
-                let ta = self.check_expr(a, exp);
+                let ta = self.check_expr(a, self.operand_hint(a, exp));
                 let sa0 = self.shallow(ta);
                 // `&x op y` on primitives: built in, through the references (core's
                 // forward-ref operator impls, without dispatch)
@@ -6365,7 +6513,9 @@ impl<'a> Fcx<'a> {
                     self.cur_binop = e.0;
                     return self.check_op_trait(op, sa0, b, lo, false);
                 }
-                let tb0 = self.check_expr(b, Some(ta));
+                // No expectation: the right operand's type is `?R` of `L: Op<?R>` until it is known
+                // (rustc op.rs), so a branch of `len * if c { a } else { b }` may be a `Vec3`.
+                let tb0 = self.check_expr(b, None);
                 let sb0 = self.shallow(tb0);
                 // a primitive left operand with a non-primitive right one is an operator trait
                 // call too (`3u32 * duration`: `impl Mul<Duration> for u32`; rustc is_builtin_binop
@@ -6478,6 +6628,7 @@ impl<'a> Fcx<'a> {
         if matches!(self.tcx.tys.kind(cur), TyKind::Error) { return self.tcx.tys.error; }
         let ts = self.ty_str(t);
         // expr.rs check_expr_field: a method of that name is E0615, a primitive has no fields (E0610)
+        self.method_name_lo = name.lo;
         if !self.tcx.tys.has_error(cur) && matches!(self.pick_all_method(e, t, s, lo), Ok(Some(_))) {
             self.err(lo, format!("E0615: attempted to take value of method `{}` on type `{}`", self.text(name), ts));
         } else if matches!(self.tcx.tys.kind(self.shallow(t)), TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Int(_) | TyKind::Float(_) | TyKind::IntVar(_) | TyKind::FloatVar(_)) {
@@ -6675,8 +6826,10 @@ impl<'a> Fcx<'a> {
                 TyKind::FnDef(d, _, _) => Some(d),
                 _ => None,
             };
-            let help = self.arg_count_help(callee, &params, args, 0);
+            let given = self.check_args_of_wrong_count(&params, args);
+            let help = self.arg_count_help(callee, &params, &given, 0);
             self.err(lo, format!("E0061: this function takes {} argument{} but {} {} supplied{}", params.len(), if params.len() == 1 { "" } else { "s" }, args.len(), if args.len() == 1 { "was" } else { "were" }, help));
+            return self.normalize_signature(ret);
         }
         for (&ty, &arg) in params.iter().zip(args) {
             self.register_wf(ty, self.ast().expr(arg).lo);
@@ -7009,16 +7162,17 @@ impl<'a> Fcx<'a> {
         // this call's expectation only (nested calls in the receiver set their own)
         let method_expected = self.method_expected.take();
         let s = self.sym(name);
-        self.check_method_sym(e, recv, s, turbofish, args, None, lo, method_expected)
+        self.check_method_sym(e, recv, s, name.lo, turbofish, args, None, lo, method_expected)
     }
 
     /// A method call by name; `extra` is the type of one more argument after `args` that has no
     /// expression (built-in macros: `write!(w, ..)` is `w.write_fmt(format_args!(..))`).
-    fn check_method_sym(&mut self, e: ExprId, recv: ExprId, s: Sym, turbofish: GenericArgsId, args: &[ExprId], extra: Option<TyId>, lo: u32, method_expected: Option<TyId>) -> TyId {
+    fn check_method_sym(&mut self, e: ExprId, recv: ExprId, s: Sym, name_lo: u32, turbofish: GenericArgsId, args: &[ExprId], extra: Option<TyId>, lo: u32, method_expected: Option<TyId>) -> TyId {
         self.extra_arg = extra;
         let rt = self.check_expr(recv, None);
         let error = self.tcx.tys.error;
         self.retry_goals(false);
+        self.method_name_lo = name_lo;
         let pick = match self.pick_all_method(e, rt, s, lo) {
             Ok(Some(pick)) => pick,
             Ok(None) => {
@@ -7078,9 +7232,12 @@ impl<'a> Fcx<'a> {
         self.apply_fn_bounds(item, &full, lo);
         let extra = self.extra_arg.take();
         let n_extra = extra.is_some() as usize;
-        if ps.len() != args.len() + 1 + n_extra {
+        let wrong_count = ps.len() != args.len() + 1 + n_extra;
+        if wrong_count {
             let want = ps.len().saturating_sub(1);
-            let help = if n_extra == 0 { let rest: Vec<TyId> = ps.iter().skip(1).copied().collect(); self.arg_count_help(Some(item), &rest, args, 0) } else { String::new() };
+            let rest: Vec<TyId> = ps.iter().skip(1).copied().collect();
+            let given = self.check_args_of_wrong_count(&rest, args);
+            let help = if n_extra == 0 { self.arg_count_help(Some(item), &rest, &given, 0) } else { String::new() };
             self.err(lo, format!("E0061: this method takes {} argument{} but {} {} supplied{}", want, if want == 1 { "" } else { "s" }, args.len() + n_extra, if args.len() + n_extra == 1 { "was" } else { "were" }, help));
         }
         if let (Some(x), Some(&pt)) = (extra, ps.get(args.len() + 1)) {
@@ -7095,8 +7252,10 @@ impl<'a> Fcx<'a> {
         // `&[String]` checks `&[]` against `&[String]`, then unsizes `&[String; 0]`. The formal
         // output may be the method's own parameter (`U` of map_or) when the expectation is a
         // known type.
-        let exp_inputs = self.method_expected_inputs(ret, &ps, method_expected);
-        self.check_method_args(item, &ps, args, exp_inputs);
+        if !wrong_count {
+            let exp_inputs = self.method_expected_inputs(ret, &ps, method_expected);
+            self.check_method_args(item, &ps, args, exp_inputs);
+        }
         // projections in the result normalize now that the call fixed the args (rustc
         // normalizes a method's output: `opt.as_deref()` is Option<&str>, not
         // Option<&<String as Deref>::Target>, so a pattern binding gets `&str`)
@@ -7395,9 +7554,12 @@ impl<'a> Fcx<'a> {
         let ps: Vec<_> = ps.into_iter().map(|t| self.normalize_signature(t)).collect();
         let extra = self.extra_arg.take();
         let n_extra = extra.is_some() as usize;
-        if ps.len() != args.len() + 1 + n_extra {
+        let wrong_count = ps.len() != args.len() + 1 + n_extra;
+        if wrong_count {
             let want = ps.len().saturating_sub(1);
-            let help = if n_extra == 0 { let rest: Vec<TyId> = ps.iter().skip(1).copied().collect(); self.arg_count_help(Some(item), &rest, args, 0) } else { String::new() };
+            let rest: Vec<TyId> = ps.iter().skip(1).copied().collect();
+            let given = self.check_args_of_wrong_count(&rest, args);
+            let help = if n_extra == 0 { self.arg_count_help(Some(item), &rest, &given, 0) } else { String::new() };
             self.err(lo, format!("E0061: this method takes {} argument{} but {} {} supplied{}", want, if want == 1 { "" } else { "s" }, args.len() + n_extra, if args.len() + n_extra == 1 { "was" } else { "were" }, help));
         }
         if let (Some(x), Some(&pt)) = (extra, ps.get(args.len() + 1)) {
@@ -7406,8 +7568,10 @@ impl<'a> Fcx<'a> {
         // the probe reads the formal result as written: normalizing it before the arguments are
         // checked would select an impl for a projection whose trait args are still open
         // (`allocs.index(heading_ix)` with several Index impls)
-        let exp_inputs = if method_expected.is_some() { self.method_expected_inputs(r, &ps, method_expected) } else { None };
-        self.check_method_args(item, &ps, args, exp_inputs);
+        if !wrong_count {
+            let exp_inputs = if method_expected.is_some() { self.method_expected_inputs(r, &ps, method_expected) } else { None };
+            self.check_method_args(item, &ps, args, exp_inputs);
+        }
         // several impls of the trait for the self type and its args still open (`v.extend(it)`
         // on Vec<String>: Extend<String> and Extend<&String>): the impls whose where-clauses
         // can hold (`T: Copy` rules out the second) -- one left fixes the args (rustc selects
@@ -7556,7 +7720,7 @@ impl<'a> Fcx<'a> {
     }
 
     fn register_goal(&mut self, goal: Goal, lo: u32) {
-        self.fulfillment_cx.register_predicate_obligation(&self.infcx, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: lo, body_id: self.b.def } });
+        self.fulfillment_cx.register_predicate_obligation(&self.infcx, self.prog, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: lo, body_id: self.b.def } });
     }
 
     fn retry_goals(&mut self, final_: bool) {
@@ -7575,7 +7739,8 @@ impl<'a> Fcx<'a> {
             // #[rustc_on_unimplemented] messages) for an unmet trait bound
             if let PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(p)) = &predicate.kind {
                 let (prog, tcx) = (self.prog, self.tcx);
-                let mut msg = trait_error_message(prog, tcx, code, p, &mut |t| self.ty_str(t));
+                let p = normalize_clause_for_diagnostics(&self.infcx, prog, &obligation.goal.param_env, p);
+                let mut msg = trait_error_message(prog, tcx, code, &p, &mut |t| self.ty_str(t));
                 if code == "E0277" { msg.push_str(&crate::next_solver::diagnostics::auto_trait_failure_notes(&self.infcx, prog, &obligation.goal, Some(&self.b))); }
                 self.err(obligation.cause.span, format!("{code}: {msg}"));
                 continue;
@@ -7591,8 +7756,9 @@ impl<'a> Fcx<'a> {
                 self.err(obligation.cause.span, msg);
                 continue;
             }
-            let detail = format!("{predicate:?}");
-            self.err(obligation.cause.span, format!("{code}: unsatisfied obligation {detail}"));
+            let (prog, tcx) = (self.prog, self.tcx);
+            let msg = obligation_message(prog, tcx, code, predicate, &mut |t| self.ty_str(t));
+            self.err(obligation.cause.span, msg);
         }
     }
 
@@ -7860,10 +8026,126 @@ impl crate::types::fold::TypeFolder for EraseFreeRegions {
     }
 }
 
+/// rustc derive_errors.rs find_best_leaf_obligation ends in deeply_normalize_for_diagnostics: the reported bound
+/// names the types its aliases normalize to (`Vec<usize>: FromIterator<u64>`, not
+/// `FromIterator<<Map<Iter<'_, &T>, {closure}> as Iterator>::Item>`). An argument that does not normalize, or
+/// normalizes to a type with inference variables of the probe, is reported as it is.
+fn normalize_clause_for_diagnostics(infcx: &crate::infer::InferCtxt<'_>, prog: &Program, env: &crate::next_solver::ParamEnvId, p: &crate::next_solver::TraitClause) -> crate::next_solver::TraitClause {
+    use crate::types::TypeFlags;
+    let tys = &infcx.tcx.tys;
+    let mut p = p.clone();
+    for arg in p.trait_ref.args.iter_mut() {
+        let crate::consts::GenericArg::Type(t) = arg else { continue };
+        let resolved = infcx.deeply_resolve_ignoring_regions(*t);
+        if !tys.flags(resolved).intersects(TypeFlags::HAS_ALIAS) { continue; }
+        let normalized = infcx.probe(|_| crate::next_solver::fulfill::ObligationCtxt::new(infcx, prog).deeply_normalize_ty(env, resolved).ok());
+        if let Some(n) = normalized.filter(|&n| !tys.flags(n).intersects(TypeFlags::HAS_NON_REGION_INFER)) { *t = n; }
+    }
+    p
+}
+
+/// A region as rustc names one in a diagnostic: `'static`, a named parameter by its name, any
+/// other `'_`.
+pub fn region_str(prog: &Program, tcx: &Tcx, r: crate::types::RegionId) -> String {
+    use crate::types::{LateParamKind, RegionKind};
+    match tcx.tys.region_kind(r) {
+        RegionKind::ReStatic => "'static".to_string(),
+        RegionKind::ReLateParam(_, LateParamKind::Named(d)) => {
+            let n = prog.name(d);
+            if n.starts_with('\'') { n.to_string() } else { format!("'{n}") }
+        }
+        _ => "'_".to_string(),
+    }
+}
+
+/// A constant as rustc prints one in a diagnostic (pretty.rs pretty_print_const): a named
+/// constant by its path, an anonymous one by its source text, the rest as the type printer
+/// writes them.
+pub fn const_str(prog: &Program, tcx: &Tcx, c: crate::consts::Const) -> String {
+    match tcx.tys.const_kind(c) {
+        crate::consts::ConstKind::Alias(_, alias) => alias_const_str(prog, alias.kind.def_id()),
+        _ => tcx.tys.const_to_string(c),
+    }
+}
+
+fn alias_const_str(prog: &Program, d: DefId) -> String {
+    if prog.def(d).kind == DefKind::AnonConst {
+        if let Some((file, relax_front::def_collector::NodeId::AnonConst(e))) = prog.def_id_to_node_id.get(&d) {
+            let pf = &prog.files[*file as usize];
+            let ex = pf.ast.expr(*e);
+            if let Ok(text) = std::str::from_utf8(pf.bytes(ex.lo, ex.hi)) { return text.to_string(); }
+        }
+    }
+    prog.def_path(d)
+}
+
+fn generic_arg_str(prog: &Program, tcx: &Tcx, arg: &crate::consts::GenericArg, ty_str: &mut dyn FnMut(TyId) -> String) -> String {
+    match arg {
+        crate::consts::GenericArg::Type(t) => ty_str(*t),
+        crate::consts::GenericArg::Const(c) => const_str(prog, tcx, *c),
+        crate::consts::GenericArg::Lifetime(r) => region_str(prog, tcx, *r),
+    }
+}
+
+fn term_str(prog: &Program, tcx: &Tcx, t: &Term, ty_str: &mut dyn FnMut(TyId) -> String) -> String {
+    match t { Term::Ty(t) => ty_str(*t), Term::Const(c) => const_str(prog, tcx, *c) }
+}
+
+fn alias_term_str(prog: &Program, a: &AliasTerm, ty_str: &mut dyn FnMut(TyId) -> String) -> String {
+    match a { AliasTerm::Ty(t) => ty_str(*t), AliasTerm::Const(c) => alias_const_str(prog, c.kind.def_id()) }
+}
+
+/// A predicate as rustc's Display writes one (`T: Trait`, `<T as Trait>::A == U`, `a <: b`,
+/// `T well-formed` ..).
+pub fn predicate_str(prog: &Program, tcx: &Tcx, p: &Predicate, ty_str: &mut dyn FnMut(TyId) -> String) -> String {
+    match &p.kind {
+        PredicateKind::Clause(ClauseKind::Trait(t)) => {
+            let args: Vec<String> = t.trait_ref.args.iter().map(|a| generic_arg_str(prog, tcx, a, ty_str)).collect();
+            let name = prog.name(t.trait_ref.def_id);
+            let tr = if args.len() > 1 { format!("{}<{}>", name, args[1..].join(", ")) } else { name.to_string() };
+            format!("{}: {}", args.first().cloned().unwrap_or_default(), tr)
+        }
+        PredicateKind::Clause(ClauseKind::Projection(c)) => format!("{} == {}", alias_term_str(prog, &c.projection_term, ty_str), term_str(prog, tcx, &c.term, ty_str)),
+        PredicateKind::Clause(ClauseKind::RegionOutlives(a, b)) => format!("{}: {}", region_str(prog, tcx, *a), region_str(prog, tcx, *b)),
+        PredicateKind::Clause(ClauseKind::TypeOutlives(t, r)) => format!("{}: {}", ty_str(*t), region_str(prog, tcx, *r)),
+        PredicateKind::Clause(ClauseKind::WellFormed(t)) => format!("{} well-formed", term_str(prog, tcx, t, ty_str)),
+        PredicateKind::Clause(ClauseKind::ConstEvaluatable(c)) => format!("the constant `{}` can be evaluated", const_str(prog, tcx, *c)),
+        PredicateKind::Clause(ClauseKind::ConstArgHasType(c, t)) => format!("the constant `{}` has type `{}`", const_str(prog, tcx, *c), ty_str(*t)),
+        PredicateKind::DynCompatible(d) => format!("the trait `{}` is dyn-compatible", prog.name(*d)),
+        PredicateKind::Subtype(s) => format!("{} <: {}", ty_str(s.a), ty_str(s.b)),
+        PredicateKind::Coerce(c) => format!("{} -> {}", ty_str(c.a), ty_str(c.b)),
+        PredicateKind::ConstEquate(a, b) => format!("{} == {}", const_str(prog, tcx, *a), const_str(prog, tcx, *b)),
+        PredicateKind::Ambiguous => "ambiguous".to_string(),
+        PredicateKind::NormalizesTo(n) => format!("normalizes-to({}, {})", alias_term_str(prog, &n.alias, ty_str), term_str(prog, tcx, &n.term, ty_str)),
+    }
+}
+
+/// rustc's wording of an obligation that does not hold, where neither the trait-bound message nor
+/// fulfillment_message words it: a subtype or coercion that does not hold is a type mismatch
+/// (FulfillmentErrorCode::Subtype, E0308), a constant argument of another type is
+/// SelectionError::ConstArgHasWrongType, an ambiguous one needs annotations (ambiguity.rs E0284),
+/// an overflow names the requirement (E0275).
+pub(crate) fn obligation_message(prog: &Program, tcx: &Tcx, code: &str, predicate: &Predicate, ty_str: &mut dyn FnMut(TyId) -> String) -> String {
+    match (code, &predicate.kind) {
+        ("E0275", _) => format!("E0275: overflow evaluating the requirement `{}`", predicate_str(prog, tcx, predicate, ty_str)),
+        ("E0283", _) => format!("E0284: type annotations needed: cannot satisfy `{}`", predicate_str(prog, tcx, predicate, ty_str)),
+        (_, PredicateKind::Subtype(p)) => {
+            let (expected, found) = if p.a_is_expected { (p.a, p.b) } else { (p.b, p.a) };
+            format!("E0308: mismatched types: expected `{}`, found `{}`", ty_str(expected), ty_str(found))
+        }
+        (_, PredicateKind::Coerce(p)) => format!("E0308: mismatched types: expected `{}`, found `{}`", ty_str(p.b), ty_str(p.a)),
+        (_, PredicateKind::ConstEquate(a, b)) => format!("E0308: mismatched types: expected `{}`, found `{}`", const_str(prog, tcx, *a), const_str(prog, tcx, *b)),
+        (_, PredicateKind::Clause(ClauseKind::ConstArgHasType(c, t))) => format!("error: the constant `{}` is not of type `{}`", const_str(prog, tcx, *c), ty_str(*t)),
+        (_, PredicateKind::Clause(ClauseKind::WellFormed(t))) => format!("error: the type `{}` is not well-formed", term_str(prog, tcx, t, ty_str)),
+        (_, PredicateKind::Clause(ClauseKind::Projection(c))) => format!("E0271: type mismatch resolving `{} == {}`", alias_term_str(prog, &c.projection_term, ty_str), term_str(prog, tcx, &c.term, ty_str)),
+        _ => format!("{code}: the requirement `{}` is not satisfied", predicate_str(prog, tcx, predicate, ty_str)),
+    }
+}
+
 pub(crate) fn trait_error_message(prog: &Program, tcx: &Tcx, code: &str, p: &crate::next_solver::TraitClause, ty_str: &mut dyn FnMut(TyId) -> String) -> String {
     let mut args = Vec::new();
     for arg in &p.trait_ref.args {
-        args.push(match arg { crate::consts::GenericArg::Type(t) => ty_str(*t), crate::consts::GenericArg::Const(c) => tcx.tys.const_to_string(*c), crate::consts::GenericArg::Lifetime(r) => format!("{r:?}") });
+        args.push(generic_arg_str(prog, tcx, arg, ty_str));
     }
     let td = p.trait_ref.def_id;
     let name = prog.name(td).to_string();
@@ -7875,6 +8157,16 @@ pub(crate) fn trait_error_message(prog: &Program, tcx: &Tcx, code: &str, p: &cra
         "E0277" if core && name == "Send" => format!("`{}` cannot be sent between threads safely", self_ty),
         "E0277" if core && name == "Sync" => format!("`{}` cannot be shared between threads safely", self_ty),
         "E0277" if core && name == "Iterator" => format!("`{}` is not an iterator", self_ty),
+        // core's FromIterator #[rustc_on_unimplemented] (library/core/src/iter/traits/collect.rs)
+        "E0277" if core && name == "FromIterator" && args.len() == 2 => {
+            let self_kind = match p.trait_ref.args.first() { Some(crate::consts::GenericArg::Type(t)) => Some(tcx.tys.kind(*t)), _ => None };
+            match self_kind {
+                Some(TyKind::Ref(_, inner, _)) if matches!(tcx.tys.kind(*inner), TyKind::Slice(_)) => format!("a slice of type `{}` cannot be built since we need to store the elements somewhere", self_ty),
+                Some(TyKind::Slice(_)) => format!("a slice of type `{}` cannot be built since `{}` has no definite size", self_ty, self_ty),
+                Some(TyKind::Array(..)) => format!("an array of type `{}` cannot be built directly from an iterator", self_ty),
+                _ => format!("a value of type `{}` cannot be built from an iterator over elements of type `{}`", self_ty, args[1]),
+            }
+        }
         "E0277" => format!("the trait bound `{}: {}` is not satisfied", self_ty, tr),
         "E0283" => format!("type annotations needed: cannot satisfy `{}: {}`", self_ty, tr),
         _ => format!("overflow evaluating the requirement `{}: {}`", self_ty, tr),
@@ -7885,7 +8177,7 @@ pub fn ty_to_string_paths(prog: &Program, tcx: &Tcx, t: TyId) -> String {
     match tcx.tys.kind(t) {
         TyKind::Adt(d, args, _) => {
             let krate = prog.syms.str(prog.crates[prog.def(*d).krate as usize].name);
-            let mut s = format!("{}::{} (crate {}, def {})", krate, prog.def_path(*d), prog.def(*d).krate, d.0);
+            let mut s = format!("{}::{}", krate, prog.def_path(*d));
             if !args.is_empty() {
                 let a: Vec<String> = tcx.tys.list(*args).iter().map(|x| ty_to_string_paths(prog, tcx, *x)).collect();
                 s.push_str(&format!("<{}>", a.join(", ")));
@@ -7953,7 +8245,7 @@ pub fn type_name(prog: &Program, tcx: &Tcx, t: TyId) -> String {
                 format!("({})", list(tcx.tys.list(*v)))
             }
         }
-        TyKind::Array(e, n) => format!("[{}; {}]", type_name(prog, tcx, *e), tcx.tys.const_to_string(*n)),
+        TyKind::Array(e, n) => format!("[{}; {}]", type_name(prog, tcx, *e), const_str(prog, tcx, *n)),
         TyKind::Slice(e) => format!("[{}]", type_name(prog, tcx, *e)),
         TyKind::Ref(m, e, _) => format!("&{}{}", if *m { "mut " } else { "" }, type_name(prog, tcx, *e)),
         TyKind::Ptr(m, e) => format!("*{} {}", if *m { "mut" } else { "const" }, type_name(prog, tcx, *e)),
@@ -8131,8 +8423,8 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
             s.push(')');
             s
         }
-        TyKind::Array(e, n) => format!("[{}; {}]", ty_to_string(stable_closures, prog, tcx, *e), tcx.tys.const_to_string(*n)),
-        TyKind::Const(v) => tcx.tys.const_to_string(*v),
+        TyKind::Array(e, n) => format!("[{}; {}]", ty_to_string(stable_closures, prog, tcx, *e), const_str(prog, tcx, *n)),
+        TyKind::Const(v) => const_str(prog, tcx, *v),
         TyKind::Slice(e) => format!("[{}]", ty_to_string(stable_closures, prog, tcx, *e)),
         TyKind::Ref(m, e, _) => format!("&{}{}", if *m { "mut " } else { "" }, ty_to_string(stable_closures, prog, tcx, *e)),
         TyKind::Ptr(m, e) => format!("*{} {}", if *m { "mut" } else { "const" }, ty_to_string(stable_closures, prog, tcx, *e)),
@@ -8164,9 +8456,10 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
         }
         TyKind::FnDef(d, _, _) => format!("fn item {}", prog.def_path(*d)),
         TyKind::Param(i) => format!("T{}", i),
-        TyKind::Infer(v) => format!("?{}", v),
-        TyKind::IntVar(v) => format!("?I{}", v),
-        TyKind::FloatVar(v) => format!("?F{}", v),
+        // rustc_type_ir/src/ty_kind.rs `impl Display for InferTy`: messages name no variable
+        TyKind::Infer(_) => "_".to_string(),
+        TyKind::IntVar(_) => "{integer}".to_string(),
+        TyKind::FloatVar(_) => "{float}".to_string(),
         TyKind::Bound(d, b) => format!("^{}.{}:{:?}", d, b.var.0, b.kind),
         TyKind::Placeholder(p) => format!("!U{}.{}", p.universe.0, p.bound.0),
         TyKind::Closure(f, e, crate::types::ClosureArgs { parent_args: owner, .. }) => {
@@ -8311,4 +8604,11 @@ fn op_trait_unimplemented(tr: &str, x: &str, y: &str) -> String {
         "ShrAssign" => assign(">>="),
         _ => format!("E0277: the trait bound `{}: {}<{}>` is not satisfied", x, tr, y),
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&CALLS, std::sync::atomic::AtomicU64::new(0));
+    reset(&CHECKED_DEFS, relax_session::sync::Mutex::new(None));
 }

@@ -19,10 +19,13 @@
 //!   leaves it off (also across WM restarts) until the person starts it from the launcher
 //!   (`start_from_launcher`, which writes `enabled = on`);
 //! - a WM restart does not cost it (Unix). It runs outside the WM's life: its output goes to its
-//!   log file, on Linux under systemd in a scope of the user's manager (the WM's unit stops its
-//!   whole control group), and `~/.makepad/wm/ai-hub.state` names its pid and what it was
-//!   started as. Its windows and its tray wait for the next WM and come back on it (the HAL's
-//!   WM shell re-attaches a tray app). The next WM keeps a live app with the same start (its
+//!   log file, on Linux under systemd in a scope of the user's service manager (the WM's session
+//!   ends with the WM), and `~/.makepad/wm/ai-hub.state` names its pid and what it was
+//!   started as. That manager must run: a dead one (a global OOM killed it, 11-03) is detected
+//!   before the start, and the WM restarts its own session, whose login scope starts it again
+//!   (the only start of it open to the user), once no app holds unsaved work ([`Manager`],
+//!   [`session_step`]); a start that waits says why. Its windows and its tray wait for the next
+//!   WM and come back on it (the HAL's WM shell re-attaches a tray app). The next WM keeps a live app with the same start (its
 //!   models stay loaded, its jobs keep running); one started from another binary or other
 //!   settings is replaced;
 //! - a stop is SIGTERM: the app's hub closes admission (the fleet routes jobs elsewhere), hands
@@ -31,11 +34,14 @@
 //! The same supervisor keeps the node's **devhub** (apps/devhub: the JIT observer the user's Mac
 //! master reaches): a [`Supervised`] service is one [`Kind`] (its app, files, log label and the
 //! env var its conf path goes in) and one [`ServiceConf`] (what its settings file says).
-//! [`HubApp`] is the AI Hub's, [`DevhubApp`] the devhub's.
+//! [`HubApp`] is the AI Hub's, [`DevhubApp`] the devhub's. While no devhub runs on a box nothing
+//! there reaches the master, so each failed start or exit of the devhub goes into its trouble
+//! record (`makepad_devhub_conf::Trouble`), which the devhub reports to the master once it runs.
 //!
-//! A hidden WM (`MAKEPAD_HIDE_WINDOWS`, the test runs) starts no hub unless
-//! `MAKEPAD_WM_AI_HUB_CONF` names its settings: test desktops must not take the GPU or the port
-//! of the real one. Its output goes to `~/.makepad/wm/ai-hub.log`.
+//! A WM that is not its node's ([`guest_wm`]: hidden, under a lease, or second on the session)
+//! starts no hub and leaves the node's alone, unless `MAKEPAD_WM_AI_HUB_CONF` names its settings:
+//! test desktops must not take the GPU or the port of the real one. The hub's output goes to
+//! `~/.makepad/wm/ai-hub.log`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -51,10 +57,15 @@ pub struct Kind {
     pub file: &'static str,
     pub label: &'static str,
     pub conf_env: &'static str,
+    /// Each failed start or exit is recorded beside its settings
+    /// (`makepad_devhub_conf::trouble_path`) for the service to report once it runs. A clean exit
+    /// (devhub's self-update) is none, nor one whose status this WM never sees (a hub an earlier
+    /// WM started).
+    pub trouble: bool,
 }
 
-pub const AI_HUB: Kind = Kind { app_id: crate::clients::HUB_SERVICE_APP, file: "ai-hub", label: "AI Hub", conf_env: NODE_CONF_ENV };
-pub const DEVHUB: Kind = Kind { app_id: crate::clients::DEVHUB_SERVICE_APP, file: "devhub", label: "devhub", conf_env: makepad_devhub::conf::NODE_CONF_ENV };
+pub const AI_HUB: Kind = Kind { app_id: crate::clients::HUB_SERVICE_APP, file: "ai-hub", label: "AI Hub", conf_env: NODE_CONF_ENV, trouble: false };
+pub const DEVHUB: Kind = Kind { app_id: crate::clients::DEVHUB_SERVICE_APP, file: "devhub", label: "devhub", conf_env: makepad_devhub_conf::NODE_CONF_ENV, trouble: true };
 
 /// What the supervisor needs from a service's settings file.
 pub trait ServiceConf: Clone {
@@ -99,7 +110,11 @@ impl ServiceConf for NodeConf {
     }
 }
 
-impl ServiceConf for makepad_devhub::conf::NodeConf {
+impl ServiceConf for makepad_devhub_conf::NodeConf {
+    // Never niced: nothing lowers a process's level again, and a timed lease runs at the level a
+    // person's app gets. The desktop keeps its CPU through the cgroups: the WM's session is a sibling
+    // of the user manager the hub and its leases run under, and nice only orders threads inside one
+    // scope.
     fn reload(path: &Path, prev: &Self) -> Self {
         if path.exists() { Self::load(path) } else { prev.clone() }
     }
@@ -110,7 +125,7 @@ impl ServiceConf for makepad_devhub::conf::NodeConf {
         ""
     }
     fn nice(&self) -> i32 {
-        self.nice
+        0
     }
     fn port(&self) -> u16 {
         self.port
@@ -119,7 +134,7 @@ impl ServiceConf for makepad_devhub::conf::NodeConf {
         Vec::new()
     }
     fn identity(&self) -> String {
-        format!("nice={} name={} port={}", self.nice, self.name, self.port)
+        format!("name={} port={}", self.name, self.port)
     }
     fn note(&self) -> String {
         format!(", node {}", self.name)
@@ -128,10 +143,10 @@ impl ServiceConf for makepad_devhub::conf::NodeConf {
 
 /// The node's devhub settings (`~/.makepad/wm/devhub.conf`, `MAKEPAD_WM_DEVHUB_CONF` names
 /// another); a hidden WM without its own file starts none.
-pub fn load_devhub_conf() -> (PathBuf, makepad_devhub::conf::NodeConf) {
+pub fn load_devhub_conf() -> (PathBuf, makepad_devhub_conf::NodeConf) {
     let path = std::env::var_os("MAKEPAD_WM_DEVHUB_CONF").filter(|p| !p.is_empty()).map(PathBuf::from).unwrap_or_else(|| crate::theme::makepad_home().join("wm/devhub.conf"));
-    let mut conf = makepad_devhub::conf::NodeConf::load(&path);
-    if std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_some() && std::env::var_os("MAKEPAD_WM_DEVHUB_CONF").is_none() {
+    let mut conf = makepad_devhub_conf::NodeConf::load(&path);
+    if stays_out("MAKEPAD_WM_DEVHUB_CONF") {
         conf.enabled = false;
     }
     (path, conf)
@@ -142,10 +157,48 @@ pub fn load_devhub_conf() -> (PathBuf, makepad_devhub::conf::NodeConf) {
 pub fn load_conf() -> (PathBuf, NodeConf) {
     let path = NodeConf::path();
     let mut conf = NodeConf::load_from(&path);
-    if std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_some() && std::env::var_os(CONF_ENV).is_none() {
+    if stays_out(CONF_ENV) {
         conf.enabled = false;
     }
     (path, conf)
+}
+
+/// A WM started as a test desktop: hidden (tests, agents) or under a lease (a lane's own). It
+/// never takes the socket path apps find by default.
+pub fn test_wm() -> bool {
+    std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_some() || std::env::var_os(makepad_remote::discovery::LEASE_ENV).is_some()
+}
+
+/// A WM that is not its node's: a test desktop, or a second one on this session (a live WM holds
+/// the default path, so it got another). It keeps none of the node's services and leaves them
+/// alone: two that keep them stop each other's hubs as rivals, under the node's leases (11-05).
+/// The update's WM comes after the old one is gone, so it holds the default path and adopts them.
+pub fn guest_wm() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use makepad_widgets::makepad_platform::makepad_hal::wm_socket;
+        let exported = std::env::var_os(wm_socket::SOCKET_ENV).filter(|p| !p.is_empty()).map(PathBuf::from);
+        test_wm() || second_on_session(exported.as_deref(), wm_socket::runtime_dir().as_deref())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        test_wm()
+    }
+}
+
+/// Whether the path this WM published (`MAKEPAD_WM_SOCKET`) is not the default one in `dir`.
+#[cfg(target_os = "linux")]
+fn second_on_session(exported: Option<&Path>, dir: Option<&Path>) -> bool {
+    use makepad_widgets::makepad_platform::makepad_hal::wm_socket;
+    match (exported, dir) {
+        (Some(path), Some(dir)) => path != wm_socket::socket_path(dir, 0),
+        _ => false,
+    }
+}
+
+/// A guest WM stays out of the service `conf_env` would name settings for, unless it does.
+pub fn stays_out(conf_env: &str) -> bool {
+    guest_wm() && std::env::var_os(conf_env).is_none()
 }
 
 /// Seconds before the `n`th restart in a row (n >= 1).
@@ -176,6 +229,34 @@ impl Running {
     }
 }
 
+/// The hub exits at once again and again: a tree a lease left at a commit it does not build at (from
+/// before its package) would keep it down for good. The tree goes to the shared commits (a thread:
+/// git on the WM's tick would stall it), and the hub, once up, puts a lease still holding it back. A
+/// tree that is at them stays: a hub that fails there is a landed bug, and its log says which.
+fn tree_to_synced() {
+    let Some(root) = registry::repo_root() else { return };
+    let spawned = std::thread::Builder::new().name("wm-devhub-tree".into()).spawn(move || {
+        for dir in [root.clone(), root.join("apps").join("commercial")] {
+            let git = |args: &[&str]| Command::new("git").args(args).current_dir(&dir).stdin(std::process::Stdio::null()).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            if !dir.join(".git").exists() {
+                continue;
+            }
+            let Some(to) = git(&["rev-parse", "-q", "--verify", "refs/devhub/synced"]) else { continue };
+            if git(&["rev-parse", "-q", "--verify", "HEAD"]).as_deref() == Some(to.as_str()) {
+                continue;
+            }
+            makepad_widgets::log!("wm: devhub does not start in {}: back at the shared {to}", dir.display());
+            let moved = git(&["read-tree", "--reset", "-u", &to]).is_some() && git(&["update-ref", "--no-deref", "HEAD", &to]).is_some() && git(&["update-ref", "refs/devhub/checkout", &to]).is_some();
+            if !moved {
+                makepad_widgets::log!("wm: devhub: moving {} to {to} failed", dir.display());
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        makepad_widgets::log!("wm: devhub: {e}");
+    }
+}
+
 /// What the app was started as: the binary cargo runs (path, size, modification time) and
 /// everything the settings hand it. A WM that finds a live app with the same identity keeps it.
 fn identity<C: ServiceConf>(binary: &Path, conf: &C) -> String {
@@ -186,6 +267,11 @@ fn identity<C: ServiceConf>(binary: &Path, conf: &C) -> String {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos());
     format!("{} {size} {modified} {}", binary.display(), conf.identity())
+}
+
+/// The settings part of a recorded identity of `binary` ([`identity`]).
+fn recorded_settings<'a>(id: &'a str, binary: &Path) -> Option<&'a str> {
+    id.strip_prefix(&format!("{} ", binary.display()))?.splitn(3, ' ').nth(2)
 }
 
 /// The registry's app of a service.
@@ -226,7 +312,7 @@ pub fn build_node_devhub() -> std::process::ExitCode {
 
 fn build_service<C: ServiceConf>(app: Supervised<C>) -> std::process::ExitCode {
     let word = app.kind.file;
-    let mut cmd = match app.cargo(Verb::Build) {
+    let mut cmd = match app.cargo(Verb::Build, false) {
         Ok(cmd) => cmd,
         Err(e) => {
             eprintln!("makepad-wm-build: {word}: {e}");
@@ -289,14 +375,114 @@ fn app_alive(kind: &Kind, pid: u32) -> bool {
     }
 }
 
-/// Linux under systemd: the WM's own unit stops its whole control group, so an app that is to
-/// outlive a WM restart runs in a scope of the user's manager (`systemd-run --user --scope`,
-/// which execs it: the child's pid is the app's).
+/// Linux under systemd: the WM's session ends with the WM, so an app that is to outlive a WM
+/// restart runs in a scope of the user's service manager (`systemd-run --user --scope`, which
+/// execs it: the child's pid is the app's).
+const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
+
+/// The user's service manager (`user@<uid>.service`) as pid1 reports it. A service starts in a
+/// scope of it, so it must run: on 11-03 a global OOM killed it, its bus socket stayed behind,
+/// and every start through `systemd-run --user` failed ("Connection refused") for 24 min until a
+/// login on the box started it again.
 #[cfg(target_os = "linux")]
-fn user_scope() -> Option<PathBuf> {
-    let run = PathBuf::from("/usr/bin/systemd-run");
-    let bus = std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("bus"));
-    (run.is_file() && bus.is_some_and(|b| b.exists())).then_some(run)
+#[derive(Clone, Debug, PartialEq)]
+pub enum Manager {
+    /// It runs: the service starts in a scope of it.
+    Up,
+    /// pid1 is starting or stopping it (`activating`, `deactivating`): the start waits.
+    Changing(String),
+    /// It is gone (`failed`, `inactive`). `down` names this outage: when it went down (its
+    /// unit's `InactiveEnterTimestampMonotonic`).
+    Down { state: String, down: String },
+    /// systemctl did not say.
+    Unknown(String),
+}
+
+#[cfg(target_os = "linux")]
+impl Manager {
+    /// From `systemctl show --property=ActiveState,InactiveEnterTimestampMonotonic`.
+    fn parse(text: &str) -> Manager {
+        let get = |key: &str| text.lines().find_map(|l| l.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v.trim().to_string())).unwrap_or_default();
+        match get("ActiveState").as_str() {
+            "active" | "reloading" | "refreshing" => Manager::Up,
+            "activating" | "deactivating" => Manager::Changing(get("ActiveState")),
+            "" => Manager::Unknown(format!("systemctl gave no ActiveState: {:?}", text.trim())),
+            state => Manager::Down { state: state.to_string(), down: get("InactiveEnterTimestampMonotonic") },
+        }
+    }
+}
+
+/// This user's service manager unit.
+#[cfg(target_os = "linux")]
+fn manager_unit() -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!("user@{}.service", std::fs::metadata("/proc/self").map_or(0, |m| m.uid()))
+}
+
+/// This user's service manager, from pid1. None: this Linux runs services without one (no
+/// `systemd-run`, or no user session: no runtime dir or no user bus socket in it), so they start
+/// as the WM's children.
+#[cfg(target_os = "linux")]
+fn user_manager() -> Option<Manager> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty())?;
+    if !Path::new(SYSTEMD_RUN).is_file() || !Path::new(&runtime).join("bus").exists() {
+        return None;
+    }
+    let unit = manager_unit();
+    Some(match Command::new("systemctl").args(["show", &unit, "--property=ActiveState,InactiveEnterTimestampMonotonic"]).stdin(Stdio::null()).output() {
+        Ok(out) if out.status.success() => Manager::parse(&String::from_utf8_lossy(&out.stdout)),
+        Ok(out) => Manager::Unknown(format!("systemctl show {unit}: {} {}", out.status, String::from_utf8_lossy(&out.stderr).trim())),
+        Err(e) => Manager::Unknown(format!("systemctl: {e}")),
+    })
+}
+
+/// Whether this WM can restart its own session: it runs as its systemd unit (which restarts it
+/// on exit 75 and opens a new login session for it), not hidden (a test desktop).
+#[cfg(target_os = "linux")]
+fn session_restartable() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some() && std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_none()
+}
+
+/// The file in `~/.makepad/wm` that names the outage the WM restarted its session for (its first
+/// line: [`Manager::Down`]'s `down`): a session restart that did not bring the manager back is
+/// not repeated.
+#[cfg(target_os = "linux")]
+const SESSION_RESTART_FILE: &str = "session-restart";
+
+/// A restart of the WM's session a service needs: why, and the outage it is for.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionRestart {
+    pub why: String,
+    pub down: String,
+}
+
+/// What the WM does about a session restart its services need, given the apps' unsaved work
+/// (`makepad_app_registry::machine::unsaved_work`): a restart ends every app of the session.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq)]
+pub enum SessionStep {
+    /// Restart now (exit 75, which the WM's unit restarts): why.
+    Restart(String),
+    /// Wait while an app holds unsaved work: what the person at the screen is told.
+    Waits(String),
+}
+
+#[cfg(target_os = "linux")]
+pub fn session_step(want: &SessionRestart, unsaved: &[(u32, String, String)]) -> SessionStep {
+    if unsaved.is_empty() {
+        return SessionStep::Restart(want.why.clone());
+    }
+    let list = unsaved.iter().map(|(_, app, what)| format!("{app}: {what}")).collect::<Vec<_>>().join("; ");
+    SessionStep::Waits(format!("{}, once no app holds unsaved work ({list})", want.why))
+}
+
+/// The WM restarts its session for `want` now: recorded in `dir` (`~/.makepad/wm`) first, so the
+/// next WM does not restart again for the same outage.
+#[cfg(target_os = "linux")]
+pub fn begin_session_restart(dir: &Path, want: &SessionRestart) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(SESSION_RESTART_FILE), format!("{}\n{}\n", want.down, want.why))
 }
 
 /// The `makepad-ai-hub-<port>-<wm pid>.scope` a process runs in (its `/proc/<pid>/cgroup`
@@ -308,8 +494,23 @@ fn hub_scope<'a>(cgroup: &'a str, file: &str, port: u16) -> Option<&'a str> {
     })
 }
 
+/// When `pid` started (clock ticks since boot).
+#[cfg(target_os = "linux")]
+fn proc_start(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat[stat.rfind(')')? + 2..].split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Whether the WM a hub's scope names is another live one, which keeps it. A pid reused since then
+/// started after the process in that scope, so it is not that WM.
+#[cfg(target_os = "linux")]
+fn kept_by_another_wm(scope: &str, pid: u32, me: u32, start: &dyn Fn(u32) -> Option<u64>) -> bool {
+    let Some(wm) = scope.strip_suffix(".scope").and_then(|s| s.rsplit('-').next()).and_then(|p| p.parse::<u32>().ok()) else { return false };
+    wm != me && matches!((start(wm), start(pid)), (Some(w), Some(p)) if w <= p)
+}
+
 /// This user's processes in a hub scope for `port` other than `keep`'s (its own children, the
-/// sandboxed Claude, share its scope).
+/// sandboxed Claude, share its scope) and no other live WM's.
 #[cfg(target_os = "linux")]
 fn rival_hubs(file: &str, port: u16, keep: Option<u32>) -> Vec<u32> {
     use std::os::unix::fs::MetadataExt;
@@ -321,7 +522,7 @@ fn rival_hubs(file: &str, port: u16, keep: Option<u32>) -> Vec<u32> {
         .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
         .filter(|pid| Some(*pid) != keep && *pid != std::process::id())
         .filter(|pid| std::fs::metadata(format!("/proc/{pid}")).is_ok_and(|m| m.uid() == me))
-        .filter(|pid| scope_of(*pid).is_some_and(|scope| kept.as_deref() != Some(scope.as_str())))
+        .filter(|pid| scope_of(*pid).is_some_and(|scope| kept.as_deref() != Some(scope.as_str()) && !kept_by_another_wm(&scope, *pid, std::process::id(), &proc_start)))
         .collect();
     out.sort_unstable();
     out
@@ -330,7 +531,7 @@ fn rival_hubs(file: &str, port: u16, keep: Option<u32>) -> Vec<u32> {
 /// The AI Hub's supervisor.
 pub type HubApp = Supervised<NodeConf>;
 /// The devhub's supervisor.
-pub type DevhubApp = Supervised<makepad_devhub::conf::NodeConf>;
+pub type DevhubApp = Supervised<makepad_devhub_conf::NodeConf>;
 
 pub struct Supervised<C: ServiceConf> {
     pub kind: &'static Kind,
@@ -361,6 +562,18 @@ pub struct Supervised<C: ServiceConf> {
     /// The kept devhub runs another program, but leases run under it: it is replaced once its
     /// leases are done (a replacement would end them: a landing's gate lost its node, 10-29).
     replace_when_idle: bool,
+    /// Where the user's service manager's state comes from (tests give a fixed one).
+    #[cfg(target_os = "linux")]
+    manager: fn() -> Option<Manager>,
+    /// Whether this WM may restart its session ([`session_restartable`]; tests set it).
+    #[cfg(target_os = "linux")]
+    restartable: bool,
+    /// The session restart its start needs (the user's service manager is down).
+    #[cfg(target_os = "linux")]
+    session_restart: Option<SessionRestart>,
+    /// What its start waits for, as last said.
+    #[cfg(target_os = "linux")]
+    waiting: Option<String>,
 }
 
 impl<C: ServiceConf> Supervised<C> {
@@ -383,7 +596,21 @@ impl<C: ServiceConf> Supervised<C> {
             adopt_by: None,
             rivals: Vec::new(),
             replace_when_idle: false,
+            #[cfg(target_os = "linux")]
+            manager: user_manager,
+            #[cfg(target_os = "linux")]
+            restartable: session_restartable(),
+            #[cfg(target_os = "linux")]
+            session_restart: None,
+            #[cfg(target_os = "linux")]
+            waiting: None,
         }
+    }
+
+    /// The session restart its start needs: the user's service manager is down.
+    #[cfg(target_os = "linux")]
+    pub fn session_restart(&self) -> Option<&SessionRestart> {
+        self.session_restart.as_ref()
     }
 
     /// The built app cargo runs (the deploy built it with the same features): its identity.
@@ -394,15 +621,16 @@ impl<C: ServiceConf> Supervised<C> {
     }
 
     /// `cargo run --release -p makepad-app-aihub --features <features>` in the checkout, with the
-    /// cargo environment of every launcher (`registry::cargo_env`), under the user's systemd
-    /// scope and `nice` where they exist: they and cargo exec, so the app's pid is the child's.
-    fn command(&self) -> Result<Command, String> {
-        self.cargo(Verb::Run)
+    /// cargo environment of every launcher (`registry::cargo_env`), in a scope of the user's
+    /// service manager when `scoped`, and under `nice` where it exists: they and cargo exec, so
+    /// the app's pid is the child's.
+    fn command(&self, scoped: bool) -> Result<Command, String> {
+        self.cargo(Verb::Run, scoped)
     }
 
     /// The start's cargo command; `Verb::Build` is the deploy's build of it ([`build_node_hub`]):
     /// the same package, features, checkout and environment, without the scope and `nice`.
-    fn cargo(&self, verb: Verb) -> Result<Command, String> {
+    fn cargo(&self, verb: Verb, scoped: bool) -> Result<Command, String> {
         let root = registry::repo_root().ok_or_else(|| format!("no makepad checkout to run the {} from", self.kind.label))?;
         let target = target_of(self.kind)?;
         let (cargo, cargo_args) = match verb {
@@ -410,10 +638,9 @@ impl<C: ServiceConf> Supervised<C> {
             Verb::Build => registry::build_argv_features(&target, &root, self.conf.features()),
         };
         let mut argv: Vec<std::ffi::OsString> = Vec::new();
-        #[cfg(target_os = "linux")]
-        if let (Verb::Run, Some(run)) = (verb, user_scope()) {
+        if verb == Verb::Run && scoped {
             let unit = format!("makepad-{}-{}-{}", self.kind.file, self.conf.port(), std::process::id());
-            argv.extend([run.into_os_string(), "--user".into(), "--scope".into(), "--quiet".into(), "--collect".into(), format!("--unit={unit}").into()]);
+            argv.extend([SYSTEMD_RUN.into(), "--user".into(), "--scope".into(), "--quiet".into(), "--collect".into(), format!("--unit={unit}").into()]);
         }
         if verb == Verb::Run && cfg!(unix) && self.conf.nice() > 0 {
             argv.extend(["nice".into(), "-n".into(), self.conf.nice().to_string().into()]);
@@ -443,7 +670,7 @@ impl<C: ServiceConf> Supervised<C> {
         if !app_alive(self.kind, pid) {
             return false;
         }
-        if id == identity(binary, &self.conf) {
+        if self.runs_as_started(pid, &id, binary) {
             makepad_widgets::log!("wm: {label}: kept pid {pid}, started by an earlier WM with this program and these settings");
             self.running = Some(Running::Adopted(pid));
             self.restart_at = None;
@@ -466,6 +693,18 @@ impl<C: ServiceConf> Supervised<C> {
         makepad_widgets::log!("wm: {label}: pid {pid} runs another program or other settings; replacing it");
         self.replace(pid, now);
         true
+    }
+
+    /// Whether the kept app `pid` (its state's identity `id`) runs as this WM would start it: these
+    /// settings and (Linux) the program `binary` holds now. Its start wrote `id` before cargo built
+    /// it, so the binary's size and time in it can be the build before: a WM restart replaced
+    /// AI Hubs that ran the current program (every devhub roll, 11-02), and a restart reloads
+    /// their models. Elsewhere the recorded identity decides.
+    fn runs_as_started(&self, pid: u32, id: &str, binary: &Path) -> bool {
+        match registry::runs_binary(pid, binary) {
+            Some(runs) => runs && recorded_settings(id, binary) == Some(self.conf.identity().as_str()),
+            None => id == identity(binary, &self.conf),
+        }
     }
 
     /// Stops the kept app `pid` (SIGTERM, SIGKILL after the grace) and starts this WM's own once
@@ -504,7 +743,11 @@ impl<C: ServiceConf> Supervised<C> {
             self.restart_at = Some(now + 1.0);
             return;
         }
-        let mut cmd = match self.command() {
+        #[cfg(target_os = "linux")]
+        let Some(scoped) = self.scope(now) else { return };
+        #[cfg(not(target_os = "linux"))]
+        let scoped = false;
+        let mut cmd = match self.command(scoped) {
             Ok(cmd) => cmd,
             Err(reason) => {
                 makepad_widgets::log!("wm: {label}: {reason}");
@@ -512,8 +755,9 @@ impl<C: ServiceConf> Supervised<C> {
                 return;
             }
         };
+        // It is to outlive this WM's run (adopt_or_replace): a session of its own says so.
         #[cfg(unix)]
-        makepad_app_host::launch::own_process_group(&mut cmd);
+        makepad_app_host::launch::own_session(&mut cmd);
         crate::host::no_console_window(&mut cmd);
         if let Some(dir) = self.log.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -589,13 +833,73 @@ impl<C: ServiceConf> Supervised<C> {
         }
     }
 
+    /// Where the start goes on Linux: Some(true) into a scope of the user's service manager,
+    /// Some(false) as this WM's child (this Linux runs services without one); None: not now (said,
+    /// and tried again later). A dead manager asks for the WM's session restart ([`session_step`]),
+    /// once per outage: a new session that did not start it again is not restarted again.
+    #[cfg(target_os = "linux")]
+    fn scope(&mut self, now: f64) -> Option<bool> {
+        let marker = self.state.with_file_name(SESSION_RESTART_FILE);
+        match (self.manager)() {
+            None => Some(false),
+            Some(Manager::Up) => {
+                self.waiting = None;
+                self.session_restart = None;
+                let _ = std::fs::remove_file(&marker);
+                Some(true)
+            }
+            Some(Manager::Changing(state)) => {
+                let what = format!("waits for the user's service manager ({} is {state})", manager_unit());
+                if self.waiting.as_deref() != Some(what.as_str()) {
+                    makepad_widgets::log!("wm: {} {what}", self.kind.label);
+                    self.waiting = Some(what);
+                }
+                self.restart_at = Some(now + 1.0);
+                None
+            }
+            Some(Manager::Down { state, down }) => {
+                let gone = format!("the user's service manager is down ({} {state}), and a start in a scope of it fails", manager_unit());
+                let tried = std::fs::read_to_string(&marker).is_ok_and(|t| t.lines().next() == Some(down.as_str()));
+                let reason = if tried {
+                    format!("{gone}; the WM's new session did not start it again: a login on this box does")
+                } else if !self.restartable {
+                    format!("{gone}; this WM does not run as its systemd unit and cannot restart its session: a login on this box starts it again")
+                } else {
+                    let why = format!("{gone}; the WM restarts its session to start it again");
+                    self.session_restart = Some(SessionRestart { why: why.clone(), down });
+                    why
+                };
+                self.retry_later(now, reason);
+                None
+            }
+            Some(Manager::Unknown(why)) => {
+                self.retry_later(now, format!("cannot tell whether the user's service manager runs: {why}"));
+                None
+            }
+        }
+    }
+
     /// A start that failed (not built yet, say) is tried again like an exit.
     fn retry_later(&mut self, now: f64, reason: String) {
         let label = self.kind.label;
         self.crashes += 1;
         let wait = backoff_s(self.crashes);
         makepad_widgets::log!("wm: {label} did not start ({reason}); trying again in {wait} s");
+        self.note_trouble(&format!("could not start: {reason}"));
         self.restart_at = Some(now + wait as f64);
+    }
+
+    /// Why it does not run, for the service to report once it does ([`Kind::trouble`]).
+    fn note_trouble(&self, what: &str) {
+        if !self.kind.trouble {
+            return;
+        }
+        let path = makepad_devhub_conf::trouble_path(&self.conf_path);
+        let prev = std::fs::read_to_string(&path).ok().and_then(|t| makepad_devhub_conf::Trouble::parse(&t));
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        if let Err(e) = std::fs::write(&path, makepad_devhub_conf::Trouble::next(prev, now_ms, what).to_text()) {
+            makepad_widgets::log!("wm: {}: {}: {e}", self.kind.label, path.display());
+        }
     }
 
     /// The last lines of its log.
@@ -670,19 +974,21 @@ impl<C: ServiceConf> Supervised<C> {
                 self.adopt_by = None;
             }
         }
+        // (and whether it is known to have failed: a clean exit is the hub's self-update, and one
+        // an earlier WM started ends with a status this WM never sees)
         let exited = match self.running.as_mut() {
             Some(Running::Child(child)) => match child.try_wait() {
-                Ok(Some(status)) => Some(status.to_string()),
+                Ok(Some(status)) => Some((status.to_string(), !status.success())),
                 Ok(None) => None,
                 Err(e) => {
                     makepad_widgets::log!("wm: {label}: {e}");
                     None
                 }
             },
-            Some(Running::Adopted(pid)) => (!app_alive(self.kind, *pid)).then(|| "exited".to_string()),
+            Some(Running::Adopted(pid)) => (!app_alive(self.kind, *pid)).then(|| ("exited".to_string(), false)),
             None => None,
         };
-        if let Some(status) = exited {
+        if let Some((status, failed)) = exited {
             let adopted = matches!(self.running, Some(Running::Adopted(_)));
             self.running = None;
             self.kill_at = None;
@@ -708,8 +1014,15 @@ impl<C: ServiceConf> Supervised<C> {
                     self.crashes = 0;
                 }
                 self.crashes += 1;
+                if self.kind.file == DEVHUB.file && self.crashes >= 2 {
+                    tree_to_synced();
+                }
                 let wait = backoff_s(self.crashes);
-                makepad_widgets::log!("wm: {label} exited ({}); restart {} in {wait} s", self.exit_reason(&status), self.crashes);
+                let reason = self.exit_reason(&status);
+                makepad_widgets::log!("wm: {label} exited ({reason}); restart {} in {wait} s", self.crashes);
+                if failed {
+                    self.note_trouble(&format!("exited ({reason})"));
+                }
                 self.restart_at = Some(now + wait as f64);
             }
             return;
@@ -911,6 +1224,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn a_kept_app_runs_as_started_when_it_runs_the_current_program() {
+        let dir = scratch("runs");
+        let program = dir.join("makepad-app-aihub");
+        std::fs::copy("/bin/sleep", &program).unwrap();
+        let h = app("runs");
+        // its start recorded the binary before cargo built it again (same bytes, a new file)
+        let stale = format!("{} 1 2 {}", program.display(), h.conf.identity());
+        let mut child = Command::new(&program).arg("30").spawn().unwrap();
+        let fresh = identity(&program, &h.conf);
+        assert!(h.runs_as_started(child.id(), &fresh, &program));
+        assert!(h.runs_as_started(child.id(), &stale, &program), "a stale size and time in its state never replace the program it runs");
+        let other = format!("{} 1 2 nice=0 features=other env=[]", program.display());
+        assert!(!h.runs_as_started(child.id(), &other, &program), "other settings replace it");
+        let next = dir.join("next");
+        std::fs::copy("/bin/sleep", &next).unwrap();
+        std::fs::rename(&next, &program).unwrap();
+        assert!(h.runs_as_started(child.id(), &stale, &program), "a relink to the same bytes keeps it");
+        std::fs::write(&next, b"another build").unwrap();
+        std::fs::rename(&next, &program).unwrap();
+        assert!(!h.runs_as_started(child.id(), &fresh, &program), "a new build replaces it");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
     fn a_hub_scope_is_the_wms_unit_for_the_port() {
         let cg = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/makepad-ai-hub-8123-2890550.scope\n";
         assert_eq!(hub_scope(cg, "ai-hub", 8123), Some("makepad-ai-hub-8123-2890550.scope"));
@@ -932,18 +1271,55 @@ mod tests {
         let _ = sleeper.wait();
     }
 
+    /// Two WMs on one session: the first holds the default path and keeps the node's services, the
+    /// second gets another and keeps none. After the first goes (its file stays, as a crash leaves
+    /// it), the next WM holds the default path again: the update's handover.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_second_wm_keeps_nothing_and_the_next_after_the_first_does() {
+        use makepad_widgets::makepad_platform::makepad_hal::wm_socket::{self, WmSocket};
+        let dir = scratch("two-wms");
+        let second_at = |path: &Path| second_on_session(Some(path), Some(&dir));
+        let first = WmSocket::bind(&dir, 0).unwrap();
+        let second = WmSocket::bind(&dir, 0).unwrap();
+        assert_eq!(first.path, wm_socket::socket_path(&dir, 0));
+        assert!(!second_at(&first.path));
+        assert!(second_at(&second.path));
+        drop(first);
+        let next = WmSocket::bind(&dir, 0).unwrap();
+        assert!(!second_at(&next.path), "{:?}", next.path);
+        // no socket published: no other WM to tell it from
+        assert!(!second_on_session(None, Some(&dir)));
+        assert!(!second_on_session(Some(&second.path), None));
+    }
+
+    /// The hub another live WM keeps is no rival; one whose WM is gone, or this WM's own leftover,
+    /// is. A process that took the dead WM's pid since is not that WM.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_hub_another_live_wm_keeps_is_no_rival() {
+        let start = |pid: u32| match pid {
+            10 => Some(100),
+            20 => Some(200),
+            30 => Some(300),
+            _ => None,
+        };
+        let scope = |wm: u32| format!("makepad-devhub-8797-{wm}.scope");
+        assert!(kept_by_another_wm(&scope(10), 20, 1, &start));
+        assert!(!kept_by_another_wm(&scope(99), 20, 1, &start), "its WM is gone");
+        assert!(!kept_by_another_wm(&scope(10), 20, 10, &start), "this WM's own");
+        assert!(!kept_by_another_wm(&scope(30), 20, 1, &start), "a reused pid");
+    }
+
     #[test]
     fn devhub_starts_and_builds_with_one_cargo_command() {
         // The WM's start and the deploy's build (`makepad-wm-build -- devhub`) are the same
         // cargo invocation with `run` for `build`: a start after the deploy compiles nothing.
-        if registry::repo_root().is_none() {
-            return;
-        }
         let dir = scratch("devhub");
-        let conf = makepad_devhub::conf::NodeConf::parse("name = t1\nport = 8797\n");
+        let conf = makepad_devhub_conf::NodeConf::parse("name = t1\nport = 8797\n");
         let d = DevhubApp::new(&DEVHUB, dir.join("devhub.conf"), conf);
         let args = |verb| -> (Vec<String>, Vec<(String, String)>) {
-            let cmd = d.cargo(verb).unwrap();
+            let cmd = d.cargo(verb, verb == Verb::Run).unwrap();
             let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
             let envs = cmd.get_envs().filter_map(|(k, v)| Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned()))).collect();
             (args, envs)
@@ -955,8 +1331,122 @@ mod tests {
         assert!(run.iter().any(|a| a == "--release"), "{run:?}");
         assert_eq!(tail(&run, "run"), tail(&build, "build"), "same package, profile and features");
         assert_eq!(run_env, build_env, "same cargo environment");
-        assert!(run_env.iter().any(|(k, v)| k == makepad_devhub::conf::NODE_CONF_ENV && v.ends_with("devhub.conf")));
+        assert!(run_env.iter().any(|(k, v)| k == makepad_devhub_conf::NODE_CONF_ENV && v.ends_with("devhub.conf")));
         assert_eq!(d.state.file_name().unwrap(), "devhub.state");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_user_managers_state_comes_from_its_unit() {
+        assert_eq!(Manager::parse("ActiveState=active\nInactiveEnterTimestampMonotonic=0\n"), Manager::Up);
+        assert_eq!(Manager::parse("ActiveState=activating\n"), Manager::Changing("activating".into()));
+        assert_eq!(Manager::parse("ActiveState=failed\nInactiveEnterTimestampMonotonic=4242\n"), Manager::Down { state: "failed".into(), down: "4242".into() });
+        assert!(matches!(Manager::parse(""), Manager::Unknown(_)));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn devhub_app(dir: &Path, manager: fn() -> Option<Manager>) -> DevhubApp {
+        let conf = makepad_devhub_conf::NodeConf::parse("name = t1\nport = 8797\n");
+        let mut d = DevhubApp::new(&DEVHUB, dir.join("devhub.conf"), conf);
+        d.log = dir.join("devhub.log");
+        d.state = dir.join("devhub.state");
+        d.first_start = false;
+        d.restart_at = None;
+        d.manager = manager;
+        d.restartable = true;
+        d
+    }
+
+    /// 11-03: a global OOM killed the user's service manager; every start of the devhub through it
+    /// failed for 24 min, retried in the WM's log only, until a login on the box started it again.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_dead_user_manager_restarts_the_session_once_and_the_outage_is_recorded() {
+        fn down() -> Option<Manager> {
+            Some(Manager::parse("ActiveState=failed\nInactiveEnterTimestampMonotonic=4242\n"))
+        }
+        fn down_later() -> Option<Manager> {
+            Some(Manager::parse("ActiveState=failed\nInactiveEnterTimestampMonotonic=9999\n"))
+        }
+        fn starting() -> Option<Manager> {
+            Some(Manager::parse("ActiveState=activating\n"))
+        }
+        fn up() -> Option<Manager> {
+            Some(Manager::Up)
+        }
+        let dir = scratch("dead-manager");
+        let trouble = || makepad_devhub_conf::Trouble::parse(&std::fs::read_to_string(makepad_devhub_conf::trouble_path(&dir.join("devhub.conf"))).unwrap()).unwrap();
+        let mut d = devhub_app(&dir, down);
+        assert_eq!(d.scope(10.0), None, "no start through a dead manager");
+        let want = d.session_restart().cloned().expect("it asks for the session restart");
+        assert_eq!(want.down, "4242");
+        assert!(want.why.contains("the user's service manager is down (user@") && want.why.ends_with("failed), and a start in a scope of it fails; the WM restarts its session to start it again"), "{}", want.why);
+        let t = trouble();
+        assert_eq!(t.tries, 1);
+        assert_eq!(t.reason, format!("could not start: {}", want.why), "the outage and its reason, for the hub to report");
+        // the restart ends every app of the session: it waits for unsaved work, then goes
+        match session_step(&want, &[(7, "Fab".into(), "bracket.fab".into())]) {
+            SessionStep::Waits(text) => assert!(text.ends_with("once no app holds unsaved work (Fab: bracket.fab)"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(session_step(&want, &[]), SessionStep::Restart(want.why.clone()));
+        begin_session_restart(&dir, &want).unwrap();
+        // the next WM, same outage: its new session did not start the manager, so no second restart
+        let mut next = devhub_app(&dir, down);
+        assert_eq!(next.scope(20.0), None);
+        assert_eq!(next.session_restart(), None, "a session restart is not repeated for one outage");
+        let t = trouble();
+        assert_eq!(t.tries, 2);
+        assert!(t.reason.ends_with("the WM's new session did not start it again: a login on this box does"), "{}", t.reason);
+        // a WM not run by its unit cannot restart its session, and says so
+        let mut manual = devhub_app(&dir, down_later);
+        manual.restartable = false;
+        assert_eq!(manual.scope(25.0), None);
+        assert_eq!(manual.session_restart(), None);
+        assert!(trouble().reason.contains("cannot restart its session"));
+        // a later outage of the manager may restart the session again
+        next.manager = down_later;
+        assert_eq!(next.scope(30.0), None);
+        assert_eq!(next.session_restart().map(|w| w.down.as_str()), Some("9999"));
+        // the new session pulls the manager in: the start waits for it, said once
+        next.manager = starting;
+        assert_eq!(next.scope(40.0), None);
+        assert_eq!(next.restart_at, Some(41.0));
+        assert!(next.waiting.as_deref().is_some_and(|w| w.ends_with("is activating)")));
+        // it runs: the start goes into a scope of it, and the outage's restart record is gone
+        next.manager = up;
+        assert_eq!(next.scope(42.0), Some(true));
+        assert_eq!((next.session_restart(), next.waiting.as_deref()), (None, None));
+        assert!(!dir.join(SESSION_RESTART_FILE).exists());
+        // the AI Hub keeps no trouble record (devhub reports its own)
+        assert!(!AI_HUB.trouble && DEVHUB.trouble);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hub exits cleanly for its self-update (the WM starts the new build): no outage. Each
+    /// self-update was reported as "could not run ... exited (exit status: 0)" (11-03).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_clean_exit_is_no_outage_and_a_failed_one_is() {
+        fn up() -> Option<Manager> {
+            Some(Manager::Up)
+        }
+        let dir = scratch("clean-exit");
+        let file = makepad_devhub_conf::trouble_path(&dir.join("devhub.conf"));
+        let mut d = devhub_app(&dir, up);
+        let mut exit_with = |cmd: &str, now: f64| {
+            let mut child = Command::new(cmd).spawn().unwrap();
+            let _ = child.wait();
+            d.running = Some(Running::Child(child));
+            d.started_at = now - STEADY_S - 1.0;
+            d.tick(now);
+        };
+        exit_with("true", 100.0);
+        assert!(!file.exists(), "its self-update is no outage");
+        exit_with("false", 200.0);
+        let t = makepad_devhub_conf::Trouble::parse(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!((t.tries, t.reason.as_str()), (1, "exited (exit status: 1)"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

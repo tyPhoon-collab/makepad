@@ -19,7 +19,7 @@ path = "src/main.rs"
 [features]
 default = ["tweaker"]
 # The design overlay (Shift+F10 with the dev overlays on). On for development
-# builds; the Builder's releases build without it (--no-default-features).
+# builds; the Runner's releases build without it (--no-default-features).
 tweaker = ["dep:makepad-widgets-tweaker", "makepad-widgets/data", "makepad-widgets/dock", "makepad-widgets/fab"]
 
 [dependencies]
@@ -49,9 +49,6 @@ makepad-audio-encode = { path = "../../libs/audio_encode" }
 makepad-video = { package = "makepad-platform-video", path = "../../platform/video" }
 makepad-font-core = { path = "../../libs/font_core" }
 ab_glyph_rasterizer = { path = "../../libs/ab_glyph_rasterizer" }
-
-[dev-dependencies]
-makepad-script-test = { path = "../../platform/script/test" }
 
 [package.metadata.makepad.desktop]
 name = "Makepad Amp"

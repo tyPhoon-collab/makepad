@@ -2,15 +2,22 @@
 //! free space drops below the floor (DESIGN.md §10.13).
 //!
 //! Categories and the paths they are (exact, computed paths; listing a folder is the only
-//! wildcard): worktrees `<work>/wt/*`; targets `<work>/target/*` + legacy `~/rc/pool/*/target`;
+//! wildcard): worktrees `<work>/wt/*`; deployment target `<checkout>/target`, work target
+//! `<work>/ci-target`, retired tree `<work>/tree` (including its target); other targets
+//! `<work>/target/*` + legacy `~/rc/pool/*/target`;
+//! native trees `<work>/native/<lane>` and their `<work>/native-target/<lane>` are one
+//! reclaimable item per lane, ordered by last lease use, never reclaimed while held.
+//! Dev caches `<work>/dev/target`, `<work>/dev/run-home/*` and the lanes' own JIT builds
+//! `<work>/dev/lane-jit/*` are lease-owned and reclaimable when idle. Dev git stores, overlays, committed tree and JIT binaries have their own owners.
 //! jit-cache `<run home>/target/*` (the newest is current) + `cache` + `flightrec`; weights
 //! `~/.makepad/weights`; desk-link `~/.makepad/wm/desk-link`; screencaps
 //! `~/makepad/local/screencap`; logs `~/.makepad/{devhub,wm}/*.log` and their rotations
 //! `*.log.<n>`; homes-tmp `<work>/tmp/*` of ended leases + `/tmp/landgate.*`.
 //!
-//! Reclaim order (stops at floor + 10 GB): 1 targets no lease or process uses (LRU), 2 JIT
+//! Reclaim order (stops at floor + 10 GB): 1 targets and native trees no lease or process uses (LRU), 2 JIT
 //! target caches that are not current, 3 ended leases' tmp + orphaned gate dirs, 4 rotated logs,
-//! 5 (work nodes only) the current JIT cache. Never automatic: worktrees (lease end owns them,
+//! 5 (work nodes only) the current JIT cache, 6 (work nodes only, no lease on the box) the target of
+//! deployment and work trees. Never automatic: retired trees, worktrees (lease end owns them,
 //! with recovery), weights, Desk Link history, screencaps and other user data; on a user machine
 //! still short after reclaim, the user data is a `disk_ask` (inbox).
 
@@ -30,7 +37,11 @@ pub const MARGIN: u64 = 10 << 30;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cat {
     Worktrees,
+    Native,
     Targets,
+    DeployTarget,
+    WorkTarget,
+    RetiredTree,
     JitCache,
     Weights,
     DeskLink,
@@ -39,13 +50,17 @@ pub enum Cat {
     HomesTmp,
 }
 
-pub const CATS: [Cat; 8] = [Cat::Worktrees, Cat::Targets, Cat::JitCache, Cat::Weights, Cat::DeskLink, Cat::Screencaps, Cat::Logs, Cat::HomesTmp];
+pub const CATS: [Cat; 12] = [Cat::Worktrees, Cat::Native, Cat::Targets, Cat::DeployTarget, Cat::WorkTarget, Cat::RetiredTree, Cat::JitCache, Cat::Weights, Cat::DeskLink, Cat::Screencaps, Cat::Logs, Cat::HomesTmp];
 
 impl Cat {
     pub fn as_str(self) -> &'static str {
         match self {
             Cat::Worktrees => "worktrees",
+            Cat::Native => "native trees",
             Cat::Targets => "targets",
+            Cat::DeployTarget => "deployment target",
+            Cat::WorkTarget => "ci-target",
+            Cat::RetiredTree => "retired tree",
             Cat::JitCache => "jit-cache",
             Cat::Weights => "weights",
             Cat::DeskLink => "desk-link",
@@ -149,14 +164,25 @@ pub struct Roots {
     pub work: PathBuf,
     pub run_home: PathBuf,
     pub tmp: PathBuf,
+    /// the deployment checkout, whose target holds the apps' build output and JIT cache
+    pub deploy: Option<PathBuf>,
 }
 
 impl Roots {
     pub fn of(work: &Path) -> Roots {
         let home = caps::home_dir();
         let run_home = std::env::var_os("MAKEPAD_RUN_HOME").filter(|h| !h.is_empty()).map(PathBuf::from).unwrap_or_else(|| home.join(".makepad-run"));
-        Roots { home, work: work.to_path_buf(), run_home, tmp: std::env::temp_dir() }
+        #[cfg(feature = "checkout")]
+        let deploy = Some(crate::sync::SyncConf::load().checkout).filter(|p| super::tree::ours(p));
+        #[cfg(not(feature = "checkout"))]
+        let deploy = None;
+        Roots { home, work: work.to_path_buf(), run_home, tmp: std::env::temp_dir(), deploy }
     }
+}
+
+/// A running overlay protects dev caches across process and disk-guard races.
+pub fn dev_cache_hold(work: &Path, active: &dyn Fn() -> Result<(), String>) -> Result<std::fs::File, String> {
+    super::jitstore::lock_while(&work.join("dev/cache.lock"), true, active, &|| {})
 }
 
 fn children(d: &Path) -> Vec<PathBuf> {
@@ -193,13 +219,37 @@ pub fn list(r: &Roots, live: &Live) -> Vec<Item> {
     for p in children(&r.work.join("target")).into_iter().filter(|p| p.is_dir()) {
         add(Cat::Targets, p, Some(1), false, "");
     }
+    let dev = r.work.join("dev");
+    add(Cat::Targets, dev.join("target"), Some(1), false, "dev Cargo target");
+    for p in children(&dev.join("lane-jit")) { add(Cat::Targets, p, Some(1), false, "a lane's own JIT build tree and target"); }
+    for p in children(&dev.join("run-home")) {
+        if p.file_name().is_some_and(|n| n == "target") {
+            for p in children(&p) { add(Cat::JitCache, p, Some(2), false, "dev JIT cache"); }
+        } else { add(Cat::JitCache, p, Some(2), false, "dev run home"); }
+    }
+    for p in [dev.join("git"), dev.join("jit"), dev.join("tree")] { add(Cat::Worktrees, p, None, false, "dev store: its owner reclaims it"); }
+    for p in children(&dev.join("overlay")).into_iter().chain(children(&dev.join("lane"))) { add(Cat::Worktrees, p, None, false, "lane state: explicit lane cleanup owns it"); }
+    for p in children(&dev.join("tmp")) { add(Cat::HomesTmp, p, Some(3), false, "tmp of an ended overlay lease"); }
     for p in children(&r.home.join("rc/pool")) {
         add(Cat::Targets, p.join("target"), Some(1), false, "legacy pool target");
     }
+    // warm targets go last, only on work nodes without a lease
+    let step = live.leases.is_empty().then_some(6);
+    if let Some(target) = r.deploy.as_ref().map(|t| t.join("target")) {
+        add(Cat::DeployTarget, target, step, false, "deployment target: the next app build is cold");
+    }
+    add(Cat::WorkTarget, r.work.join("ci-target"), step, false, "work tree target: the next lease build is cold");
+    add(Cat::RetiredTree, r.work.join("tree"), None, false, "reclaimable retired tree including its target; manual removal only");
     let jit = children(&r.run_home.join("target"));
     let current = jit.iter().max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()).cloned();
     for p in jit {
         let cur = Some(&p) == current.as_ref();
+        // a running process of that cache holds its live lock (relax store.rs hold_build): never
+        // taken, whatever its step (an embedded node's own loader runs from one of these)
+        if !crate::jitcache::held_locks(&p).is_empty() {
+            add(Cat::JitCache, p, None, false, "in use: a running process holds its live lock");
+            continue;
+        }
         add(Cat::JitCache, p, Some(if cur { 5 } else { 2 }), false, if cur { "current JIT cache" } else { "" });
     }
     add(Cat::JitCache, r.run_home.join("cache"), None, false, "source stores: imports stay stored");
@@ -222,6 +272,20 @@ pub fn list(r: &Roots, live: &Live) -> Vec<Item> {
     }
     for p in children(&r.tmp).into_iter().filter(|p| name(p).starts_with("landgate.")) {
         add(Cat::HomesTmp, p, Some(3), false, "orphaned gate dir");
+    }
+    #[cfg(feature = "checkout")]
+    {
+        let mut lanes: std::collections::BTreeMap<_, _> = super::tree::natives(&r.work).into_iter().collect();
+        for p in children(&r.work.join("native-target")) {
+            if p.is_dir() && super::exec::valid_name(&name(&p)) { lanes.entry(name(&p)).or_insert(0); }
+        }
+        for (lane, mtime) in lanes {
+            let path = super::tree::native_root(&r.work, &lane);
+            let target = super::tree::native_target(&r.work, &lane);
+            let bytes = dir_size(&path).0 + dir_size(&target).0;
+            let used = live.user_of(&path).or_else(|| live.user_of(&target)).or_else(|| super::tree::held(&path).then(|| "tree hold".into()));
+            out.push(Item { cat: Cat::Native, path, bytes, mtime: mtime / 1000, step: used.is_none().then_some(1), user_data: false, note: used.map_or_else(|| "native tree and target".into(), |u| format!("in use: {u}")) });
+        }
     }
     out
 }
@@ -246,6 +310,47 @@ pub fn mac_items(repo: &Path) -> Vec<Item> {
 
 fn gb(b: u64) -> f64 {
     b as f64 / GB
+}
+
+/// Where what goes waits for its delete (`<work>/trash`): a rename takes no time whatever it holds,
+/// so no lock is held over a delete, and a hub that stops halfway leaves whole trees or none at
+/// their places.
+fn trash(work: &Path) -> PathBuf {
+    work.join("trash")
+}
+
+/// Moves `p` to the trash (a missing one is gone already).
+pub fn to_trash(work: &Path, p: &Path) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if std::fs::symlink_metadata(p).is_err() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(trash(work))?;
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::fs::rename(p, trash(work).join(format!("{}-{}-{}-{n}", name(p), crate::proto::wall_ms(), std::process::id())))
+}
+
+/// Deletes what is in the trash: what it freed (what could not go stays for the next time).
+pub fn empty_trash(work: &Path) -> u64 {
+    let mut freed = 0;
+    for p in children(&trash(work)) {
+        let bytes = dir_size(&p).0;
+        match remove(&p) {
+            Ok(()) => freed += bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("devhub disk: {}: {e}", p.display()),
+        }
+    }
+    freed
+}
+
+/// [`empty_trash`] on a thread of its own, at low priority: nobody waits for it.
+pub fn empty_trash_soon(work: &Path) {
+    let work = work.to_path_buf();
+    let _ = std::thread::Builder::new().name("devhub-trash".into()).spawn(move || {
+        crate::os::nice_this_thread();
+        empty_trash(&work);
+    });
 }
 
 /// Deletes exactly `p` (a directory tree or one file); never follows a symlink out.
@@ -311,8 +416,12 @@ impl Guard {
         self.state.lock().unwrap().dirty = true;
     }
 
+    /// Free bytes on the work dir's filesystem. Unknown (no probe for this OS, or a failed
+    /// probe) reads as unlimited: a guard that cannot measure must not reclaim. (Android had no
+    /// probe; 0 read as "below the floor" and the running loader's own JIT cache was deleted
+    /// every 60 s, so no launch ever started warm.)
     pub fn free(&self) -> u64 {
-        caps::disk_space(&self.roots.work).map_or(0, |(f, _)| f)
+        caps::disk_space(&self.roots.work).map_or(u64::MAX, |(f, _)| f)
     }
 
     /// The cached listing, measured again when stale or changed (or `force`).
@@ -336,8 +445,9 @@ impl Guard {
         (self.publish)(hub_record(&self.machine, "", 0, "disk", sev, line, String::new()));
     }
 
-    /// The periodic look: floor / warn crossings, and automatic reclaim below the floor.
-    pub fn check(&self, live: &dyn Fn() -> Live) {
+    /// The periodic look: floor / warn crossings, and automatic reclaim below the floor; `quiet`
+    /// (a timed lease runs) skips the walk that refreshes what the roots hold.
+    pub fn check(&self, live: &dyn Fn() -> Live, quiet: bool) {
         let free = self.free();
         let (floor_cross, warn_cross) = {
             let mut st = self.state.lock().unwrap();
@@ -355,7 +465,7 @@ impl Guard {
                 self.emit(Sev::Warn, format!("disk_floor: {} has {:.0} GB free, floor {:.0} GB: reclaiming", self.machine, gb(free), gb(self.floor())));
             }
             self.reclaim(&live(), false, 0);
-        } else {
+        } else if !quiet {
             let _ = self.items(&live(), false);
         }
     }
@@ -385,8 +495,8 @@ impl Guard {
                 continue;
             }
             let total: u64 = of.iter().map(|i| i.bytes).sum();
-            let auto: u64 = of.iter().filter(|i| i.step.is_some()).map(|i| i.bytes).sum();
-            out.push(format!("{{\"cat\":\"{}\",\"gb\":{:.2},\"n\":{},\"reclaimable_gb\":{:.2}}}", c.as_str(), gb(total), of.len(), gb(auto)));
+            let reclaimable: u64 = of.iter().filter(|i| i.step.is_some() || (i.cat == Cat::RetiredTree && live.user_of(&i.path).is_none())).map(|i| i.bytes).sum();
+            out.push(format!("{{\"cat\":\"{}\",\"gb\":{:.2},\"n\":{},\"reclaimable_gb\":{:.2}}}", c.as_str(), gb(total), of.len(), gb(reclaimable)));
         }
         let mut freed = 0;
         for i in &p.take {
@@ -400,7 +510,29 @@ impl Guard {
                 out.push(format!("{{\"kept\":{},\"why\":{}}}", json_str(&i.path.to_string_lossy()), json_str(&u)));
                 continue;
             }
-            match remove(&i.path) {
+            let dev = self.roots.work.join("dev");
+            let _cache = if i.path.starts_with(dev.join("target")) || i.path.starts_with(dev.join("run-home")) || i.path.starts_with(dev.join("lane-jit")) {
+                let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dev.join("cache.lock"));
+                match lock {
+                    Ok(f) if f.try_lock().is_ok() => Some(f),
+                    _ => { out.push(format!("{{\"kept\":{},\"why\":\"dev cache in use or lock unavailable\"}}", json_str(&i.path.to_string_lossy()))); continue; }
+                }
+            } else { None };
+            #[cfg(feature = "checkout")]
+            let removed = if i.cat == Cat::Native {
+                let target = super::tree::native_target(&self.roots.work, &name(&i.path));
+                if let Some(u) = live.user_of(&target) {
+                    out.push(format!("{{\"kept\":{},\"why\":{}}}", json_str(&i.path.to_string_lossy()), json_str(&u)));
+                    continue;
+                }
+                super::tree::remove_native(&self.roots.work, &name(&i.path)).map(|r| {
+                    for b in r.bundles { self.emit(Sev::Warn, format!("ws_recovered: native tree {} bundled to {}", i.path.display(), b.display())); }
+                    empty_trash(&self.roots.work);
+                })
+            } else { remove(&i.path).map_err(|e| e.to_string()) };
+            #[cfg(not(feature = "checkout"))]
+            let removed = remove(&i.path).map_err(|e| e.to_string());
+            match removed {
                 Ok(()) => {
                     freed += i.bytes;
                     out.push(format!("{{\"reclaimed\":{},\"cat\":\"{}\",\"gb\":{:.2}}}", json_str(&i.path.to_string_lossy()), i.cat.as_str(), gb(i.bytes)));
@@ -463,8 +595,8 @@ mod tests {
     fn lists_categories_and_keeps_what_is_in_use() {
         let base = std::env::temp_dir().join(format!("devhub-disk-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let r = Roots { home: base.join("home"), work: base.join("home/devhub"), run_home: base.join("home/.makepad-run"), tmp: base.join("tmp") };
-        for d in ["home/devhub/target/abc/release", "home/devhub/target/lane-x", "home/devhub/tmp/L1", "home/devhub/wt/x-L2", "home/.makepad/wm", "home/.makepad-run/target/0001", "tmp/landgate.Q1"] {
+        let r = Roots { home: base.join("home"), work: base.join("home/devhub"), deploy: Some(base.join("home/makepad")), run_home: base.join("home/.makepad-run"), tmp: base.join("tmp") };
+        for d in ["home/makepad/target", "home/devhub/ci-target", "home/devhub/tree/target", "home/devhub/target/abc/release", "home/devhub/target/lane-x", "home/devhub/tmp/L1", "home/devhub/wt/x-L2", "home/.makepad/wm", "home/.makepad-run/target/0001", "tmp/landgate.Q1"] {
             std::fs::create_dir_all(base.join(d)).unwrap();
         }
         std::fs::write(base.join("home/devhub/target/abc/release/bin"), vec![1u8; 100_000]).unwrap();
@@ -474,6 +606,11 @@ mod tests {
         let live = Live { leases: vec![(base.join("home/devhub/target/lane-x"), "L9".into())], cwds: vec![] };
         let items = list(&r, &live);
         let find = |p: &str| items.iter().find(|i| i.path == base.join(p)).unwrap_or_else(|| panic!("{p}: {items:?}"));
+        assert_eq!(find("home/makepad/target").cat, Cat::DeployTarget);
+        assert_eq!(find("home/devhub/ci-target").cat, Cat::WorkTarget);
+        assert_eq!(find("home/devhub/tree").cat, Cat::RetiredTree);
+        assert_eq!(find("home/devhub/tree").step, None);
+        assert!(plan(&items, 0, 100 << 30, false).take.iter().all(|i| i.cat != Cat::RetiredTree));
         assert_eq!(find("home/devhub/target/abc").step, Some(1));
         assert!(find("home/devhub/target/abc").bytes >= 100_000);
         assert_eq!(find("home/devhub/target/lane-x").step, None);

@@ -183,7 +183,7 @@ mod tests {
         assert!(repack_nv12(&[0; 10], 6, 3).is_none());
     }
 
-    /// Access units from GStreamer's own test source and encoder (where installed), decoded back.
+    /// Access units from GStreamer's own test source and encoder, decoded back.
     fn encoded_test_units(gst: &'static LibGst, frames: u32) -> Option<Vec<Vec<u8>>> {
         let launch = format!("videotestsrc num-buffers={frames} ! video/x-raw,width=320,height=240,framerate=30/1 ! \
             x264enc tune=zerolatency key-int-max=10 ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=sink sync=false");
@@ -217,17 +217,20 @@ mod tests {
 
     #[test]
     fn decodes_a_live_h264_stream_where_gstreamer_is_installed() {
-        let Some(gst) = LibGst::get() else { eprintln!("no GStreamer: stream decode not exercised"); return };
-        let Some(units) = encoded_test_units(gst, 30).filter(|u| !u.is_empty()) else { eprintln!("no x264enc: stream decode not exercised"); return };
+        let gst = LibGst::get().expect("GStreamer runtime");
+        let units = encoded_test_units(gst, 30).expect("GStreamer test-source and x264 encoder pipeline");
         assert_eq!(units.len(), 30);
         let mut decoder = LinuxStreamDecoder::new(StreamVideoCodec::H264).expect("stream decoder");
         let mut frames = Vec::new();
         for (i, unit) in units.iter().enumerate() {
             frames.extend(decoder.push_packet(unit, i as i64 * 333_333).expect("push"));
         }
-        for _ in 0..50 {
-            if frames.len() >= units.len() { break; }
-            frames.extend(decoder.flush().expect("flush"));
+        // every picture, until the decoder has gone 10 s (500 flushes of 20 ms) without one
+        let mut quiet = 0;
+        while frames.len() < units.len() && quiet < 500 {
+            let more = decoder.flush().expect("flush");
+            quiet = if more.is_empty() { quiet + 1 } else { 0 };
+            frames.extend(more);
         }
         assert!(frames.len() >= 25, "decoded {} of {} pictures", frames.len(), units.len());
         let f = &frames[0];

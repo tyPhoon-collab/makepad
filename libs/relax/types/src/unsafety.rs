@@ -36,6 +36,7 @@ enum Op {
     DerefOfRawPointer,
     AccessToUnionField,
     CallToFunctionWith(DefId),
+    UseOfInlineAssembly,
 }
 
 struct V<'a> {
@@ -211,6 +212,7 @@ impl V<'_> {
             Op::UseOfExternStatic => "use of extern static".into(),
             Op::DerefOfRawPointer => "dereference of raw pointer".into(),
             Op::AccessToUnionField => "access to union field".into(),
+            Op::UseOfInlineAssembly => "use of inline assembly".into(),
             Op::CallToFunctionWith(d) => format!("call to function `{}` with `#[target_feature]`", self.fn_path(d)),
         }
     }
@@ -509,7 +511,26 @@ impl V<'_> {
                 let m = *self.ast.row(m);
                 if m.args == NO_MAC_ARGS { return; }
                 let args = *self.ast.mac_arg(m.args);
-                self.exprs(args.exprs);
+                // rustc check_unsafety: `asm!` is an unsafe operation (UseOfInlineAssembly);
+                // `naked_asm!` is not, its `#[unsafe(naked)]` function is the unit of unsafety
+                if args.asm.is_some() && self.ast.segs(m.path.segs).last().is_some_and(|s| self.pf.text(s.name) == "asm") {
+                    self.requires_unsafe(lo, Op::UseOfInlineAssembly);
+                }
+                // rustc check_unsafety: a label block of `asm!` is a safe context of its own
+                let labels: Vec<ExprId> = args.asm.map_or(Vec::new(), |asm| self.ast.list(asm.ops).iter().filter(|op| op.dir == AsmDir::Label).filter_map(|op| op.input).collect());
+                if labels.is_empty() {
+                    self.exprs(args.exprs);
+                } else {
+                    for &x in self.ast.list(args.exprs) {
+                        if labels.contains(&x) {
+                            let saved = std::mem::replace(&mut self.ctx, Ctx::Safe);
+                            self.expr(x);
+                            self.ctx = saved;
+                        } else {
+                            self.expr(x);
+                        }
+                    }
+                }
                 if let Some(p) = args.pat { self.pat(p, lo); }
                 if let Some(g) = args.guard { self.expr(g); }
                 // format strings' inline `{NAME}` arguments naming a static
@@ -589,40 +610,70 @@ pub fn run_body_errors(prog: &Program, tcx: &Tcx, body: &Body) -> Vec<String> {
 /// (an impl whose supertrait bound does not hold). `makepad check` runs these as part of its
 /// item checks; `run` used to skip them.
 pub fn run_crate_impl_errors(prog: &Program, tcx: &Tcx, krate: u32) -> std::sync::Arc<Vec<String>> {
-    static MEMO: std::sync::Mutex<Option<std::collections::HashMap<(u32, u64), std::sync::Arc<Vec<String>>>>> = std::sync::Mutex::new(None);
     let epoch = tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
-    if let Some(e) = MEMO.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&(krate, epoch))) {
+    if let Some(e) = IMPL_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&(krate, epoch))) {
         return e.clone();
     }
-    // a body type-checked while these checks run (a constant a well-formedness check evaluates)
-    // does not start them again: that would ask for the query in progress (a false E0391)
-    thread_local! { static ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-    if ACTIVE.with(|a| a.replace(true)) {
-        return std::sync::Arc::new(Vec::new());
-    }
-    struct Reset;
-    impl Drop for Reset { fn drop(&mut self) { ACTIVE.with(|a| a.set(false)); } }
-    let _reset = Reset;
+    let Some(_active) = ImplChecks::enter() else { return std::sync::Arc::new(Vec::new()) };
     let mut out = Vec::new();
-    for i in 0..prog.defs.len() {
-        let d = DefId(i as u32);
-        let def = prog.def(d);
-        if def.krate != krate || def.kind != DefKind::Impl { continue; }
-        out.extend(check_impl(prog, tcx, d));
-        let Some(&td) = tcx.impl_trait.get(&d) else { continue };
-        let tdef = prog.def(td);
-        let tast = &prog.files[tdef.file as usize].ast;
-        let ItemKind::Trait(tr) = tast.item(tdef.item).kind else { continue };
-        let t = tast.row(tr);
-        if t.unsafe_ || t.auto || !tast.list(t.supers).is_empty() {
-            out.extend(crate::wfcheck::obligations::check_def(prog, tcx, d));
-        }
+    for d in crate_impls(prog, tcx, &[krate]) {
+        out.extend(impl_errors_inner(prog, tcx, d.1));
     }
+    store_crate_impl_errors(krate, epoch, out)
+}
+
+/// run_crate_impl_errors' memo: (crate, collect epoch) -> its impls' errors, in definition order
+static IMPL_ERRORS: std::sync::Mutex<Option<std::collections::HashMap<(u32, u64), std::sync::Arc<Vec<String>>>>> = std::sync::Mutex::new(None);
+
+thread_local! {
+    /// this thread runs impl checks (run_crate_impl_errors, impl_errors)
+    static IMPL_CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A body type-checked while impl checks run (a constant a well-formedness check evaluates)
+/// does not start them again: that would ask for the query in progress (a false E0391).
+struct ImplChecks;
+impl ImplChecks {
+    fn enter() -> Option<ImplChecks> {
+        (!IMPL_CHECKS.with(|a| a.replace(true))).then_some(ImplChecks)
+    }
+}
+impl Drop for ImplChecks {
+    fn drop(&mut self) { IMPL_CHECKS.with(|a| a.set(false)); }
+}
+
+/// The live impls of `crates` (crate, impl), in definition order; a refused edit's impls are excluded.
+pub fn crate_impls(prog: &Program, tcx: &Tcx, crates: &[u32]) -> Vec<(u32, DefId)> {
+    (0..prog.defs.len() as u32).map(DefId).filter(|&d| { let def = prog.def(d); def.kind == DefKind::Impl && crates.contains(&def.krate) && !tcx.refused_impls.contains(&d) }).map(|d| (prog.def(d).krate, d)).collect()
+}
+
+/// Impl `d`'s part of its crate's run_crate_impl_errors (one impl, so a whole crate's can be
+/// checked on several threads: makepad run's app check). None: impl checks run on this thread.
+pub fn impl_errors(prog: &Program, tcx: &Tcx, d: DefId) -> Option<Vec<String>> {
+    let _active = ImplChecks::enter()?;
+    Some(impl_errors_inner(prog, tcx, d))
+}
+
+fn impl_errors_inner(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
+    let mut out = check_impl(prog, tcx, d);
+    let Some(&td) = tcx.impl_trait.get(&d) else { return out };
+    let tdef = prog.def(td);
+    let tast = &prog.files[tdef.file as usize].ast;
+    let ItemKind::Trait(tr) = tast.item(tdef.item).kind else { return out };
+    let t = tast.row(tr);
+    if t.unsafe_ || t.auto || !tast.list(t.supers).is_empty() {
+        out.extend(crate::wfcheck::obligations::check_def(prog, tcx, d));
+    }
+    out
+}
+
+/// Stores crate `krate`'s impl errors for collect epoch `epoch` (its impls' impl_errors in
+/// definition order); the first stored value stands.
+pub fn store_crate_impl_errors(krate: u32, epoch: u64, out: Vec<String>) -> std::sync::Arc<Vec<String>> {
     // (the memo outlives compiler generations: its contents are made in the kept heap)
     let _k = crate::zone_alloc::kept();
     let out = std::sync::Arc::new(out.clone());
-    MEMO.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((krate, epoch), out.clone());
-    out
+    IMPL_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry((krate, epoch)).or_insert(out).clone()
 }
 
 /// rustc_hir_analysis coherence/unsafety.rs (E0199, E0200), E0197 (inherent impls) and
@@ -723,4 +774,10 @@ mod tests {
             .flat_map(|d| super::check_impl(&prog, &tcx, d)).collect();
         assert!(impls.iter().any(|e| e.contains("E0200")) && impls.iter().any(|e| e.contains("E0199")), "{impls:?}");
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&IMPL_ERRORS, std::sync::Mutex::new(None));
 }

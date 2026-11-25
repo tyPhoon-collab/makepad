@@ -23,7 +23,7 @@ use {
         makepad_math::{Rect, Vec2Index, Vec2d},
         makepad_network::HttpRequest,
         makepad_script::value::ScriptHandle,
-        shared_bytes::SharedBytes,
+        shared_bytes::HostBuf,
         texture::{Texture, TextureId},
         window::WindowVisuals,
         window::{CxWindow, WindowId},
@@ -48,6 +48,16 @@ pub enum CxThreadPriority {
     Utility,
     Background,
     Idle,
+}
+
+/// A redraw asked during a draw event for a list the drawing had not recorded yet.
+#[derive(Clone, Copy)]
+pub(crate) struct InDrawRedraw {
+    pub(crate) list: DrawListId,
+    /// and every list drawn inside it
+    pub(crate) children: bool,
+    /// who asked (frame sources)
+    pub(crate) by: &'static std::panic::Location<'static>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1054,15 +1064,15 @@ impl Cx {
     ///
     /// This maps local files and stored Android assets, then falls back to
     /// already-loaded resource bytes (required for wasm/network-backed assets).
-    pub fn get_resource_font_bytes(&mut self, heap_key: usize, handle: ScriptHandle) -> Option<SharedBytes> {
+    pub fn get_resource_font_bytes(&mut self, heap_key: usize, handle: ScriptHandle) -> Option<HostBuf> {
         let path = self.get_resource_abs_path(heap_key, handle)?;
         self.get_resource_font_bytes_by_path(&path)
     }
 
     /// Font identity captured in its owning script heap. A local handle alone
     /// cannot identify a resource once a draw object leaves that heap.
-    pub fn get_resource_font_bytes_by_path(&self, path: &str) -> Option<SharedBytes> {
-        if let Ok(bytes) = SharedBytes::from_file_mmap_or_read(path) {
+    pub fn get_resource_font_bytes_by_path(&self, path: &str) -> Option<HostBuf> {
+        if let Ok(bytes) = HostBuf::from_file_mmap_or_read(path) {
             return Some(bytes);
         }
         #[cfg(target_os = "android")]
@@ -1072,18 +1082,18 @@ impl Cx {
         let resources = self.script_data.resources.resources.borrow();
         let res = resources.iter().find(|res| res.abs_path == path)?;
         if let crate::script::res::CxScriptResourceData::Loaded(data) = &res.data {
-            return Some(SharedBytes::from_owned(data.clone()));
+            return Some(HostBuf::from_vec(data.as_slice().to_vec()));
         }
         res.dependency_path
             .as_deref()
             .and_then(|path| self.get_dependency(path).ok())
-            .map(SharedBytes::from_owned)
+            .map(|data| HostBuf::from_vec(data.as_slice().to_vec()))
     }
 
     /// Maps an APK font by its resource or dependency path, reusing the mapping across
     /// family loads. Cache actual asset paths so package-root and resource changes can resolve anew.
     #[cfg(target_os = "android")]
-    pub fn get_resource_font_asset_bytes_by_path(&self, path: &str) -> Option<SharedBytes> {
+    pub fn get_resource_font_asset_bytes_by_path(&self, path: &str) -> Option<HostBuf> {
         let map_asset = |path: &str| {
             let mut assets = self.hal.mapped_font_assets.borrow_mut();
             if let Some(bytes) = assets.get(path) {
@@ -2213,6 +2223,33 @@ impl Cx {
         self.get_pass_window_id(draw_pass_id)
     }
 
+    /// Retain a window's last image, holding GPU work for its entire pass tree.
+    /// Input and offscreen passes keep running. Callers should also skip recording expensive
+    /// window content. Resuming requests one full redraw, including child passes.
+    pub fn set_window_paused(&mut self, window: WindowId, paused: bool) {
+        if !self.windows.is_valid(window) || self.windows[window].paint_paused == paused {
+            return;
+        }
+        self.windows[window].paint_paused = paused;
+        self.windows[window].paint_once = false;
+        if !paused {
+            if let Some(pass) = self.windows[window].main_pass_id {
+                self.redraw_pass_and_child_passes(pass);
+            }
+            // Resuming from inside an offscreen update still owes the window its final frame.
+            self.window_redrawn = true;
+        }
+    }
+
+    /// Permit one pending paint of a paused window (for example a low-rate preview).
+    /// This does not record content; the caller requests the relevant area's redraw too.
+    pub fn repaint_window_once(&mut self, window: WindowId) {
+        if self.windows.is_valid(window) {
+            self.windows[window].paint_once = true;
+            self.window_redrawn = true;
+        }
+    }
+
     /// Measure where the frame time goes: every pass's GPU time by what it draws for (the
     /// headset's eyes, a desktop window, offscreen) and the draws' CPU time
     /// ([`crate::pass_load`]); [`Cx::take_pass_load`] reads it.
@@ -2488,9 +2525,14 @@ impl Cx {
         }
     }
 
+    /// The list records again in the next drawing. Asked while the frame draws: a list this
+    /// drawing has not recorded yet records in it (its turn in the walk is still to come), one it
+    /// recorded already, or is recording, in the next frame. Nothing asked in a draw is lost, and
+    /// nothing records twice in one.
     #[track_caller]
     pub fn redraw_list(&mut self, draw_list_id: DrawListId) {
         if self.in_draw_event {
+            self.redraw_while_drawing(draw_list_id, false, std::panic::Location::caller());
             return;
         }
         self.frame_requests += 1;
@@ -2512,9 +2554,11 @@ impl Cx {
         self.new_draw_event.draw_lists.push(draw_list_id);
     }
 
+    /// [`Self::redraw_list`] of the list and every list drawn inside it.
     #[track_caller]
     pub fn redraw_list_and_children(&mut self, draw_list_id: DrawListId) {
         if self.in_draw_event {
+            self.redraw_while_drawing(draw_list_id, true, std::panic::Location::caller());
             return;
         }
         self.frame_requests += 1;
@@ -2532,6 +2576,45 @@ impl Cx {
         self.new_draw_event
             .draw_lists_and_children
             .push(draw_list_id);
+    }
+
+    fn redraw_while_drawing(&mut self, list: DrawListId, children: bool, by: &'static std::panic::Location<'static>) {
+        if self.draw_lists.is_id_freed(list) {
+            return;
+        }
+        if self.recorded_in_this_drawing(list) {
+            self.redraw_next_frame(list, children, by);
+        } else if !self.in_draw_redraws.iter().any(|r| r.list == list && r.children == children) {
+            self.in_draw_redraws.push(InDrawRedraw { list, children, by });
+        }
+    }
+
+    fn redraw_next_frame(&mut self, list: DrawListId, children: bool, by: &'static std::panic::Location<'static>) {
+        self.frame_requests += 1;
+        crate::frame_sources::note(crate::frame_sources::Kind::Redraw, by);
+        self.note_window_redraw();
+        let lists = if children { &mut self.new_draw_event.draw_lists_and_children } else { &mut self.new_draw_event.draw_lists };
+        if !lists.contains(&list) {
+            lists.push(list);
+        }
+    }
+
+    /// The drawing under way recorded `list`, or is recording it.
+    fn recorded_in_this_drawing(&self, list: DrawListId) -> bool {
+        self.draw_lists.checked_index(list).is_some_and(|l| l.redraw_id > self.drawing_start)
+    }
+
+    /// The draw event ended: a list asked for in it that it never recorded (behind a list the
+    /// frame kept, or gone from the walk) records in the next frame.
+    pub(crate) fn carry_in_draw_redraws(&mut self) {
+        // taken and put back: the list keeps its room for the next draw
+        let mut asked = std::mem::take(&mut self.in_draw_redraws);
+        for r in asked.drain(..) {
+            if !self.draw_lists.is_id_freed(r.list) && !self.recorded_in_this_drawing(r.list) {
+                self.redraw_next_frame(r.list, r.children, r.by);
+            }
+        }
+        self.in_draw_redraws = asked;
     }
 
     pub fn get_ime_area_rect(&self) -> Rect {
@@ -3162,7 +3245,7 @@ mod tests {
     /// window size: the target sized with `pass_pixel_size` of the logical size the pass is set
     /// to, the pass by `get_pass_rect` (snapped to `pass_logical_size`) and then the frame's
     /// pass size (`pass_pixel_size` again). A target floored where the pass was ceiled was a
-    /// pixel short at 1.25 / 1.41 / 1.75 and the GPU refused the pass (149, Scope's Glass).
+    /// pixel short at 1.25 / 1.41 / 1.75 and the GPU refused the pass (a node, an app's Glass).
     #[test]
     fn a_pass_is_exactly_its_target_at_every_scale_and_size() {
         let sizes = [1.0, 7.0, 99.5, 333.0, 640.0, 875.25, 876.0, 1179.0, 1180.0, 1235.7, 1920.0, 2559.0, 4097.3];

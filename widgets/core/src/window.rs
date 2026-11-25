@@ -270,6 +270,7 @@ script_mod! {
     mod.widgets.WindowBase = #(Window::register_widget(vm))
     mod.widgets.Window = set_type_default() do mod.widgets.WindowBase{
         demo: false
+        depth_buffer: true
         show_caption_bar: true
         fullscreen_caption: true
         // The window chrome the theme declares (`WindowChrome`): the host's (follow), traffic
@@ -636,6 +637,15 @@ pub struct Window {
     main_draw_list: DrawList2d,
     #[live]
     pass: ScriptDrawPass,
+    /// Allocate and attach a `DepthD32` buffer on the window's root pass.
+    /// Defaults to `true` for widgets that layer ink with `draw_depth`
+    /// (`TabBar`, `Dock`, `Chart`, `MapView`); windows whose root pass only
+    /// composites offscreen viewports and flat painter's-order UI can set
+    /// `depth_buffer: false` to omit the window-sized depth attachment.
+    #[live(true)]
+    depth_buffer: bool,
+    #[rust]
+    depth_buffer_attached: Option<bool>,
     #[new]
     depth_texture: Texture,
     #[live]
@@ -1308,13 +1318,18 @@ impl Window {
         let room = cx.caption_badge_room();
         // a direct child of the bar: no tree walk
         let gap = self.view.child(id!(caption_bar)).child(id!(jit_ring_gap));
-        let visible = has_content && room > 0.0;
-        if gap.visible() != visible {
-            if let Some(mut view) = gap.borrow_mut::<View>() {
-                view.walk.width = Size::Fixed(room);
-            }
-            gap.set_visible(cx, visible);
+        // A re-apply of the window's template (a sheet, a live edit) puts back its zero
+        // width and can leave the gap visible, so the width is checked on its own.
+        let width = Size::Fixed(room);
+        let resized = gap.borrow_mut::<View>().is_some_and(|mut view| {
+            let resized = view.walk.width != width;
+            view.walk.width = width;
+            resized
+        });
+        if resized {
+            gap.redraw(cx);
         }
+        gap.set_visible(cx, has_content && room > 0.0);
     }
 
     /// Shows or hides an app's `caption_window_gap`, anywhere in its caption bar.
@@ -1793,30 +1808,44 @@ impl Window {
         self.sync_system_bar_appearance(cx);
 
         if self.initialized {
+            self.sync_depth_buffer(cx);
             return;
         }
         self.initialized = true;
 
         self.window.handle.set_pass(cx, &self.pass.handle);
         //self.pass.set_window_clear_color(cx, vec4(0.0,0.0,0.0,0.0));
-        self.depth_texture = Texture::new_with_format(
-            cx,
-            TextureFormat::DepthD32 {
-                size: TextureSize::Auto,
-                initial: true,
-            },
-        );
-        self.pass.handle.set_depth_texture(
-            cx,
-            &self.depth_texture,
-            DrawPassClearDepth::ClearWith(1.0),
-        );
+        self.sync_depth_buffer(cx);
 
         if self.demo {
             self.demo_next_frame = cx.new_next_frame();
         }
         self.screen_cap.set_window_id(self.window.window_id().id());
         self.screen_cap.start_managed_once(cx);
+    }
+
+    fn sync_depth_buffer(&mut self, cx: &mut Cx) {
+        if self.depth_buffer_attached == Some(self.depth_buffer) {
+            return;
+        }
+        self.depth_buffer_attached = Some(self.depth_buffer);
+        if self.depth_buffer {
+            self.depth_texture = Texture::new_with_format(
+                cx,
+                TextureFormat::DepthD32 {
+                    size: TextureSize::Auto,
+                    initial: true,
+                },
+            );
+            self.pass.handle.set_depth_texture(
+                cx,
+                &self.depth_texture,
+                DrawPassClearDepth::ClearWith(1.0),
+            );
+        } else {
+            self.pass.handle.clear_depth_texture(cx);
+            self.depth_texture = Texture::new(cx);
+        }
     }
 
     pub fn begin(&mut self, cx: &mut Cx2d) -> Redrawing {
@@ -1933,7 +1962,7 @@ impl Window {
         // Only the direct display owner draws a cursor, above every child.
         if let OsType::LinuxDirect = cx.os_type() {
             let shape = cx.mouse_cursor();
-            self.draw_cursor.draw_vars.set_dyn_instance(cx, id!(shape), &[crate::cursor::shape_value(shape)]);
+            crate::cursor::set_shape(&mut self.draw_cursor, cx, shape);
             self.cursor_draw_list.begin_overlay_last(cx);
             self.draw_cursor.draw_abs(cx, Rect {
                 pos: self.last_mouse_pos - crate::cursor::hotspot(shape, self.mouse_cursor_size),
@@ -2078,11 +2107,7 @@ impl Window {
             );
             self.synthetic_cursor_frame = cx.new_next_frame();
         }
-        self.draw_synthetic_cursor.draw_vars.set_dyn_instance(
-            cx,
-            id!(shape),
-            &[crate::cursor::shape_value(shape)],
-        );
+        crate::cursor::set_shape(&mut self.draw_synthetic_cursor, cx, shape);
         self.draw_synthetic_cursor.draw_abs(
             cx,
             Rect {

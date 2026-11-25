@@ -37,6 +37,7 @@ pub mod fake_camera;
 pub mod clipboard;
 pub mod drag_promise;
 pub mod direct;
+pub mod display_profiles;
 pub mod user_input;
 #[cfg(target_os = "linux")]
 pub mod wide_desktop;
@@ -56,10 +57,15 @@ pub use backend::linux::wm::native as hosted_native;
 #[cfg(target_os = "linux")]
 pub use backend::linux::wm::{prepare_exec as wm_prepare_exec, undo_exec as wm_undo_exec};
 pub mod cmds;
+#[cfg(test)]
+mod cmd_tests;
+pub mod compute;
 pub mod codec;
 pub mod events;
 pub mod font;
 pub mod ledger;
+pub mod lease;
+pub use lease::hal_lease_release;
 pub mod gpu_limits;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_prof;
@@ -89,6 +95,10 @@ pub use window_controls::{host_caption, host_window_controls, HostCaption, Windo
 
 #[cfg(target_vendor = "apple")]
 pub use backend::apple::media::{can_play_type, video_h264_probe};
+/// What a macOS process hands to the image it execs into so its window keeps its place in the
+/// stacking and its focus (the exec restart).
+#[cfg(target_os = "macos")]
+pub use backend::apple::appkit::restack_handover;
 #[cfg(target_os = "linux")]
 pub use backend::linux::media::can_play_type;
 #[cfg(target_os = "android")]
@@ -110,19 +120,41 @@ use std::time::Duration;
 
 pub use session::{AppCaption, CAPTION_BADGE_ROOM, CloseAs, DomainLaunch, ExecRecord};
 
+/// The loader's reader of the files its run serves from virtual folders (an overlay lease's
+/// sources, a git run): the program names such a file, but there is none on disk. None: the
+/// path is not virtual.
+pub type VirtualRead = fn(&str) -> Option<std::io::Result<Vec<u8>>>;
+static VIRTUAL_READ: OnceLock<VirtualRead> = OnceLock::new();
+
+/// Set once, by the loader, before a session opens fonts or loads an automation script.
+pub fn set_virtual_reader(read: VirtualRead) {
+    let _ = VIRTUAL_READ.set(read);
+}
+
+/// A file the run serves from a virtual folder; None: it is on disk.
+pub(crate) fn read_virtual(path: &str) -> Option<std::io::Result<Vec<u8>>> {
+    VIRTUAL_READ.get().and_then(|read| read(path))
+}
+
 /// What the relax host provides so a privileged session can start, stop and relaunch apps
 /// (`DomainStart` / `DomainStop` / `DomainRelaunch`): host-native code, registered with
 /// [`Hal::set_domain_host`]. Called outside the HAL's lock, on the thread that submitted the
 /// command, so an implementation may call back into the HAL. A started app opens its session with
 /// `OpenReq { parent: launch.parent, app_key: launch.app_key, .. }`; a relaunch first stops the
-/// old app (it was asked to quit with `stop(domain, QUIT)`, which returns once its run has ended,
-/// and its session is freed before `relaunch`) and then starts the new one the same way. `stop`
+/// old app (asked to quit with `stop(domain, QUIT)`, and its session is freed before
+/// `relaunch`) and then starts the new one the same way. `stop`
 /// with `KILL` is called after the session is freed (the app hears one quit request on its next pump)
-/// and likewise returns once the run has ended. Progress and crashes are reported with [`Hal::report_domain`].
+/// may leave a retiring run alive; `can_reuse_domain` then requires a fresh session id.
+/// Progress and crashes are reported with [`Hal::report_domain`].
 pub trait DomainHost: Send + Sync {
     fn start(&self, launch: DomainLaunch) -> Result<(), String>;
     /// `domain_stop::QUIT` (the app was asked to quit) or `KILL` (its session is already freed).
     fn stop(&self, domain: u32, mode: u32);
+    /// Synchronous hosts have already joined in `stop`. An asynchronous host
+    /// returns false until every thread and callback of the old run is gone.
+    fn can_reuse_domain(&self, _domain: u32) -> bool { true }
+    /// Preserve host-owned presentation/state when a relaunch needs a fresh id.
+    fn domain_replaced(&self, _previous: u32, _replacement: u32) {}
     fn relaunch(&self, launch: DomainLaunch) -> Result<(), String>;
 }
 
@@ -294,7 +326,7 @@ pub struct Hal {
 /// one file descriptor on /dev/nvidiaN per memory allocation, and the usual soft limit is 1024:
 /// a game with a few hundred buffers, textures and upload arenas reached it, and from then on every create on the device -- fences, command pools, upload
 /// arenas, descriptor pools -- failed with OUT_OF_HOST/DEVICE_MEMORY while the GPU had 16 GB free
-/// (149, Sandbox at ~1 fps). The hard limit is the system's real bound (524288 on a node).
+/// (a node, an app at ~1 fps). The hard limit is the system's real bound (524288 on a node).
 /// Hosted children inherit the raised limit from their host.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn raise_open_file_limit() {
@@ -364,6 +396,25 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The process's Hal ([`Hal::global`]).
+static GLOBAL: OnceLock<Arc<Hal>> = OnceLock::new();
+
+/// The process's exit ends the global Hal's backend first ([`Hal::before_exit`]) in every way the
+/// process ends, a host that never calls it among them: a test binary exits when its harness's
+/// main returns, with the GPU frames of its last sessions still in the driver workers, and
+/// exit() then ran the driver's exit handlers under them (a SIGSEGV in a batch's completion).
+/// Registered once the backend, and with it the driver, is made: exit() runs the handlers
+/// last registered first, so this one runs before those the driver registered as it loaded.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn before_exit_at_exit() {
+    extern "C" { fn atexit(f: extern "C" fn()) -> i32; }
+    extern "C" fn at_exit() { if let Some(hal) = GLOBAL.get() { hal.before_exit(); } }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| { unsafe { atexit(at_exit) }; });
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn before_exit_at_exit() {}
+
 impl Hal {
     pub fn new() -> Arc<Hal> {
         raise_open_file_limit();
@@ -378,8 +429,7 @@ impl Hal {
     }
 
     pub fn global() -> &'static Hal {
-        static HAL: OnceLock<Arc<Hal>> = OnceLock::new();
-        HAL.get_or_init(Hal::new)
+        GLOBAL.get_or_init(Hal::new)
     }
 
     // ---- the four ops
@@ -450,7 +500,11 @@ impl Hal {
                         None
                     }
                 },
-                backend_id::HEADLESS => Some(Box::new(Headless)),
+                backend_id::HEADLESS => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    { *backend::shell::snapshot() = backend::shell::Snapshot::new("headless", "headless backend requested".into()); }
+                    Some(Box::new(Headless::default()))
+                },
                 #[cfg(target_vendor = "apple")]
                 backend_id::METAL => backend::apple::Metal::new(req.flags, sessions.clone(), notify.clone()).map(|m| Box::new(m) as Box<dyn Backend>),
                 #[cfg(windows)]
@@ -480,8 +534,21 @@ impl Hal {
             None if st.exited => return refused,
             None => match make(req.backend) {
                 Some(b) => {
+                    // Linux names its shell in `connect`; offscreen (hidden) windows have no shell.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if b.info().backend != backend_id::HEADLESS {
+                        let offscreen = req.flags & open_flags::OFFSCREEN_WINDOWS != 0;
+                        if offscreen || !cfg!(target_os = "linux") {
+                            *backend::shell::snapshot() = if offscreen {
+                                backend::shell::Snapshot::new("offscreen", "hidden windows: no shell or WM".into())
+                            } else {
+                                backend::shell::Snapshot::new(std::env::consts::OS, String::new())
+                            };
+                        }
+                    }
                     st.backend = Some((b.info().backend, b));
                     st.backend_inits += 1;
+                    if GLOBAL.get().is_some_and(|hal| std::ptr::eq(&**hal, self)) { before_exit_at_exit(); }
                     // a remote headset slot's XR window events wake the pumps like the backend's
                     xr_remote::set_wake(notify.clone());
                 }
@@ -594,15 +661,30 @@ impl Hal {
     }
 
     fn run_host_calls(&self, calls: Vec<session::HostCall>) {
-        for call in calls {
-            // a relaunch frees what is left of the old session (the app has stopped by now) and
-            // makes it again, empty, under the same id
-            if let session::HostCall::Relaunch(l) = &call {
-                let mut guard = lock(&self.state);
-                guard.world.relaunch_domain(l.domain);
-                self.finish(guard, &[]);
-            }
+        for mut call in calls {
             let host = lock(&self.domain_host).clone();
+            if let session::HostCall::Relaunch(l) = &mut call {
+                if host.as_ref().is_some_and(|h| !h.can_reuse_domain(l.domain)) {
+                    // Old threads must never pump events or submit commands to
+                    // the replacement. Retire the old session and its key too.
+                    let previous = l.domain;
+                    let mut guard = lock(&self.state);
+                    guard.world.schedule_close(previous, CloseAs::Exit("relaunch".into()));
+                    self.finish(guard, &[]);
+                    let mut guard = lock(&self.state);
+                    if !guard.world.session(l.parent).is_some_and(|parent| !parent.closing) {
+                        self.finish(guard, &[]);
+                        continue;
+                    }
+                    *l = guard.world.start_domain(l.parent, l.req, l.app.clone(), l.args.clone());
+                    self.finish(guard, &[]);
+                    if let Some(h) = &host { h.domain_replaced(previous, l.domain); }
+                } else {
+                    let mut guard = lock(&self.state);
+                    guard.world.relaunch_domain(l.domain);
+                    self.finish(guard, &[]);
+                }
+            }
             let (domain, result) = match (call, host) {
                 (session::HostCall::Stop { domain, mode }, Some(h)) => {
                     h.stop(domain, mode);
@@ -845,7 +927,9 @@ impl Hal {
     /// backend leaves the Hal -- no call reaches it any more, no backend is made again -- and its
     /// driver threads stop and are joined (work in flight completes or is abandoned), so exit()
     /// never runs the driver's exit handlers under a thread inside the driver. Returns once
-    /// they are gone. A host API, the last HAL call of every way the host ends; once is enough.
+    /// they are gone. The last HAL call of every way the process ends: a host calls it where it
+    /// ends, and the process's exit calls it for the global Hal (`before_exit_at_exit`); once is
+    /// enough.
     pub fn before_exit(&self) {
         let backend = {
             let mut guard = lock(&self.state);
@@ -859,6 +943,11 @@ impl Hal {
             // more driver calls on the way out)
             std::mem::forget(b);
         }
+    }
+
+    /// A quit request waits for `session`'s next pump (World::quit_on_its_way).
+    pub fn quit_on_its_way(&self, session: u32) -> bool {
+        lock(&self.state).world.quit_on_its_way(session)
     }
 
     /// Wakes one session's pump (a `Wake` event for it alone).
@@ -887,8 +976,17 @@ impl Hal {
 
     /// Puts an event into the session's queue, as if the OS had delivered it.
     pub fn inject(&self, session: u32, e: RawEvent) {
-        if let Some(s) = lock(&self.state).world.session_mut(session) {
-            s.events.push(e);
+        {
+            let mut st = lock(&self.state);
+            // (a badge's press is the host session's, as the OS's would be)
+            if st.world.injected_on_badge(session, &e) {
+                drop(st);
+                self.sig.notify(&[session::HOST]);
+                return;
+            }
+            if let Some(s) = st.world.session_mut(session) {
+                s.events.push(e);
+            }
         }
         self.sig.notify(&[session]);
     }
@@ -1122,6 +1220,26 @@ pub fn expect_main_loop() {
     main_loop::expect()
 }
 
+/// A run of this process's app ended in place (`makepad run`): what the HAL holds of it outside its
+/// session goes, as a fresh process has it. The session's close frees the rest (`free_session`);
+/// the window, the GPU device and the host's own session stay.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn end_run() {
+    completion::end_run();
+    framecap::end_run();
+    gpu_prof::end_run();
+    inspect::end_run();
+    lease::end_run();
+    profile::end_run();
+    a11y::end_run();
+    stream_decode::end_run();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    stream_encode::end_run();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    frame_tap::end_run();
+    backend::end_run();
+}
+
 /// Ends [`run_main_loop`] (any thread), as the app does when it is done.
 pub fn stop_main_loop() {
     main_loop::stop()
@@ -1267,6 +1385,14 @@ pub fn hal_wake() {
 #[relax_api]
 pub fn hal_wake_session(session: u32) {
     Hal::global().wake_session(session)
+}
+
+/// A quit request waits for `session`'s next `hal_pump` (asked for since its last one: a window
+/// manager's DomainStop, the system's quit). The session's own thread asks before it draws, so a
+/// quit that came while a handler ran is taken before the next frame.
+#[relax_api]
+pub fn hal_quit_on_its_way(session: u32) -> bool {
+    Hal::global().quit_on_its_way(session)
 }
 
 /// One texture or buffer of a session's GPU ledger (`hal_allocations`).
@@ -1988,4 +2114,18 @@ pub fn hal_fleet_tls_free(handle: i64) {
 #[relax_api]
 pub fn hal_battery() -> i64 {
     backend::android::fleet::battery().map_or(-1, |(level, charging)| level as i64 | (charging as i64) << 8)
+}
+
+/// The host's hook for the Android BACKGROUND lifecycle (the activity stopped): an Android process
+/// is killed, never exited, so the makepad run host writes its compile cache from here (the loader's
+/// quit write) instead of at an exit that never comes. Set once, before the first stop.
+static BACKGROUND_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+pub fn set_background_hook(f: fn()) {
+    let _ = BACKGROUND_HOOK.set(f);
+}
+#[cfg(target_os = "android")]
+pub(crate) fn background_hook() {
+    if let Some(f) = BACKGROUND_HOOK.get() {
+        f();
+    }
 }

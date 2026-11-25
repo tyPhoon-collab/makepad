@@ -35,7 +35,7 @@ impl Renderer {
                 );
                 shadow.draw_vars.geometry_id = Some(geometry.geometry_id());
                 if shadow.draw_vars.can_instance() {
-                    let new_area = cx.add_instance(&shadow.draw_vars);
+                    let new_area = cx.add_instance(&mut shadow.draw_vars);
                     shadow.draw_vars.area = cx.update_area_refs(shadow.draw_vars.area, new_area);
                 }
             }
@@ -77,7 +77,7 @@ impl Renderer {
                     sd.sdf_d = inst.d;
                     sd.sdf_e = inst.e;
                     if sd.draw_vars.can_instance() {
-                        let new_area = cx.add_instance(&sd.draw_vars);
+                        let new_area = cx.add_instance(&mut sd.draw_vars);
                         sd.draw_vars.area =
                             cx.update_area_refs(sd.draw_vars.area, new_area);
                     }
@@ -92,23 +92,23 @@ impl Renderer {
         // stickers over the passthrough feed; with it, planted on the floor.
         // Drawn last so it blends over everything it sits beneath.
         if !shows_environment {
-            if let Some(footprint) = Self::world_footprint(world) {
+            if let (Some(footprint), Some(draw_alpha)) = (Self::world_footprint(world), draws.alpha.as_deref_mut()) {
                 let (center, radius) = footprint;
                 let mut transform = Mat4f::identity();
                 transform.v[12] = center.x;
                 transform.v[13] = center.y - 0.02 / self.stage.scale.max(1.0e-4);
                 transform.v[14] = center.z;
-                draws.alpha.cube.cube.transform = transform;
-                draws.alpha.cube.cube.cube_pos = vec3(0.0, 0.0, 0.0);
+                draw_alpha.cube.cube.transform = transform;
+                draw_alpha.cube.cube.cube_pos = vec3(0.0, 0.0, 0.0);
                 // Flat slab: thin in y, footprint-sized in x/z.
                 let thickness = 0.04 / self.stage.scale.max(1.0e-4);
-                draws.alpha.cube.cube.cube_size =
+                draw_alpha.cube.cube.cube_size =
                     vec3(radius * 2.0, thickness, radius * 2.0);
-                draws.alpha.cube.cube.color = vec4(0.0, 0.0, 0.0, 0.25);
-                draws.alpha.cube.cube.depth_clip = 1.0;
-                draws.alpha.cube.glow = 0.0;
-                draws.alpha.cube.color_adjust_ctl = vec4(0.0, 1.0, 1.0, 0.0);
-                draws.alpha.cube.cube.draw(cx);
+                draw_alpha.cube.cube.color = vec4(0.0, 0.0, 0.0, 0.25);
+                draw_alpha.cube.cube.depth_clip = 1.0;
+                draw_alpha.cube.glow = 0.0;
+                draw_alpha.cube.color_adjust_ctl = vec4(0.0, 1.0, 1.0, 0.0);
+                draw_alpha.cube.cube.draw(cx);
                 stats.dyn_instances += 1;
                 stats.shadow_catcher_drawn = true;
             }
@@ -116,7 +116,7 @@ impl Renderer {
 
         // 5.2 An MR box stage's box: its twelve edges as thin light bars, just inside the box
         // (the scene list clips to it), so the box reads as a glass case over the room.
-        if let (Some(b), StageMode::MrBox) = (self.clip_box, self.stage.mode) {
+        if let (Some(b), StageMode::MrBox, Some(draw_alpha)) = (self.clip_box, self.stage.mode, draws.alpha.as_deref_mut()) {
             const BAR: f32 = 0.003;
             let (s, c) = (b.yaw.sin(), b.yaw.cos());
             // the box's own frame in the room (turn + centre), then into the world the scene
@@ -131,11 +131,11 @@ impl Renderer {
             box_frame.v[14] = b.center.z;
             let transform = Mat4f::mul(&self.stage.matrix().invert(), &box_frame);
             let h = vec3(b.half.x - BAR, b.half.y - BAR, b.half.z - BAR);
-            draws.alpha.cube.cube.transform = transform;
-            draws.alpha.cube.cube.color = vec4(0.72, 0.86, 1.0, 0.55);
-            draws.alpha.cube.cube.depth_clip = 1.0;
-            draws.alpha.cube.glow = 0.8;
-            draws.alpha.cube.color_adjust_ctl = vec4(0.0, 1.0, 1.0, 0.0);
+            draw_alpha.cube.cube.transform = transform;
+            draw_alpha.cube.cube.color = vec4(0.72, 0.86, 1.0, 0.55);
+            draw_alpha.cube.cube.depth_clip = 1.0;
+            draw_alpha.cube.glow = 0.8;
+            draw_alpha.cube.color_adjust_ctl = vec4(0.0, 1.0, 1.0, 0.0);
             for axis in 0..3 {
                 for a in [-1.0f32, 1.0] {
                     for d in [-1.0f32, 1.0] {
@@ -144,9 +144,9 @@ impl Renderer {
                             1 => (vec3(a * h.x, 0.0, d * h.z), vec3(BAR, h.y * 2.0, BAR)),
                             _ => (vec3(a * h.x, d * h.y, 0.0), vec3(BAR, BAR, h.z * 2.0)),
                         };
-                        draws.alpha.cube.cube.cube_pos = pos;
-                        draws.alpha.cube.cube.cube_size = size;
-                        draws.alpha.cube.cube.draw(cx);
+                        draw_alpha.cube.cube.cube_pos = pos;
+                        draw_alpha.cube.cube.cube_size = size;
+                        draw_alpha.cube.cube.draw(cx);
                         stats.dyn_instances += 1;
                     }
                 }
@@ -184,7 +184,7 @@ impl Renderer {
                     smoke.smoke_a = vec4(v.center.x, v.center.y, v.center.z, v.radius.max(0.05));
                     smoke.smoke_b = vec4(v.density.clamp(0.0, 4.0), v.age, v.seed, 0.0);
                     if smoke.draw_vars.can_instance() {
-                        let new_area = cx.add_instance(&smoke.draw_vars);
+                        let new_area = cx.add_instance(&mut smoke.draw_vars);
                         smoke.draw_vars.area = cx.update_area_refs(smoke.draw_vars.area, new_area);
                     }
                 }
@@ -210,7 +210,7 @@ impl Renderer {
                     fw.color = f.color;
                     fw.color_tail = f.color_tail;
                     if fw.draw_vars.can_instance() {
-                        let new_area = cx.add_instance(&fw.draw_vars);
+                        let new_area = cx.add_instance(&mut fw.draw_vars);
                         fw.draw_vars.area = cx.update_area_refs(fw.draw_vars.area, new_area);
                     }
                 }
@@ -251,7 +251,7 @@ impl Renderer {
                         1.0,
                     );
                     if fl.draw_vars.can_instance() {
-                        let new_area = cx.add_instance(&fl.draw_vars);
+                        let new_area = cx.add_instance(&mut fl.draw_vars);
                         fl.draw_vars.area = cx.update_area_refs(fl.draw_vars.area, new_area);
                     }
                     stats.flares += 1;
@@ -290,7 +290,7 @@ impl Renderer {
                         mark.kind.shader_id(),
                     );
                     if decal.draw_vars.can_instance() {
-                        let new_area = cx.add_instance(&decal.draw_vars);
+                        let new_area = cx.add_instance(&mut decal.draw_vars);
                         decal.draw_vars.area = cx.update_area_refs(decal.draw_vars.area, new_area);
                         stats.bullet_decals += 1;
                     }
@@ -331,7 +331,7 @@ impl Renderer {
                 && sc.screen_size.y > 0.0
                 && sc.draw_vars.can_instance()
             {
-                let new_area = cx.add_instance(&sc.draw_vars);
+                let new_area = cx.add_instance(&mut sc.draw_vars);
                 sc.draw_vars.area = cx.update_area_refs(sc.draw_vars.area, new_area);
             }
             // Sprite billboards are cut-out artwork, always: the quad is a
@@ -355,7 +355,7 @@ impl Renderer {
                 sc.tint = inst.tint;
                 sc.color_adjust_ctl = inst.color_adjust;
                 if sc.draw_vars.can_instance() {
-                    let new_area = cx.add_instance(&sc.draw_vars);
+                    let new_area = cx.add_instance(&mut sc.draw_vars);
                     sc.draw_vars.area = cx.update_area_refs(sc.draw_vars.area, new_area);
                 }
             }

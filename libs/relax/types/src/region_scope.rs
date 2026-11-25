@@ -45,7 +45,7 @@ pub struct ScopeTree {
     /// The tail expressions of blocks of editions before 2024, whose temporaries are dropped earlier
     /// from edition 2024 (rustc `backwards_incompatible_scope`; recorded for the lint
     /// `tail_expr_drop_order`, which only `makepad check` runs).
-    backwards_incompatible_nodes: std::collections::HashSet<Node>,
+    backwards_incompatible_nodes: crate::fxhash::HashSet<Node>,
     positions: HashMap<u32, ExprPosition>,
     yield_in_scope: Vec<Vec<u32>>,
 }
@@ -87,9 +87,16 @@ impl ScopeTree {
     }
 }
 
-/// The sole edition hook. Frontend expansion contexts will replace this file-level input.
-/// rustc_hir_analysis/src/check/region.rs:146,357 uses the node's span edition.
-pub fn node_edition(file: &ParsedFile, _node: Node) -> u16 { file.edition }
+/// The edition of a node's span (rustc_hir_analysis/src/check/region.rs:146,357): a block or
+/// `if` a macro body wrote has its definition's edition, one substituted from the caller the
+/// caller's (ParsedFile::edition_at).
+pub fn node_edition(file: &ParsedFile, node: Node) -> u16 {
+    match node {
+        Node::Block(b) => file.edition_at(file.ast.block(BlockId(b)).lo),
+        Node::Expr(e) => file.edition_at(file.ast.expr(ExprId(e)).lo),
+        _ => file.edition,
+    }
+}
 
 /// Read-only provider for a typechecked item and its nested bodies. No consumer switches here.
 /// A query owner can cache this alongside the parsed body and its resolved constructor identities.

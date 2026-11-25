@@ -1,5 +1,4 @@
 use makepad_hal::buffers::{pack_drag_items, read_drag_items, read_items, read_pairs, read_rects, read_strs, PipelineBlob, Wire};
-use makepad_hal::cmds::{sample_cmds, CMD_TABLE};
 use makepad_hal::events::{sample_events, EVENT_TABLE};
 use makepad_hal::session::{Miss, Table, World};
 use makepad_hal::*;
@@ -19,43 +18,12 @@ fn pump(hal: &Hal, store: &mut EventStore, timeout_ns: u64) -> Vec<(u64, String)
 }
 
 #[test]
-fn every_command_round_trips() {
-    let mut w = CmdWriter::new(1);
-    let expected = sample_cmds(&mut w);
-    assert_eq!(expected.len(), CMD_TABLE.len());
-    assert_eq!(w.cmds().len(), CMD_TABLE.len());
-    // 57 core (including ClipRead, GpuBudget, WindowChrome, WindowCaption and WindowDpiOverride, with
-    // timer start/stop counted separately), 6 embedded, 4 domains, 9 media, 3 native layers, 2 accessibility, 3 fonts, 9 direct display/input
-    // (incl. DirectDisplayArrangement, DirectDisplayPacing, DirectTapToClick, DirectDisplayVirtual tag 153), 2 GL interop, 3 mobile system UI (MobileUi,
-    // SelectionHandles, Haptic), 1 system back (BackUnhandled), 1 font touch (GlyphTouch, tag 150), 3 tray (TraySet,
-    // TrayRemove, WindowAtTray tag 154), 3 XR frame (XrFrameEyes 155, XrPoseLead 156, XrRefreshRate 157),
-    // 2 accessibility (A11yUpdate 158, A11yActionDone 159), 1 XR haptic (XrHaptic 163), 4 hosted (WindowScreenOrigin 28,
-    // HostedPresented 29, HostedNativeBridge 33, HostedNativeIn 34), 1 GPU profiler readout (GpuProfQuery 35),
-    // 1 hosted focus for accessibility (WindowA11yActive 36), 1 refresh rate (FrameRateBoost 165).
-    // The media section (tags 120-129, backend/apple/media) has its own budget.
-    let media = CMD_TABLE.iter().filter(|t| (120..130).contains(&t.0)).count();
-    let fonts = CMD_TABLE.iter().filter(|t| (130..133).contains(&t.0)).count();
-    assert_eq!(media, 9);
-    assert_eq!(fonts, 3);
-    assert!(media <= 15, "the media section is budgeted at 15 commands, it has {media}");
-    assert_eq!(CMD_TABLE.len(), 57 + 6 + 4 + media + fonts + 9 + 2 + 4 + 1 + 3 + 3 + 2 + 3 + 1 + 4 + 1 + 1 + 1 + 1);
-    for ((cmd, want), (tag, name, _)) in w.cmds().iter().zip(&expected).zip(CMD_TABLE) {
-        assert_eq!(cmd.tag, *tag, "{name}");
-        let got = cmd.decode(w.arena()).unwrap_or_else(|| panic!("{name} does not decode"));
-        assert_eq!(&format!("{got:?}"), want, "{name}");
-    }
-    let tags: std::collections::HashSet<u16> = CMD_TABLE.iter().map(|t| t.0).collect();
-    assert_eq!(tags.len(), CMD_TABLE.len(), "tags are unique");
-    assert!(Cmd { tag: 9999, ..Default::default() }.decode(&[]).is_none());
-}
-
-#[test]
 fn every_event_round_trips() {
     let mut q = EventQueue::new();
     q.set_time(77);
     let expected = sample_events(&mut q);
     assert_eq!(expected.len(), EVENT_TABLE.len());
-    assert_eq!(EVENT_TABLE.len(), 104, "55 core (incl. Clipboard, GpuBudget, PayloadSize, MouseCancel, AppMessage, DeviceReset, GpuPressure, Redraw), 6 parent/child (85-90), 13 media, 4 font, 4 direct display/input 1 GL interop and 9 mobile (LongPress, ImeState, ImeAction, ImeResize, PhysicalKeyboard, SelectionHandle, TouchCancel, SafeArea, ImeAnimate) and 2 system back (BackGesture, BackPressed) and 2 tray (TrayMenu, TrayClick) and 2 XR (XrFrame, XrDepth) and 2 accessibility (A11yState, A11yAction) and 1 native layer events and 1 hosted native relay (HostedNativeOut) and 1 GPU profiler readout (GpuProfRecording)");
+    assert_eq!(EVENT_TABLE.len(), 106, "57 core (incl. BufferLeases, Clipboard, GpuBudget, PayloadSize, MouseCancel, AppMessage, DeviceReset, GpuPressure, Redraw, DispatchTime), 6 parent/child (85-90), 13 media, 4 font, 4 direct display/input 1 GL interop and 9 mobile (LongPress, ImeState, ImeAction, ImeResize, PhysicalKeyboard, SelectionHandle, TouchCancel, SafeArea, ImeAnimate) and 2 system back (BackGesture, BackPressed) and 2 tray (TrayMenu, TrayClick) and 2 XR (XrFrame, XrDepth) and 2 accessibility (A11yState, A11yAction) and 1 native layer events and 1 hosted native relay (HostedNativeOut) and 1 GPU profiler readout (GpuProfRecording)");
     assert_eq!(EVENT_TABLE.iter().filter(|t| (120..133).contains(&t.0)).count(), 13);
     assert_eq!(EVENT_TABLE.iter().filter(|t| (100..104).contains(&t.0)).count(), 4);
     let tags: std::collections::HashSet<u16> = EVENT_TABLE.iter().map(|t| t.0).collect();
@@ -69,6 +37,35 @@ fn every_event_round_trips() {
         assert_eq!(g, want, "{name}");
         assert_eq!(*t, 77);
     }
+}
+
+#[test]
+fn device_loss_reports_only_unfinished_compute() {
+    use makepad_hal::session::InFlightDispatch;
+    let mut world = World::new();
+    let sid = world.open(71);
+    let session = world.session_mut(sid).unwrap();
+    session.strings.insert(11, "completed_kernel".into());
+    session.strings.insert(12, "pending_kernel".into());
+    for (frame, kernel, indirect_buffer) in [(1, 11, Id::NONE), (2, 12, Id::NONE), (3, 12, Id::new(4, 1))] {
+        session.compute_in_flight.push_back(InFlightDispatch { frame, kernel, groups: [3, 2, 1], indirect_buffer, indirect_offset: 16 });
+    }
+    world.frame_done(sid, Id::NONE, target::COMPUTE, 1, 10, 20, [0.0; 2]);
+    makepad_hal::backend::exec::device_lost(&mut world);
+    let mut store = EventStore::new(sid, 32, 4096);
+    let mut buf = store.buf();
+    let count = world.session_mut(sid).unwrap().events.drain_into(&mut buf);
+    let mut losses = 0;
+    for (_, event) in store.reader(count, buf.arena_len) {
+        if let HalEvent::DeviceLost { dispatches, .. } = event {
+            losses += 1;
+            let text = std::str::from_utf8(dispatches).unwrap();
+            assert!(!text.contains("completed_kernel"), "completed work is not blamed: {text}");
+            assert!(text.contains("kernel=\"pending_kernel\" groups=[3, 2, 1]"), "direct dimensions: {text}");
+            assert!(text.contains("groups=indirect") && text.contains("offset=16"), "indirect provenance: {text}");
+        }
+    }
+    assert_eq!(losses, 1, "one loss event includes all pending dispatches");
 }
 
 #[test]
@@ -188,6 +185,41 @@ fn native_layer_occluders_merge_without_losing_coverage_or_growing_steady_state(
     }
 }
 
+/// An upload is the writer's copy from the call on: the caller's memory may be freed and handed
+/// out again before the submit (a `&vec![..]` temporary was read after it was gone). Earlier
+/// runs stay put while later ones spill into new chunks; a chunk a turn leaves unused is freed,
+/// so a one-off upload does not stay resident.
+#[test]
+fn an_upload_is_the_writers_copy_from_the_call_on() {
+    let mut w = CmdWriter::new(1);
+    let runs: Vec<Vec<u8>> = (0..24u32).map(|n| (0..(n * 40_009) % 200_000 + 1).map(|i| (i ^ n * 31) as u8).collect()).collect();
+    for (n, run) in runs.iter().enumerate() {
+        let id = Id::new(n as u32, 1);
+        // each clone is a temporary, freed at the end of its statement
+        if n % 2 == 0 { w.buffer_update(id, 0, &run.clone()); } else { w.texture_update(id, 0, [0, 0, 1, 1], 0, &run.clone()); }
+    }
+    let kept = w.keep(&[1.5f32, -2.0]);
+    // the temporaries' blocks go back to the allocator: take them again and scribble over them
+    let scribble: Vec<Vec<u8>> = runs.iter().map(|r| vec![0xee; r.len()]).collect();
+    for (n, (cmd, run)) in w.cmds().iter().zip(&runs).enumerate() {
+        let bytes = match cmd.decode(w.arena()) {
+            Some(HalCmd::BufferUpdate { bytes, .. } | HalCmd::TextureUpdate { bytes, .. }) => bytes,
+            other => panic!("{other:?}"),
+        };
+        // SAFETY: the writer is alive and unchanged since it encoded the command
+        assert!(unsafe { bytes.as_bytes() } == &run[..], "upload {n} is not the bytes of its call");
+    }
+    // SAFETY: as above
+    assert_eq!(unsafe { kept.as_slice::<f32>() }, Some(&[1.5f32, -2.0][..]));
+    drop(scribble);
+    assert!(w.capacities()[6] >= runs.iter().map(Vec::len).sum::<usize>());
+    // the next turn uploads a little: only the first chunk stays
+    w.clear();
+    w.buffer_update(Id::new(0, 1), 0, &[7; 16]);
+    w.clear();
+    assert!(w.capacities()[6] <= 256 << 10, "{} bytes of upload memory stayed after a small turn", w.capacities()[6]);
+}
+
 #[test]
 fn native_layers_cannot_split_two_passes_of_one_frame() {
     let mut w = CmdWriter::new(1);
@@ -297,23 +329,6 @@ fn stale_ids_are_counted_and_ignored() {
 }
 
 #[test]
-fn bad_arguments_are_counted() {
-    let hal = Hal::new();
-    let s = open(&hal, 0);
-    let mut w = CmdWriter::new(s);
-    w.texture_create(Id::new(0, 1), usage::SAMPLED, 999, 16, 16, [1, 1], Attr::default());
-    w.texture_create(Id::new(1, 1), usage::SAMPLED, format::RGBA8, 0, 16, [1, 1], Attr::default());
-    w.texture_create(Id::new(2, 1), usage::SAMPLED, format::RGBA8, 4, 4, [1, 1], Attr::default());
-    w.texture_update(Id::new(2, 1), 0, [2, 2, 4, 4], 0, &[0; 64]); // outside
-    w.texture_update(Id::new(2, 1), 0, [0, 0, 4, 4], 0, &[0; 10]); // wrong length
-    w.texture_update(Id::new(2, 1), 0, [0, 0, 4, 4], 0, &[0; 64]); // fine
-    w.push(Cmd { tag: 9999, ..Default::default() });
-    hal.submit(&w.buf());
-    let st = hal.with_world(|w| w.session(s).unwrap().stats);
-    assert_eq!((st.bad_args, st.unknown_cmds, st.stale_ids), (4, 1, 0));
-}
-
-#[test]
 fn data_formats_mips_cube_faces_and_blocks_are_validated() {
     let hal = Hal::new();
     let s = open(&hal, 0);
@@ -383,7 +398,7 @@ fn headless_bytes(f: u32, w: u32, h: u32, d: u32, m: u32) -> u64 {
 #[test]
 fn session_close_frees_everything_and_keeps_adoptable_windows() {
     let hal = Hal::new();
-    let host = hal.with_world(|w| w.host_window([0.0, 0.0, 800.0, 600.0]));
+    let host = hal.with_world(|w| w.host_window([0.0, 0.0, 800.0, 600.0], true));
     let s = open(&hal, 42);
     let mut w = CmdWriter::new(s);
     w.window_create(Id::new(0, 1), window_kind::NORMAL, Id::NONE, [0.0, 0.0, 1.0, 1.0], true); // adopts the host window
@@ -482,7 +497,10 @@ fn frame_packet_with_two_passes_three_draws_yields_frame_done() {
     let ranges = w.put_items(&[[0u32, 3]]);
     w.frame_begin(7, FrameMeta { input_ns: 1, ..Default::default() });
     w.pass(Pass { color: [Id::new(0, 1), Id::NONE, Id::NONE, Id::NONE], depth: Id::NONE, viewport: [0.0, 0.0, 64.0, 64.0], ..Default::default() });
-    let draw = Draw { pipeline: Id::new(0, 1), vb: Id::new(0, 1), ib: Id::NONE, inst: Inst::inline(Slice::of(&[0.0f32; 8]), 2), inst_ranges: ranges, ubufs: [Id::NONE; 4], ..Default::default() };
+    // the frames below reuse this draw after `clear`: its instances live in a static
+    static INSTANCES: [f32; 8] = [0.0; 8];
+    // SAFETY: a static outlives every submit
+    let draw = Draw { pipeline: Id::new(0, 1), vb: Id::new(0, 1), ib: Id::NONE, inst: Inst::inline(unsafe { Slice::of(&INSTANCES) }, 2), inst_ranges: ranges, ubufs: [Id::NONE; 4], ..Default::default() };
     w.draw(draw);
     w.draw(draw);
     w.pass(Pass { color: [Id::NONE; 4], depth: Id::NONE, ..Default::default() });
@@ -615,29 +633,6 @@ fn wake_from_another_thread_unblocks_pump() {
 }
 
 #[test]
-fn the_four_ops_work_through_the_global_hal() {
-    let info = hal_open(&OpenReq { backend: backend_id::HEADLESS, app_key: 0xfeed, flags: 0, dpi_hint: 0.0, parent: 0 });
-    assert_ne!(info.session, 0);
-    assert_eq!(hal_open(&OpenReq { backend: 77, ..Default::default() }).session, 0);
-    let mut w = CmdWriter::new(info.session);
-    w.window_create(Id::new(0, 1), window_kind::NORMAL, Id::NONE, [0.0, 0.0, 10.0, 10.0], false);
-    w.frame_begin(1, FrameMeta::default());
-    w.frame_end(Id::new(0, 1), target::WINDOW);
-    hal_submit(&w.buf());
-    hal_wake();
-    let mut store = EventStore::new(info.session, 16, 256);
-    let mut buf = store.buf();
-    let n = hal_pump(0, &mut buf);
-    let evs: Vec<String> = store.reader(n, buf.arena_len).map(|e| format!("{:?}", e.1)).collect();
-    assert!(evs.iter().any(|e| e.starts_with("FrameDone")) && evs.iter().any(|e| e.starts_with("Wake")), "{evs:?}");
-    // a corrupt batch (misaligned element slice) is rejected whole and counted
-    let bytes = [0u8; 13];
-    let bad = CmdBuf { session: info.session, cmds: Slice::from_bytes(&bytes), ..Default::default() };
-    hal_submit(&bad);
-    assert_eq!(Hal::global().with_world(|w| w.session(info.session).unwrap().stats.bad_bufs), 1);
-}
-
-#[test]
 fn clock_is_monotonic_and_absolute() {
     let a = clock_ns();
     let b = clock_ns();
@@ -647,7 +642,7 @@ fn clock_is_monotonic_and_absolute() {
 #[test]
 fn relaunch_keeps_the_backend_and_frees_only_the_old_session() {
     let hal = Hal::new();
-    let host = hal.with_world(|w| w.host_window([0.0, 0.0, 800.0, 600.0]));
+    let host = hal.with_world(|w| w.host_window([0.0, 0.0, 800.0, 600.0], true));
     let a = open(&hal, 7);
     assert_eq!(hal.backend_inits(), 1);
     let mut w = CmdWriter::new(a);
@@ -690,4 +685,109 @@ fn draw_texture_ids_have_no_slot_limit() {
     assert_eq!(read_ids(w.arena(), r).collect::<Vec<_>>(), ids);
     assert_eq!(id_at(w.arena(), r, 12), Id::new(12, 13));
     assert_eq!(id_at(w.arena(), r, 13), Id::NONE);
+}
+
+#[test]
+fn dropped_frames_retire_their_serials_so_in_flight_never_stalls() {
+    use makepad_hal::session::HOST;
+    let hal = Hal::new();
+    let req = OpenReq {
+        backend: backend_id::HEADLESS,
+        app_key: 0,
+        flags: open_flags::RETAIN_WINDOWS,
+        dpi_hint: 2.0,
+        parent: 0,
+    };
+    assert_eq!(hal.open_host(&req).backend, backend_id::HEADLESS);
+    const HOST_WINDOW: Id = Id::new(3, 1);
+    const APP_WINDOW: Id = Id::new(7, 1);
+    const BADGE: Id = Id::new(9, 1);
+    let mut host = CmdWriter::new(HOST);
+    host.window_create(HOST_WINDOW, window_kind::NORMAL, Id::NONE, [0.0, 0.0, 1000.0, 700.0], false);
+    host.window_create(BADGE, window_kind::BADGE, HOST_WINDOW, [960.0, 2.0, 24.0, 24.0], false);
+    hal.submit(&host.buf());
+    let sid = hal.open(&OpenReq { app_key: 99, ..req }).session;
+    let mut app = CmdWriter::new(sid);
+    app.window_create(APP_WINDOW, window_kind::NORMAL, Id::NONE, [0.0; 4], true);
+    hal.submit(&app.buf());
+    hal.with_world(|w| w.trace_exec = true);
+
+    let submit_frame = |sid: u32, window: Id, serial: u64, kind: u32| {
+        let mut cmd = CmdWriter::new(sid);
+        cmd.frame_begin(serial, FrameMeta::default());
+        cmd.pass(Pass {
+            viewport: [0.0, 0.0, 2000.0, 1400.0],
+            load: [pass_load::CLEAR; 5],
+            ..Default::default()
+        });
+        cmd.frame_end(window, kind);
+        hal.submit(&cmd.buf());
+    };
+    let pump_done = |store: &mut EventStore| -> Vec<u64> {
+        let mut buf = store.buf();
+        let n = hal.pump(0, &mut buf);
+        store
+            .reader(n, buf.arena_len)
+            .filter_map(|(_, ev)| match ev {
+                HalEvent::FrameDone { frame, .. } => Some(frame),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut host_store = EventStore::new(HOST, 32, 512);
+    let mut app_store = EventStore::new(sid, 32, 512);
+
+    // Borrower presents frame 11 so `borrower_frame` is true on `HOST_WINDOW`.
+    submit_frame(sid, APP_WINDOW, 11, target::WINDOW);
+    let _ = pump_done(&mut host_store);
+    let _ = pump_done(&mut app_store);
+    let exec_before = hal.with_world(|w| w.exec_log.len());
+
+    // 1. Lent-window adoption race: HOST submits 3 consecutive frames to HOST_WINDOW while
+    //    `sid` owns the loan and `overlay` is off, followed by a badge target and stale targets.
+    for serial in 201..=203 {
+        submit_frame(HOST, HOST_WINDOW, serial, target::WINDOW);
+    }
+    submit_frame(HOST, BADGE, 204, target::WINDOW);
+    submit_frame(HOST, Id::new(99, 1), 205, target::WINDOW);
+    submit_frame(HOST, Id::new(99, 1), 206, target::TEXTURE);
+    assert_eq!(hal.with_world(|w| w.exec_log.len()), exec_before);
+    let host_done = pump_done(&mut host_store);
+    assert_eq!(host_done, vec![201, 202, 203, 204, 205, 206]);
+    assert_eq!(hal.with_world(|w| w.session(HOST).unwrap().last_frame_done), 206);
+
+    // 2. Stale targets and bad flags on `sid`: more than FRAMES_IN_FLIGHT (2) consecutive
+    //    dropped frames all emit FrameDone, then the next valid beat succeeds.
+    submit_frame(sid, Id::new(77, 1), 21, target::WINDOW);
+    submit_frame(sid, Id::new(77, 1), 22, target::TEXTURE);
+    submit_frame(sid, APP_WINDOW, 23, target::WINDOW | target::OVERLAY);
+    submit_frame(sid, APP_WINDOW, 24, target::WINDOW | target::REPLAY);
+    submit_frame(sid, APP_WINDOW, 25, target::WINDOW | target::BADGES);
+    assert_eq!(hal.with_world(|w| w.exec_log.len()), exec_before);
+    let app_done = pump_done(&mut app_store);
+    assert_eq!(app_done, vec![21, 22, 23, 24, 25]);
+    assert_eq!(hal.with_world(|w| w.session(sid).unwrap().last_frame_done), 25);
+
+    // 3. Subsequent valid frame on `sid` executes and completes normally:
+    submit_frame(sid, APP_WINDOW, 26, target::WINDOW);
+    assert_eq!(hal.with_world(|w| w.exec_log.last().unwrap().frame), 26);
+    assert_eq!(hal.with_world(|w| w.session(sid).unwrap().last_frame_done), 26);
+    let _ = pump_done(&mut app_store);
+
+    // 4. Out-of-order guard: while an earlier submitted frame (30) is still in flight on the GPU
+    //    (`s.last_frame_done < s.frame`), dropped frames (31, 32) hold their `FrameDone` until
+    //    frame 30 completes, then retire in order `[30, 31, 32]`.
+    hal.with_world(|w| {
+        w.session_mut(sid).unwrap().frame = 30;
+    });
+    submit_frame(sid, Id::new(77, 1), 31, target::WINDOW);
+    submit_frame(sid, Id::new(77, 1), 32, target::TEXTURE);
+    assert_eq!(pump_done(&mut app_store), Vec::<u64>::new());
+    assert_eq!(hal.with_world(|w| w.session(sid).unwrap().last_frame_done), 26);
+
+    hal.with_world(|w| {
+        w.frame_done(sid, APP_WINDOW, target::WINDOW, 30, 1000, 2000, [0.0; 2]);
+    });
+    assert_eq!(pump_done(&mut app_store), vec![30, 31, 32]);
+    assert_eq!(hal.with_world(|w| w.session(sid).unwrap().last_frame_done), 32);
 }

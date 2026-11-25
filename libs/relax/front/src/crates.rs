@@ -19,6 +19,8 @@ pub struct CrateUnit {
     pub proc_macro: bool,
     /// the unit is a binary target (its `main` is checked)
     pub bin: bool,
+    /// built with `--test` (GraphUnit::harness): no entry point of its own
+    pub harness: bool,
     pub build_script: bool,
     /// package version from cargo's pkg_id ("1.15.1")
     pub version: String,
@@ -30,6 +32,8 @@ pub struct CrateUnit {
 pub struct HostUnit {
     pub features: Vec<String>,
     pub deps: Vec<(usize, String)>,
+    /// Build-script cfgs and environment for this host feature set, not the target's.
+    pub build_outputs: Option<(Vec<String>, Vec<(String, String)>)>,
 }
 
 /// Returns the original crate name before any `__relax_v` multi-version suffix.
@@ -38,6 +42,14 @@ pub fn base_crate_name(s: &str) -> &str {
         Some(i) => &s[..i],
         None => s,
     }
+}
+
+/// The internal name of a package's own crate. A sysroot crate is the only crate that keeps one of
+/// the sysroot's names, so that name identifies it, in crate indices and in string-keyed tables
+/// alike: `tests/alloc.rs` is not `alloc`. What a program sees of the name (`crate_name`,
+/// `module_path!`, `CARGO_CRATE_NAME`) goes through base_crate_name.
+pub fn own_crate_name(name: String) -> String {
+    if matches!(name.as_str(), "core" | "alloc" | "std" | "proc_macro" | "test") { format!("{name}__relax_vown") } else { name }
 }
 
 /// Gives multi-version library crates a canonical identifier-safe name (`<name>__relax_v<ver>`)
@@ -87,9 +99,10 @@ pub fn disambiguate_multi_version_crates(units: &mut [CrateUnit]) {
 
 /// Crates Relax provides itself (std/substitutes.txt: `<name> <version prefix> <root>`):
 /// a unit of that crate at a matching version loads the provided root instead of its sources
-/// (same name; deps become core/alloc/std only; features ignored). The rustc build keeps the
-/// real crates. Also hands the graph to the proc-macro host (macro_reg::register_and_strip);
-/// `additive`: the graph of a program started into a running one joins the registered graph.
+/// (same name; deps become core/alloc/std only; features ignored); one at another version is
+/// compiled from its own source, which a --verbose load says. The rustc build keeps the real crates.
+/// Also hands the graph to the proc-macro host (macro_reg::register_and_strip); `additive`: the
+/// graph of a program started into a running one joins the registered graph.
 pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [CrateUnit], std_dir: &str, additive: bool) -> Result<(), String> {
     let table = match crate::vfs::read_to_string(format!("{}/substitutes.txt", std_dir)) {
         Ok(t) => t,
@@ -98,6 +111,20 @@ pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [Cra
             return Ok(());
         }
     };
+    for line in apply_substitute_table(units, std_dir, &table) {
+        if sess.options.verbose {
+            eprintln!("makepad run: {line}");
+        }
+    }
+    // proc-macro crates run in the JIT proc-macro host; the app graph sees them empty
+    crate::macro_reg::register_and_strip(sess, units, std_dir, additive)?;
+    Ok(())
+}
+
+/// The table's substitutions made in `units`; returns a line for each unit of a provided crate at
+/// another version (its own source is compiled).
+fn apply_substitute_table(units: &mut [CrateUnit], std_dir: &str, table: &str) -> Vec<String> {
+    let mut own = Vec::new();
     for line in table.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -114,7 +141,8 @@ pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [Cra
             }
             let matches = u.version == ver || u.version.starts_with(&format!("{}.", ver));
             if !matches {
-                return Err(format!("{}: crate `{}` is version {}, std/substitutes.txt provides {} -- update the table or the provided crate", u.src_path, name, u.version, ver));
+                own.push(format!("crate `{}` is version {}, substitutes.txt provides {}: its own source is compiled", name, u.version, ver));
+                continue;
             }
             u.src_path = format!("{}/{}", std_dir, root);
             u.edition = 2021;
@@ -123,9 +151,33 @@ pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [Cra
             u.host = None;
         }
     }
-    // proc-macro crates run in the JIT proc-macro host; the app graph sees them empty
-    crate::macro_reg::register_and_strip(sess, units, std_dir, additive)?;
-    Ok(())
+    own
+}
+
+#[cfg(test)]
+#[test]
+fn a_provided_crate_at_another_version_compiles_its_own_source_and_says_so() {
+    let unit = |version: &str| CrateUnit {
+        name: "smallvec".to_string(),
+        src_path: format!("/registry/smallvec-{version}/src/lib.rs"),
+        edition: 2018,
+        features: vec!["union".to_string()],
+        deps: Vec::new(),
+        host: None,
+        proc_macro: false,
+        bin: false,
+        harness: false,
+        build_script: false,
+        version: version.to_string(),
+        registry: true,
+    };
+    let mut units = vec![unit("1.13.2"), unit("0.6.14")];
+    let said = apply_substitute_table(&mut units, "/std", "# comment\nsmallvec 1 smallvec/lib.rs\n");
+    assert_eq!(units[0].src_path, "/std/smallvec/lib.rs");
+    assert!(units[0].features.is_empty());
+    assert_eq!(units[1].src_path, "/registry/smallvec-0.6.14/src/lib.rs");
+    assert_eq!(units[1].features, ["union"]);
+    assert_eq!(said, ["crate `smallvec` is version 0.6.14, substitutes.txt provides 1: its own source is compiled"]);
 }
 
 /// Unit indices with every crate after its dependencies.
@@ -163,7 +215,7 @@ pub struct SrcFile {
 }
 
 /// Loads every lib/proc-macro unit of cargo's `--unit-graph` output, deduplicated by
-/// source path (host and target copies of a crate parse the same files).
+/// source path and test mode (host and target copies still share a crate).
 pub fn load_units(path: &str) -> Result<Vec<CrateUnit>, String> {
     let data = crate::vfs::read(path).map_err(|e| format!("{}: {}", path, e))?;
     let j = json::parse(&data)?;
@@ -205,9 +257,10 @@ pub fn load_units(path: &str) -> Result<Vec<CrateUnit>, String> {
             map.push(usize::MAX);
             continue;
         }
+        let harness = u.get("mode").is_some_and(|m| m.str() == "test");
         let mut found = usize::MAX;
         for i in 0..out.len() {
-            if crate::vfs::normalize_path(&out[i].src_path) == crate::vfs::normalize_path(&src_path) {
+            if out[i].harness == harness && crate::vfs::normalize_path(&out[i].src_path) == crate::vfs::normalize_path(&src_path) {
                 found = i;
                 break;
             }
@@ -266,7 +319,7 @@ pub fn load_units(path: &str) -> Result<Vec<CrateUnit>, String> {
             None => String::new(),
         };
         map.push(out.len());
-        out.push(CrateUnit { name, src_path, edition, features, deps, host: None, proc_macro: kind_pm, bin: false, build_script, version, registry: !pkg.starts_with("path+") });
+        out.push(CrateUnit { name, src_path, edition, features, deps, host: None, proc_macro: kind_pm, bin: false, harness, build_script, version, registry: !pkg.starts_with("path+") });
     }
     // remap dependency indices to deduplicated crate indices; drop build-script deps
     for c in out.iter_mut() {
@@ -277,6 +330,9 @@ pub fn load_units(path: &str) -> Result<Vec<CrateUnit>, String> {
             }
         }
         c.deps = nd;
+    }
+    for c in &mut out {
+        c.name = own_crate_name(std::mem::take(&mut c.name));
     }
     disambiguate_multi_version_crates(&mut out);
 
@@ -339,24 +395,6 @@ pub fn path_attrs_cfg(p: crate::cfg::Src, attrs: &[Attr], cfg: &crate::cfg::CfgS
     }
 }
 
-pub fn path_attrs_src(p: crate::cfg::Src, attrs: &[Attr], out: &mut Vec<String>) {
-    for a in attrs {
-        let lo = a.toks.lo as usize;
-        let hi = a.toks.hi as usize;
-        let mut i = lo;
-        while i + 2 < hi {
-            let t = p.tok(i);
-            if t.kind == T::Ident && &p.src[t.lo as usize..t.hi as usize] == b"path" {
-                if p.tok(i + 1).kind == T::Eq && p.tok(i + 2).kind == T::Str {
-                    let s = p.tok(i + 2);
-                    out.push(str_lit(p.src, s.lo, s.hi));
-                }
-            }
-            i += 1;
-        }
-    }
-}
-
 /// Pending module file.
 struct Job {
     crate_idx: u32,
@@ -376,7 +414,7 @@ pub fn discover(sess: &std::sync::Arc<crate::Session>, crates: &[CrateUnit], cfg
         files: Vec<SrcFile>,
         missing: Vec<String>,
         errors: Vec<String>,
-        seen: Vec<String>,
+        seen: Vec<(u32, String)>,
     }
     let sources = std::sync::Arc::new(crate::source::SourceRegistry::default());
     let contexts = crate::source_context::Context::for_units(crates, sources, sess);
@@ -392,7 +430,7 @@ pub fn discover(sess: &std::sync::Arc<crate::Session>, crates: &[CrateUnit], cfg
     {
         let mut s = state.lock().unwrap();
         for i in 0..crates.len() {
-            s.seen.push(crates[i].src_path.clone());
+            s.seen.push((i as u32, crates[i].src_path.clone()));
             s.queue.push(Job { crate_idx: i as u32, path: crates[i].src_path.clone(), edition: crates[i].edition, mod_rs: true, active: true });
         }
     }
@@ -409,7 +447,7 @@ pub fn discover(sess: &std::sync::Arc<crate::Session>, crates: &[CrateUnit], cfg
                         if s.active == 0 {
                             break None;
                         }
-                        s = cv.wait(s).unwrap();
+                        s = crate::pool::wait(&cv, &state, s).unwrap();
                     }
                 };
                 let job = match job {
@@ -448,14 +486,14 @@ pub fn discover(sess: &std::sync::Arc<crate::Session>, crates: &[CrateUnit], cfg
                         if crate::vfs::exists(c) {
                             ok = true;
                             let mut dup = false;
-                            for x in &s.seen {
-                                if x == c {
+                            for (krate, path) in &s.seen {
+                                if *krate == job.crate_idx && path == c {
                                     dup = true;
                                     break;
                                 }
                             }
                             if !dup {
-                                s.seen.push(c.clone());
+                                s.seen.push((job.crate_idx, c.clone()));
                                 let ismodrs = mod_rs || c.ends_with("/mod.rs");
                                 s.queue.push(Job { crate_idx: job.crate_idx, path: c.clone(), edition: job.edition, mod_rs: ismodrs, active: act });
                             }
@@ -538,9 +576,32 @@ pub fn set_crate_env(name: &str, env: Vec<(String, String)>) {
     t.push((name.to_string(), env));
 }
 
+/// cargo's `[env]` configuration as it applies to the run (resolve::cargo_env): every crate's
+/// compile-time environment and every build script's take it after the variables cargo sets
+/// itself (cargo apply_env_config: a crate's cargo variables and build-script rustc-env win).
+/// Set by `makepad run` / `check` for its workspace; a build script's own run has it in its
+/// process environment.
+static CONFIG_ENV: relax_session::sync::Mutex<Vec<(String, String)>> = relax_session::sync::Mutex::new(Vec::new());
+
+pub fn set_config_env(env: Vec<(String, String)>) {
+    // the table lives for the run: filled in the kept phase
+    let _k = crate::zone_alloc::kept();
+    *CONFIG_ENV.lock().unwrap() = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+}
+
+/// The `[env]` entries that apply (set_config_env).
+pub fn config_env() -> Vec<(String, String)> {
+    CONFIG_ENV.lock().unwrap().clone()
+}
+
+/// `key`'s `[env]` value (set_config_env).
+pub fn config_env_value(key: &str) -> Option<String> {
+    CONFIG_ENV.lock().unwrap().iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+}
+
 /// Value of `env!(key)` / `option_env!(key)` in crate `krate`.
 pub fn crate_env_named(krate: &str, key: &str) -> Option<String> {
-    crate_env_registered(krate, key).or_else(|| std::env::var(key).ok())
+    crate_env_registered(krate, key).or_else(|| config_env_value(key)).or_else(|| std::env::var(key).ok())
 }
 
 /// The value `makepad run` registered for the crate (cargo's per-crate vars, build-script
@@ -557,4 +618,22 @@ pub fn crate_env_registered(krate: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+#[test]
+fn a_package_crate_never_keeps_a_sysroot_name() {
+    for name in ["core", "alloc", "std", "proc_macro", "test"] {
+        let own = own_crate_name(name.to_string());
+        assert_ne!(own, name);
+        assert_eq!(base_crate_name(&own), name);
+    }
+    assert_eq!(own_crate_name("alloc_menu".to_string()), "alloc_menu");
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&CRATE_ENV, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&CONFIG_ENV, relax_session::sync::Mutex::new(Vec::new()));
 }

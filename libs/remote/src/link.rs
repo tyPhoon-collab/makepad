@@ -94,22 +94,36 @@ fn link_id() -> String {
     format!("{}-{:x}", std::process::id(), crate::cmd::wall_ms())
 }
 
+impl Target {
+    /// The endpoint a discovery file names: its Unix socket, or where there are none (Windows)
+    /// its `tcp:` loopback port and the file's token.
+    pub fn of(app: &crate::discovery::App) -> Target {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(addr) = app.socket.strip_prefix("tcp:") {
+            return Target::Loopback(addr.to_string(), app.text("token").unwrap_or_default());
+        }
+        Target::Unix(PathBuf::from(&app.socket))
+    }
+}
+
 impl Client {
     pub fn new(target: Target, name: &str) -> Client {
         Client(Arc::new(Inner { target, name: name.to_string(), link_id: link_id(), conn: Mutex::new(None), ever: Mutex::new(false), seqs: Mutex::new(HashMap::new()), caps: Mutex::new(Vec::new()), timeout: Mutex::new(None) }))
     }
 
     /// Dials a local endpoint: `spec` is a socket path, a discovery file's `tcp:` socket (Windows),
-    /// a pid or an app name (discovery files).
+    /// a pid or the name of an app this program's lease started.
     pub fn connect(spec: &str) -> Result<Client, Error> {
+        Client::connect_as(spec, &crate::discovery::Caller::program())
+    }
+
+    /// [`Client::connect`], with what an app name reaches decided for `caller`.
+    pub fn connect_as(spec: &str, caller: &crate::discovery::Caller) -> Result<Client, Error> {
         let target = if spec.contains('/') || spec.ends_with(".sock") {
             Target::Unix(PathBuf::from(spec))
         } else {
-            let app = crate::discovery::find(spec).ok_or_else(|| Error::Refused(CLOSE_LINK_LOST, format!("no running makepad-remote endpoint `{spec}`")))?;
-            match app.socket.strip_prefix("tcp:") {
-                Some(addr) => Target::Loopback(addr.to_string(), app.text("token").unwrap_or_default()),
-                None => Target::Unix(PathBuf::from(app.socket)),
-            }
+            let app = crate::discovery::find(spec, caller).map_err(|why| Error::Refused(CLOSE_LINK_LOST, why))?;
+            Target::of(&app)
         };
         let c = Client::new(target, "client");
         c.conn()?;
@@ -205,6 +219,12 @@ impl Client {
         Ok(conn)
     }
 
+    /// True once the connection this client had has ended (its next call dials a new one): a
+    /// call that failed then lost the link itself, not an answer from the far side.
+    pub fn link_ended(&self) -> bool {
+        self.0.conn.lock().unwrap().as_ref().is_some_and(|c| !c.is_usable())
+    }
+
     /// The services the endpoint listed in HELLO_OK (`name/version`).
     pub fn caps(&self) -> Vec<String> {
         self.0.caps.lock().unwrap().clone()
@@ -250,7 +270,13 @@ impl Client {
 
     /// Follows the `watch` service (events) or `stream` service (chunks).
     pub fn feed(&self, service: &str) -> Feed {
-        Feed { client: self.clone(), service: service.to_string(), ch: None }
+        Feed { client: self.clone(), service: service.to_string(), ch: None, from: None }
+    }
+
+    /// [`Client::feed`] from record `from` on, as far as the endpoint's ring still holds them,
+    /// instead of from now.
+    pub fn feed_from(&self, service: &str, from: u64) -> Feed {
+        Feed { client: self.clone(), service: service.to_string(), ch: None, from: Some(from) }
     }
 
     pub fn watch(&self) -> Feed {
@@ -337,6 +363,8 @@ pub struct Feed {
     client: Client,
     service: String,
     ch: Option<Channel>,
+    /// where the first channel starts (a reconnect goes on from the last record read)
+    from: Option<u64>,
 }
 
 impl Feed {
@@ -347,8 +375,12 @@ impl Feed {
         let mut tries = 0u32;
         loop {
             if self.ch.is_none() {
-                match self.client.open(&self.service, "") {
-                    Ok(ch) => self.ch = Some(ch),
+                let args = self.from.map_or(String::new(), |from| format!("from={from}"));
+                match self.client.open(&self.service, &args) {
+                    Ok(ch) => {
+                        self.ch = Some(ch);
+                        self.from = None;
+                    }
                     Err(Error::LinkLost(w)) => {
                         tries += 1;
                         if tries > retries {

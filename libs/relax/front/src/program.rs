@@ -424,9 +424,15 @@ pub struct CrateInfo {
     pub proc_macro: bool,
     /// a binary target: the check requires its `main`
     pub is_bin: bool,
+    /// built with `--test` (libtest's main): the check requires no main of it
+    pub harness: bool,
     /// the crate's errors are reported (set by the check for its checked crates): validation-only
     /// checks run for it and for no other crate
     pub validate: bool,
+    /// a provided crate (rustc built it into the loader and `makepad run` binds it): rustc lays
+    /// its types out, so none of them takes the live layout, wherever the crate's sources are
+    /// (an edit of one rebuilds makepad, it is never patched in place). Set when the unit binds it.
+    pub rustc_laid: bool,
     /// relaxed-Rust features this crate opts in to (relaxed.rs; empty = strict), read on first
     /// use (only a relaxable error or the borrow checker asks; strict programs never read it)
     relaxed: std::sync::OnceLock<Vec<String>>,
@@ -543,13 +549,19 @@ fn retain_load_memos<K: Clone + std::hash::Hash + Eq, V: Clone>(
     entries.retain(|k, v| keep(k, v));
     let kept = entries.len();
     if kept != before {
-        *cache = Default::default();
+        *cache = cache.empty_like();
         for (k, v) in entries {
             cache.insert(k, v);
         }
     }
     (kept, before - kept)
 }
+
+/// Buckets (log2) of the per-(module, name) memos, `scope_cache` and `glob_cache`: a body check
+/// of a big workspace fills each with ~1M entries (sandbox: 0.88M and 0.98M), and a chain longer
+/// than a node or two is a cache miss per node on every lookup. 8 MB of buckets each, in zeroed
+/// pages that stay untouched until a bucket is used.
+const NAME_MEMO_BITS: u32 = 20;
 
 pub struct Program {
     collected_starts: Vec<collected::Start>,
@@ -571,6 +583,10 @@ pub struct Program {
     /// text (declarations, then the skipped bodies' part, then generated bodies): the code
     /// cache never keys or resolves closures, sites or positions through them.
     edit_versions: Vec<u32>,
+    /// Per boot file a live edit gave a version: the version current now (a refused or rolled
+    /// back version is not), and per committed version the boot file it is a version of.
+    edit_current: HashMap<u32, u32>,
+    edit_boot: HashMap<u32, u32>,
     /// Committed files used only during a warm checker crate recollection.
     check_files: Option<std::collections::HashMap<String, u32>>,
     parse_reuse: HashMap<u32, std::sync::Arc<crate::parse_work::Reuse>>,
@@ -605,10 +621,6 @@ pub struct Program {
     /// bodies are being checked: during collection nearly every lookup is unique, and a memo
     /// would cost more than it saves (set by jit::Unit::new)
     pub body_memos: std::sync::atomic::AtomicBool,
-    /// `path_segs` per path occurrence: (file, segment count, first lo, a hash of every
-    /// segment's span) -> the segments' kinds and symbols (a pure function of the file's text;
-    /// cleared when a file is replaced)
-    pub path_seg_cache: crate::conc::MemoMap<(u32, u32, u32, u64), std::sync::Arc<[(crate::ast::SegKind, Sym)]>>,
     /// traits each module's scope binds, with visibility (after import resolution)
     trait_bind_cache: crate::conc::MemoMap<u32, std::sync::Arc<Vec<(DefId, BindVis)>>>,
     /// imports are resolved (glob results no longer change)
@@ -644,7 +656,7 @@ pub struct Program {
     /// `macro_rules!` definitions seen so far (files parse in load order)
     pub macros: crate::collected::Deferred<std::sync::Arc<crate::macros::MacroTable>>,
     /// per crate root: what the preload found (macro definitions, files; preload.rs)
-    ahead: HashMap<(String, String), u32>,
+    ahead: HashMap<crate::preload::CrateKey, u32>,
     /// the preload's parse workers and the files submitted to them not yet loaded
     pool: Option<std::sync::Arc<crate::preload::Pool>>,
     pool_workers: Vec<std::thread::JoinHandle<()>>,
@@ -724,6 +736,13 @@ pub struct Program {
     pub legacy_const_args: crate::collected::ImageMap<DefId, std::sync::Arc<crate::def_collector::LegacyOwner>>,
     pub(crate) legacy_const_attrs: std::sync::Arc<HashMap<DefId, Vec<u32>>>,
     declaration_versions: HashMap<u32, DeclarationState>,
+    /// per file version: the import changes it made to the macro table (revert_version)
+    import_versions: HashMap<u32, Vec<crate::macros::ImportEdit>>,
+    /// the file version whose added items are being collected (add_items)
+    adding_to: Option<u32>,
+    /// the named modules live edits added (add_items: a new `mod x;` or `mod x { .. }`), in the
+    /// order made: `edit_added_files` finds the files of theirs that are not boot files
+    edit_mods: Vec<u32>,
     pub def_id_to_node_id: crate::collected::ImageMap<DefId, (u32, crate::def_collector::NodeId)>,
     pub impl_trait_in_trait_data: crate::collected::ImageMap<DefId, crate::assoc::ImplTraitInTraitData>,
     pub associated_types_for_impl_traits: crate::collected::ImageMap<DefId, Vec<DefId>>,
@@ -873,6 +892,8 @@ impl Program {
             mod_dirs: Default::default(),
             source_versions: Default::default(),
             edit_versions: Vec::new(),
+            edit_current: Default::default(),
+            edit_boot: Default::default(),
             check_files: None,
             parse_reuse: Default::default(),
             syms: Interner::default(),
@@ -901,6 +922,9 @@ impl Program {
             legacy_const_args: Default::default(),
             legacy_const_attrs: Default::default(),
             declaration_versions: Default::default(),
+            import_versions: Default::default(),
+            adding_to: None,
+            edit_mods: Vec::new(),
             def_id_to_node_id: Default::default(),
             impl_trait_in_trait_data: Default::default(),
             associated_types_for_impl_traits: Default::default(),
@@ -920,19 +944,18 @@ impl Program {
             trait_scope: Default::default(),
             errors: Vec::new(),
             macros: Default::default(),
-            glob_cache: Default::default(),
+            glob_cache: crate::conc::MemoMap::with_bits(NAME_MEMO_BITS),
             glob_amb_cache: Default::default(),
             glob_prec_cache: Default::default(),
             own_crates: Vec::new(),
             sim_ambiguity: None,
             sim_diags: None,
             sim_macros: None,
-            scope_cache: Default::default(),
+            scope_cache: crate::conc::MemoMap::with_bits(NAME_MEMO_BITS),
             import_used: Default::default(),
             glob_used: Default::default(),
             extern_used: Default::default(),
             body_memos: Default::default(),
-            path_seg_cache: Default::default(),
             trait_bind_cache: Default::default(),
             prelexed: Default::default(),
             ahead: Default::default(),
@@ -1208,12 +1231,35 @@ impl Program {
         out
     }
 
-    /// Current module versions, one per authored path (excluding deferred macro fragments).
-    pub fn current_source_files(&self) -> std::collections::BTreeMap<String, u32> {
-        let mut files = std::collections::BTreeMap::new();
+    /// Current module versions, one per authored path `keep` takes (excluding deferred macro
+    /// fragments).
+    pub fn current_source_files(&self, keep: impl Fn(&str) -> bool) -> std::collections::BTreeMap<String, u32> {
+        self.current_source_file_sets(keep).into_iter().filter_map(|(path, files)| Some((path, *files.last()?))).collect()
+    }
+
+    /// `current_source_files` with every crate's file of a path, one per crate: a `--lib` test
+    /// root's harness crate and the plain library its dev-dependencies link are two crates of one
+    /// path (M50). The last is the one `current_source_files` names. `keep` picks the paths before
+    /// any is copied: a live session asking whether its few saved paths are sources had every
+    /// module's path (std's too) cloned into the map, 25-40 ms of the owner per edit (Fab, 11-04).
+    pub fn current_source_file_sets(&self, keep: impl Fn(&str) -> bool) -> std::collections::BTreeMap<String, Vec<u32>> {
+        let mut files: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
+        let mut bound = Vec::with_capacity(self.mods.len());
         for module in &self.mods {
-            if let Some(path) = self.file_paths.get(module.file as usize) {
-                files.insert(path.clone(), module.file);
+            // Refused module additions keep their definitions for old compiler
+            // references, but their files are not versions of the running tree.
+            let live = module.parent_mod.is_none_or(|parent| {
+                bound[parent as usize] && (module.lexical_parent.is_some()
+                    || self.mods[parent as usize].types.get(&self.def(module.def).name) == Some(&module.def))
+            });
+            bound.push(live);
+            if !live { continue; }
+            if let Some(path) = self.file_paths.get(module.file as usize).filter(|p| keep(p)) {
+                // the last module of a path names its crate's file and orders it
+                let krate = self.file_crate.get(module.file as usize);
+                let of = files.entry(path.clone()).or_default();
+                of.retain(|&f| self.file_crate.get(f as usize) != krate);
+                of.push(module.file);
             }
         }
         files
@@ -1248,9 +1294,9 @@ impl Program {
         let root_mod = self.new_module(root_def, None, None, krate, 0);
         self.defs[root_def.0 as usize].sub = root_mod;
         self.defs[root_def.0 as usize].scope = root_mod;
-        self.crates.push(CrateInfo { name: cname, root_mod, edition, recursion_limit: 128, deps, cfg, proc_macro: false, is_bin: false, validate: false, relaxed: Default::default(), features: Default::default(), impl_view: Default::default(), root_path: root.to_string(), context: crate::source_context::Context::new(root, self.sources.clone(), &self.session) });
+        self.crates.push(CrateInfo { name: cname, root_mod, edition, recursion_limit: 128, deps, cfg, proc_macro: false, is_bin: false, harness: false, validate: false, rustc_laid: false, relaxed: Default::default(), features: Default::default(), impl_view: Default::default(), root_path: root.to_string(), context: crate::source_context::Context::new(root, self.sources.clone(), &self.session) });
         let kname = self.syms.str(cname).to_string();
-        let akey = (kname.clone(), root.to_string());
+        let akey = crate::preload::crate_key(&kname, root, &self.crates[krate as usize].cfg);
         if !self.ahead.contains_key(&akey) {
             if crate::preload::trace() {
                 eprintln!("boot-trace: {} ({}) was not preloaded", kname, root);
@@ -1294,38 +1340,14 @@ impl Program {
         // modules declared before it (the preload's scan found them)
         {
             let _profile = crate::load_profile::span(self.session.runtime.profile, "crate-macro-publication", &ahead.name);
-            let table = std::sync::Arc::make_mut(&mut self.macros);
-            for d in &ahead.defs {
-                table.push(d.clone());
-            }
-            for (k, v) in &ahead.aliases {
-                table.add_alias(k.0.clone(), k.1.clone(), v.clone());
-            }
             // the extern prelude is the crate's dependencies as this load names them (every
             // loader passes them here; a preload without them -- the bring-up checker's, the
             // proc-macro host's -- gets them now): macro paths through `dep::` resolve with it
-            let mut externs: crate::fxhash::HashMap<String, String> = ahead.mods.externs.clone();
-            for (s, ci) in &self.crates[krate as usize].deps {
-                if let Some(c) = self.crates.get(*ci as usize) {
-                    let n = self.syms.str(*s);
-                    // (std / core / alloc are in every extern prelude already)
-                    if !matches!(n, "std" | "core" | "alloc") {
-                        externs.insert(n.to_string(), self.syms.str(c.name).to_string());
-                    }
-                }
-            }
-            // Resolve scopes against the loader's complete dependency imports. Do not retain
-            // a scope the prescan computed against its earlier macro table.
-            let mods = std::sync::Arc::new(crate::macros::CrateMods { root: ahead.mods.root.clone(), src: ahead.mods.src.clone(), mods: ahead.mods.mods.clone(), items: ahead.mods.items.clone(), uses: ahead.mods.uses.clone(), externs, renames: ahead.mods.renames.clone(), recursion_limit: ahead.mods.recursion_limit, ..Default::default() });
-            table.add_crate(ahead.name.clone(), mods);
-            if !ahead.macro_use.is_empty() {
-                let v = table.macro_use.entry(ahead.name.clone()).or_default();
-                for u in &ahead.macro_use {
-                    if !v.contains(u) {
-                        v.push(u.clone());
-                    }
-                }
-            }
+            let externs: Vec<_> = self.crates[krate as usize].deps.iter().filter_map(|(s, ci)| {
+                self.crates.get(*ci as usize).map(|c| (self.syms.str(*s).to_string(), self.syms.str(c.name).to_string()))
+            }).collect();
+            crate::preload::publish_macros(std::sync::Arc::make_mut(&mut self.macros), &ahead.name,
+                &ahead.defs, &ahead.aliases, &ahead.mods, &ahead.macro_use, &externs);
         }
         if let Some(pool) = &self.pool { pool.start_parsing(ci, self.macros.clone()); }
         if !ahead.prelexed.is_empty() {
@@ -1378,6 +1400,7 @@ impl Program {
         self.cur_image = false;
         r?;
         std::sync::Arc::make_mut(&mut self.macros).seal_crate(&kname);
+        if let Some(pool) = &self.pool { pool.crate_loaded(ci, self.macros.clone()); }
         Ok(krate)
     }
 
@@ -1421,13 +1444,13 @@ impl Program {
         for h in std::mem::take(&mut self.pool_workers) {
             let _ = h.join();
         }
-        self.ahead = crates.iter().enumerate().map(|(i, c)| ((c.name.clone(), c.root.clone()), i as u32)).collect();
+        self.ahead = crates.iter().enumerate().map(|(i, c)| (c.key(), i as u32)).collect();
         if let Some(plan) = &plan {
             // A suffix retains the full recipe and dependency indices used by
             // the plan that certified its collected prefix.
             self.load_recipe = plan.crates().to_vec();
         } else { for c in &crates {
-            if let Some(saved) = self.load_recipe.iter_mut().find(|old| old.name == c.name && old.root == c.root) { *saved = c.clone(); }
+            if let Some(saved) = self.load_recipe.iter_mut().find(|old| old.name == c.name && old.root == c.root && old.cfg.holds("test") == c.cfg.holds("test")) { *saved = c.clone(); }
             else { self.load_recipe.push(c.clone()); }
         } }
         let (pool, workers) = crate::preload::start_with_plan(sess, crates, &self.macros, images, bounded, self.sources.clone(), plan);
@@ -1457,7 +1480,7 @@ impl Program {
         let mut next = Program::new(&session);
         next.sources = sources;
         next.load_recipe = recipe.clone();
-        next.ahead = recipe.iter().enumerate().map(|(i, c)| ((c.name.clone(), c.root.clone()), i as u32)).collect();
+        next.ahead = recipe.iter().enumerate().map(|(i, c)| (c.key(), i as u32)).collect();
         let (pool, workers) = crate::preload::start_with_contexts(&session, recipe, &next.macros, None, false, next.sources.clone(), contexts);
         next.demand_plan = pool.demand_plan.clone();
         next.pool = Some(pool);
@@ -1475,6 +1498,7 @@ impl Program {
             };
             next.crates[k as usize].proc_macro = c.proc_macro;
             next.crates[k as usize].is_bin = c.is_bin;
+            next.crates[k as usize].harness = c.harness;
         }
         next.prelude_crate = self.prelude_crate;
         next.resolve_imports();
@@ -1641,9 +1665,27 @@ impl Program {
         let _profile = crate::load_profile::span(self.session.runtime.profile, "front-image-write", path);
         if !sink.file(path, pf) { return; }
         pf.sink = Some(sink.clone());
+        // Worker-parsed bodies are still exclusively owned here.
+        if let Some(mut part) = pf.part.take() {
+            let mut tail = &mut pf.ast;
+            while tail.part.get().is_some_and(|a| a.part.get().is_some()) { tail = tail.part.get_mut().unwrap(); }
+            let mut ast = tail.part.take().expect("parsed part AST");
+            sink.part(pf, &mut part, &mut ast);
+            let mut tail = &mut pf.ast;
+            while tail.part.get().is_some() { tail = tail.part.get_mut().unwrap(); }
+            assert!(tail.part.set(ast).is_ok());
+            assert!(pf.part.set(part).is_ok());
+        }
         if let (crate::arena::Arena::Mapped(src), Some(c)) = (&pf.src, self.crates.get(krate as usize)) {
             if c.context.sources().map_authored(path, &src[..pf.src_len as usize]) {
-                for c in &self.crates { c.context.release_read(path); }
+                let key = crate::vfs::ReadSnapshot::key(path);
+                // (a load's contexts share one snapshot: the distinct ones are a handful)
+                let mut reads: Vec<*const crate::vfs::ReadSnapshot> = Vec::new();
+                for c in &self.crates {
+                    let snapshot = c.context.read_snapshot();
+                    let p = std::sync::Arc::as_ptr(snapshot);
+                    if !reads.contains(&p) { reads.push(p); snapshot.release(&key); }
+                }
             }
         }
     }
@@ -1727,7 +1769,7 @@ impl Program {
                 eprintln!("boot-trace-reparse: {path} ({why}) speculative_module={:?} published_module={:?}", x.mod_path, self.cur_mod_path);
             }
         }
-        let (mut pf, used, prep) = match ahead {
+        let (mut pf, mut used, mut prep) = match ahead {
             Some(x) => x,
             None => {
                 // the macro prescan read and lexed most files already
@@ -1736,12 +1778,87 @@ impl Program {
                     (None, Some((s, t))) => (s, Some(t)),
                     (None, None) => (self.crates[krate as usize].context.read_source(path)?.src.to_vec(), None),
                 };
+                if let Some(version) = self.adding_to {
+                    let c = &self.crates[krate as usize];
+                    if let Some(e) = crate::preload::new_file_imports(path, &self.cur_mod_path, &kname, c.root_path(), edition, &c.cfg, &src, &c.context) {
+                        std::sync::Arc::make_mut(&mut self.macros).apply_import_edit(&e);
+                        self.import_versions.entry(version).or_default().push(e);
+                    }
+                }
                 let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&kname, path, &self.cur_mod_path, &self.crates[krate as usize].cfg));
                 let (pf, used) = self.crates[krate as usize].context.parse_input(src, pre, edition,
                     Some(crate::macros::MacroScope::new(self.macros.clone())), bctx, crate::parser::lazy_auto())?;
                 (pf, used.unwrap(), None)
             }
         };
+        // A lookup that found no definition of the table may name one an expansion writes in a
+        // file the load reaches later or defers (`#[macro_use] mod defs;` before the call, its
+        // macro_rules! written by a macro): the crate's outline (the demand plan's expansion of
+        // its module tree) has it. Parse again with the outline's definitions of those names
+        // when one changes a lookup this parse made. They are this file's parse table only:
+        // the load publishes each definition when it reaches its file.
+        let mut parse_table = self.macros.clone();
+        let mut outline = None;
+        while !self.cur_image {
+            // (a name the crate defines already is one its textual scope does not reach here, one
+            // a `use .. as` of the crate binds resolves through that import, and a built-in's is
+            // no macro_rules!: no outline changes those, and the load does not wait for the plan)
+            let mut missing = used.failed_lookups();
+            missing.retain(|n| !parse_table.defs.get(n).is_some_and(|defs| defs.iter().any(|d| d.krate == kname)) && !used.local.iter().any(|d| &d.name == n)
+                && !parse_table.aliases.get(&kname).is_some_and(|a| a.contains_key(n))
+                && !BUILTIN_MACROS.contains(&n.as_str()) && crate::builtins::macro_def_for(&kname, n).is_none());
+            if missing.is_empty() { break; }
+            let defs = outline.get_or_insert_with(|| self.pool.as_ref().and_then(|p| p.outline_macros(self.cur_ahead)));
+            if tr { eprintln!("boot-trace-outline: {path} unresolved {missing:?}, outline {:?}", defs.as_ref().map(|d| d.iter().filter(|d| missing.contains(&d.name)).map(|d| format!("{}@{}:{}", d.name, d.def_file, d.def_pos)).collect::<Vec<_>>())); }
+            let Some(defs) = defs else { break };
+            let mut table = parse_table.clone();
+            let next = std::sync::Arc::make_mut(&mut table);
+            let mut added = false;
+            for d in defs.iter().filter(|d| missing.contains(&d.name) && d.def_file != path) {
+                if !next.defs.get(&d.name).is_some_and(|known| known.iter().any(|k| k.krate == d.krate && k.def_file == d.def_file && k.def_pos == d.def_pos)) {
+                    next.push(d.clone());
+                    added = true;
+                }
+            }
+            if !added || used.replays(&table, &kname, path) { break; }
+            let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&kname, path, &self.cur_mod_path, &self.crates[krate as usize].cfg));
+            let (fresh, uses) = self.crates[krate as usize].context.parse_input(
+                pf.src[..pf.src_len as usize].to_vec(), None, edition,
+                Some(crate::macros::MacroScope::new(table.clone())), bctx, crate::parser::lazy_auto(),
+            )?;
+            parse_table = table;
+            pf = fresh;
+            used = uses.unwrap();
+            prep = None;
+            PARSE_AGAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if tr { eprintln!("boot-trace-reparse: {path} (outline macros) {missing:?}"); }
+        }
+        // Attribute/item expansions can export macros used by an earlier signature.
+        // Revisit that parse only when publishing its own macro surface changes a
+        // recorded lookup. Rebuild from the incoming table so discarded expansions
+        // cannot leave stale definitions behind.
+        let incoming = parse_table.clone();
+        while pf.ast.tys.iter().any(|t| matches!(t, Ty::Mac(_))) {
+            let mut table = incoming.clone();
+            let next = std::sync::Arc::make_mut(&mut table);
+            for d in &used.local {
+                if !next.defs.get(&d.name).is_some_and(|defs| defs.iter().any(|known| std::sync::Arc::ptr_eq(known, d))) {
+                    next.push(d.clone());
+                }
+            }
+            if !used.uses.is_empty() { next.add_exp_uses(&kname, used.uses.clone()); }
+            if used.replays(&table, &kname, path) { break; }
+            let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&kname, path, &self.cur_mod_path, &self.crates[krate as usize].cfg));
+            let (fresh, uses) = self.crates[krate as usize].context.parse_input(
+                pf.src[..pf.src_len as usize].to_vec(), None, edition,
+                Some(crate::macros::MacroScope::new(table.clone())), bctx, crate::parser::lazy_auto(),
+            )?;
+            parse_table = table;
+            pf = fresh;
+            used = uses.unwrap();
+            prep = None;
+            PARSE_AGAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if tr && tl.elapsed().as_secs_f64() > 0.002 {
             eprintln!("boot-trace-file: {:.1} ms {} ({})", tl.elapsed().as_secs_f64() * 1e3, path, why);
         }
@@ -1757,10 +1874,11 @@ impl Program {
             let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&kname, path, &self.cur_mod_path, &self.crates[krate as usize].cfg));
             let (mut fresh, fused) = self.crates[krate as usize].context.parse_input(
                 pf.src[..pf.src_len as usize].to_vec(), None, edition,
-                Some(crate::macros::MacroScope::new(self.macros.clone())), bctx, crate::parser::lazy_auto(),
+                Some(crate::macros::MacroScope::new(parse_table.clone())), bctx, crate::parser::lazy_auto(),
             ).unwrap_or_else(|e| panic!("front verify parse {}: {:?}", path, e));
             fresh.bind_sources(path, &self.sources).expect("front verify sources");
             let fprep = prepare_file(&mut fresh, &self.crates[krate as usize].cfg);
+            if pf.part.get().is_some() { let _ = fresh.part(&self.crates[krate as usize].cfg); }
             verify(&pf, &fresh);
             assert_eq!(crate::crate_image::encode(&used), crate::crate_image::encode(&fused.unwrap()), "front MacroUse: {}", path);
             assert_eq!(crate::crate_image::encode(&prep), crate::crate_image::encode(&fprep), "front FilePrep: {}", path);
@@ -1810,7 +1928,9 @@ impl Program {
         let krate = self.file_crate[old as usize];
         let kname = self.syms.str(self.crates[krate as usize].name).to_string();
         // the module path the file was loaded under (module_path!())
-        let mod_path = match self.reload_files().mods.get(&old).into_iter().flatten().map(|&m| &self.mods[m as usize]).find(|m| m.lexical_parent.is_none()) {
+        let own_module = self.reload_files().mods.get(&old).into_iter().flatten().copied().find(|&m| self.mods[m as usize].lexical_parent.is_none());
+        let dir = own_module.map_or_else(|| dir_of(path).to_string(), |m| self.module_source_directory(m).0);
+        let mod_path = match own_module.map(|m| &self.mods[m as usize]) {
             Some(m) if m.def.0 != u32::MAX && (m.def.0 as usize) < self.defs.len() && self.defs[m.def.0 as usize].kind == DefKind::Mod && self.defs[m.def.0 as usize].file != old => {
                 self.def_path(m.def)
             }
@@ -1823,7 +1943,7 @@ impl Program {
                 std::sync::Arc::make_mut(&mut macros).crates.insert(kname.clone(), context);
             }
         }
-        ParseSnapshot { old, path: path.to_string(), edition, kname, mod_path,
+        ParseSnapshot { old, path: path.to_string(), edition, kname, mod_path, dir, root: root.to_string(), together: Vec::new(),
             cfg: self.crates[krate as usize].cfg.clone(), macros,
             reuse: self.parse_reuse.get(&old).cloned().unwrap_or_default(),
             previous: Some(self.files[old as usize].clone()), context: self.crates[krate as usize].context.clone() }
@@ -1838,6 +1958,7 @@ impl Program {
         let normal = self.mods[parent as usize].normal;
         let mod_path = format!("{}::{}", self.def_path(self.mods[normal as usize].def), child);
         ParseSnapshot { old: self.mods[normal as usize].file, path: path.to_string(), edition: self.crates[krate as usize].edition, kname, mod_path,
+            dir: dir_of(path).to_string(), root: self.crates[krate as usize].root_path().to_string(), together: Vec::new(),
             cfg: self.crates[krate as usize].cfg.clone(), macros: self.macros.clone(), reuse: Default::default(), previous: None,
             context: self.crates[krate as usize].context.clone() }
     }
@@ -1875,7 +1996,7 @@ impl Program {
         self.defs[d.0 as usize].sub = m;
         self.mods[m as usize].globs.push((pdef, false));
         if self.imports_done {
-            self.scope_cache.clear();
+            self.forget_bindings();
         }
         let dir = dir_of(&self.file_paths[f as usize]).to_string();
         let items: Vec<ItemId> = self.files[f as usize].ast.root_items.iter().copied().collect();
@@ -2017,7 +2138,6 @@ impl Program {
     pub fn memo_mem_lines(&self) -> Vec<(String, u64)> {
         let mut out = Vec::new();
         let mut push = |name: &str, (n, b): (usize, usize)| out.push((format!("program {} ({})", name, n), b as u64));
-        push("path_seg_cache", self.path_seg_cache.mem_stats(|_, v| 16 + v.len() * std::mem::size_of::<(crate::ast::SegKind, Sym)>()));
         push("scope_cache", self.scope_cache.mem_stats(|_, _| 0));
         push("glob_cache", self.glob_cache.mem_stats(|_, _| 0));
         push("trait_bind_cache", self.trait_bind_cache.mem_stats(|_, v| 40 + v.capacity() * std::mem::size_of::<(DefId, BindVis)>()));
@@ -2032,7 +2152,6 @@ impl Program {
     pub unsafe fn detach_caches(&self, retired: &mut Vec<Box<dyn Send>>) {
         retired.push(Box::new(self.glob_cache.detach()));
         retired.push(Box::new(self.scope_cache.detach()));
-        retired.push(Box::new(self.path_seg_cache.detach()));
         retired.push(Box::new(self.trait_bind_cache.detach()));
         retired.push(Box::new(self.trait_scope.detach()));
     }
@@ -2043,8 +2162,15 @@ impl Program {
     pub unsafe fn reclaim_caches(&self) {
         self.glob_cache.reclaim();
         self.scope_cache.reclaim();
-        self.path_seg_cache.reclaim();
         self.trait_bind_cache.reclaim();
+        self.trait_scope.reclaim();
+    }
+
+    /// A module's bindings changed: what name lookups and the traits in scope answered goes.
+    fn forget_bindings(&self) {
+        self.scope_cache.clear();
+        self.trait_bind_cache.clear();
+        self.trait_scope.clear();
     }
 
     /// Hot reload: makes a parsed version current. `pairs`: (old item, new item) for every item
@@ -2054,6 +2180,67 @@ impl Program {
     /// Whether file `f` is a version a live edit committed (`edit_versions`).
     pub fn is_edit_version(&self, f: u32) -> bool {
         self.edit_versions.contains(&f)
+    }
+
+    /// Whether a live edit committed a file version, current or not (a refused or rolled-back
+    /// version stays loaded): the program's tables are no longer the boot's.
+    pub fn has_edit_versions(&self) -> bool {
+        !self.edit_versions.is_empty()
+    }
+
+    /// Per boot file a live edit gave a version: the version current now.
+    pub fn current_versions(&self) -> &HashMap<u32, u32> {
+        &self.edit_current
+    }
+
+    /// The files of the modules live edits added (a new `mod x;` loaded its file after the boot,
+    /// by the edit or by the post-boot loader later) that are in the program's text now: each as
+    /// (the index it was loaded at, its version current now). With the boot files they are the
+    /// text the code cache's keys follow after an edit (cache.rs keys_follow_text).
+    pub fn edit_added_files(&self) -> Vec<(u32, u32)> {
+        let first = |f: u32| self.edit_boot.get(&f).copied().unwrap_or(f);
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for &m in &self.edit_mods {
+            let md = &self.mods[m as usize];
+            // (an inline module's file is its parent's; a module whose file is not loaded yet has
+            // none of its own)
+            let f = first(md.file);
+            if (f as usize) < self.boot_files || f as usize >= self.files.len() || f == first(self.def(md.def).file) {
+                continue;
+            }
+            if self.module_in_text(m) && !out.iter().any(|x| x.0 == f) {
+                out.push((f, self.edit_current.get(&f).copied().unwrap_or(f)));
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Whether named module `m` is in the program's text now: the `mod` item of each module up to
+    /// one a boot file declares is in its file's current version, and binds the module there (an
+    /// edit that removed it, or was refused, unbound it).
+    fn module_in_text(&self, m: u32) -> bool {
+        let mut m = m;
+        for _ in 0..256 {
+            let md = &self.mods[m as usize];
+            let Some(parent) = md.parent_mod else { return true };
+            let d = self.def(md.def);
+            if !self.is_current_version(d.file) || self.mods[parent as usize].types.get(&d.name) != Some(&md.def) {
+                return false;
+            }
+            if (self.edit_boot.get(&d.file).copied().unwrap_or(d.file) as usize) < self.boot_files {
+                return true;
+            }
+            m = self.mods[parent as usize].normal;
+        }
+        false
+    }
+
+    /// Whether file `f` is the version current now: a boot file no edit replaced, or the version
+    /// an edit made current (a replaced, refused or rolled-back version is not).
+    pub fn is_current_version(&self, f: u32) -> bool {
+        let boot = self.edit_boot.get(&f).copied().unwrap_or(f);
+        self.edit_current.get(&boot).map_or(true, |&now| now == f)
     }
 
     pub fn commit_version(&mut self, v: FileVersion, pairs: &[(u32, u32)]) -> Result<u32, String> {
@@ -2087,18 +2274,15 @@ impl Program {
             let s = std::str::from_utf8(&v.pf.src[lo as usize..hi as usize]).unwrap_or("?").to_string();
             self.syms.intern(&s);
         }
-        // A path's segments depend only on its file's text (a file version never changes) and
-        // on whether each name is interned yet; path_segs recomputes an entry that met a name
-        // not interned, so the memo stays valid across a scoped item edit. Clearing (and freeing)
-        // it cost ~0.7 s per item edit once boot filled it (lead decision 52 R1).
-        if !same_scopes && visible.is_none() {
-            self.path_seg_cache.clear();
-        }
+        let new = self.files.len() as u32;
         let table = std::sync::Arc::make_mut(&mut self.macros);
         for d in v.macros {
             table.push(d);
         }
-        let new = self.files.len() as u32;
+        if let Some(e) = v.imports {
+            table.apply_import_edit(&e);
+            self.import_versions.insert(new, vec![e]);
+        }
         let fwd: HashMap<u32, u32> = pairs.iter().copied().collect();
         // block modules: the same (paired) items under a block (block ids shift with the edit)
         let mut by_items: HashMap<Vec<u32>, u32> = HashMap::default();
@@ -2123,6 +2307,9 @@ impl Program {
         self.source_versions.entry(old).or_insert_with(|| self.crates[krate as usize].context.clone());
         self.source_versions.insert(new, v.context.clone());
         self.edit_versions.push(new);
+        let boot = self.edit_boot.get(&old).copied().unwrap_or(old);
+        self.edit_boot.insert(new, boot);
+        self.edit_current.insert(boot, new);
         self.crates[krate as usize].context = v.context;
         let mut pf = v.pf;
         self.map_image(&v.path, krate, &mut pf);
@@ -2228,12 +2415,17 @@ impl Program {
     /// Hot reload: a refused patch (or a rolled-back one) points every def of `new` back at
     /// `old` (the version stays loaded, unused). `pairs` as given to commit_version.
     pub fn revert_version(&mut self, old: u32, new: u32, pairs: &[(u32, u32)]) {
+        if let Some(&boot) = self.edit_boot.get(&new) {
+            if old == boot { self.edit_current.remove(&boot); } else { self.edit_current.insert(boot, old); }
+        }
         if let Some(context) = self.source_versions.get(&old) {
             self.crates[self.file_crate[old as usize] as usize].context = context.clone();
         }
         self.parse_reuse.remove(&new);
-        self.path_seg_cache.clear();
-        self.scope_cache.clear();
+        self.forget_bindings();
+        for e in self.import_versions.remove(&new).unwrap_or_default().into_iter().rev() {
+            std::sync::Arc::make_mut(&mut self.macros).apply_import_edit(&e.undone());
+        }
         let back: Vec<(u32, u32)> = pairs.iter().map(|&(a, b)| (b, a)).collect();
         self.retarget_file(new, old, &back);
         self.collect_version_definitions(old, false, false, None).expect("previously collected definition body");
@@ -2243,40 +2435,47 @@ impl Program {
     /// Hot reload: collects items a new file version added. `items`: (item, where it goes):
     /// `Ok(module)` for a module-level item, `Err(impl def)` for an associated item of an existing
     /// impl. Returns the new defs (names bound in their modules, impls registered).
-    /// A live edit added variants at the end of enum `d` (M10): their defs, after the running
-    /// ones. Returns how many variants the enum had (for `truncate_variants` on a refusal).
-    pub fn add_variants(&mut self, d: DefId) -> usize {
+    /// The variant defs of enum `d` from its item's text (a live edit, M10): a running variant
+    /// keeps its def by name wherever the text now puts it (its index, `sub`, follows; code
+    /// type-checked before the edit names a variant by its def), and an added one gets a new def.
+    /// Reload compares the result with its running AdtT snapshot. Returns the list the enum had,
+    /// for `restore_variants` on a refusal.
+    pub fn add_variants(&mut self, d: DefId) -> Vec<DefId> {
         let (file, item, sub, dkrate, dscope) = {
             let df = self.def(d);
             (df.file, df.item, df.sub, df.krate, df.scope)
         };
         let li = sub as usize;
-        let had = self.variants.get(li).map_or(0, |v| v.len());
+        let had: Vec<DefId> = self.variants.get(li).cloned().unwrap_or_default();
         let names: Vec<Ident> = match &self.files[file as usize].ast.item(item).kind {
             ItemKind::Enum(r) => { let ast = &self.files[file as usize].ast; ast.list(ast.row(*r).variants).iter().map(|x| x.name).collect() }
             _ => return had,
         };
-        let (krate, scope) = self.variants.get(li).and_then(|v| v.first()).map_or((dkrate, dscope), |&v0| (self.def(v0).krate, self.def(v0).scope));
-        // The definition table describes the published source, including renamed
-        // or reordered variants. Reload compares it with its running AdtT snapshot.
-        for vi in 0..had.min(names.len()) {
-            let name = self.ident(file, names[vi]);
-            let vd = self.variants[li][vi];
-            self.defs[vd.0 as usize].name = name;
+        let Some(_) = self.variants.get(li) else { return had };
+        let (krate, scope) = had.first().map_or((dkrate, dscope), |&v0| (self.def(v0).krate, self.def(v0).scope));
+        let mut list: Vec<DefId> = Vec::with_capacity(names.len());
+        for (vi, n) in names.iter().enumerate() {
+            let name = self.ident(file, *n);
+            let vd = match had.iter().copied().find(|v| self.defs[v.0 as usize].name == name && !list.contains(v)) {
+                Some(v) => v,
+                None => self.add_def(Def { kind: DefKind::Variant, name, parent: d, file, item, sub: vi as u32, is_pub: true, krate, scope }),
+            };
+            self.defs[vd.0 as usize].sub = vi as u32;
+            list.push(vd);
         }
-        for vi in had..names.len() {
-            let vname = self.ident(file, names[vi]);
-            let vd = self.add_def(Def { kind: DefKind::Variant, name: vname, parent: d, file, item, sub: vi as u32, is_pub: true, krate, scope });
-            self.variants[li].push(vd);
-        }
+        self.variants[li] = list;
         had
     }
 
-    /// Undoes `add_variants` (a refused edit): enum `d` has `n` variants again.
-    pub fn truncate_variants(&mut self, d: DefId, n: usize) {
+    /// Undoes `add_variants` (a refused edit): enum `d` has the variant defs `had` again, each at
+    /// its index.
+    pub fn restore_variants(&mut self, d: DefId, had: &[DefId]) {
         let li = self.def(d).sub as usize;
+        for (vi, v) in had.iter().enumerate() {
+            self.defs[v.0 as usize].sub = vi as u32;
+        }
         if let Some(v) = self.variants.get_mut(li) {
-            v.truncate(n);
+            *v = had.to_vec();
         }
     }
 
@@ -2284,16 +2483,28 @@ impl Program {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        self.adding_to = Some(file);
+        let added = self.collect_added_items(file, items);
+        self.adding_to = None;
+        added
+    }
+
+    fn collect_added_items(&mut self, file: u32, items: &[(ItemId, Result<u32, DefId>)]) -> Result<Vec<DefId>, String> {
         let first = self.defs.len();
         for &(iid, at) in items {
             match at {
-                Ok(module) => self.collect_items(file, &[iid], module, "", false)?,
-                Err(imp) => {
-                    let krate = self.defs[imp.0 as usize].krate;
-                    let module = self.defs[imp.0 as usize].scope;
-                    if let Some(ad) = self.collect_assoc(file, iid, imp, krate, module)? {
-                        let ii = self.defs[imp.0 as usize].sub as usize;
-                        self.impls[ii].items.push(ad);
+                Ok(module) => {
+                    let (dir, mod_rs) = self.module_source_directory(module);
+                    self.collect_items(file, &[iid], module, &dir, mod_rs)?;
+                }
+                Err(owner) => {
+                    let krate = self.defs[owner.0 as usize].krate;
+                    let module = self.defs[owner.0 as usize].scope;
+                    if let Some(ad) = self.collect_assoc(file, iid, owner, krate, module)? {
+                        // an impl's item, or a trait's: after the items it has (their places in
+                        // the trait's vtable stay)
+                        let sub = self.defs[owner.0 as usize].sub as usize;
+                        if self.defs[owner.0 as usize].kind == DefKind::Trait { self.traits[sub].push(ad); } else { self.impls[sub].items.push(ad); }
                         self.collect_body_items(file, iid, module, Some(ad))?;
                         crate::def_collector::collect_definitions(self, ad)?;
                     }
@@ -2301,13 +2512,42 @@ impl Program {
             }
         }
         if self.imports_done {
-            self.scope_cache.clear();
+            self.forget_bindings();
             self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
         }
         // only the crates that can see `file` can see what it added (lead decision 52 R1)
         let visible = self.crates_seeing_files([file].into_iter());
         crate::assoc::collect_in(self, Some(&visible));
         Ok((first as u32..self.defs.len() as u32).map(DefId).collect())
+    }
+
+    /// Derive child-module lookup from the published declarations, including
+    /// when the program was restored from a collected image (mod_dirs is a
+    /// loader cache). Match collect_items' inline and #[path] ownership rules.
+    fn module_source_directory(&self, module: u32) -> (String, bool) {
+        let module = &self.mods[self.mods[module as usize].normal as usize];
+        let path = &self.file_paths[module.file as usize];
+        let Some(parent) = module.parent_mod else { return (dir_of(path).into(), true) };
+        let def = self.def(module.def);
+        let pf = &self.files[def.file as usize];
+        let item = pf.ast.item(def.item);
+        let mut paths = Vec::new();
+        crate::crates::path_attrs_cfg(self.src(def.file), pf.ast.list(item.attrs), &self.crates[module.krate as usize].cfg, &mut paths);
+        if matches!(item.kind, ItemKind::Mod(None)) {
+            let mod_rs = !paths.is_empty() || path.ends_with("/mod.rs");
+            return (if mod_rs { dir_of(path).into() } else { format!("{}/{}", dir_of(path), stem_of(path)) }, mod_rs);
+        }
+        let (mut dir, mod_rs) = self.module_source_directory(parent);
+        if let Some(authored) = pf.authored_path(item.lo).filter(|p| p != &self.file_paths[def.file as usize]) {
+            dir = if mod_rs { dir_of(&authored).into() } else { format!("{}/{}", dir_of(&authored), dir.rsplit('/').next().unwrap_or("")) };
+        }
+        let child = if let Some(relative) = paths.first() {
+            let base = if mod_rs { dir.as_str() } else { dir_of(&self.file_paths[def.file as usize]) };
+            crate::crates::join_path(base, relative)
+        } else {
+            format!("{}/{}", dir, self.syms.str(def.name))
+        };
+        (child, true)
     }
 
     /// Recollect one crate from the checker's current file versions. Other crates' ASTs
@@ -2411,8 +2651,13 @@ impl Program {
                     self.impls[ii].items.retain(|x| *x != d);
                 }
             }
+            // a trait's item leaves its trait (a trait that goes keeps its list: it is unbound)
+            if parent.0 != u32::MAX && (parent.0 as usize) < self.defs.len() && self.defs[parent.0 as usize].kind == DefKind::Trait && !defs.contains(&parent) {
+                let ti = self.defs[parent.0 as usize].sub as usize;
+                if let Some(items) = self.traits.get_mut(ti) { items.retain(|x| *x != d); }
+            }
         }
-        self.scope_cache.clear();
+        self.forget_bindings();
         self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
     }
 
@@ -2449,14 +2694,104 @@ impl Program {
             self.imports[i].bound &= !(BOUND_TYPES | BOUND_VALUES);
             out.push(UseUndo { index: i, module: m, bind, done, glob, bound, gone });
         }
-        self.scope_cache.clear();
+        self.forget_bindings();
         self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
         out
     }
 
-    /// Undoes `unbind_use` (a refused edit).
+    /// Hot reload: the imports that bound one of `defs` (defs an edit removed, a fn's old def
+    /// that a new signature replaced among them) resolve again from their paths, as a fresh run
+    /// resolves them: to the def at the path now, or to nothing. Returns the undo record
+    /// (`rebind_use`) and the imports that no longer resolve: (file, position, path).
+    pub fn reresolve_imports_of(&mut self, defs: &[DefId]) -> (Vec<UseUndo>, Vec<(u32, u32, String)>) {
+        let gone_defs: crate::fxhash::HashSet<DefId> = defs.iter().copied().collect();
+        let (mut undo, mut again) = (Vec::new(), Vec::new());
+        for i in 0..self.imports.len() {
+            let im = &self.imports[i];
+            let (true, false, Some(name)) = (im.done, im.glob, im.bind) else { continue };
+            let (m, bound) = (im.module, im.bound);
+            let md = &self.mods[m as usize];
+            let hit = (bound & BOUND_TYPES != 0 && md.types.get(&name).is_some_and(|d| gone_defs.contains(d)))
+                || (bound & BOUND_VALUES != 0 && md.values.get(&name).is_some_and(|d| gone_defs.contains(d)));
+            if !hit {
+                continue;
+            }
+            let mut gone = Vec::new();
+            for (is_type, bit) in [(true, BOUND_TYPES), (false, BOUND_VALUES)] {
+                if bound & bit == 0 {
+                    continue;
+                }
+                let md = &mut self.mods[m as usize];
+                let d = if is_type { md.types.remove(&name) } else { md.values.remove(&name) };
+                let flags = md.import_pub.remove(&(name, is_type)).unwrap_or(0);
+                if let Some(d) = d {
+                    gone.push((is_type, name, d, flags));
+                }
+            }
+            undo.push(UseUndo { index: i, module: m, bind: Some(name), done: true, glob: false, bound, gone });
+            self.imports[i].done = false;
+            self.imports[i].bound &= !(BOUND_TYPES | BOUND_VALUES);
+            again.push(i);
+        }
+        if again.is_empty() {
+            return (undo, Vec::new());
+        }
+        self.forget_bindings();
+        self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
+        // strict passes while they make progress, then one that settles (resolve_imports_passes)
+        for settle in [false, true] {
+            self.import_settle = settle;
+            loop {
+                let mut progress = false;
+                for &i in &again {
+                    if !self.imports[i].done && self.try_import(i) {
+                        self.imports[i].done = true;
+                        progress = true;
+                    }
+                }
+                if !progress {
+                    break;
+                }
+            }
+        }
+        self.import_settle = false;
+        self.forget_bindings();
+        self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
+        let unresolved = again.iter().filter(|&&i| !self.imports[i].done).map(|&i| (self.imports[i].file, self.imports[i].pos, self.import_path(i))).collect();
+        (undo, unresolved)
+    }
+
+    /// An import's path as written (`crate::w::f`, `w::*`).
+    fn import_path(&self, i: usize) -> String {
+        let im = &self.imports[i];
+        let mut p = String::new();
+        for (k, s) in &im.segs {
+            if !p.is_empty() {
+                p.push_str("::");
+            }
+            p.push_str(match k {
+                SegKind::Crate => "crate",
+                SegKind::SelfValue => "self",
+                SegKind::Super => "super",
+                _ => self.syms.str(*s),
+            });
+        }
+        if im.glob {
+            p.push_str("::*");
+        }
+        p
+    }
+
+    /// Undoes `unbind_use` and `reresolve_imports_of` (a refused or rolled-back edit): what the
+    /// import binds now goes, what it bound before comes back.
     pub fn rebind_use(&mut self, undo: Vec<UseUndo>) {
-        for u in undo {
+        for u in undo.into_iter().rev() {
+            let im = &self.imports[u.index];
+            if let (true, Some(name)) = (im.done, im.bind) {
+                let md = &mut self.mods[u.module as usize];
+                if im.bound & BOUND_TYPES != 0 { md.types.remove(&name); md.import_pub.remove(&(name, true)); }
+                if im.bound & BOUND_VALUES != 0 { md.values.remove(&name); md.import_pub.remove(&(name, false)); }
+            }
             let im = &mut self.imports[u.index];
             im.bind = u.bind;
             im.done = u.done;
@@ -2468,7 +2803,7 @@ impl Program {
                 md.import_pub.insert((name, is_type), flags);
             }
         }
-        self.scope_cache.clear();
+        self.forget_bindings();
         self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
     }
 
@@ -2496,7 +2831,7 @@ impl Program {
         for (j, im) in self.imports.iter().enumerate() {
             self.imports_of_module.entry(im.module).or_default().push(j as u32);
         }
-        self.scope_cache.clear();
+        self.forget_bindings();
         self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
     }
 
@@ -2509,17 +2844,21 @@ impl Program {
                 DefKind::Fn | DefKind::Const | DefKind::Static => self.define(scope, false, name, d),
                 DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Trait | DefKind::Mod => self.define(scope, true, name, d),
                 DefKind::AssocFn | DefKind::AssocConst | DefKind::AssocTy => {
-                    if self.defs[parent.0 as usize].kind == DefKind::Impl {
-                        let ii = self.defs[parent.0 as usize].sub as usize;
-                        if !self.impls[ii].items.contains(&d) {
-                            self.impls[ii].items.push(d);
-                        }
+                    let sub = self.defs[parent.0 as usize].sub as usize;
+                    let items = match self.defs[parent.0 as usize].kind {
+                        DefKind::Impl => Some(&mut self.impls[sub].items),
+                        // (the caller restores the trait's order: its vtable's)
+                        DefKind::Trait => self.traits.get_mut(sub),
+                        _ => None,
+                    };
+                    if let Some(items) = items.filter(|v| !v.contains(&d)) {
+                        items.push(d);
                     }
                 }
                 _ => {}
             }
         }
-        self.scope_cache.clear();
+        self.forget_bindings();
         self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
     }
 
@@ -2572,6 +2911,14 @@ impl Program {
         for id in reload(&mut self.reload).mods.remove(&from).unwrap_or_default() {
             self.set_mod_file(id, to);
         }
+        // An import sits at its `use` item, which a later edit finds it by (unbind_use).
+        let (was, now) = (&self.files[from as usize].ast, &self.files[to as usize].ast);
+        let moved: HashMap<u32, u32> = m.iter()
+            .filter(|(&a, _)| matches!(was.items[a as usize].kind, ItemKind::Use { .. } | ItemKind::ExternCrate(_)))
+            .map(|(&a, &b)| (was.items[a as usize].lo, now.items[b as usize].lo)).collect();
+        for im in self.imports.iter_mut().filter(|im| im.file == from) {
+            if let Some(&pos) = moved.get(&im.pos) { im.file = to; im.pos = pos; }
+        }
         for (&a, &b) in m.iter() {
             if let Some(&d) = self.item_defs.get(&(from, a)) {
                 self.item_defs.insert((to, b), d);
@@ -2586,6 +2933,7 @@ impl Program {
             None => idx,
         };
         if let Some(r) = self.reload.get_mut() { r.mods.entry(file).or_default().push(idx); }
+        if self.adding_to.is_some() && lexical_parent.is_none() { self.edit_mods.push(idx); }
         self.mods.push(Module {
             def,
             lexical_parent,
@@ -2809,7 +3157,7 @@ impl Program {
                                 }
                                 if exists {
                                     // rustc_expand module.rs `default_submod_path`: both `x.rs` and `x/mod.rs` exist
-                                    if path_attr.is_empty() && cands.len() == 2 && *c == cands[0] && crate::lexer::validation_enabled() {
+                                    if path_attr.is_empty() && cands.len() == 2 && *c == cands[0] {
                                         let other = &cands[1];
                                         let other_exists = self.check_files.as_ref().map_or(false, |m| m.contains_key(other)) || self.crates[krate as usize].context.exists(other);
                                         self.module_probes.push((other.clone(), other_exists));
@@ -2823,7 +3171,7 @@ impl Program {
                                             break;
                                         }
                                     }
-                                    if self.demand_plan.as_ref().is_some_and(|p| p.skips(self.crates[krate as usize].root_path(), c)) {
+                                    if self.demand_plan.as_ref().is_some_and(|p| p.skips(self.crates[krate as usize].root_path(), self.crates[krate as usize].cfg.holds("test"), c)) {
                                         let is_mod_rs = child_mod_rs || c.ends_with("/mod.rs");
                                         let cdir = if is_mod_rs { dir_of(c).to_string() } else { format!("{}/{}", dir_of(c), stem_of(c)) };
                                         self.skipped_files.insert(m, (c.clone(), cdir, is_mod_rs));
@@ -3228,8 +3576,7 @@ impl Program {
     fn resolve_imports_in(&mut self, visible: Option<&[bool]>) {
         self.imports_done = false;
         self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
-        self.trait_bind_cache.clear();
-        self.scope_cache.clear();
+        self.forget_bindings();
         self.resolve_imports_fixpoint(0);
         self.imports_done = true;
         crate::assoc::collect_in(self, visible);
@@ -3271,6 +3618,7 @@ impl Program {
         self.imports_done = false;
         self.resolve_imports_fixpoint(i0);
         self.imports_done = true;
+        self.forget_bindings();
         crate::assoc::collect_in(self, Some(visible));
     }
 
@@ -3751,23 +4099,19 @@ impl Program {
         // Scope/trait-scope also read the implicit prelude. A changed prelude
         // therefore invalidates those scopes even without an explicit glob edge.
         let prelude_changed = self.prelude_modules().iter().any(|m| invalid.contains(m));
-        let files: crate::fxhash::HashSet<u32> = invalid.iter().map(|&m| self.mods[m as usize].file).collect();
         let scope = retain_load_memos(&mut self.scope_cache, |(m, _, _), v| !prelude_changed && !invalid.contains(m) && v.is_some());
         let glob = retain_load_memos(&mut self.glob_cache, |(m, _, _), v| !invalid.contains(m) && v.is_some());
-        // Segments are file text, not resolution results. Invalidate the files of
-        // changed scopes conservatively; unchanged files cannot acquire new text.
-        let path_seg = retain_load_memos(&mut self.path_seg_cache, |(f, _, _, _), _| !files.contains(f));
         let trait_bind = retain_load_memos(&mut self.trait_bind_cache, |m, v| !invalid.contains(m) && !v.is_empty());
         let trait_scope = retain_load_memos(&mut self.trait_scope, |m, v| !prelude_changed && !invalid.contains(m) && !v.is_empty());
         self.imports_done = true;
         self.load_graph = Some(graph);
         if std::env::var_os("MAKEPAD_RUN_DEFERRED_TRACE").is_some() {
-            let kept = scope.0 + glob.0 + path_seg.0 + trait_bind.0 + trait_scope.0;
-            let dropped = scope.1 + glob.1 + path_seg.1 + trait_bind.1 + trait_scope.1;
-            eprintln!("makepad-run deferred: front-load {} imports_retried={} imports_done={} settle_retries={} wait_modules={} modules_invalidated={} cache_kept={} cache_dropped={} prelude_changed={} scope={:?} glob={:?} path_seg={:?} trait_bind={:?} trait_scope={:?} index_built={}",
+            let kept = scope.0 + glob.0 + trait_bind.0 + trait_scope.0;
+            let dropped = scope.1 + glob.1 + trait_bind.1 + trait_scope.1;
+            eprintln!("makepad-run deferred: front-load {} imports_retried={} imports_done={} settle_retries={} wait_modules={} modules_invalidated={} cache_kept={} cache_dropped={} prelude_changed={} scope={:?} glob={:?} trait_bind={:?} trait_scope={:?} index_built={}",
                 self.def_path(self.mods[m as usize].def), retried, completed, settled, affected.len(),
                 if prelude_changed { self.mods.len() } else { invalid.len() }, kept, dropped, prelude_changed,
-                scope, glob, path_seg, trait_bind, trait_scope, indexed);
+                scope, glob, trait_bind, trait_scope, indexed);
         }
         Ok((d0, bindings_changed))
     }
@@ -3854,22 +4198,8 @@ impl Program {
         let reportable: Vec<usize> = pending.into_iter().filter(|&i| self.import_reportable(i, &mut macro_binds)).collect();
         for i in reportable {
             if !deferred.contains(&i) {
+                let p = self.import_path(i);
                 let im = &self.imports[i];
-                let mut p = String::new();
-                for (k, s) in &im.segs {
-                    if !p.is_empty() {
-                        p.push_str("::");
-                    }
-                    p.push_str(match k {
-                        SegKind::Crate => "crate",
-                        SegKind::SelfValue => "self",
-                        SegKind::Super => "super",
-                        _ => self.syms.str(*s),
-                    });
-                }
-                if im.glob {
-                    p.push_str("::*");
-                }
                 let f = &self.files[im.file as usize];
                 let source_pos = f.diagnostic_pos(im.pos);
                 let source_pos = source_pos.min(f.src_len);
@@ -3934,7 +4264,7 @@ impl Program {
         let mut tdef = None;
         let mut vdef = None;
         let mut src_mod: Option<u32> = None;
-        if segs.len() == 1 && (global || (edition >= 2018 && last_kind == SegKind::Ident)) {
+        if segs.len() == 1 && ((global && (edition >= 2018 || self.imports[i].ext)) || (edition >= 2018 && last_kind == SegKind::Ident)) {
             // `use foo;` / `extern crate foo` / `use ::foo` -> extern crate, else item in scope
             if let Some(c) = self.extern_crate(module, last) {
                 tdef = Some(self.mods[self.crates[c as usize].root_mod as usize].def);
@@ -3949,7 +4279,7 @@ impl Program {
             };
             tdef = Some(m);
         } else if segs.len() == 1 {
-            // 2015 edition: `use x;` / `use {x, y};` name items of the crate root (Reference
+            // 2015 edition: `use x;` / `use ::x;` / `use {x, y};` name items of the crate root (Reference
             // items/use-declarations.md: "In the 2015 edition, `use` paths are relative to the crate
             // root"); extern crates are reached there too (2015 has them in the root)
             let root = self.mods[self.crates[my_crate as usize].root_mod as usize].def;
@@ -4234,8 +4564,8 @@ impl Program {
     /// Imports of the checked crates that name nothing rustc would resolve but Relax's lenient
     /// resolution accepts: a path through `alloc` without `extern crate alloc;` (not in the extern
     /// prelude), and a macro-named import through a module that does not exist. Run once the
-    /// checked crates are known; each is rustc's E0432.
-    pub fn strict_import_errors(&self, own: &[bool]) -> Vec<String> {
+    /// checked crates are known; each is rustc's E0432 (with the import's index: it counts as used).
+    pub fn strict_import_errors(&self, own: &[bool]) -> Vec<(usize, String)> {
         let mut out = Vec::new();
         let mut macro_binds: Option<crate::fxhash::HashSet<Sym>> = None;
         for i in 0..self.imports.len() {
@@ -4253,7 +4583,7 @@ impl Program {
             let p: Vec<&str> = im.segs.iter().map(|(k, s)| match k { SegKind::Crate => "crate", SegKind::SelfValue => "self", SegKind::Super => "super", _ => self.syms.str(*s) }).collect();
             let f = &self.files[im.file as usize];
             let pos = f.diagnostic_pos(im.pos).min(f.src_len);
-            out.push(self.record_error(im.file, pos, "resolve", format!("E0432: unresolved import `{}`", p.join("::"))));
+            out.push((i, self.record_error(im.file, pos, "resolve", format!("E0432: unresolved import `{}`", p.join("::")))));
         }
         out
     }
@@ -4272,7 +4602,7 @@ impl Program {
             let mut bits = vec![0u64; n.div_ceil(64)];
             let mut todo = vec![view as usize];
             for (c, k) in self.crates.iter().enumerate() {
-                if matches!(crate::crates::base_crate_name(self.syms.str(k.name)), "core" | "alloc" | "std") { todo.push(c); }
+                if matches!(self.syms.str(k.name), "core" | "alloc" | "std") { todo.push(c); }
             }
             while let Some(c) = todo.pop() {
                 if c >= n || bits[c / 64] & (1 << (c % 64)) != 0 { continue; }
@@ -4645,7 +4975,7 @@ impl Program {
             let r = self.lookup_in_module_pass(m, name, ns_type, q);
             let stale = q.hits.iter().any(|(x, given)| q.memo.get(x).map_or(false, |fin| fin != given));
             if !stale || pass > q.prev.len() + 1 {
-                if cacheable {
+                if cacheable && !quiet_lookups() {
                     // (a final answer of the pass is there already)
                     self.glob_cache.insert_first((m, name, ns_type), r);
                 }
@@ -4692,7 +5022,7 @@ impl Program {
         // instead of walking its globs again (a miss walks every module the globs reach)
         if q.hits.len() != hits || q.taints != taints {
             q.tainted.insert(m);
-        } else if cacheable {
+        } else if cacheable && !quiet_lookups() {
             self.glob_cache.insert_first((m, name, ns_type), r);
         }
         r
@@ -4884,7 +5214,7 @@ impl Program {
             return r;
         }
         let r = self.lookup_in_scope_uncached(module, name, ns_type);
-        self.scope_cache.insert((module, name, ns_type), r);
+        if !quiet_lookups() { self.scope_cache.insert((module, name, ns_type), r); }
         r
     }
 
@@ -5461,7 +5791,26 @@ pub struct SharedParse {
 /// `makepad check` records which imports its name resolutions go through (the lint
 /// `unused_imports`); a run does not.
 static RECORD_IMPORT_USES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub fn record_import_uses() -> bool { RECORD_IMPORT_USES.load(std::sync::atomic::Ordering::Relaxed) }
+pub fn record_import_uses() -> bool { RECORD_IMPORT_USES.load(std::sync::atomic::Ordering::Relaxed) && !quiet_lookups() }
+
+thread_local! {
+    static QUIET_LOOKUPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+/// Lookups that are no uses of what they find (a typo suggestion's scan of every name in scope:
+/// rustc's lookup_typo_candidate records no import use) while one lives on this thread: nothing
+/// is recorded, and nothing goes to the lookup caches (a cached answer records no use when a
+/// real lookup takes it later).
+pub struct QuietLookups(());
+impl QuietLookups {
+    pub fn begin() -> Self {
+        QUIET_LOOKUPS.with(|q| q.set(q.get() + 1));
+        QuietLookups(())
+    }
+}
+impl Drop for QuietLookups {
+    fn drop(&mut self) { QUIET_LOOKUPS.with(|q| q.set(q.get() - 1)); }
+}
+fn quiet_lookups() -> bool { QUIET_LOOKUPS.with(|q| q.get() != 0) }
 pub fn set_record_import_uses(on: bool) { RECORD_IMPORT_USES.store(on, std::sync::atomic::Ordering::Relaxed); }
 
 static SHARED_STD: relax_session::sync::Mutex<Option<HashMap<String, std::sync::Arc<SharedParse>>>> = relax_session::sync::Mutex::new(None);
@@ -5557,12 +5906,26 @@ pub struct ParseSnapshot {
     pub edition: u16,
     pub kname: String,
     pub mod_path: String,
+    /// where the file's `mod x;` items look for their files
+    pub dir: String,
+    /// the crate's root file
+    pub root: String,
+    /// the import changes of the files edited together with this one (share_import_edits)
+    pub together: Vec<crate::macros::ImportEdit>,
     pub cfg: CfgSet,
     pub macros: std::sync::Arc<crate::macros::MacroTable>,
     pub reuse: std::sync::Arc<crate::parse_work::Reuse>,
     pub previous: Option<std::sync::Arc<ParsedFile>>,
     pub context: std::sync::Arc<crate::source_context::Context>,
 }
+/// Files edited together: each parse sees the imports the others write.
+pub fn share_import_edits<'a>(snapshots: &mut [Option<ParseSnapshot>], sources: impl Iterator<Item = &'a [u8]>) {
+    if snapshots.len() < 2 { return; }
+    let together: Vec<_> = snapshots.iter().zip(sources).filter_map(|(s, src)| crate::preload::import_edit(s.as_ref()?, src)).collect();
+    if together.is_empty() { return; }
+    for s in snapshots.iter_mut().flatten() { s.together = together.clone(); }
+}
+
 impl ParseSnapshot {
     pub fn parse(&self, src: Vec<u8>) -> Result<FileVersion, String> {
         // classify may ask for old lazy bodies. Complete their OnceLock off the unit lock
@@ -5589,6 +5952,7 @@ impl ParseSnapshot {
             assert_eq!(v.pf.token_origins, full.pf.token_origins);
             assert_eq!(v.pf.rules_exp, full.pf.rules_exp);
             assert_eq!(v.pf.body_origin, full.pf.body_origin);
+            assert_eq!(v.pf.pm_editions, full.pf.pm_editions);
             assert_eq!(v.idents, full.idents);
             let defs = |v: &FileVersion| v.macros.iter().map(|d| format!("{:?}:{:?}:{}:{}:{:?}:{}:{:?}", d.name, d.krate, d.exported, d.builtin, d.def_file, d.def_pos, d.arms)).collect::<Vec<_>>();
             assert_eq!(defs(&v), defs(&full));
@@ -5608,18 +5972,24 @@ impl ParseSnapshot {
             .map_err(|(span, m)| format!("{}:{}: {}", path, span.lo, m))?;
         let prep = prepare_file(&mut pf, cfg);
         let local = used.map(|u| u.local).unwrap_or_default();
-        Ok(FileVersion { old: *old, path: path.clone(), pf, blocks: prep.blocks, idents: prep.idents, macros: local, reuse: Default::default(), context })
+        Ok(FileVersion { old: *old, path: path.clone(), pf, blocks: prep.blocks, idents: prep.idents, macros: local, imports: None, reuse: Default::default(), context })
     }
 
     pub fn parse_full(&self, src: Vec<u8>) -> Result<FileVersion, String> {
         let Self { old, path, edition, kname, mod_path, cfg, macros, .. } = self;
         let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(kname, path, mod_path, cfg));
+        let imports = crate::preload::import_edit(self, &src);
+        let mut macros = macros.clone();
+        if imports.is_some() || !self.together.is_empty() {
+            let table = std::sync::Arc::make_mut(&mut macros);
+            for e in self.together.iter().chain(&imports) { table.apply_import_edit(e); }
+        }
         let context = if self.context.sources().find(path).and_then(|id| self.context.sources().get(id).ok()).is_some_and(|old| old.src.as_ref() == src) { self.context.clone() } else { self.context.edited(path, src.clone().into()) };
         let (mut pf, used) = context.parse(src, None, *edition,
-            Some(crate::macros::MacroScope::new(macros.clone())), bctx, false)?;
+            Some(crate::macros::MacroScope::new(macros)), bctx, false)?;
         let used = used.unwrap();
         let prep = prepare_file(&mut pf, cfg);
-        Ok(FileVersion { old: *old, path: path.clone(), pf, blocks: prep.blocks, idents: prep.idents, macros: used.local, reuse: Default::default(), context })
+        Ok(FileVersion { old: *old, path: path.clone(), pf, blocks: prep.blocks, idents: prep.idents, macros: used.local, imports, reuse: Default::default(), context })
     }
 }
 
@@ -5631,6 +6001,7 @@ pub struct FileVersion {
     blocks: BodyBlocks,
     idents: Vec<(u32, u32)>,
     macros: Vec<crate::macros::MacroRef>,
+    imports: Option<crate::macros::ImportEdit>,
     pub reuse: std::sync::Arc<crate::parse_work::Reuse>,
     pub context: std::sync::Arc<crate::source_context::Context>,
 }
@@ -5775,7 +6146,7 @@ fn strip_cfg_stmts(ast: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId) {
                     out.push(Stmt::Expr(expr, semi));
                     // the statement's attributes are kept for the lint passes (lint levels, and the
                     // fact that a value had attributes: `#[cfg(..)] { x }` is not an unused-braces case)
-                    kept_attrs.push((expr, attrs));
+                    kept_attrs.push(AttrsStmt { attrs, expr, semi });
                 }
             }
             Stmt::Let(r) if { let attrs = ast.row(*r).attrs; !attrs.is_empty() && !crate::cfg::active(src, ast.list(attrs), cfg) } => {}
@@ -5784,7 +6155,7 @@ fn strip_cfg_stmts(ast: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId) {
     }
     let l = ast.push_list(out);
     ast.block_mut(b).stmts = l;
-    ast.stmt_attrs.extend(kept_attrs);
+    ast.stmt_attrs.extend_from_slice(&kept_attrs);
 }
 
 /// Closures in an owner's expression ranges, including its lazily materialized body.
@@ -5852,41 +6223,36 @@ pub fn hint_path(defs: &[Def], syms: &Interner, files: &[std::sync::Arc<ParsedFi
 /// Files parsed ahead (preload.rs) that the loader parsed again (run.rs reports it).
 pub static PARSE_AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A path's segments as (kind, symbol), memoised per occurrence in `path_seg_cache` once body
-/// memos are on.
-pub fn path_segs(prog: &Program, file: u32, p: &Path) -> std::sync::Arc<[(SegKind, Sym)]> {
-    if !prog.body_memos.load(std::sync::atomic::Ordering::Relaxed) {
-        return path_segs_uncached(prog, file, p).into();
-    }
-    let mut h: u64 = 0;
-    for s in prog.files[file as usize].ast.segs(p.segs) {
-        h = (h.rotate_left(5) ^ (((s.name.lo as u64) << 32) | s.name.hi as u64)).wrapping_mul(0xf135_7aea_2e62_a9c5);
-    }
-    let lo = prog.files[file as usize].ast.segs(p.segs).first().map_or(0, |s| s.name.lo);
-    let key = (file, p.segs.len() as u32, lo, h);
-    let stale = match prog.path_seg_cache.get(&key) {
-        // (a name not interned when the entry was made may be now: Program::commit_version_in)
-        Some(v) if v.iter().any(|&(_, sym)| sym == u32::MAX) => Some(v),
-        Some(v) => return v,
-        None => None,
-    };
-    let v: std::sync::Arc<[(SegKind, Sym)]> = path_segs_uncached(prog, file, p).into();
-    if stale.as_deref() != Some(&*v) { prog.path_seg_cache.insert(key, v.clone()); }
-    v
+/// A path's segments as (kind, symbol), `u32::MAX` for a name no file interned: held inline up
+/// to four segments. Built afresh on each call: two string-table probes per segment cost less
+/// than any memo of them (a per-occurrence one held 4M entries for sandbox and cost 8% of the
+/// body checks walking its chains).
+pub struct PathSegs {
+    len: usize,
+    inline: [(SegKind, Sym); 4],
+    spill: Vec<(SegKind, Sym)>,
 }
 
-fn path_segs_uncached(prog: &Program, file: u32, p: &Path) -> Vec<(SegKind, Sym)> {
-    let f = &prog.files[file as usize];
-    let mut v = Vec::new();
-    for s in prog.files[file as usize].ast.segs(p.segs) {
-        let t = f.text(s.name);
-        let t = match t.strip_prefix("r#") {
-            Some(x) => x,
-            None => t,
-        };
-        v.push((s.kind(), prog.syms.get(t).unwrap_or(u32::MAX)));
+impl std::ops::Deref for PathSegs {
+    type Target = [(SegKind, Sym)];
+    #[inline]
+    fn deref(&self) -> &[(SegKind, Sym)] {
+        if self.len > 4 { &self.spill } else { &self.inline[..self.len] }
     }
-    v
+}
+
+pub fn path_segs(prog: &Program, file: u32, p: &Path) -> PathSegs {
+    let f = &prog.files[file as usize];
+    let segs = f.ast.segs(p.segs);
+    let mut out = PathSegs { len: segs.len(), inline: [(SegKind::Ident, u32::MAX); 4], spill: Vec::new() };
+    if segs.len() > 4 { out.spill.reserve_exact(segs.len()); }
+    for (i, s) in segs.iter().enumerate() {
+        let t = f.text(s.name);
+        let t = t.strip_prefix("r#").unwrap_or(t);
+        let v = (s.kind(), prog.syms.get(t).unwrap_or(u32::MAX));
+        if segs.len() <= 4 { out.inline[i] = v } else { out.spill.push(v) }
+    }
+    out
 }
 
 /// One lookup through glob imports (a fixpoint over glob cycles, see lookup_in_module_vis).
@@ -6082,7 +6448,6 @@ mod deferred_load_tests {
         p.defer_skipped_imports(1, &pending);
         p.scope_cache.clear();
         p.glob_cache.clear();
-        p.path_seg_cache.clear();
         p.trait_bind_cache.clear();
         p.trait_scope.clear();
         p.imports_done = true;
@@ -6263,4 +6628,16 @@ mod deferred_load_tests {
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&RECORD_IMPORT_USES, std::sync::atomic::AtomicBool::new(false));
+    reset(&SHARED_STD, relax_session::sync::Mutex::new(None));
+    reset(&SHARING, std::sync::atomic::AtomicBool::new(false));
+    reset(&WORLD_WAITERS, std::sync::atomic::AtomicUsize::new(0));
+    reset(&PARSE_AGAIN, std::sync::atomic::AtomicU64::new(0));
+    reset(&COLLECTING, std::sync::atomic::AtomicBool::new(false));
+    reset(&COLLECT_MISSES, relax_session::sync::Mutex::new(Vec::new()));
 }

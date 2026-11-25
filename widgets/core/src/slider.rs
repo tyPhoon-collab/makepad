@@ -3183,7 +3183,7 @@ impl Slider {
         self.draw_bg.rect_size = rect.size.into();
         self.draw_bg.draw_vars.append_group_id = cx.draw_call_group_background().0;
         if self.draw_bg.draw_vars.can_instance() {
-            let new_area = cx.add_aligned_instance(&self.draw_bg.draw_vars);
+            let new_area = cx.add_aligned_instance(&mut self.draw_bg.draw_vars);
             self.backdrop_area = cx.update_area_refs(self.backdrop_area, new_area);
         }
         if own_list {
@@ -3705,6 +3705,13 @@ impl SliderRef {
         }
 
         return None;
+    }
+
+    /// The top of the range, so a host that sets it from its own draw can
+    /// leave it alone when it already holds: an apply redraws the slider,
+    /// and in a draw that asks for the next frame.
+    pub fn max(&self) -> Option<f64> {
+        self.borrow().map(|inner| inner.max)
     }
 
     pub fn set_value(&self, cx: &mut Cx, v: f64) {

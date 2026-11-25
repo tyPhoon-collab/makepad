@@ -11,7 +11,7 @@ use makepad_vulkan::vk;
 use crate::FastMap;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Clone)]
 pub(super) struct Token { pub sid: u32, pub incarnation: Arc<FrameProgress> }
@@ -22,6 +22,8 @@ pub(super) enum Event {
     /// `gpu_span`: the frame's first and last timestamps in seconds of the device's clock (the
     /// frame timer orders a frame's passes by it).
     Frame { target: Id, kind: u32, frame: u64, window: bool, gpu_ns: u64, gpu_span: [f64; 2] },
+    DispatchTime { name: String, gpu_ns: u64 },
+    BufferLeases { req: u32, status: u32, leases: Vec<crate::lease::Lease> },
     Readback { req: u32, status: u32, rect: [u32; 4], pixels: Vec<u8> },
     Pick { req: u32, ids: Vec<u32> },
     Shared { id: Id, handle: u64 },
@@ -42,6 +44,7 @@ impl Mailbox {
 }
 
 pub(super) enum Ticket {
+    BufferLeases { token: Token, req: u32, ranges: Vec<(Arc<Buffer>, u64, u64, crate::lease::Lease)> },
     #[cfg(target_os = "linux")]
     Capture { token: Token, window: Id, size: [u32;2], format: u32, buffer: Arc<Buffer> },
     Frame { token: Token, target: Id, kind: u32, frame: u64, window: bool },
@@ -90,13 +93,15 @@ pub(super) struct Slot {
     fence: vk::Fence,
     /// the timestamp pool and how many queries it holds (a profiled frame's batch grew it)
     query: (vk::QueryPool, u32),
-    /// Per layout: the pool and how many sets it holds.
-    descriptors: FastMap<vk::DescriptorSetLayout, (vk::DescriptorPool, u32)>,
+    /// Per program (`Program::alive`'s address: taken while the `Weak` holds it, so another program
+    /// never finds this pool, whatever handles the driver gives): the pool, how many sets it holds,
+    /// and whether its program is still there.
+    descriptors: FastMap<usize, (vk::DescriptorPool, u32, Weak<()>)>,
 }
 
 impl Drop for Slot {
     fn drop(&mut self) { unsafe {
-        for (_, (pool, _)) in self.descriptors.drain() { self.dev.raw.destroy_descriptor_pool(pool, None); }
+        for (_, (pool, _, _)) in self.descriptors.drain() { self.dev.raw.destroy_descriptor_pool(pool, None); }
         if self.query.0 != vk::QueryPool::null() { self.dev.raw.destroy_query_pool(self.query.0, None); }
         self.dev.raw.destroy_fence(self.fence, None);
         self.dev.raw.destroy_command_pool(self.pool, None);
@@ -109,10 +114,48 @@ impl Drop for Slot {
 pub(super) struct Spare {
     slots: Mutex<Vec<Slot>>,
     arenas: Mutex<Arenas>,
+    /// batches made and not yet dropped (completed or abandoned): at `IN_FLIGHT_MAX` the
+    /// renderer waits for room (`Batch::new`) instead of recording ahead of the submit worker
+    in_flight: Mutex<usize>,
+    room: std::sync::Condvar,
 }
 pub(super) type Spares = Arc<Spare>;
-/// More frames than this in flight at once are not kept for reuse.
-const SPARE_SLOTS: usize = 256;
+
+impl Spare {
+    /// Command buffer slots alive: the batches in flight and the reset ones kept for reuse
+    /// (each with its command, descriptor and timestamp pools).
+    pub fn slots(&self) -> u64 {
+        (self.in_flight() + lock(&self.slots).len()) as u64
+    }
+
+    /// The descriptor pools the reset slots keep for the next frames.
+    pub fn descriptor_pools(&self) -> u64 {
+        lock(&self.slots).iter().map(|slot| slot.descriptors.len() as u64).sum()
+    }
+
+    /// Batches made and not yet dropped.
+    pub fn in_flight(&self) -> usize {
+        *lock(&self.in_flight)
+    }
+
+    /// Releases the free arenas no batch took for `ARENA_IDLE` (an idle app frees its uploads).
+    pub fn trim(&self) {
+        let released = lock(&self.arenas).give(std::iter::empty());
+        drop(released);
+    }
+}
+
+/// More slots than this are not kept for reuse: twice the batches that may be in flight.
+const SPARE_SLOTS: usize = 2 * IN_FLIGHT_MAX;
+/// Batches recorded and not yet completed at once; the renderer waits for room at this many
+/// (every target frame of a beat is a batch: a window frame with its effect passes is a few).
+/// Without the bound a submit worker slower than the renderer queued seconds of frames, and the
+/// backlog fed itself: every batch took a fresh slot, descriptor pools and arena (a Snapdragon
+/// 685 swipe: 1,439 slots made in 27 s, none reused, each frame shown 21 s after its recording).
+const IN_FLIGHT_MAX: usize = 8;
+/// The longest one wait for room: the worker may itself wait on the host freeing GPU memory
+/// (`submit_until_room`), which needs the renderer running.
+const IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The smallest upload arena; arenas grow by powers of two up to `ARENA_MAX`.
 const ARENA_MIN: u64 = 256 * 1024;
@@ -194,16 +237,21 @@ pub(super) struct Batch {
     pub prof: Option<super::prof::BatchProf>,
     /// The recorded frame this batch presents (its display time goes to the profiler).
     pub prof_key: Option<crate::gpu_prof::FrameKey>,
+    pub dispatch_query: u32,
+    pub dispatch_times: Vec<(Token, String, u32)>,
     pub images: Vec<Arc<Image>>,
     pub buffers: Vec<Arc<Buffer>>,
     pub pipelines: Vec<Arc<Pipeline>>,
+    pub compute_pipelines: Vec<Arc<super::compute::Program>>,
+    pub compute_descriptors: Vec<super::compute::Descriptors>,
     pub passes: Vec<Arc<RenderPass>>,
     pub framebuffers: Vec<vk::Framebuffer>,
-    /// Per layout: the pool, how many sets it holds, and whether this batch sized it (a reused
-    /// pool is checked against this batch's draws once).
-    descriptors: FastMap<vk::DescriptorSetLayout, (vk::DescriptorPool, u32, bool)>,
+    /// Per program (`Slot::descriptors`): the pool, how many sets it holds, whether this batch sized
+    /// it (a reused pool is checked against this batch's draws once), and whether its program is
+    /// still there.
+    descriptors: FastMap<usize, (vk::DescriptorPool, u32, bool, Weak<()>)>,
     pub tickets: Vec<Ticket>,
-    pub scanout: Option<(Arc<dyn super::surface::FramePresenter>, Arc<Image>, Token, Id, Id, u32, u64)>,
+    pub scanout: Option<(Arc<dyn super::surface::FramePresenter>, Arc<Image>, Token, u32, Id, Id, u32, u64)>,
     pub present: Option<Present>,
     #[cfg(target_os = "android")]
     pub native_frame: Option<(crate::backend::android::native_layer::Frame, Option<Arc<super::share::sync::Semaphore>>)>,
@@ -275,7 +323,7 @@ impl Batch {
             let sid = match ticket {
                 #[cfg(target_os = "linux")]
                 Ticket::Capture { token, .. } => token.sid,
-                Ticket::Frame { token, .. } | Ticket::Read { token, .. } | Ticket::Shared { token, .. } | Ticket::Copy { token, .. } => token.sid,
+                Ticket::Frame { token, .. } | Ticket::Read { token, .. } | Ticket::Shared { token, .. } | Ticket::Copy { token, .. } | Ticket::BufferLeases { token, .. } => token.sid,
                 Ticket::Host { .. } | Ticket::FrameCap { .. } => continue,
             };
             if !sids.contains(&sid) { sids.push(sid); }
@@ -287,11 +335,24 @@ impl Batch {
     /// A batch on a reset slot. `queries`: timestamps it writes (0: none; 2: its own start and
     /// end; more: a profiled frame's passes, `prof`).
     pub fn new(dev: Arc<Device>, spares: &Spares, queries: u32, reserve: u64) -> Result<Self, String> {
+        {
+            let mut n = lock(&spares.in_flight);
+            if *n >= IN_FLIGHT_MAX {
+                crate::profile::count("vk batch waited for room");
+                let waited = std::time::Instant::now();
+                while *n >= IN_FLIGHT_MAX {
+                    let (guard, timeout) = spares.room.wait_timeout(n, IN_FLIGHT_WAIT.saturating_sub(waited.elapsed())).unwrap_or_else(|e| e.into_inner());
+                    n = guard;
+                    if timeout.timed_out() && *n >= IN_FLIGHT_MAX { crate::profile::count("vk batch waited for room: timed out"); break; }
+                }
+            }
+            *n += 1;
+        }
         let spare = lock(&spares.slots).pop();
         if spare.is_none() { crate::profile::count("vk batch slot made"); }
         let mut b = Self { dev, spares: spares.clone(), reusable: false, pool: vk::CommandPool::null(), cb: vk::CommandBuffer::null(), fence: vk::Fence::null(),
-            query: (vk::QueryPool::null(), 0), idle_query: (vk::QueryPool::null(), 0), prof: None, prof_key: None,
-            images: Vec::new(), buffers: Vec::new(), pipelines: Vec::new(), passes: Vec::new(), framebuffers: Vec::new(),
+            query: (vk::QueryPool::null(), 0), idle_query: (vk::QueryPool::null(), 0), prof: None, prof_key: None, dispatch_query: 2, dispatch_times: Vec::new(),
+            images: Vec::new(), buffers: Vec::new(), pipelines: Vec::new(), compute_pipelines: Vec::new(), compute_descriptors: Vec::new(), passes: Vec::new(), framebuffers: Vec::new(),
             descriptors: FastMap::default(), tickets: Vec::new(), scanout: None, present: None, tap: None, arena: None, arenas: Vec::new(), reserve, allocs: 0, draw_counts: FastMap::default(),
             #[cfg(target_os = "android")] native_frame: None,
             #[cfg(target_os = "android")] native_signal: None,
@@ -306,7 +367,12 @@ impl Batch {
             b.cb = slot.cb;
             b.fence = std::mem::replace(&mut slot.fence, vk::Fence::null());
             b.idle_query = std::mem::replace(&mut slot.query, (vk::QueryPool::null(), 0));
-            b.descriptors = slot.descriptors.drain().map(|(layout, (pool, sets))| (layout, (pool, sets, false))).collect();
+            // A pool goes with its program: nothing else would free it, and a slot would reset it
+            // every batch for good.
+            for (program, (pool, sets, alive)) in slot.descriptors.drain() {
+                if alive.strong_count() == 0 { unsafe { b.dev.raw.destroy_descriptor_pool(pool, None); } }
+                else { b.descriptors.insert(program, (pool, sets, false, alive)); }
+            }
         }
         unsafe {
             if b.pool == vk::CommandPool::null() {
@@ -384,7 +450,7 @@ impl Batch {
                     None => {
                         self.allocs += 1;
                         crate::profile::count("upload arena allocs");
-                        match Buffer::scratch(self.dev.clone(), want, buffer_usage()) {
+                        match Buffer::scratch(self.dev.clone(), crate::ledger::Pool::UploadArena, want, buffer_usage()) {
                             Ok(b) => b,
                             // out of memory: the pool's free arenas go first (and the host is
                             // asked for room), then one more try
@@ -392,7 +458,7 @@ impl Batch {
                                 let released = lock(&self.spares.arenas).release_all();
                                 drop(released);
                                 self.dev.refused("upload arena");
-                                Buffer::scratch(self.dev.clone(), want, buffer_usage())?
+                                Buffer::scratch(self.dev.clone(), crate::ledger::Pool::UploadArena, want, buffer_usage())?
                             }
                             Err(e) => return Err(e),
                         }
@@ -446,17 +512,18 @@ impl Batch {
     }
 
     fn descriptors(&mut self, p: &Program, state: usize) -> Result<vk::DescriptorSet, String> {
-        // a reused pool that holds fewer sets than this batch draws with the layout is replaced
-        if let Some((pool, sets, sized)) = self.descriptors.get_mut(&p.descriptors).filter(|(_, _, sized)| !*sized) {
+        let program = Arc::as_ptr(&p.alive) as usize;
+        // a reused pool that holds fewer sets than this batch draws with the program is replaced
+        if let Some((pool, sets, sized, _)) = self.descriptors.get_mut(&program).filter(|(_, _, sized, _)| !*sized) {
             let draws = *self.draw_counts.get(&state).ok_or("pipeline missing from frame descriptor counts")?;
             *sized = true;
             if *sets < draws {
                 crate::profile::count("vk descriptor pool too small: remade");
                 unsafe { self.dev.raw.destroy_descriptor_pool(*pool, None); }
-                self.descriptors.remove(&p.descriptors);
+                self.descriptors.remove(&program);
             }
         }
-        let pool = if let Some((pool, _, _)) = self.descriptors.get(&p.descriptors) { *pool } else {
+        let pool = if let Some((pool, _, _, _)) = self.descriptors.get(&program) { *pool } else {
             // Sized to the next power of two: a slot's pool serves the frames after this one, and a
             // frame drawing one more than its pool holds remade it (a destroy and a create, both
             // driver round trips) every few frames as a view's draw count wandered.
@@ -470,7 +537,7 @@ impl Batch {
             }
             let sizes: Vec<_> = counts.into_iter().map(|(ty, count)| vk::DescriptorPoolSize::default().ty(ty).descriptor_count(count)).collect();
             let pool = unsafe { self.dev.raw.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(draws).pool_sizes(&sizes), None) }.map_err(error)?;
-            self.descriptors.insert(p.descriptors, (pool, draws, true)); pool
+            self.descriptors.insert(program, (pool, draws, true, Arc::downgrade(&p.alive))); pool
         };
         let layouts = [p.descriptors];
         // one set, written in place (the wrapper returns a Vec per call)
@@ -624,7 +691,10 @@ impl Batch {
     /// its FrameDone follows the present (or the frame's end: superseded by a newer frame,
     /// swapchain replaced, worker closing, SHOW_TRIES exhausted -- then it is not presented).
     fn show(self, present: Present, tries: u32, later: super::device::Later, complete: Arc<Worker>, mailbox: Mailbox) {
+        // (profiled: the acquire, copy and present of one frame on the submit worker)
+        let at = if crate::profile::on() { crate::clock_ns() } else { 0 };
         let shown = present.chain.show(&present.image);
+        if at != 0 { crate::profile::since(crate::profile::Metric::ToPresent, at); }
         crate::profile::count(match &shown {
             Ok(Shown::Presented) => "vk show: presented",
             Ok(Shown::Dropped) => "vk show: dropped",
@@ -724,8 +794,24 @@ impl Batch {
         // calls of this worker, whose ICD exit handlers run concurrently with exit().
         let mut out: Vec<(Token, Event)> = Vec::new();
         let mut push = |token: Token, event: Event| out.push((token, event));
+        for (token, name, query) in self.dispatch_times.drain(..) {
+            let mut span = [0u64; 2];
+            if timed && unsafe { self.dev.raw.get_query_pool_results(self.query.0, query, &mut span, vk::QueryResultFlags::TYPE_64) }.is_ok() {
+                let gpu_ns = ((span[1].wrapping_sub(span[0]) & mask) as f64 * period) as u64;
+                push(token, Event::DispatchTime { name, gpu_ns });
+            }
+        }
         for ticket in self.tickets.drain(..) {
             match ticket {
+                Ticket::BufferLeases { token, req, ranges } => {
+                    let status = if self.dev.lost.load(Ordering::Acquire) { readback::DEVICE_LOST }
+                        else if failed { readback::FAILED }
+                        else if ranges.iter().all(|(buffer, offset, len, _)| buffer.invalidate_range(*offset, *len).is_ok()) { readback::OK }
+                        else { readback::FAILED };
+                    let leases = if status == readback::OK { ranges.into_iter().map(|(_, _, _, lease)| lease).collect() } else { Vec::new() };
+                    push(token, Event::BufferLeases { req, status, leases });
+                }
+
                 #[cfg(target_os = "linux")]
                 Ticket::Capture { token, window, size, format, buffer } => {
                     if !failed {
@@ -805,7 +891,7 @@ impl Batch {
         if let Some((sid, window, image)) = tap { crate::frame_tap::offer(sid, window, &image); }
         if let Some(scanout) = scanout {
             if failed {
-                scanout.0.dropped(scanout.5, scanout.4);
+                scanout.0.dropped(scanout.6, scanout.5);
             } else {
                 hand_over(scanout, self_prof_key, mailbox);
             }
@@ -814,9 +900,9 @@ impl Batch {
 }
 
 /// A frame for a presenter: its image, and what reports it shown to its session.
-fn hand_over(scanout: (Arc<dyn super::surface::FramePresenter>, Arc<Image>, Token, Id, Id, u32, u64), prof_key: Option<crate::gpu_prof::FrameKey>, mailbox: Mailbox) {
-    let (presenter, image, token, target, native, owner, frame) = scanout;
-    presenter.submit(owner, native, image, Box::new(move |time| {
+fn hand_over(scanout: (Arc<dyn super::surface::FramePresenter>, Arc<Image>, Token, u32, Id, Id, u32, u64), prof_key: Option<crate::gpu_prof::FrameKey>, mailbox: Mailbox) {
+    let (presenter, image, token, from, target, native, owner, frame) = scanout;
+    presenter.submit(owner, native, from, image, Box::new(move |time| {
         // the presenter's time is when the frame reached the display
         if let Some(key) = prof_key { crate::gpu_prof::shown(key, time); }
         let sid = token.sid;
@@ -827,12 +913,15 @@ fn hand_over(scanout: (Arc<dyn super::surface::FramePresenter>, Arc<Image>, Toke
 
 impl Drop for Batch {
     fn drop(&mut self) { unsafe {
+        // room for the renderer's next batch, whatever this one's end
+        { let mut n = lock(&self.spares.in_flight); *n = n.saturating_sub(1); }
+        self.spares.room.notify_all();
         // a batch dropped before it completed (never submitted): its timed passes answer nothing
         if let Some(prof) = self.prof.take() { prof.finish(&self.dev, vk::QueryPool::null(), true); }
         for framebuffer in self.framebuffers.drain(..) { self.dev.raw.destroy_framebuffer(framebuffer, None); }
         let slot = Slot { dev: self.dev.clone(), pool: self.pool, cb: self.cb, fence: self.fence,
             query: if self.query.0 != vk::QueryPool::null() { self.query } else { self.idle_query },
-            descriptors: self.descriptors.drain().map(|(layout, (pool, sets, _))| (layout, (pool, sets))).collect() };
+            descriptors: self.descriptors.drain().map(|(program, (pool, sets, _, alive))| (program, (pool, sets, alive))).collect() };
         if self.query.0 != vk::QueryPool::null() && self.idle_query.0 != vk::QueryPool::null() { self.dev.raw.destroy_query_pool(self.idle_query.0, None); }
         if !self.reusable { crate::profile::count("vk batch slot destroyed (not reusable)"); return; } // dropping the slot destroys its objects
         // the arenas go back once nothing else holds them (freed here, outside the lock, if the
@@ -843,7 +932,7 @@ impl Drop for Batch {
         drop(released);
         let reset = self.dev.raw.reset_command_buffer(slot.cb, vk::CommandBufferResetFlags::default())
             .and_then(|_| self.dev.raw.reset_fences(&[slot.fence]))
-            .and_then(|_| slot.descriptors.values().try_for_each(|(pool, _)| self.dev.raw.reset_descriptor_pool(*pool, vk::DescriptorPoolResetFlags::default())));
+            .and_then(|_| slot.descriptors.values().try_for_each(|(pool, _, _)| self.dev.raw.reset_descriptor_pool(*pool, vk::DescriptorPoolResetFlags::default())));
         if reset.is_err() { crate::profile::count("vk batch slot destroyed (reset failed)"); return; }
         let mut slots = lock(&self.spares.slots);
         if slots.len() < SPARE_SLOTS { slots.push(slot); } else { crate::profile::count("vk batch slot destroyed (spares full)"); }

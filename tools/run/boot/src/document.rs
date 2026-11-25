@@ -410,7 +410,7 @@ mod tests {
     /// The bundled document compiles for every dialect, with the window layer's pipe.
     #[test]
     fn bundled_document_compiles_with_its_layer() {
-        for dialect in [makepad_hal::dialect::MSL, makepad_hal::dialect::SPIRV, makepad_hal::dialect::HLSL] {
+        for dialect in [makepad_hal::dialect::MSL, makepad_hal::dialect::SPIRV, makepad_hal::dialect::HLSL, makepad_hal::dialect::GLSL] {
             let program = super::Program::compile(&crate::Document::bundled(), dialect, 0, 1)
                 .unwrap_or_else(|e| panic!("{:?}", e.iter().map(|d| d.message.clone()).collect::<Vec<_>>()));
             assert!(program.layer.is_some() && program.icon);

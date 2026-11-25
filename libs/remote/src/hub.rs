@@ -210,8 +210,8 @@ impl Hub {
         c.len()
     }
 
-    /// (kept, still open) clients, without pruning (tests).
-    #[cfg(test)]
+    /// (kept, still open) clients, without pruning (the Unix hub tests).
+    #[cfg(all(test, unix))]
     pub(crate) fn kept_clients(&self) -> (usize, usize) {
         let c = self.0.clients.lock().unwrap();
         (c.len(), c.iter().filter(|c| !c.is_closed()).count())
@@ -622,12 +622,60 @@ pub fn ask(client: &Client, target: &str, service: &str, args: &str, line: &str,
     ch.send(line.as_bytes().to_vec()).map_err(|e| e.to_string())?;
     let mut had_err = false;
     loop {
+        let Some(event) = ch.recv() else { return Err("the hub connection ended".into()) };
+        if let Some(done) = answer_event(event, &mut had_err, each) {
+            return done;
+        }
+    }
+}
+
+/// One routed channel to `target`'s `service` for a run of requests, one at a time: [`ask`] routes
+/// each request, which takes two threads in the hub and the service's thread at the far end. A
+/// master following the logs of its leases' runs that way spawned 1.4k threads in 25 s (11-06).
+pub struct Asking(Channel);
+
+impl Asking {
+    pub fn open(client: &Client, target: &str, service: &str) -> Result<Asking, String> {
+        client.open("route", &format!("{target} {service} ")).map(Asking).map_err(|e| e.to_string())
+    }
+
+    /// On a `route` channel already open (`<target> <service> `).
+    pub fn on(ch: Channel) -> Asking {
+        Asking(ch)
+    }
+
+    /// One request: `each` gets every answer line but the `end` line. `Ok(true)` when the answer
+    /// held an `err` line; `Err`: the channel ended or was refused (open another).
+    pub fn ask(&self, line: &str, each: &mut dyn FnMut(&str)) -> Result<bool, String> {
+        self.0.send(line.as_bytes().to_vec()).map_err(|e| e.to_string())?;
+        let mut had_err = false;
+        loop {
+            let Some(event) = self.0.recv() else { return Err("the hub connection ended".into()) };
+            if let Some(done) = answer_event(event, &mut had_err, &mut |l| {
+                each(l);
+                true
+            }) {
+                return done;
+            }
+        }
+    }
+}
+
+/// One request of `target`'s `app` service (its AI tools: `list`, `call <service>.<tool>\n<json>`,
+/// [`crate::app::app_request_of`]) through the hub: `each` gets its answer lines, which end with
+/// the channel. `Ok(true)` when the answer held an `err` line; `Err` the hub's or the far side's
+/// refusal (a process with no AI tools says `unsupported service`).
+pub fn ask_app(client: &Client, target: &str, request: &str, each: &mut dyn FnMut(&str) -> bool) -> Result<bool, String> {
+    app_answer(client.open("route", &format!("{target} app {request}")).map_err(|e| e.to_string())?, each)
+}
+
+/// The answer of an `app` request's channel ([`ask_app`]): its lines until the channel ends.
+pub(crate) fn app_answer(ch: Channel, each: &mut dyn FnMut(&str) -> bool) -> Result<bool, String> {
+    let mut had_err = false;
+    loop {
         match ch.recv() {
             Some(Event::Data(d)) => {
                 for l in String::from_utf8_lossy(&d).lines().filter(|l| !l.is_empty()) {
-                    if l.starts_with("{\"end\":") {
-                        return Ok(had_err);
-                    }
                     had_err |= l.starts_with("{\"err\":");
                     if !each(l) {
                         return Ok(had_err);
@@ -635,10 +683,51 @@ pub fn ask(client: &Client, target: &str, service: &str, args: &str, line: &str,
                 }
             }
             Some(Event::Opened(_)) => {}
-            Some(Event::Closed(CLOSE_NORMAL, _)) => return Err("the answer ended without an end line".into()),
+            Some(Event::Closed(CLOSE_NORMAL, _)) => return Ok(had_err),
             Some(Event::Closed(_, why)) => return Err(why),
             None => return Err("the hub connection ended".into()),
         }
+    }
+}
+
+/// [`ask`] that gives the answer up once `keep` says no (asked every 20 ms while no line comes):
+/// `Ok(None)` then. The request's channel closes with it, which ends the request at the far end
+/// too (an app's `watch` stops waiting).
+pub fn ask_while(client: &Client, target: &str, service: &str, args: &str, line: &str, each: &mut dyn FnMut(&str) -> bool, keep: &dyn Fn() -> bool) -> Result<Option<bool>, String> {
+    let ch = client.open("route", &format!("{target} {service} {args}")).map_err(|e| e.to_string())?;
+    ch.send(line.as_bytes().to_vec()).map_err(|e| e.to_string())?;
+    let mut had_err = false;
+    loop {
+        let event = match ch.recv_timeout(Duration::from_millis(20)) {
+            Ok(event) => event,
+            Err(true) if keep() => continue,
+            Err(true) => return Ok(None),
+            Err(false) => return Err("the hub connection ended".into()),
+        };
+        if let Some(done) = answer_event(event, &mut had_err, each) {
+            return done.map(Some);
+        }
+    }
+}
+
+/// One event of an answer to [`ask`]: Some once it ends the answer.
+fn answer_event(event: Event, had_err: &mut bool, each: &mut dyn FnMut(&str) -> bool) -> Option<Result<bool, String>> {
+    match event {
+        Event::Data(d) => {
+            for l in String::from_utf8_lossy(&d).lines().filter(|l| !l.is_empty()) {
+                if l.starts_with("{\"end\":") {
+                    return Some(Ok(*had_err));
+                }
+                *had_err |= l.starts_with("{\"err\":");
+                if !each(l) {
+                    return Some(Ok(*had_err));
+                }
+            }
+            None
+        }
+        Event::Opened(_) => None,
+        Event::Closed(CLOSE_NORMAL, _) => Some(Err("the answer ended without an end line".into())),
+        Event::Closed(_, why) => Some(Err(why)),
     }
 }
 

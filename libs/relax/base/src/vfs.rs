@@ -10,6 +10,10 @@
 //! the outermost mount, on top of the store: a file there is read instead of the store's. Only
 //! edited files exist there. `.makepad-run-edits` in it records, per edited file, the store blob it
 //! was edited from (`new` for a file the store lacks), and `.makepad-run-base/<path>` keeps that blob.
+//! `.makepad-run-deleted` lists whiteouts, one relative path per line: those store files are absent
+//! through every VFS read and probe. Their base blobs are recorded in `.makepad-run-edits` too.
+//! A whiteout carries over only while the store still holds its base blob; otherwise reconciliation
+//! removes it and reports the change.
 //! At a run's start (`reconcile_edits`) edits whose store file is unchanged carry over to the
 //! release being run; when the release changed the file too, the edit moves to
 //! `.makepad-run-conflicts/<commit>/<path>` (beside it `<path>.base`) and the run reports it -- an edit
@@ -22,7 +26,7 @@
 //! bytes still are that blob is not an edit; `reconcile_edits` brings it to the release being run.
 //! One whose bytes changed becomes an edit (recorded in `.makepad-run-edits` from that blob).
 use crate::gitstore::{self as store, Entry, Oid, Store};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -56,6 +60,12 @@ pub fn record_from_env() -> Result<(), String> {
     *RECORDED.lock().unwrap() = Some((Default::default(), f));
     RECORDING.store(true, Ordering::Release);
     Ok(())
+}
+
+/// Whether this process records its reads (MAKEPAD_RUN_READ_LOG): reads made only for the log
+/// (provided::read_identity_files) are skipped when it does not.
+pub fn recording() -> bool {
+    RECORDING.load(Ordering::Acquire)
 }
 
 fn note(kind: u8, path: &std::path::Path) {
@@ -260,6 +270,40 @@ fn edited_file(path: &str) -> Option<std::path::PathBuf> {
     p.is_file().then_some(p)
 }
 
+/// The whiteout list changes on disk during a live run; stat it, parse only when it changes.
+static WHITEOUTS: RwLock<Option<(std::path::PathBuf, Option<FileStat>, Arc<BTreeSet<String>>)>> = RwLock::new(None);
+
+fn load_deleted(dir: &std::path::Path) -> BTreeSet<String> {
+    std::fs::read_to_string(dir.join(".makepad-run-deleted")).unwrap_or_default().lines()
+        .filter(|p| !p.is_empty()).map(str::to_string).collect()
+}
+
+fn save_deleted(dir: &std::path::Path, deleted: &BTreeSet<String>) -> io::Result<()> {
+    let tmp = dir.join(".makepad-run-deleted.tmp");
+    std::fs::write(&tmp, deleted.iter().map(|p| format!("{p}\n")).collect::<String>())?;
+    std::fs::rename(tmp, dir.join(".makepad-run-deleted"))
+}
+
+fn deleted_paths(dir: &std::path::Path) -> Arc<BTreeSet<String>> {
+    let stat = disk_stat(&dir.join(".makepad-run-deleted").to_string_lossy());
+    let cache = WHITEOUTS.read().unwrap();
+    if let Some((_, _, paths)) = cache.as_ref().filter(|(at, held, _)| at == dir && *held == stat) {
+        return paths.clone();
+    }
+    drop(cache);
+    let _k = crate::zone_alloc::kept();
+    let paths = Arc::new(load_deleted(dir));
+    *WHITEOUTS.write().unwrap() = Some((dir.to_path_buf(), stat, paths.clone()));
+    paths
+}
+
+fn whiteout(path: &str) -> bool {
+    if !ANY.load(Ordering::Acquire) { return false; }
+    let Some((_, rel)) = edit_path(path) else { return false };
+    let Some(dir) = EDITS.read().unwrap().clone() else { return false };
+    deleted_paths(&dir).contains(&rel)
+}
+
 /// Whether virtual files are writable (an edits folder is set).
 pub fn edits_enabled() -> bool {
     EDITS.read().unwrap().is_some()
@@ -270,6 +314,7 @@ pub fn set_edits(dir: Option<std::path::PathBuf>) {
     // process state: built in the kept heap
     let _k = crate::zone_alloc::kept();
     *EDITS.write().unwrap() = dir;
+    *WHITEOUTS.write().unwrap() = None;
 }
 
 impl Mount {
@@ -338,6 +383,8 @@ pub struct ReadSnapshot {
 }
 impl ReadSnapshot {
     pub fn new(profile: bool) -> Arc<Self> { Arc::new(Self { profile, ..Self::default() }) }
+    /// Snapshot keys preserve parent components until canonicalization records an alias.
+    pub fn key(path: &str) -> String { normalize_components(path, false) }
     pub fn bind(self: &Arc<Self>) -> ReadScope {
         let id = BIND_SEQ.fetch_add(1, Ordering::Relaxed);
         // the thread's table outlives the compiler generation the load runs in
@@ -346,8 +393,8 @@ impl ReadSnapshot {
         ReadScope { id, _thread: std::marker::PhantomData }
     }
     pub fn alias(&self, path: &std::path::Path, canonical: &std::path::Path) {
-        let path = normalize_components(&path.to_string_lossy(), false);
-        let canonical = normalize_components(&canonical.to_string_lossy(), false);
+        let path = Self::key(&path.to_string_lossy());
+        let canonical = Self::key(&canonical.to_string_lossy());
         if path == canonical { return; }
         let mut paths = self.paths.lock().unwrap();
         if let Some(entry) = paths.files.remove(&path) {
@@ -359,18 +406,17 @@ impl ReadSnapshot {
         }
         paths.aliases.insert(path, canonical);
     }
-    /// Drops the snapshot's copy of `path` once its bytes live elsewhere (a mapped image); the
+    /// Drops the snapshot's copy for `ReadSnapshot::key` once its bytes live elsewhere; the
     /// bytes stay alive only for holders that already have them.
-    pub fn release(&self, path: &std::path::Path) {
-        let key = normalize_components(&path.to_string_lossy(), false);
+    pub fn release(&self, key: &str) {
         let mut paths = self.paths.lock().unwrap();
-        let key = paths.aliases.get(&key).cloned().unwrap_or(key);
+        let key = paths.aliases.get(key).cloned().unwrap_or_else(|| key.to_string());
         if let Some(entry) = paths.files.remove(&key) {
             if self.profile { paths.retired.push((key, entry)); }
         }
     }
     fn read_shared(&self, path: &std::path::Path) -> io::Result<Arc<[u8]>> {
-        let key = normalize_components(&path.to_string_lossy(), false);
+        let key = Self::key(&path.to_string_lossy());
         let (key, entry) = {
             let mut paths = self.paths.lock().unwrap();
             let key = paths.aliases.get(&key).cloned().unwrap_or(key);
@@ -417,6 +463,7 @@ fn read_disk(path: &std::path::Path, entry: Option<&ReadEntry>) -> io::Result<Ve
 /// that keep authored sources need not copy the snapshot into another Arc.
 pub fn read_shared(path: impl AsRef<std::path::Path>) -> io::Result<Arc<[u8]>> {
     let path = path.as_ref();
+    if whiteout(&path.to_string_lossy()) { return Err(not_found(&path.to_string_lossy())); }
     let result = if let Some(snapshot) = read_snapshot() {
         snapshot.read_shared(path)
     } else {
@@ -429,6 +476,7 @@ pub fn read_shared(path: impl AsRef<std::path::Path>) -> io::Result<Arc<[u8]>> {
 /// The file's bytes.
 pub fn read(path: impl AsRef<std::path::Path>) -> io::Result<Vec<u8>> {
     let path = path.as_ref();
+    if whiteout(&path.to_string_lossy()) { return Err(not_found(&path.to_string_lossy())); }
     let result = if let Some(snapshot) = read_snapshot() { snapshot.read_shared(path).map(|bytes| bytes.to_vec()) } else { read_uncached(path, None) };
     if result.is_ok() { crate::why::read(path); }
     result
@@ -447,6 +495,7 @@ fn read_uncached_inner(path: &std::path::Path, entry: Option<&ReadEntry>) -> io:
         return read_disk(path, entry);
     }
     let s = path.to_string_lossy();
+    if whiteout(&s) { return Err(not_found(&s)); }
     match find(&s) {
         None => read_disk(path, entry),
         Some(_) if edited_file(&s).is_some() => read_disk(&edited_file(&s).unwrap(), entry),
@@ -489,6 +538,7 @@ pub fn metadata(path: impl AsRef<std::path::Path>) -> io::Result<Metadata> {
 
 fn metadata_inner(path: &std::path::Path) -> io::Result<Metadata> {
     let s = path.to_string_lossy();
+    if whiteout(&s) { return Err(not_found(&s)); }
     if let Some((mount, rel)) = ANY.load(Ordering::Acquire).then(|| find(&s)).flatten() {
         if let Some(edited) = edited_file(&s) { return metadata(edited); }
         let is_dir = mount.is_dir(&rel);
@@ -543,6 +593,13 @@ pub fn canonicalize(path: impl AsRef<std::path::Path>) -> io::Result<std::path::
     std::fs::canonicalize(path)
 }
 
+/// A path's one spelling, for comparing two paths: [`canonicalize`]d where a mount or the disk
+/// has it, else [`normalize_path`]d. A path under an overlay's virtual root is on no disk, and
+/// Windows spells one path several ways (`C:\a` and `c:/a`).
+pub fn canonical(path: &str) -> String {
+    canonicalize(path).map(|p| normalize_path(&p.to_string_lossy())).unwrap_or_else(|_| normalize_path(path))
+}
+
 pub fn exists(path: impl AsRef<std::path::Path>) -> bool {
     let found = exists_inner(path.as_ref());
     if found {
@@ -552,6 +609,7 @@ pub fn exists(path: impl AsRef<std::path::Path>) -> bool {
 }
 
 fn exists_inner(path: &std::path::Path) -> bool {
+    if whiteout(&path.to_string_lossy()) { return false; }
     if !ANY.load(Ordering::Acquire) {
         return path.exists();
     }
@@ -571,6 +629,7 @@ pub fn is_file(path: impl AsRef<std::path::Path>) -> bool {
 }
 
 fn is_file_inner(path: &std::path::Path) -> bool {
+    if whiteout(&path.to_string_lossy()) { return false; }
     if !ANY.load(Ordering::Acquire) {
         return path.is_file();
     }
@@ -590,6 +649,7 @@ pub fn is_dir(path: impl AsRef<std::path::Path>) -> bool {
 }
 
 fn is_dir_inner(path: &std::path::Path) -> bool {
+    if whiteout(&path.to_string_lossy()) { return false; }
     if !ANY.load(Ordering::Acquire) {
         return path.is_dir();
     }
@@ -610,6 +670,7 @@ pub fn read_dir(path: impl AsRef<std::path::Path>) -> io::Result<Vec<(String, bo
 }
 
 fn read_dir_inner(path: &std::path::Path) -> io::Result<Vec<(String, bool)>> {
+    if whiteout(&path.to_string_lossy()) { return Err(not_found(&path.to_string_lossy())); }
     let disk = || -> io::Result<Vec<(String, bool)>> {
         let mut v: Vec<(String, bool)> = std::fs::read_dir(path)?
             .flatten()
@@ -624,23 +685,21 @@ fn read_dir_inner(path: &std::path::Path) -> io::Result<Vec<(String, bool)>> {
     match find(&path.to_string_lossy()) {
         None => disk(),
         Some((m, rel)) => {
-            let edited: Vec<(String, bool)> = match edit_path(&path.to_string_lossy()) {
-                Some((p, _)) => std::fs::read_dir(p)
-                    .map(|d| {
-                        d.flatten()
-                            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.file_type().map(|t| t.is_dir()).unwrap_or(false)))
-                            .filter(|(n, _)| !n.starts_with(".makepad-run-"))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            };
+            // the run's edits copy of the folder, when there is one (empty: a folder the run made)
+            let edited: Option<Vec<(String, bool)>> = edit_path(&path.to_string_lossy()).and_then(|(p, _)| {
+                std::fs::read_dir(p).ok().map(|d| {
+                    d.flatten()
+                        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.file_type().map(|t| t.is_dir()).unwrap_or(false)))
+                        .filter(|(n, _)| !n.starts_with(".makepad-run-"))
+                        .collect()
+                })
+            });
             let mut v = match m.folders().get(&rel) {
                 Some(v) => v.clone(),
-                None if !edited.is_empty() => Vec::new(),
+                None if edited.is_some() => Vec::new(),
                 None => return Err(not_found(&path.to_string_lossy())),
             };
-            for e in edited {
+            for e in edited.unwrap_or_default() {
                 if !v.iter().any(|x| x.0 == e.0) {
                     v.push(e);
                 }
@@ -652,6 +711,12 @@ fn read_dir_inner(path: &std::path::Path) -> io::Result<Vec<(String, bool)>> {
                     if !name.is_empty() && !name.contains('/') && !v.iter().any(|e| e.0 == name) {
                         v.push((name.to_string(), true));
                     }
+                }
+            }
+            if let Some((_, rel)) = edit_path(&here) {
+                if let Some(dir) = EDITS.read().unwrap().clone() {
+                    let deleted = deleted_paths(&dir);
+                    v.retain(|(name, _)| !deleted.contains(&if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") }));
                 }
             }
             v.sort();
@@ -723,16 +788,42 @@ pub fn file_stat(path: &str) -> Option<FileStat> {
     if ANY.load(Ordering::Acquire) && find(path).is_some() {
         return None;
     }
+    disk_stat(path)
+}
+
+#[cfg(unix)]
+fn disk_stat(path: &str) -> Option<FileStat> {
+    use std::os::unix::fs::MetadataExt;
     let m = std::fs::metadata(path).ok()?;
-    let ns = |t: std::io::Result<std::time::SystemTime>| t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64);
-    #[cfg(unix)]
-    let (ctime_ns, ino) = {
-        use std::os::unix::fs::MetadataExt;
-        (m.ctime().max(0) as u64 * 1_000_000_000 + m.ctime_nsec().max(0) as u64, m.ino())
+    let mtime_ns = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64;
+    Some(FileStat { size: m.len(), mtime_ns, ctime_ns: m.ctime().max(0) as u64 * 1_000_000_000 + m.ctime_nsec().max(0) as u64, ino: m.ino() })
+}
+
+/// Windows' metadata has no change time or file index on stable Rust, so one attributes-only
+/// handle (nothing reads the content; a folder opens too) answers all of it. A file system without
+/// a change time answers 0: size and mtime are all its stat can say.
+#[cfg(windows)]
+fn disk_stat(path: &str) -> Option<FileStat> {
+    use makepad_windows_sys::Win32::Foundation::HANDLE;
+    use makepad_windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     };
-    #[cfg(not(unix))]
-    let (ctime_ns, ino) = (0, 0);
-    Some(FileStat { size: m.len(), mtime_ns: ns(m.modified())?, ctime_ns, ino })
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    let f = std::fs::OpenOptions::new().access_mode(0).custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0).open(path).ok()?;
+    let h = HANDLE(f.as_raw_handle() as _);
+    let mut file = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(h, &mut file) }.ok()?;
+    let mut times = FILE_BASIC_INFO::default();
+    unsafe { GetFileInformationByHandleEx(h, FileBasicInfo, &mut times as *mut FILE_BASIC_INFO as *mut std::ffi::c_void, std::mem::size_of::<FILE_BASIC_INFO>() as u32) }.ok()?;
+    // 100 ns ticks since 1601
+    let ns = |t: i64| (t as u64).checked_sub(116_444_736_000_000_000).map(|t| t * 100);
+    let wide = |high: u32, low: u32| (high as u64) << 32 | low as u64;
+    Some(FileStat {
+        size: wide(file.nFileSizeHigh, file.nFileSizeLow),
+        mtime_ns: ns(times.LastWriteTime)?,
+        ctime_ns: ns(times.ChangeTime).unwrap_or(0),
+        ino: wide(file.nFileIndexHigh, file.nFileIndexLow),
+    })
 }
 
 /// When the file last changed (a git file: never, None; the caller treats it as unchanged).
@@ -752,7 +843,7 @@ pub fn identity(path: &str) -> Option<String> {
         return None;
     }
     let (m, _) = find(path)?;
-    if edited_file(path).is_some() {
+    if whiteout(path) || edited_file(path).is_some() {
         return None;
     }
     Some(match m.store.range {
@@ -1013,10 +1104,12 @@ pub fn prepare_edit(path: &str, keep: bool) -> io::Result<std::path::PathBuf> {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not an editable path"));
     }
     let _g = EDIT_LOCK.lock().unwrap();
+    let dir = EDITS.read().unwrap().clone().unwrap();
+    let mut deleted = load_deleted(&dir);
+    if deleted.remove(&rel) { save_deleted(&dir, &deleted)?; }
     if disk.is_file() {
         return Ok(disk);
     }
-    let dir = EDITS.read().unwrap().clone().unwrap();
     if let Some(parent) = disk.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1047,11 +1140,78 @@ pub fn prepare_edit(path: &str, keep: bool) -> io::Result<std::path::PathBuf> {
     Ok(disk)
 }
 
+/// The edits ledger's stamp (modified time, length); None without an edits folder or ledger.
+/// Every edit of a mounted store's file rewrites the ledger (`save_records`): a watcher whose
+/// last look saw this stamp knows no virtual file changed since, without a stat per file.
+pub fn edits_ledger_stamp() -> Option<(std::time::SystemTime, u64)> {
+    let dir = EDITS.read().unwrap().clone()?;
+    let m = std::fs::metadata(dir.join(".makepad-run-edits")).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
 /// The disk path of `path` in the edits folder when it is an edited file or folder there
 /// (removing or renaming an edited file).
 pub fn edited_disk_path(path: &str) -> Option<std::path::PathBuf> {
     let (p, rel) = edit_path(path)?;
     (!rel.starts_with(".makepad-run-") && p.exists()).then_some(p)
+}
+
+/// The edits folder as one look found it: each file and folder in it (the run's own
+/// `.makepad-run-*` files left out) with its (modified time, length). A watcher's round that
+/// looks at every virtual file takes their stamps from it: one walk of the edits instead of a
+/// failing stat per unedited file (5,500 of them on a big app's every edit).
+pub struct EditsLook(BTreeMap<String, (std::time::SystemTime, u64)>);
+
+impl EditsLook {
+    /// The edits folder now; None without one.
+    pub fn now() -> Option<EditsLook> {
+        let dir = EDITS.read().unwrap().clone()?;
+        let mut found = BTreeMap::new();
+        let mut todo = vec![(dir, String::new())];
+        while let Some((at, rel)) = todo.pop() {
+            let Ok(entries) = std::fs::read_dir(&at) else { continue };
+            for e in entries.flatten() {
+                let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+                if rel.is_empty() && name.starts_with(".makepad-run-") {
+                    continue;
+                }
+                let rel = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+                let Ok(m) = std::fs::metadata(e.path()) else { continue };
+                let Ok(modified) = m.modified() else { continue };
+                if m.is_dir() {
+                    todo.push((e.path(), rel.clone()));
+                }
+                found.insert(rel, (modified, m.len()));
+            }
+        }
+        Some(EditsLook(found))
+    }
+
+    /// Each edit in the folder: its place there (`edit_rel`) and its (modified time, length).
+    pub fn entries(&self) -> impl Iterator<Item = (&str, (std::time::SystemTime, u64))> {
+        self.0.iter().map(|(rel, stamp)| (rel.as_str(), *stamp))
+    }
+}
+
+/// Where an edit of virtual `path` sits in the edits folder (relative to it), as `EditsLook`
+/// lists it; None when it can have none there (a disk or frozen path, no edits folder, the run's
+/// own files).
+pub fn edit_rel(path: &str) -> Option<String> {
+    let (_, rel) = edit_path(path)?;
+    (!rel.is_empty() && !rel.starts_with(".makepad-run-")).then_some(rel)
+}
+
+/// Where an edit of `path` lives on disk (whether or not there is one yet): what a file watcher
+/// watches for a virtual file. None for a disk path or without an edits folder.
+pub fn edit_location(path: &str) -> Option<std::path::PathBuf> {
+    if !is_virtual(path) { return None; }
+    let (p, rel) = edit_path(path)?;
+    (!rel.is_empty() && !rel.starts_with(".makepad-run-")).then_some(p)
+}
+
+/// The edits folder's record file (`.makepad-run-edits`): replaced whenever an edit is added.
+pub fn edits_record() -> Option<std::path::PathBuf> {
+    EDITS.read().unwrap().as_ref().map(|d| d.join(".makepad-run-edits"))
 }
 
 /// A folder made in a virtual folder: made in the edits folder.
@@ -1075,6 +1235,7 @@ pub fn reconcile_edits() -> Vec<String> {
     }
     let _g = EDIT_LOCK.lock().unwrap();
     let mut records = load_records(&dir);
+    let mut deleted = load_deleted(&dir);
     let mut out = Vec::new();
     let mut changed = false;
     let roots: Vec<String> = {
@@ -1085,7 +1246,7 @@ pub fn reconcile_edits() -> Vec<String> {
     let Some(outer) = roots.first().cloned() else { return Vec::new() };
     for (rel, base) in records.clone() {
         let disk = dir.join(&rel);
-        if !disk.is_file() {
+        if !disk.is_file() && !deleted.contains(&rel) {
             records.remove(&rel);
             changed = true;
             continue;
@@ -1093,6 +1254,14 @@ pub fn reconcile_edits() -> Vec<String> {
         let vpath = format!("{outer}/{rel}");
         let Some((m, mrel)) = find(&vpath) else { continue };
         let now = m.file(&mrel).filter(|e| e.mode != 0o160000).map(|e| e.oid);
+        if deleted.contains(&rel) {
+            if now.is_some() && now == base { continue; }
+            deleted.remove(&rel);
+            records.remove(&rel);
+            changed = true;
+            out.push(format!("{rel}: whiteout removed; {}", if now.is_none() { "absent in this release" } else { "changed in this release too" }));
+            continue;
+        }
         if now == base {
             continue;
         }
@@ -1129,6 +1298,7 @@ pub fn reconcile_edits() -> Vec<String> {
         }
     }
     if changed {
+        if let Err(e) = save_deleted(&dir, &deleted) { out.push(format!("whiteouts: {e}")); }
         let _ = save_records(&dir, &records);
     }
     out
@@ -1245,6 +1415,100 @@ mod tests {
         set_edits(None);
         MOUNTS.write().unwrap().retain(|m| m.root != normalize_path(root));
         let _ = std::fs::remove_dir_all(&edits);
+    }
+
+    /// A watcher's look at the edits folder gives each virtual file the stamp a stat of its edit
+    /// gives (an edited file, an edited file in a new folder), and none to an unedited file or
+    /// to the run's own ledger.
+    #[test]
+    fn an_edits_look_stamps_each_virtual_file_as_its_stat_does() {
+        let _one = EDITS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = test_store::Fixture::new(&[("app/a.rs", b"a"), ("app/b.rs", b"b")]);
+        let root = "/edits-look-test/vfs/m";
+        let edits = fixture.store.path.with_extension("look-edits");
+        mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+        set_edits(Some(edits.clone()));
+        std::fs::write(prepare_edit(&format!("{root}/app/a.rs"), false).unwrap(), b"a2").unwrap();
+        std::fs::write(prepare_edit(&format!("{root}/app/new/c.rs"), false).unwrap(), b"c").unwrap();
+        let look = EditsLook::now().unwrap();
+        let found: BTreeMap<&str, _> = look.entries().collect();
+        let stat = |p: &str| edited_disk_path(p).and_then(|d| std::fs::metadata(d).ok()).map(|m| (m.modified().unwrap(), m.len()));
+        for p in ["app/a.rs", "app/new/c.rs", "app/b.rs", "app/none.rs", ".makepad-run-edits"] {
+            let p = format!("{root}/{p}");
+            assert_eq!(edit_rel(&p).and_then(|rel| found.get(rel.as_str()).copied()), stat(&p), "{p}");
+        }
+        assert!(stat(&format!("{root}/app/a.rs")).is_some() && stat(&format!("{root}/app/new/c.rs")).is_some());
+        assert!(stat(&format!("{root}/app/b.rs")).is_none());
+        set_edits(None);
+        MOUNTS.write().unwrap().retain(|m| m.root != normalize_path(root));
+        let _ = std::fs::remove_dir_all(&edits);
+    }
+
+    /// Sandbox game_store (asset client cache.rs open: create_dir_all(tmp), then read_dir(tmp)): a
+    /// folder the run made in a virtual folder lists, empty, as the disk's new folder does; it
+    /// was NotFound while it had no entries.
+    #[test]
+    fn a_folder_made_in_a_virtual_folder_lists_while_empty() {
+        let _one = EDITS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = test_store::Fixture::new(&[("app/a.rs", b"a")]);
+        let root = "/empty-dir-test/vfs/m";
+        let edits = fixture.store.path.with_extension("empty-dir-edits");
+        mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+        set_edits(Some(edits.clone()));
+        let made = format!("{root}/app/cache/tmp");
+        std::fs::create_dir_all(prepare_edit_dir(&made).unwrap()).unwrap();
+        assert!(is_dir(&made));
+        assert_eq!(read_dir(&made).unwrap(), Vec::<(String, bool)>::new());
+        assert_eq!(read_dir(format!("{root}/app/cache")).unwrap(), vec![("tmp".to_string(), true)]);
+        assert_eq!(read_dir(format!("{root}/app")).unwrap(), vec![("a.rs".to_string(), false), ("cache".to_string(), true)]);
+        assert_eq!(read_dir(format!("{root}/app/none")).unwrap_err().kind(), io::ErrorKind::NotFound);
+        set_edits(None);
+        MOUNTS.write().unwrap().retain(|m| m.root != normalize_path(root));
+        let _ = std::fs::remove_dir_all(&edits);
+    }
+
+    /// A test target's source under an overlay is on no disk: its spellings (the Windows host's
+    /// separators among them) are one path.
+    #[test]
+    fn a_virtual_source_has_one_canonical_spelling() {
+        let _one = EDITS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = test_store::Fixture::new(&[("app/tests/chain.rs", b"t")]);
+        let root = "/canonical-test/vfs/m";
+        mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+        let path = format!("{root}/app/tests/chain.rs");
+        assert!(std::fs::canonicalize(&path).is_err());
+        for spelling in [r"\canonical-test\vfs\m\app\tests\chain.rs", "/canonical-test/vfs/m/app/./src/../tests/chain.rs"] {
+            assert_eq!(canonical(spelling), canonical(&path), "{spelling}");
+        }
+        assert_eq!(canonical(&path), path);
+        MOUNTS.write().unwrap().retain(|m| m.root != normalize_path(root));
+        // off every mount and disk: by its components, the drive's letter in one case
+        assert_eq!(canonical(r"C:\nowhere\tests\chain.rs"), canonical("c:/nowhere/tests/chain.rs"));
+    }
+
+    /// A Windows host's overlay (a lease's tree on a drive): the test runner names a target's
+    /// source `c:\..`, the package graph `C:\..` or `c:/..`, and a verbatim `\\?\C:\..` comes from
+    /// a canonicalize. Each is the one path, under the mount and inside it: `makepad run --subject`
+    /// found no test target for makepad-git's worktree_conformance.rs on such a node (11-06).
+    #[test]
+    fn a_windows_overlay_source_has_one_spelling_per_drive_case_and_separator() {
+        let _one = EDITS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = test_store::Fixture::new(&[("libs/git/tests/worktree_conformance.rs", b"t")]);
+        let root = r"C:\Users\u\devhub\native\lane";
+        mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+        let graph = r"C:\Users\u\devhub\native\lane\libs\git\tests\worktree_conformance.rs";
+        assert!(is_virtual(graph));
+        for spelling in [
+            r"c:\Users\u\devhub\native\lane\libs\git\tests\worktree_conformance.rs",
+            "c:/Users/u/devhub/native/lane/libs/git/tests/worktree_conformance.rs",
+            "C:/Users/u/devhub/native/lane/libs/git/tests/worktree_conformance.rs",
+            r"\\?\C:\Users\u\devhub\native\lane\libs\git\tests\worktree_conformance.rs",
+            r"c:\Users\u\devhub\native\lane\libs\git\src\..\tests\worktree_conformance.rs",
+        ] {
+            assert_eq!(canonical(spelling), canonical(graph), "{spelling}");
+        }
+        assert_eq!(canonical(graph), "c:/Users/u/devhub/native/lane/libs/git/tests/worktree_conformance.rs");
+        MOUNTS.write().unwrap().retain(|m| m.root != normalize_path(root));
     }
 
     #[test]
@@ -1394,4 +1658,10 @@ mod tests {
         FROZEN.write().unwrap().retain(|p| relative(p, &normalize_path(roots[0])).is_none());
         MOUNTS.write().unwrap().retain(|m| m.commit != fixture.commit);
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&HELD, relax_session::sync::Mutex::new(Vec::new()));
 }

@@ -15,6 +15,9 @@ pub mod draw_vector;
 pub mod sdf;
 pub mod video_color;
 pub mod finish;
+pub mod paint_lookup;
 pub mod surface;
 #[cfg(test)]
 mod frag_depth_tests;
+#[cfg(test)]
+mod frag_position_tests;

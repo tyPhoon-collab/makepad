@@ -1,11 +1,13 @@
 //! This machine's capabilities and health: hardware from the OS (Linux `/proc` + `/sys` +
 //! `nvidia-smi`; macOS `sysctl` + `statfs`), policy from `~/.makepad/devhub/lease.conf`.
 //!
-//! `lease.conf` is `key = value` lines: `role = pool|suite|bench|user-wm|device`, `slots.<kind> = 0|1` (whether it takes the kind; one lease runs at a time),
+//! `lease.conf` is `key = value` lines: `role = pool|hot|suite|bench|user-wm|device` (`bench`: the
+//! boxes timed leases go to), `slots.<kind> = 0|1` (one write lease per kind; CI only with `slots.ci`),
 //! `disk_floor_gb`, `disk_warn_gb`, `timed = on|off`, `spec = <text>`, `work = <dir>` (default
-//! `~/devhub`), CPU pinning for leases (`cpus.shared = 8-15,24-31`, `cpus.timed = 0-7,16-23`) and
+//! [`WORK_DIR`] in home), CPU pinning for leases (`cpus.shared = 8-15,24-31`, `cpus.timed = 0-7,16-23`) and
 //! `user_idle_min` (default 3: minutes without a person's input before a node with our WM
 //! takes work again, [`super::UserSense`]).
+//! `native_trees` (default 3) bounds per-lane native trees and their targets.
 
 use super::{Caps, Kind, Role};
 use std::path::{Path, PathBuf};
@@ -20,8 +22,10 @@ pub struct LeaseConf {
     pub disk_warn_gb: f64,
     pub timed: bool,
     pub spec: String,
-    /// where leases work: `wt/`, `lane/`, `target/`, `tmp/`, `recovered/`
+    /// where leases work: `dev/` for overlays; `native/`, `native-target/`, `ci-tree/`,
+    /// `ci-target/`, `lane/`, `target/`, `tmp/`, `recovered/` for tree leases
     pub work: PathBuf,
+    pub native_trees: u32,
     /// taskset CPU lists for shared kinds and for `timed` (empty: no pinning)
     pub cpus_shared: String,
     pub cpus_timed: String,
@@ -31,10 +35,15 @@ pub struct LeaseConf {
 
 /// `user_idle_min`'s default.
 pub const USER_IDLE_MIN: u32 = 3;
+pub const NATIVE_TREES: u32 = 3;
 
 pub fn home_dir() -> PathBuf {
     crate::os::home_dir()
 }
+
+/// The default work dir under home. Spotlight skips a `.noindex` dir on macOS: it indexed build
+/// output beside timed leases at over a core and a half (11-03).
+pub const WORK_DIR: &str = if cfg!(target_os = "macos") { "devhub.noindex" } else { "devhub" };
 
 pub fn conf_path() -> PathBuf {
     crate::proto::home().join("lease.conf")
@@ -54,7 +63,8 @@ impl LeaseConf {
             disk_warn_gb: 50.0,
             timed: true,
             spec: String::new(),
-            work: home.join("devhub"),
+            work: home.join(WORK_DIR),
+            native_trees: NATIVE_TREES,
             cpus_shared: String::new(),
             cpus_timed: String::new(),
             user_idle_min: USER_IDLE_MIN,
@@ -70,6 +80,7 @@ impl LeaseConf {
                 "timed" => c.timed = v != "off",
                 "spec" => c.spec = v.to_string(),
                 "work" => c.work = v.strip_prefix("~/").map_or_else(|| PathBuf::from(v), |r| home.join(r)),
+                "native_trees" => c.native_trees = v.parse().unwrap_or(c.native_trees),
                 "cpus.shared" if valid_cpus(v) => c.cpus_shared = v.to_string(),
                 "cpus.timed" if valid_cpus(v) => c.cpus_timed = v.to_string(),
                 "user_idle_min" => c.user_idle_min = v.parse().ok().filter(|m| *m >= 1).unwrap_or(c.user_idle_min),
@@ -84,12 +95,11 @@ impl LeaseConf {
         c
     }
 
-    /// Slots per kind: the conf's, else build 2, test 2, screen 3, long 2, gate 1, gpu = #GPUs,
-    /// timed 1 (0 with `timed = off`). `inspect` is not counted.
+    /// One slot per kind by default; CI only where `slots.ci` opts in, never on a user's box.
+    /// `inspect` is not counted.
     pub fn slots(&self, gpus: u32) -> Vec<(Kind, u32)> {
-        // one box per lease: a slot only says the node takes the kind (0: never)
-        let defaults = [(Kind::Build, 1), (Kind::Test, 1), (Kind::Screen, 1), (Kind::Long, 1), (Kind::Gate, 1), (Kind::Gpu, gpus.min(1)), (Kind::Timed, self.timed as u32)];
-        defaults.iter().map(|(k, d)| (*k, self.slots.iter().find(|(x, _)| x == k).map_or(*d, |(_, n)| *n))).collect()
+        let defaults = [(Kind::Build, 1), (Kind::Test, 1), (Kind::Screen, 1), (Kind::Long, 1), (Kind::Gate, 1), (Kind::Gpu, gpus.min(1)), (Kind::Timed, self.timed as u32), (Kind::Ci, 0)];
+        defaults.iter().map(|(k, d)| (*k, if *k == Kind::Ci && self.role.users() { 0 } else { self.slots.iter().find(|(x, _)| x == k).map_or(*d, |(_, n)| *n) })).collect()
     }
 }
 
@@ -98,15 +108,16 @@ impl LeaseConf {
 pub fn settable(key: &str, value: &str) -> Result<(), String> {
     let num = || value.parse::<f64>().map(|_| ()).map_err(|_| format!("{key} takes a number"));
     match key {
-        "role" => Role::parse(value).map(|_| ()).ok_or_else(|| "role = pool|suite|bench|user-wm|device".to_string()),
+        "role" => Role::parse(value).map(|_| ()).ok_or_else(|| "role = pool|hot|suite|bench|user-wm|device".to_string()),
         "disk_floor_gb" | "disk_warn_gb" => num(),
+        "native_trees" => value.parse::<u32>().map(|_| ()).map_err(|_| "native_trees takes a count".to_string()),
         "timed" => matches!(value, "on" | "off").then_some(()).ok_or_else(|| "timed = on|off".to_string()),
         "spec" => (!value.is_empty() && value.len() <= 64 && value.bytes().all(|b| b.is_ascii_graphic())).then_some(()).ok_or_else(|| "spec: one word".to_string()),
         "cpus.shared" | "cpus.timed" => (value.is_empty() || valid_cpus(value)).then_some(()).ok_or_else(|| format!("{key}: a CPU list like 8-15,24-31")),
         "user_idle_min" => value.parse::<u32>().ok().filter(|m| (1..=1440).contains(m)).map(|_| ()).ok_or_else(|| "user_idle_min: whole minutes, 1..1440".to_string()),
         k => match k.strip_prefix("slots.").and_then(Kind::parse) {
             Some(_) => value.parse::<u32>().map(|_| ()).map_err(|_| format!("{key} takes a count")),
-            None => Err(format!("`{key}` is not a lease.conf key the master sets (role, slots.<kind>, disk_floor_gb, disk_warn_gb, timed, spec, cpus.shared, cpus.timed, user_idle_min)")),
+            None => Err(format!("`{key}` is not a lease.conf key the master sets (role, slots.<kind>, native_trees, disk_floor_gb, disk_warn_gb, timed, spec, cpus.shared, cpus.timed, user_idle_min)")),
         },
     }
 }
@@ -133,7 +144,41 @@ fn valid_cpus(v: &str) -> bool {
     !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit() || b == b',' || b == b'-')
 }
 
+/// The CPUs a taskset list names (`8-15,24-31`: 16); 0 for none or one taskset would refuse.
+pub fn cpu_count(list: &str) -> u32 {
+    let mut n = 0;
+    for part in list.split(',') {
+        let (a, b) = part.split_once('-').unwrap_or((part, part));
+        match (a.parse::<u32>(), b.parse::<u32>()) {
+            (Ok(a), Ok(b)) if a <= b => n += b - a + 1,
+            _ => return 0,
+        }
+    }
+    n
+}
+
 /// Measures this machine now (`node`: its devhub name; `apply`: DEVHUB2's applier kind).
+/// PATH with the user's rustup toolchain first (`$CARGO_HOME/bin`, else `~/.cargo/bin`) when it has
+/// one: a box whose system Rust sits in /usr/bin builds with the fleet's rustup stable. None: as is.
+pub fn rust_path() -> Option<String> {
+    let bin = std::env::var_os("CARGO_HOME").filter(|h| !h.is_empty()).map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))?.join("bin");
+    if !bin.join(if cfg!(windows) { "rustc.exe" } else { "rustc" }).is_file() {
+        return None;
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let rest: Vec<PathBuf> = std::env::split_paths(&path).filter(|p| *p != bin).collect();
+    std::env::join_paths(std::iter::once(bin).chain(rest)).ok().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// `prog` (cargo, rustc) as a lease's run finds it ([`rust_path`]).
+pub fn rust_command(prog: &str) -> std::process::Command {
+    let mut c = std::process::Command::new(prog);
+    if let Some(p) = rust_path() {
+        c.env("PATH", p);
+    }
+    c
+}
+
 /// The node's `rustc -V` version (`1.97.1`), looked at every 5 min (an update needs no hub restart).
 fn rustc_version() -> String {
     static LAST: std::sync::Mutex<Option<(std::time::Instant, String)>> = std::sync::Mutex::new(None);
@@ -142,13 +187,27 @@ fn rustc_version() -> String {
         let _ = t;
         return v.clone();
     }
-    let v = std::process::Command::new("rustc").arg("-V").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().nth(1).unwrap_or("").to_string()).unwrap_or_default();
+    let v = rust_command("rustc").arg("-V").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().nth(1).unwrap_or("").to_string()).unwrap_or_default();
     *g = Some((std::time::Instant::now(), v.clone()));
     v
 }
 
+/// The same live WM display reported in caps, without reprobing the hardware/toolchain.
+#[cfg(target_os = "linux")]
+pub(super) fn display() -> Option<String> {
+    os::display()
+}
+
+/// The box's WM answered on another hosted wire at the last caps measure (its socket and
+/// answer): no display for gui work until it restarts (`sync::serve` rolls that restart).
+#[cfg(target_os = "linux")]
+pub fn other_wire() -> Option<String> {
+    os::OTHER_WIRE.lock().unwrap().clone()
+}
+
 pub fn measure(node: &str, conf: &LeaseConf, apply: &str) -> Caps {
     let mut c = os::hardware();
+    c.exec_limits = crate::os::exec_limits().ok().flatten();
     c.node = node.to_string();
     let (free, total) = disk_space(&conf.work).unwrap_or((0, 0));
     c.disk_free_gb = free as f64 / GB;
@@ -161,10 +220,48 @@ pub fn measure(node: &str, conf: &LeaseConf, apply: &str) -> Caps {
     c.timed = conf.timed;
     c.apply = apply.to_string();
     c.hub_rev = hub_rev().to_string();
+    c.hub_rss_mb = crate::procinfo::proc(std::process::id()).map_or(0, |p| p.rss_bytes >> 20);
+    c.hub_heap_mb = (crate::heap::live() >> 20) as u64;
+    c.sick = sick();
+    c.clocksource = clocksource();
     c.rustc = rustc_version();
     c.hub_proto = super::HUB_PROTO;
     c.services = services();
+    c.hub_building = super::exec::hub_building();
+    c.jit_store = Some(std::sync::Arc::new(super::jitstore::Store::new(&conf.work).snapshot()));
+    c.native_trees = conf.native_trees;
+    c.cpus_shared = cpu_count(&conf.cpus_shared);
+    c.cpus_timed = cpu_count(&conf.cpus_timed);
+    #[cfg(feature = "checkout")]
+    { c.native = super::tree::natives(&conf.work).into_iter().map(|(lane, _)| lane).collect(); }
     c
+}
+
+/// The kernel's current clock source on an x86 Linux box (`tsc`; `hpet` or `acpi_pm` when the
+/// kernel marked the TSC unstable); empty elsewhere.
+pub fn clocksource() -> String {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        std::fs::read_to_string("/sys/devices/system/clocksource/clocksource0/current_clocksource").map(|s| s.trim().to_string()).unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+/// Why a box takes no timed leases for its clock, if so: off the TSC every clock read is a slow
+/// syscall, which inflates what a timed run measures (a slicing run's wall 35.2 s against 15.8 s
+/// on the same hardware on the TSC, the same commit, 11-04). The name only: no per-box setting.
+pub fn slow_clock(clocksource: &str) -> Option<String> {
+    (!clocksource.is_empty() && clocksource != "tsc").then(|| format!("no timed leases: clocksource {clocksource} (TSC unstable since boot; a reboot restores it)"))
+}
+
+/// Why a Mac starts no new lease now, if so: its memory pressure is past normal. What runs there
+/// goes on; a lease that starts beside a box at warn pushes it into swap (11-04).
+pub fn mac_pressure(level: u32) -> Option<&'static str> {
+    match level {
+        0 | 1 => None,
+        2 => Some("mac pressure warn"),
+        _ => Some("mac pressure critical"),
+    }
 }
 
 /// The WM-supervised services of this node (`~/.makepad/wm/<name>.state`, written at each start):
@@ -185,13 +282,100 @@ pub fn services() -> Vec<(String, u64)> {
     out
 }
 
+/// Why this box's toolchain cannot link, from its last probe (see [`probe_toolchain`]).
+static SICK: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// Why git cannot work this box's stores: its last store command that failed for the box, not
+/// for the request ([`git_failed`]), until a probe of the stores passes ([`probe_git`]).
+static GIT_SICK: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Why this box takes no lease (empty: it takes them).
+pub fn sick() -> String {
+    let t = SICK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let g = GIT_SICK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut why = Vec::new();
+    if !t.is_empty() { why.push(format!("its toolchain cannot link: {t}")); }
+    if !g.is_empty() { why.push(format!("git fails on its stores: {g}")); }
+    why.join("; ")
+}
+
+/// A git error that is the box's, not the request's: git could not start, read its working
+/// directory or write the disk. Every later lease there would fail the same way at its start (a
+/// node whose hub sat in a removed tree failed every timed job sent to it, 11-03).
+fn box_git_error(err: &str) -> bool {
+    err.starts_with("git: ") || ["Unable to read current working directory", "No space left on device", "Read-only file system"].iter().any(|p| err.contains(p))
+}
+
+/// Why git fails on this box's stores (empty: it works them).
+pub fn git_sick() -> String {
+    GIT_SICK.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Notes a failed store command: one that is the box's takes it out of rotation until
+/// [`probe_git`] passes.
+pub fn git_failed(err: &str) {
+    if box_git_error(err) {
+        *GIT_SICK.lock().unwrap_or_else(|e| e.into_inner()) = crate::proto::clean(err, 200);
+    }
+}
+
+/// Whether git works this box's stores again: a read of each (no write, nothing fetched), only
+/// while it is out of rotation for git (no git process otherwise). Returns (why, changed).
+pub fn probe_git() -> (Option<String>, bool) {
+    let before = GIT_SICK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if before.is_empty() {
+        return (None, false);
+    }
+    #[cfg(feature = "checkout")]
+    let why = {
+        let stores = crate::sync::git::stores_dir();
+        ["makepad", "commercial"].iter().map(|r| stores.join(format!("{r}.git"))).filter(|s| s.is_dir())
+            .find_map(|s| crate::sync::git::run(None, Some(&s), &[], &["rev-parse", "--git-dir"]).err())
+    };
+    // a hub without the checkout keeps no stores: git starting again is the probe
+    #[cfg(not(feature = "checkout"))]
+    let why = crate::lease::wt::git(None, None, &["--version"]).err();
+    let mut g = GIT_SICK.lock().unwrap_or_else(|e| e.into_inner());
+    *g = why.clone().map(|w| crate::proto::clean(&w, 200)).unwrap_or_default();
+    let changed = *g != before;
+    (why, changed)
+}
+
+/// Links a small program the way a build does, system libraries included (a damaged SDK fails every
+/// lane's job at its last step). The first line that says why, or None. `changed`: the verdict moved.
+pub fn probe_toolchain(dir: &std::path::Path) -> (Option<String>, bool) {
+    let src = dir.join("toolchain-probe.rs");
+    let out = dir.join(if cfg!(windows) { "toolchain-probe.exe" } else { "toolchain-probe" });
+    let text = "#[cfg(target_os = \"macos\")] #[link(name = \"objc\")] #[link(name = \"m\")] #[link(name = \"Foundation\", kind = \"framework\")] #[link(name = \"Metal\", kind = \"framework\")] unsafe extern \"C\" {}\nfn main() {}\n";
+    let why = (|| {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        std::fs::write(&src, text).map_err(|e| e.to_string())?;
+        let o = makepad_remote::group::command("rustc").envs(rust_path().map(|p| ("PATH", p))).args(["--edition", "2021"]).arg(&src).arg("-o").arg(&out).current_dir(dir).stdin(std::process::Stdio::null()).output().map_err(|e| format!("rustc: {e}"))?;
+        if o.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&o.stderr).into_owned();
+        let line = err.lines().find(|l| l.contains("tapi error") || l.contains("ld:") || l.starts_with("error")).unwrap_or("rustc failed").trim().to_string();
+        Err(crate::proto::clean(&line, 200))
+    })()
+    .err();
+    let _ = std::fs::remove_file(&out);
+    let mut s = SICK.lock().unwrap_or_else(|e| e.into_inner());
+    let now = why.clone().unwrap_or_default();
+    let changed = *s != now;
+    *s = now;
+    (why, changed)
+}
+
 /// The commit this hub's checkout held when the hub started (its code; read once, from the files
 /// under `.git`: the tree moves with leases later).
 pub fn hub_rev() -> &'static str {
     static REV: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     REV.get_or_init(|| {
+        if let Ok(rev) = std::env::var(BUILT_AT) {
+            return rev;
+        }
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        // a tree a deploy script or sync wrote with no `.git` of its own (103) names its commit in
+        // a tree a deploy script or sync wrote with no `.git` of its own (a node's) names its commit in
         // FLEET-REVISION.txt
         head_sha(&repo).or_else(|| {
             let t = std::fs::read_to_string(repo.join("FLEET-REVISION.txt")).ok()?;
@@ -199,6 +383,11 @@ pub fn hub_rev() -> &'static str {
         }).unwrap_or_default()
     })
 }
+
+/// What a master that restarts itself tells the build it execs into: the commit it built. Its
+/// checkout's HEAD has moved on when a landing came during the build or the drain, and a master
+/// that took that HEAD for its own never built the landing (its CLI stayed behind, 11-04).
+pub const BUILT_AT: &str = "DEVHUB_BUILT_AT";
 
 /// HEAD's commit of a checkout, from its files (a linked worktree's `.git` file, a loose ref or
 /// packed-refs).
@@ -268,6 +457,29 @@ pub fn parse_battery(capacity: &str, status: &str) -> Option<(u32, bool)> {
     Some((pct, matches!(status.trim(), "Charging" | "Full")))
 }
 
+/// How long [`load_now`] measures the CPU for.
+pub const LOAD_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The box's load now: (CPU use in percent over [`LOAD_WINDOW`], available RAM in GB). A lease-end
+/// answers it after the teardown: the caps the master holds are a 10 s average from up to 10 s ago
+/// and still count the ended lease's work (a medium lease waited 23 s, two caps rounds, after two
+/// small tests that pegged its box had ended, 11-04).
+pub fn load_now() -> Option<(f64, f64)> {
+    os::load_now()
+}
+
+/// (this box's RAM, what its swap files take of its disk), bytes, where swap grows on the volume
+/// it swaps to: macOS. A Linux box swaps to a fixed file or partition, so memory cannot fill its
+/// disk (the kernel's OOM killer ends what outgrows the RAM).
+#[cfg(target_os = "macos")]
+pub fn swap_on_disk() -> Option<(u64, u64)> {
+    os::swap_on_disk()
+}
+#[cfg(not(target_os = "macos"))]
+pub fn swap_on_disk() -> Option<(u64, u64)> {
+    None
+}
+
 /// (free, total) bytes of the volume holding `path` (its nearest existing ancestor).
 pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     let mut p = path.to_path_buf();
@@ -277,7 +489,8 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     os::disk_space(&p)
 }
 
-#[cfg(target_os = "linux")]
+// Android: bionic shares the /proc files, statvfs layout and power-supply nodes
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod os {
     use super::*;
 
@@ -297,7 +510,7 @@ mod os {
             cpu_pct,
             gpu_busy: gpu.iter().map(|g| (g.util_pct, g.mem_used_gb)).collect(),
             arch: std::env::consts::ARCH.to_string(),
-            os: "linux".into(),
+            os: std::env::consts::OS.to_string(),
             cpu,
             cores: cores.max(1),
             load1: parse_loadavg(&read("/proc/loadavg")),
@@ -305,25 +518,82 @@ mod os {
             ram_avail_gb: avail,
             gpus: gpu.iter().map(|g| (g.name.clone(), g.mem_total_gb)).collect(),
             display: display(),
+            // read after display(): its probe leaves the answer of a WM on another wire
+            wm_wire: OTHER_WIRE.lock().unwrap().clone().unwrap_or_default(),
             battery: battery(),
             ..Default::default()
         }
     }
 
-    /// A live makepad WM socket (`$XDG_RUNTIME_DIR/makepad-wm-<n>` that accepts), else a Wayland one.
-    fn display() -> Option<String> {
+    pub fn load_now() -> Option<(f64, f64)> {
+        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+        let a = crate::top::parse_proc_stat(&read("/proc/stat"))?;
+        std::thread::sleep(LOAD_WINDOW);
+        let b = crate::top::parse_proc_stat(&read("/proc/stat"))?;
+        (b.1 > a.1).then(|| (crate::top::cpu_pct(a, b), parse_meminfo(&read("/proc/meminfo")).1))
+    }
+
+    /// The box's live makepad WM session. An arbitrary Wayland compositor (including a
+    /// headless one) is not a display on which CI may boot apps.
+    pub(super) fn display() -> Option<String> {
         let rt = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", uid())));
-        let mut wayland = None;
-        for e in std::fs::read_dir(&rt).ok()?.flatten() {
+        let mut sockets: Vec<_> = std::fs::read_dir(&rt).ok()?.flatten().filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with("makepad-wm-") && !name.ends_with(".lock") && std::os::unix::net::UnixStream::connect(e.path()).is_ok() {
-                return Some(format!("wm:{name}"));
+            let index = name.strip_prefix("makepad-wm-")?.parse::<u32>().ok()?;
+            Some((index, name, e.path()))
+        }).collect();
+        sockets.sort_by_key(|(index, _, _)| *index);
+        let mut other = None;
+        let found = sockets.into_iter().find_map(|(_, name, path)| match hosts_apps(&path) {
+            Ok(()) => Some(format!("wm:{name}")),
+            Err(answer) => {
+                other = other.take().or(answer.map(|a| format!("{name} answered {a:?}")));
+                None
             }
-            if name.starts_with("wayland-") && !name.ends_with(".lock") {
-                wayland = Some(format!("wayland:{name}"));
+        });
+        *OTHER_WIRE.lock().unwrap() = if found.is_some() { None } else { other };
+        found
+    }
+
+    pub(super) static OTHER_WIRE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    /// Whether the WM at `path` takes today's apps, asked the way an app asks it
+    /// (platform/hal wm_socket): `hello2` first; a WM from before that closes it unanswered and
+    /// is asked the legacy `hello <wire>` with the apps' wire fingerprint. A WM on another wire
+    /// cannot host them (Fab could not start on a node, 2026-11-02), so the box is no display for
+    /// gui work until its WM restarts. A slow answer is no evidence of another wire.
+    /// `Err(Some(answer))`: a WM on another wire; `Err(None)`: none answers there.
+    fn hosts_apps(path: &Path) -> Result<(), Option<String>> {
+        use std::io::{BufRead, ErrorKind, Read, Write};
+        use std::os::unix::net::UnixStream;
+        enum Answer { Dead, Slow, Line(String) }
+        let ask = |line: String| {
+            let Ok(s) = UnixStream::connect(path) else { return Answer::Dead };
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+            let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(3)));
+            if (&s).write_all(line.as_bytes()).is_err() {
+                return Answer::Dead;
             }
+            let mut answer = String::new();
+            match std::io::BufReader::new(&s).take(512).read_line(&mut answer) {
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Answer::Slow,
+                // closed unanswered (or reset): an old WM's way of not knowing the line
+                _ => Answer::Line(answer.trim().to_string()),
+            }
+        };
+        let said = |a: &str, what: &str| a.strip_prefix("makepad-wm ").is_some_and(|r| r.starts_with(what));
+        match ask("makepad-wm hello2 1-65535\n".into()) {
+            Answer::Dead => Err(None),
+            Answer::Slow => Ok(()),
+            Answer::Line(a) if said(&a, "ok ") => Ok(()),
+            Answer::Line(a) if said(&a, "incompatible ") => Err(Some(a)),
+            Answer::Line(_) => match ask(format!("makepad-wm hello {:016x}\n", makepad_studio_protocol::WIRE)) {
+                Answer::Slow => Ok(()),
+                Answer::Line(a) if said(&a, "ok") => Ok(()),
+                Answer::Line(a) if said(&a, "mismatch ") => Err(Some(a)),
+                _ => Err(None),
+            },
         }
-        wayland.or_else(|| std::env::var("WAYLAND_DISPLAY").ok().filter(|w| !w.is_empty()).map(|w| format!("wayland:{w}")))
     }
 
     fn uid() -> u32 {
@@ -398,6 +668,19 @@ mod os {
         if len == 4 { v & 0xffff_ffff } else { v }
     }
 
+    pub(super) fn swap_on_disk() -> Option<(u64, u64)> {
+        // struct xsw_usage (sys/sysctl.h)
+        #[repr(C)]
+        #[derive(Default)]
+        struct Usage { total: u64, avail: u64, used: u64, pagesize: u32, encrypted: u32 }
+        let mut u = Usage::default();
+        let mut len = std::mem::size_of::<Usage>();
+        if unsafe { sysctlbyname(b"vm.swapusage\0".as_ptr(), &mut u as *mut Usage as *mut _, &mut len, std::ptr::null_mut(), 0) } != 0 {
+            return None;
+        }
+        Some((sysctl_u64("hw.memsize"), u.total))
+    }
+
     fn sysctl_str(name: &str) -> String {
         let n = format!("{name}\0");
         let mut buf = [0u8; 256];
@@ -426,15 +709,29 @@ mod os {
         Some((busy, busy + t[2] as u64))
     }
 
+    pub fn load_now() -> Option<(f64, f64)> {
+        let a = cpu_ticks()?;
+        std::thread::sleep(LOAD_WINDOW);
+        let b = cpu_ticks()?;
+        (b.1 > a.1).then(|| (crate::top::cpu_pct(a, b), crate::procinfo::machine().mem_avail_mb as f64 / 1024.0))
+    }
+
     pub fn hardware() -> Caps {
         let m = crate::procinfo::machine();
         // CPU use since the previous measure (the master asks every 10 s): what decides "busy", not
         // the 1-minute load average, which stays high for a minute after a lease's build ended
-        static LAST: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+        // (a measure within the same tick as the last one, from another caller, answers the last
+        // value and keeps its base: the ticks advance at 100 Hz)
+        static LAST: std::sync::Mutex<(Option<(u64, u64)>, Option<f64>)> = std::sync::Mutex::new((None, None));
         let now = cpu_ticks();
-        let cpu_pct = match (LAST.lock().unwrap().replace(now.unwrap_or((0, 0))), now) {
-            (Some(a), Some(b)) if b.1 > a.1 => Some(crate::top::cpu_pct(a, b)),
-            _ => None,
+        let cpu_pct = {
+            let mut last = LAST.lock().unwrap();
+            match (last.0, now) {
+                (Some(a), Some(b)) if b.1 > a.1 => *last = (now, Some(crate::top::cpu_pct(a, b))),
+                (Some(_), Some(_)) => {}
+                _ => *last = (now, None),
+            }
+            last.1
         };
         Caps {
             cpu_pct,
@@ -445,6 +742,7 @@ mod os {
             load1: m.load1,
             ram_gb: sysctl_u64("hw.memsize") as f64 / GB,
             ram_avail_gb: m.mem_avail_mb as f64 / 1024.0,
+            mem_pressure: sysctl_u64("kern.memorystatus_vm_pressure_level") as u32,
             // a Mac shows windows on its own session; the GPU is the SoC's (not a lease resource)
             display: Some("macos".into()),
             ..Default::default()
@@ -490,6 +788,13 @@ mod os {
 mod os {
     use super::*;
 
+    pub fn load_now() -> Option<(f64, f64)> {
+        let a = crate::os::cpu_times()?;
+        std::thread::sleep(LOAD_WINDOW);
+        let b = crate::os::cpu_times()?;
+        (b.1 > a.1).then(|| (crate::top::cpu_pct(a, b), crate::os::memory().1 as f64 / GB))
+    }
+
     pub fn hardware() -> Caps {
         let (total, avail) = crate::os::memory();
         // CPU use since the previous measure (the master asks every 10 s)
@@ -524,12 +829,16 @@ mod os {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
 mod os {
     use super::*;
 
     pub fn hardware() -> Caps {
         Caps { arch: std::env::consts::ARCH.to_string(), os: std::env::consts::OS.to_string(), cores: 1, ..Default::default() }
+    }
+
+    pub fn load_now() -> Option<(f64, f64)> {
+        None
     }
 
     pub fn disk_space(_path: &Path) -> Option<(u64, u64)> {
@@ -539,29 +848,41 @@ mod os {
 
 #[cfg(test)]
 mod tests {
+    /// Only a git error that is the box's takes it out of rotation: one about the request (a
+    /// commit it does not have) is the request's.
+    #[test]
+    fn a_box_git_error_is_told_from_a_request_error() {
+        assert!(super::box_git_error("git bundle: fatal: Unable to read current working directory"));
+        assert!(super::box_git_error("git: No such file or directory (os error 2)"));
+        assert!(super::box_git_error("git fetch: error: unable to write file: No space left on device"));
+        assert!(!super::box_git_error("git rev-parse: fatal: bad revision 'deadbeef'"));
+        assert!(!super::box_git_error("git read-tree: error: Entry 'x' not uptodate. Cannot merge."));
+    }
 
     /// macOS measures CPU use like Linux (two samples of all cores' ticks): the busy check uses it.
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_measures_cpu_use() {
+    fn macos_measures_cpu_use_and_memory_pressure() {
         let _ = os::hardware();
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let p = os::hardware().cpu_pct.expect("a second measure has the CPU use");
+        let c = os::hardware();
+        let p = c.cpu_pct.expect("a second measure has the CPU use");
         assert!((0.0..=100.0).contains(&p), "{p}");
+        assert!(matches!(c.mem_pressure, 1 | 2 | 4), "{}", c.mem_pressure);
     }
     use super::*;
 
     #[test]
     fn cpuinfo_meminfo_loadavg_nvidia_battery() {
-        let cpu = "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD Ryzen 7 CPU-B 8-Core Processor\n\nprocessor\t: 1\nmodel name\t: AMD Ryzen 7 CPU-B 8-Core Processor\n";
-        assert_eq!(parse_cpuinfo(cpu), ("AMD Ryzen 7 CPU-B 8-Core Processor".to_string(), 2));
+        let cpu = "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: CPU-B 8-Core Processor\n\nprocessor\t: 1\nmodel name\t: CPU-B 8-Core Processor\n";
+        assert_eq!(parse_cpuinfo(cpu), ("CPU-B 8-Core Processor".to_string(), 2));
         let (t, a) = parse_meminfo("MemTotal:       65536000 kB\nMemFree:  100 kB\nMemAvailable:   32768000 kB\n");
         assert!((t - 62.5).abs() < 0.01 && (a - 31.25).abs() < 0.01);
         assert_eq!(parse_loadavg("3.52 2.10 1.00 2/900 1234\n"), 3.52);
-        let g = parse_nvidia("NVIDIA GeForce GPU-B, 32607\nNVIDIA GeForce GPU-A, 24564\n");
+        let g = parse_nvidia("NVIDIA GeForce GPU-B, 33000\nNVIDIA GeForce GPU-A, 25000\n");
         assert_eq!(g.len(), 2);
         assert_eq!(g[0].0, "NVIDIA GeForce GPU-B");
-        assert!((g[1].1 - 23.99).abs() < 0.01);
+        assert!((g[1].1 - 24.41).abs() < 0.01);
         assert!(parse_nvidia("").is_empty());
         assert_eq!(parse_battery("87\n", "Discharging\n"), Some((87, false)));
         assert_eq!(parse_battery("100", "Full"), Some((100, true)));
@@ -577,9 +898,9 @@ mod tests {
         let home = Path::new("/home/me");
         let d = LeaseConf::parse("", home);
         assert_eq!((d.role, d.disk_floor_gb, d.disk_warn_gb, d.timed), (Role::Pool, 25.0, 50.0, true));
-        assert_eq!(d.work, PathBuf::from("/home/me/devhub"));
-        assert_eq!(d.slots(2), vec![(Kind::Build, 1), (Kind::Test, 1), (Kind::Screen, 1), (Kind::Long, 1), (Kind::Gate, 1), (Kind::Gpu, 1), (Kind::Timed, 1)]);
-        let c = LeaseConf::parse("# the 166 conf\nrole = user-wm\nslots.build = 1\nslots.nope = 4\nslots.test=6\ndisk_floor_gb = 40\ntimed = off\nspec = CPU-A+GPU-A  # comment\nwork = ~/scratch/dh\ncpus.shared = 8-15,24-31\ncpus.timed = rm -rf\n", home);
+        assert_eq!(d.work, home.join(WORK_DIR));
+        assert_eq!(d.slots(2), vec![(Kind::Build, 1), (Kind::Test, 1), (Kind::Screen, 1), (Kind::Long, 1), (Kind::Gate, 1), (Kind::Gpu, 1), (Kind::Timed, 1), (Kind::Ci, 0)]);
+        let c = LeaseConf::parse("# a node's conf\nrole = user-wm\nslots.build = 1\nslots.nope = 4\nslots.test=6\ndisk_floor_gb = 40\ntimed = off\nspec = CPU-A+GPU-A  # comment\nwork = ~/scratch/dh\ncpus.shared = 8-15,24-31\ncpus.timed = rm -rf\n", home);
         assert_eq!(c.role, Role::UserWm);
         assert_eq!(c.disk_floor_gb, 40.0);
         assert!(!c.timed);
@@ -587,6 +908,7 @@ mod tests {
         assert_eq!(c.work, PathBuf::from("/home/me/scratch/dh"));
         assert_eq!(c.cpus_shared, "8-15,24-31");
         assert_eq!(c.cpus_timed, "");
+        assert_eq!((cpu_count(&c.cpus_shared), cpu_count("3"), cpu_count("0-3,8"), cpu_count(""), cpu_count("5-2"), cpu_count("1,,2")), (16, 1, 5, 0, 0, 0));
         let s = c.slots(0);
         assert!(s.contains(&(Kind::Build, 1)) && s.contains(&(Kind::Test, 6)) && s.contains(&(Kind::Timed, 0)) && s.contains(&(Kind::Gpu, 0)));
     }
@@ -596,8 +918,8 @@ mod tests {
         assert!(settable("role", "user-wm").is_ok() && settable("role", "boss").is_err());
         assert!(settable("slots.build", "3").is_ok() && settable("slots.build", "x").is_err() && settable("slots.nope", "1").is_err());
         assert!(settable("work", "/tmp").is_err() && settable("cpus.shared", "rm -rf").is_err());
-        let t = conf_with("# 165\nrole = pool  # was\nslots.build = 2\n", &[("role".into(), "user-wm".into()), ("cpus.shared".into(), "8-15,24-31".into())]);
-        assert_eq!(t, "# 165\nrole = user-wm  # was\nslots.build = 2\ncpus.shared = 8-15,24-31\n");
+        let t = conf_with("# a node\nrole = pool  # was\nslots.build = 2\n", &[("role".into(), "user-wm".into()), ("cpus.shared".into(), "8-15,24-31".into())]);
+        assert_eq!(t, "# a node\nrole = user-wm  # was\nslots.build = 2\ncpus.shared = 8-15,24-31\n");
         let c = LeaseConf::parse(&t, Path::new("/h"));
         assert_eq!((c.role, c.cpus_shared.as_str()), (Role::UserWm, "8-15,24-31"));
     }

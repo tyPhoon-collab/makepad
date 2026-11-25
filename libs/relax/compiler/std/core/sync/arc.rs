@@ -57,6 +57,11 @@ impl<T> Arc<T> {
         Arc { ptr: unsafe { ptr::NonNull::new_unchecked(p) }, _marker: crate::marker::PhantomData }
     }
 
+    pub fn pin(data: T) -> crate::pin::Pin<Arc<T>> {
+        // The value stays in the Arc allocation when its owning handle moves.
+        unsafe { crate::pin::Pin::new_unchecked(Self::new(data)) }
+    }
+
     pub fn new_cyclic<F: FnOnce(&Weak<T>) -> T>(data_fn: F) -> Arc<T> {
         let (h, p) = alloc_block(crate::mem::size_of::<T>(), crate::mem::align_of::<T>(), 0, 1);
         let p = p as *mut T;
@@ -332,6 +337,38 @@ impl<'a, T: Clone> From<&'a [T]> for Arc<[T]> {
     }
 }
 
+// library/alloc/src/rcs/arc.rs:4095,4135,4223,4250 @8d1a764
+impl<'a, T: Clone> From<&'a mut [T]> for Arc<[T]> {
+    fn from(v: &'a mut [T]) -> Arc<[T]> {
+        Arc::from(&*v)
+    }
+}
+
+impl<'a> From<&'a mut str> for Arc<str> {
+    fn from(v: &'a mut str) -> Arc<str> {
+        Arc::from(&*v)
+    }
+}
+
+impl<'a, B> From<crate::borrow::Cow<'a, B>> for Arc<B>
+where
+    B: crate::borrow::ToOwned + ?Sized,
+    Arc<B>: From<&'a B> + From<<B as crate::borrow::ToOwned>::Owned>,
+{
+    fn from(cow: crate::borrow::Cow<'a, B>) -> Arc<B> {
+        match cow {
+            crate::borrow::Cow::Borrowed(s) => Arc::from(s),
+            crate::borrow::Cow::Owned(s) => Arc::from(s),
+        }
+    }
+}
+
+impl From<Arc<str>> for Arc<[u8]> {
+    fn from(rc: Arc<str>) -> Arc<[u8]> {
+        unsafe { Arc::from_raw(Arc::into_raw(rc) as *const [u8]) }
+    }
+}
+
 /// Moves a boxed (possibly unsized) value into a new Arc block and frees the box's allocation.
 impl<T: ?Sized> From<crate::boxed::Box<T>> for Arc<T> {
     fn from(b: crate::boxed::Box<T>) -> Arc<T> {
@@ -432,6 +469,20 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Arc<T> {
     }
 }
 
+impl<T: ?Sized + crate::error::Error> crate::error::Error for Arc<T> {
+    fn cause(&self) -> Option<&dyn crate::error::Error> {
+        crate::error::Error::cause(&**self)
+    }
+
+    fn source(&self) -> Option<&(dyn crate::error::Error + 'static)> {
+        crate::error::Error::source(&**self)
+    }
+
+    fn provide<'a>(&'a self, request: &mut crate::error::Request<'a>) {
+        crate::error::Error::provide(&**self, request);
+    }
+}
+
 impl<T: ?Sized> fmt::Pointer for Arc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Pointer::fmt(&(self.ptr.as_ptr() as *const T), f)
@@ -455,6 +506,17 @@ impl<T> Weak<T> {
 }
 
 impl<T: ?Sized> Weak<T> {
+    pub fn into_raw(self) -> *const T {
+        let p = self.ptr.as_ptr() as *const T;
+        crate::mem::forget(self);
+        p
+    }
+
+    /// Reclaims the weak count transferred by `into_raw`, including an empty Weak.
+    pub unsafe fn from_raw(p: *const T) -> Weak<T> {
+        Weak { ptr: unsafe { ptr::NonNull::new_unchecked(p as *mut T) } }
+    }
+
     pub fn upgrade(&self) -> Option<Arc<T>> {
         if is_dangling(self.ptr.as_ptr()) {
             return None;

@@ -6,11 +6,11 @@
 use super::program::Attr;
 use super::render::{Renderer, Then, Token};
 use super::sys::{self, GLenum, GLuint};
-use super::{BufObj, GlBackend, PipeState, Tex, TexObj};
+use super::{BufObj, Composed, GlBackend, PipeState, Tex, TexObj};
 use crate::backend::exec::{self, LentState};
 use crate::buffers::{id_at, read_ids, read_pairs, CmdView};
-use crate::ledger::Kind;
-use crate::session::{LentRef, Session, TextureObj};
+use crate::ledger::{Kind, Pool};
+use crate::session::{LentRef, Session, TextureObj, HOST};
 use crate::types::*;
 use std::sync::Arc;
 
@@ -28,6 +28,8 @@ pub(super) struct FrameJob {
     pub present: Option<((u32, Id), Arc<TexObj>)>,
     /// a window image was rendered (offscreen and embedded windows are done when rendered)
     pub window: bool,
+    /// answered when done (`FrameDone`); a badge layer's replay over a new frame is not
+    pub answer: bool,
 }
 
 pub(super) struct PassJob {
@@ -67,6 +69,7 @@ pub(super) struct DrawJob {
     /// Some(max) = blended with MAX instead of ADD
     pub blend: Option<bool>,
     pub depth_write: bool,
+    pub depth_greater: bool,
     pub cull: bool,
     pub scissor: [i32; 4],
     pub draw_buffers: u32,
@@ -133,10 +136,53 @@ impl GlBackend {
         Ok(obj)
     }
 
+    /// A window with a badge layer reads as it was last presented: with the layer.
     pub(super) fn window_image(&mut self, s: &mut Session, id: Id) -> Option<Arc<TexObj>> {
         if let Some(em) = s.windows.get(s.id, id).ok().and_then(|w| w.val.embedded) { return self.resolve(s, em.tex); }
         let (sid, id) = self.window_key(s.id, id);
+        if let Some(Some(composed)) = self.badged.get(&id.index).filter(|_| sid == HOST) {
+            if composed.gen == id.gen { return Some(composed.obj.clone()); }
+        }
         self.win.get(&(sid, id.index)).filter(|t| t.gen == id.gen).map(|t| t.obj.clone())
+    }
+
+    /// The image a badge layer frame of host window `key` draws into: the window's retained image
+    /// copied into the window's composed image (made at its size) on the render thread, ahead of
+    /// the frame. `None`: nothing rendered yet.
+    fn begin_compose(&mut self, key: (u32, Id)) -> Option<Arc<TexObj>> {
+        let base = self.win.get(&(key.0, key.1.index)).filter(|t| t.gen == key.1.gen)?.obj.clone();
+        let fits = |c: &Composed| c.gen == key.1.gen && [c.obj.desc.w, c.obj.desc.h] == [base.desc.w, base.desc.h];
+        let composed = match self.badged.get(&key.1.index)?.as_ref().filter(|c| fits(c)) {
+            Some(c) => c.obj.clone(),
+            None => {
+                let obj = self.new_texture(TextureObj { format: format::BGRA8, w: base.desc.w, h: base.desc.h, depth: 1, mips: 1,
+                    usage: usage::RENDER_TARGET | usage::SAMPLED, bytes: 0, imported: false, uploaded: 0, lent: None })
+                    .map_err(|e| eprintln!("[hal-gl] badge layer image: {e}")).ok()?;
+                let charge = self.pools.charge(Pool::WindowCopies, obj.desc.bytes);
+                self.badged.insert(key.1.index, Some(Composed { gen: key.1.gen, obj: obj.clone(), _charge: charge }));
+                obj
+            }
+        };
+        let (from, to, size) = (base.key, composed.key, [base.desc.w, base.desc.h]);
+        self.queue.push(move |r| { r.blit(from, to, size); });
+        Some(composed)
+    }
+
+    /// A composed window layer's texture `layer` takes the borrower's newest frame of host window
+    /// `window` (`Gpu::layer_copy`): the window's retained image, which every frame renders into
+    /// (the surface shows a copy of it), over the area both have; copied on the render thread
+    /// ahead of session 0's frame that samples it.
+    pub(super) fn copy_into_layer(&mut self, s: &mut Session, window: Id, layer: Id) -> bool {
+        let Some(source) = self.win.get(&(HOST, window.index)).filter(|t| t.gen == window.gen).map(|t| t.obj.clone()) else { return true };
+        let Some(image) = self.resolve(s, layer) else { return true };
+        if source.desc.format != image.desc.format || Arc::ptr_eq(&source, &image) { return true }
+        if image.swizzled {
+            eprintln!("[hal-gl] window layer: its texture is not a render target");
+            return true;
+        }
+        let (from, to, size) = (source.key, image.key, [source.desc.w.min(image.desc.w), source.desc.h.min(image.desc.h)]);
+        self.queue.push(move |r| { r.blit(from, to, size); });
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -152,12 +198,42 @@ impl GlBackend {
         s.stats.max_frame_ns = s.stats.max_frame_ns.max(packet.meta.build_end_ns.saturating_sub(packet.meta.build_start_ns));
         let is_window = kind & !target::FLAGS == target::WINDOW;
         let pick = kind & target::PICK != 0;
+        let replay = kind & target::REPLAY != 0;
+        let key = self.window_key(sid, target);
+        // a window with a badge layer: its frames stay in the retained image, the layer's frame
+        // (`target::BADGES`, from the executor right after) composes and presents it
+        let layered = is_window && !pick && key.0 == HOST && self.badged.contains_key(&key.1.index);
+        let badges = layered && kind & target::BADGES != 0;
+        if badges {
+            self.compose = self.begin_compose(key);
+            // an opaque panel or a window layer (`target::OVERLAY`) needs nothing under it: with
+            // no frame of the window kept yet (an app parked before it drew under the layer) the
+            // window's retained image is made at the window pass's size and composed over as it is
+            if self.compose.is_none() && kind & target::OVERLAY != 0 {
+                let window_pass = view.passes[pr.clone()].iter().find(|p| p.kind != pass_kind::COMPUTE && p.color.iter().all(|c| c.is_none()));
+                if let Some(v) = window_pass.map(|p| p.viewport) {
+                    let size = [(v[0] + v[2]).ceil().max(1.0) as u32, (v[1] + v[3]).ceil().max(1.0) as u32];
+                    if self.window_storage(s, target, size, now).is_ok() {
+                        self.compose = self.begin_compose(key);
+                    }
+                }
+            }
+            if self.compose.is_none() {
+                // nothing rendered yet to draw the layer over
+                if !replay {
+                    let (token, frame) = (Self::token(s), packet.frame);
+                    self.queue.push(move |r| r.after_gpu(Then::Frame { token, target, kind, frame, window: false }));
+                }
+                return Some(exec::SubmittedFrame { deps: Vec::new(), window: false });
+            }
+        }
         let mut deps = Vec::new();
         let mut window_image = None;
         let mut bytes = FrameBytes { uniforms: Vec::new(), instances: Vec::new(), align: self.caps.ubo_align };
         let mut instance_words = false;
         let mut passes = Vec::new();
         for pass in &view.passes[pr] {
+            if pass.kind == pass_kind::COMPUTE { crate::compute::unsupported(); continue; }
             let draws = &view.draws[slice(pass.draws, view.draws.len()).unwrap()];
             let before = s.stats.skipped_draws;
             let missing = pick && draws.iter().any(|d| read_ids(view.arena, d.pick_tex).any(|t| self.pick_pending.contains(&(sid, t))));
@@ -191,13 +267,15 @@ impl GlBackend {
                 window = true;
                 let embedded = s.windows.get(sid, target).is_ok_and(|w| w.val.embedded.is_some());
                 let hosted = s.windows.get(sid, target).is_ok_and(|w| w.val.is_hosted());
-                if !embedded && !hosted && self.shell.is_some() {
-                    present = Some((self.window_key(sid, target), image));
+                // (a frame under a badge layer is done once rendered: the layer's frame presents)
+                if !embedded && !hosted && !(layered && !badges) && self.shell.is_some() {
+                    present = Some((key, image));
                 }
             }
         }
+        self.compose = None;
         let job = FrameJob { token: Self::token(s), target, kind, frame: packet.frame, uniforms: bytes.uniforms, instances: bytes.instances,
-            instance_words, passes, present, window };
+            instance_words, passes, present, window, answer: !replay };
         self.queue.push(move |r| r.run_frame(job));
         Some(exec::SubmittedFrame { deps, window })
     }
@@ -209,7 +287,7 @@ impl GlBackend {
         if v.iter().any(|v| !v.is_finite() || *v < 0.0) || v[2] <= 0.0 || v[3] <= 0.0 {
             return Err("invalid pass viewport".into());
         }
-        let size = [(v[0] + v[2]).ceil() as u32, (v[1] + v[3]).ceil() as u32];
+        let mut size = [(v[0] + v[2]).ceil() as u32, (v[1] + v[3]).ceil() as u32];
         let mut colors: Vec<(usize, Arc<TexObj>)> = Vec::new();
         let mut window = None;
         for (i, id) in pass.color.iter().enumerate().filter(|(_, id)| !id.is_none()) {
@@ -224,9 +302,14 @@ impl GlBackend {
         }
         if colors.is_empty() && is_window {
             let embedded = s.windows.get(s.id, target).ok().and_then(|w| w.val.embedded);
-            let tex = match embedded {
-                Some(em) => self.resolve(s, em.tex).ok_or("missing embedded window storage")?,
-                None => self.window_storage(s, target, size, now)?,
+            let tex = match (embedded, self.compose.clone()) {
+                (Some(em), _) => self.resolve(s, em.tex).ok_or("missing embedded window storage")?,
+                // a badge layer is drawn over what the window has (a resize may be landing)
+                (None, Some(composed)) => {
+                    size = [size[0].min(composed.desc.w), size[1].min(composed.desc.h)];
+                    composed
+                }
+                (None, None) => self.window_storage(s, target, size, now)?,
             };
             window = Some(tex.clone());
             colors.push((0, tex));
@@ -254,6 +337,7 @@ impl GlBackend {
         }
         let mut prepared = Vec::new();
         for d in draws {
+            if d.storage_buffers.len != 0 { crate::compute::unsupported(); continue; }
             s.stats.draws += 1;
             if d.index[1] == 0 || d.inst.count == 0 { continue; }
             match self.prepare(s, pass, d, view.arena, pick, &colors, &depth, target_size, bytes, instance_words, now, deps) {
@@ -412,7 +496,7 @@ impl GlBackend {
             s.ledger.touch(Kind::Buffer, id.index, id.gen, s.frame, now);
         }
         Ok(Some(DrawJob { program, vb, ib, index_u32, index: d.index, blocks, buffers, textures, twins, pick: pick_words, instances, stride,
-            ranges, blend, depth_write: depth.is_some() && d.flags & Draw::DEPTH_WRITE != 0, cull: d.flags & Draw::CULL != 0, scissor, draw_buffers }))
+            ranges, blend, depth_write: depth.is_some() && d.flags & Draw::DEPTH_WRITE != 0, depth_greater: d.flags & Draw::DEPTH_GREATER != 0, cull: d.flags & Draw::CULL != 0, scissor, draw_buffers }))
     }
 }
 
@@ -423,6 +507,7 @@ struct Bound {
     draw_buffers: Option<u32>,
     blend: Option<Option<bool>>,
     depth_write: Option<bool>,
+    depth_greater: Option<bool>,
     cull: Option<bool>,
 }
 
@@ -455,8 +540,12 @@ impl Renderer {
             (gl.glBufferData)(sys::ARRAY_BUFFER, job.instances.len() as isize, job.instances.as_ptr() as _, sys::STREAM_DRAW);
             (gl.glBindBuffer)(sys::ARRAY_BUFFER, 0);
         }
+        let sizes = [job.uniforms.len() as u64, job.instances.len() as u64];
+        if self.arena_charges.as_ref().is_none_or(|(was, _)| *was != sizes) {
+            self.arena_charges = Some((sizes, sizes.map(|bytes| self.pools.charge(Pool::UploadArena, bytes))));
+        }
         if job.instance_words {
-            Self::words_texture(&self.ctx.gl, self.instance_arena, job.instances.len() as u64 / 4, &mut self.arena_words);
+            Self::words_texture(&self.ctx.gl, &self.pools, Pool::UploadArena, self.instance_arena, job.instances.len() as u64 / 4, &mut self.arena_words);
         }
         for pass in &job.passes {
             if let Err(e) = self.run_pass(pass) { eprintln!("[hal-gl] pass: {e}"); }
@@ -468,7 +557,9 @@ impl Renderer {
                 Err(e) => { eprintln!("[hal-gl] present: {e}"); window = false; }
             }
         }
-        self.after_gpu(Then::Frame { token: job.token, target: job.target, kind: job.kind, frame: job.frame, window });
+        if job.answer {
+            self.after_gpu(Then::Frame { token: job.token, target: job.target, kind: job.kind, frame: job.frame, window });
+        }
     }
 
     fn run_pass(&mut self, p: &PassJob) -> Result<(), String> {
@@ -527,14 +618,14 @@ impl Renderer {
             words = match &d.instances {
                 Some(Instances::Buffer(b, _)) => self.buffers.get_mut(&b.key).map(|g| {
                     if g.words_stale || g.words.is_none() {
-                        let mut tex = g.words.unwrap_or((0, 0));
-                        Self::words_texture(&self.ctx.gl, g.name, g.size / 4, &mut tex);
+                        let mut tex = g.words.take().unwrap_or_default();
+                        Self::words_texture(&self.ctx.gl, &self.pools, Pool::WordTextures, g.name, g.size / 4, &mut tex);
                         g.words = Some(tex);
                         g.words_stale = false;
                     }
-                    (unit, g.words.unwrap().0)
+                    (unit, g.words.as_ref().map_or(0, |w| w.tex))
                 }),
-                _ => Some((unit, self.arena_words.0)),
+                _ => Some((unit, self.arena_words.tex)),
             };
         }
         let gl = &self.ctx.gl;
@@ -561,6 +652,10 @@ impl Renderer {
                     None => (gl.glDisable)(sys::BLEND),
                 }
                 bound.blend = Some(d.blend);
+            }
+            if bound.depth_greater != Some(d.depth_greater) {
+                (gl.glDepthFunc)(if d.depth_greater { sys::GREATER } else { sys::LEQUAL });
+                bound.depth_greater = Some(d.depth_greater);
             }
             if bound.depth_write != Some(d.depth_write) {
                 (gl.glDepthMask)(d.depth_write as u8);

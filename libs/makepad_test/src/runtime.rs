@@ -35,12 +35,17 @@ pub struct TestConfig {
     pub artifacts_dir: PathBuf,
     /// Extra environment for the app process. `CARGO_TARGET_DIR`, when set,
     /// also applies to the build. `MAKEPAD_TEST_DPI=N` scales screenshots
-    /// to N pixels per layout point.
+    /// to N pixels per layout point. `MAKEPAD_TEST_HOME` is the app's
+    /// stand-in for the user's home folder: an empty `home/` in the test's
+    /// artifacts unless the test names one. An app keeps its per-user state
+    /// (preferences, documents, linked devices) below it, so a test starts
+    /// from the defaults and never reads or changes the person's.
     pub env: HashMap<String, String>,
     /// Extra arguments appended after `--remote`.
     pub app_args: Vec<String>,
     /// Show the window (unfocused). Default is hidden (`MAKEPAD_HIDE_WINDOWS=1`).
     pub visible: bool,
+    /// Native startup after the build. JIT startup includes compilation and is uncapped.
     pub startup_timeout: Duration,
     pub action_timeout: Duration,
     pub poll_interval: Duration,
@@ -58,9 +63,13 @@ impl TestConfig {
         let manifest_dir = manifest_dir.into();
         let package_name = package_name.into();
         let test_name = test_name.into();
-        let artifacts_dir = manifest_dir
-            .join("target")
-            .join("makepad_test")
+        // `MAKEPAD_TEST_ARTIFACTS`: a run's own root (devhub sets one per lease, so two jobs in
+        // one tree never share a test's artifacts or app home)
+        let root = std::env::var_os("MAKEPAD_TEST_ARTIFACTS")
+            .filter(|root| !root.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| manifest_dir.join("target").join("makepad_test"));
+        let artifacts_dir = root
             .join(sanitize_path_component(&package_name))
             .join(sanitize_path_component(&test_name));
 
@@ -130,20 +139,22 @@ pub struct TestApp {
 }
 
 impl TestApp {
-    fn start(config: TestConfig) -> TestResult<Self> {
+    fn start(mut config: TestConfig) -> TestResult<Self> {
         if config.artifacts_dir.exists() {
             fs::remove_dir_all(&config.artifacts_dir)?;
         }
         fs::create_dir_all(&config.artifacts_dir)?;
+        if !config.env.contains_key("MAKEPAD_TEST_HOME") {
+            let home = config.artifacts_dir.join("home");
+            fs::create_dir_all(&home)?;
+            config.env.insert("MAKEPAD_TEST_HOME".to_string(), home.display().to_string());
+        }
 
-        let executable = app_process::build_release_binary(
-            &config.manifest_dir,
+        let app = app_process::launch_package(
+            &config.launch_spec(),
             &config.package_name,
             config.bin_name.as_deref(),
-            &config.artifacts_dir,
-            config.env.get("CARGO_TARGET_DIR").map(String::as_str),
         )?;
-        let app = app_process::launch(&config.launch_spec(), &executable)?;
 
         if config.startup_pause > Duration::ZERO {
             thread::sleep(config.startup_pause);
@@ -278,6 +289,49 @@ impl TestApp {
         self.client().snapshot()
     }
 
+    /// Wait for three successful event-loop snapshots, 100 ms apart.
+    pub fn wait_until_ready(&self, timeout: Duration) -> Duration {
+        let started = Instant::now();
+        let mut consecutive = 0;
+        while started.elapsed() < timeout {
+            if let Err(err) = self.ensure_running() {
+                panic_for_error(err);
+            }
+            if self.client().snapshot().is_ok() {
+                consecutive += 1;
+                if consecutive == 3 {
+                    break;
+                }
+            } else {
+                consecutive = 0;
+            }
+            let delay = if consecutive == 0 {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_millis(100)
+            };
+            thread::sleep(delay.min(timeout.saturating_sub(started.elapsed())));
+        }
+
+        let elapsed = started.elapsed();
+        if elapsed >= timeout || elapsed > Duration::from_secs(10) {
+            let recent_log = self
+                .log_since(0)
+                .map(|tail| tail.lines[tail.lines.len().saturating_sub(40)..].join("\n"))
+                .unwrap_or_else(|err| format!("could not read app log: {err}"));
+            let secs = elapsed.as_secs_f64();
+            if elapsed >= timeout {
+                panic!(
+                    "timed out after {secs:.1} s waiting for app readiness; recent app log:\n{recent_log}"
+                );
+            }
+            println!(
+                "[makepad_test] app needed {secs:.1} s before it answered; recent app log:\n{recent_log}"
+            );
+        }
+        elapsed
+    }
+
     /// Draw and worker diagnostics after a sequence number, without forcing a frame.
     pub fn log_since(&self, since: u64) -> TestResult<crate::LogTail> {
         self.ensure_running()?;
@@ -380,6 +434,19 @@ impl TestApp {
             }
         }
         Ok(())
+    }
+
+    /// Move the mouse to a point of the first window, no button down: what is there is hovered.
+    pub fn move_to(&self, x: f64, y: f64) {
+        self.client().mouse(&MouseInput::at(MouseKind::Move, Some(0), x, y)).unwrap_or_else(|err| panic_for_error(err));
+    }
+
+    /// Press the mouse at a point of the first window and hold it, for what has no node of its own
+    /// to press (a dock's splitter bar): [`PointerDrag::move_by`], then [`PointerDrag::release`].
+    pub fn press_at(&self, x: f64, y: f64) -> PointerDrag {
+        let window = Some(0);
+        self.client().mouse(&MouseInput::at(MouseKind::Down, window, x, y)).unwrap_or_else(|err| panic_for_error(err));
+        PointerDrag { app: self.clone(), window, start: (x, y), at: (x, y) }
     }
 
     /// Scrolls at a point in the focused window: a mouse wheel when `phase` is `None`, else one step of
@@ -569,6 +636,55 @@ impl TestApp {
 pub struct Locator {
     app: TestApp,
     selector: Selector,
+}
+
+/// A mouse drag in progress: see [`Locator::press_and_drag`].
+pub struct PointerDrag {
+    app: TestApp,
+    window: Option<usize>,
+    start: (f64, f64),
+    at: (f64, f64),
+}
+
+impl PointerDrag {
+    /// Move in steps to `(dx, dy)` from the press point.
+    pub fn move_by(&mut self, dx: f64, dy: f64) -> &mut Self {
+        let client = self.app.client();
+        let from = self.at;
+        let to = (self.start.0 + dx, self.start.1 + dy);
+        for step in 1..=DRAG_STEPS {
+            let t = step as f64 / DRAG_STEPS as f64;
+            self.at = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+            client.mouse(&MouseInput::at(MouseKind::Move, self.window, self.at.0, self.at.1)).unwrap_or_else(|err| panic_for_error(err));
+        }
+        self
+    }
+
+    /// A flick to `(dx, dy)` from the press point, `seconds` long, and let go at its end. Its events
+    /// carry their own times, counted from zero, so what it throws is the same however long the
+    /// app takes over each.
+    pub fn fling_by(mut self, dx: f64, dy: f64, seconds: f64) {
+        let client = self.app.client();
+        let from = self.at;
+        let to = (self.start.0 + dx, self.start.1 + dy);
+        for step in 1..=DRAG_STEPS {
+            let t = step as f64 / DRAG_STEPS as f64;
+            self.at = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+            let moved = MouseInput { time: Some(seconds * t), ..MouseInput::at(MouseKind::Move, self.window, self.at.0, self.at.1) };
+            client.mouse(&moved).unwrap_or_else(|err| panic_for_error(err));
+        }
+        let up = MouseInput { time: Some(seconds), ..MouseInput::at(MouseKind::Up, self.window, self.at.0, self.at.1) };
+        client.mouse(&up).unwrap_or_else(|err| panic_for_error(err));
+        self.app.inner.borrow_mut().focus_window = self.window;
+        self.app.pace_after_action();
+    }
+
+    /// Let go where the pointer is.
+    pub fn release(self) {
+        self.app.client().mouse(&MouseInput::at(MouseKind::Up, self.window, self.at.0, self.at.1)).unwrap_or_else(|err| panic_for_error(err));
+        self.app.inner.borrow_mut().focus_window = self.window;
+        self.app.pace_after_action();
+    }
 }
 
 impl Locator {
@@ -837,6 +953,17 @@ impl Locator {
         self.app.try_drag_from(&target, dx, dy, true)
     }
 
+    /// Press here and keep the button down: [`PointerDrag::move_by`], rest as long as the test
+    /// wants (what the app does meanwhile is part of the gesture), then [`PointerDrag::release`].
+    pub fn press_and_drag(self) -> PointerDrag {
+        let target = self.resolve_unique_visible().unwrap_or_else(|err| panic_for_error(err));
+        let (x, y) = snapshot_center_f64(&target);
+        let window = Some(target.window_index());
+        let client = self.app.client();
+        client.mouse(&MouseInput::at(MouseKind::Down, window, x, y)).unwrap_or_else(|err| panic_for_error(err));
+        PointerDrag { app: self.app, window, start: (x, y), at: (x, y) }
+    }
+
     /// Like [`Self::drag_by`], with one finger on a touch screen instead of the mouse.
     pub fn touch_drag_by(self, dx: f64, dy: f64) -> Self {
         if let Err(err) = self.try_touch_drag_by(dx, dy) {
@@ -904,7 +1031,12 @@ impl Locator {
         let mut args = vec![("q",q.as_str()),("json","1"),("wait","1")];
         if let Some(w) = self.selector.window_arg() { args.push(("w",w)); }
         args.extend_from_slice(extra);
-        self.app.client().get_json(command, &args)?;
+        if let Err(refused) = self.app.client().get_json(command, &args) {
+            // The app's refusal ("no such node", "ambiguous") names no selector: when the
+            // selector does not pick one visible widget, say which selector and what it matched.
+            self.resolve_unique_visible()?;
+            return Err(refused);
+        }
         if let Some(node) = self.app.query_widgets(&self.selector, false)?.first() {
             self.app.inner.borrow_mut().focus_window = Some(node.window_index());
         }
@@ -1014,13 +1146,14 @@ where
             Ok(())
         }
         Ok(Err(err)) => {
+            let err = with_jit_capture(&app, err);
             capture_failure_artifacts(&app, err.message());
             app.pause_before_shutdown();
             app.shutdown();
             Err(err)
         }
         Err(payload) => {
-            let err = TestError::from_panic_payload(payload);
+            let err = with_jit_capture(&app, TestError::from_panic_payload(payload));
             capture_failure_artifacts(&app, err.message());
             app.pause_before_shutdown();
             app.shutdown();
@@ -1050,6 +1183,17 @@ pub fn run_current_package_test<F, R>(
     };
     if let Err(err) = run_with_config(config, test) {
         panic_for_error(err);
+    }
+}
+
+/// A failed test of a JIT app names the app's state at the failure (first, before the
+/// screenshots): a wait that timed out says what the app was doing, without a rerun.
+fn with_jit_capture(app: &TestApp, err: TestError) -> TestError {
+    let first = err.message().lines().next().unwrap_or("");
+    let why: String = format!("test failed: {first}").chars().take(200).collect();
+    match app.client().jit_capture(&why) {
+        Some(state) => TestError::new(format!("{}\n  JIT state at the failure: {state}", err.message())),
+        None => err,
     }
 }
 
@@ -1206,7 +1350,7 @@ fn env_duration_ms(name: &str) -> Duration {
 mod tests {
     use super::{
         button_index, env_duration_ms, sanitize_path_component,
-        snapshot_is_visible, visible_mode_enabled, TestError, TestResult, NodeMatch,
+        snapshot_is_visible, visible_mode_enabled, NodeMatch,
     };
     use crate::{Selector, TestConfig};
     use makepad_studio_protocol::MouseButton;
@@ -1247,11 +1391,15 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The default: neither variable set (a devhub lease sets its own artifact root).
         let old_visible = std::env::var("MAKEPAD_TEST_VISIBLE").ok();
+        let old_artifacts = std::env::var("MAKEPAD_TEST_ARTIFACTS").ok();
         std::env::remove_var("MAKEPAD_TEST_VISIBLE");
+        std::env::remove_var("MAKEPAD_TEST_ARTIFACTS");
         let config =
             TestConfig::current_package("/tmp/example", "makepad-example", "ui::test").unwrap();
         restore_env_var("MAKEPAD_TEST_VISIBLE", old_visible);
+        restore_env_var("MAKEPAD_TEST_ARTIFACTS", old_artifacts);
         assert_eq!(
             config.artifacts_dir,
             PathBuf::from("/tmp/example")
@@ -1312,12 +1460,6 @@ mod tests {
             sanitize_path_component("ui::captures failure"),
             "ui__captures_failure"
         );
-    }
-
-    #[test]
-    fn result_alias_accepts_test_error() {
-        let result: TestResult<()> = Err(TestError::new("boom"));
-        assert!(result.is_err());
     }
 
     #[test]

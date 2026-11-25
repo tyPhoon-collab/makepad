@@ -1,9 +1,8 @@
-//! git, the only tool sync drives on a node: one bare store per repo (`~/devhub/git/<repo>.git`,
-//! DESIGN.md §10.12) that bundles are fetched into, and the node's ONE tree (the synced checkout,
-//! a linked worktree of the store), moved between commits with `read-tree -m -u` by syncs and
-//! leases alike. Only files that differ between the two commits are written (cargo fingerprints
-//! and the JITs' watchers see exactly the change); a file with local edits, or an untracked file
-//! in the way, makes git refuse, and nothing moves.
+//! Git stores shared by the deployment and work trees: one bare store per repo
+//! (`~/devhub/git/<repo>.git`, DESIGN.md §10.12). Sync moves the deployment checkout with
+//! `read-tree -m -u`: only changed files get new mtimes, preserving cargo and JIT caches.
+//! Local edits or untracked files in the way make the move refuse. Leases use detached
+//! worktree HEADs ([`crate::lease::tree`]), independently of the deployment refs.
 //!
 //! Every call is `git` with fixed arguments (never a shell); hooks are off (`core.hooksPath` to
 //! /dev/null), so nothing that arrives in a bundle ever runs.
@@ -11,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-/// The ref that names the commit the node's tree holds now (a sync's or a lease's).
+/// The deployment checkout's commit; lease worktree HEADs never move it.
 pub const CHECKOUT_REF: &str = "refs/devhub/checkout";
 /// The ref that names the last commit a sync moved the tree to: syncs move forward from it only.
 pub const SYNCED_REF: &str = "refs/devhub/synced";
@@ -45,14 +44,22 @@ pub fn stores_dir() -> PathBuf {
 }
 
 /// Runs `git <args>` in `dir` (or with the store as GIT_DIR); stdout on success.
+#[track_caller]
 pub fn run(dir: Option<&Path>, git_dir: Option<&Path>, env: &[(&str, &Path)], args: &[&str]) -> Result<String, String> {
-    let mut cmd = makepad_remote::group::command("git");
+    run_with(dir, git_dir, env, args, None)
+}
+
+/// [`run`] with `input` on git's stdin.
+#[track_caller]
+fn run_with(dir: Option<&Path>, git_dir: Option<&Path>, env: &[(&str, &Path)], args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
+    let mut cmd = crate::git_exec::command();
     cmd.arg("-c").arg("core.hooksPath=/dev/null").arg("-c").arg("advice.detachedHead=false");
     if let Some(g) = git_dir {
         cmd.arg("--git-dir").arg(g);
     }
-    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    if let Some(d) = dir {
+    cmd.args(args).stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // git reads its working directory at start: never the hub's (proto::settle_cwd)
+    if let Some(d) = dir.or(git_dir) {
         cmd.current_dir(d);
     }
     // the hub's own environment never steers git; `env` is the call's
@@ -60,14 +67,36 @@ pub fn run(dir: Option<&Path>, git_dir: Option<&Path>, env: &[(&str, &Path)], ar
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let out = cmd.output().map_err(|e| format!("git: {e}"))?;
+    let out = match input {
+        None => cmd.output(),
+        Some(input) => cmd.spawn().and_then(|mut child| {
+            use std::io::Write;
+            // small inputs (ref edits): written whole before git's output is read
+            let wrote = child.stdin.take().map_or(Ok(()), |mut i| i.write_all(input));
+            let out = child.wait_with_output();
+            wrote.and(out)
+        }),
+    }
+    .map_err(|e| {
+        let err = format!("git: {e}");
+        crate::lease::caps::git_failed(&err);
+        err
+    })?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let err: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).take(12).collect();
-        Err(format!("git {}: {}", args.first().unwrap_or(&""), err.join(" | ")))
+        let err = format!("git {}: {}", args.first().unwrap_or(&""), failure(out.status, &out.stderr));
+        crate::lease::caps::git_failed(&err);
+        Err(err)
     }
+}
+
+/// What a failed git said: its stderr's lines, and how it ended (one a signal ended says nothing:
+/// an overlay feed's failure read `bare rev-list: ` and no more, 11-04).
+pub fn failure(status: std::process::ExitStatus, stderr: &[u8]) -> String {
+    let err = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = err.lines().map(str::trim).filter(|l| !l.is_empty()).take(12).collect();
+    if lines.is_empty() { status.to_string() } else { format!("{} ({status})", lines.join(" | ")) }
 }
 
 /// One repo's store on a node.
@@ -148,6 +177,13 @@ impl Store {
         self.rev(&dst).ok_or_else(|| format!("the bundle holds no branch {branch}"))
     }
 
+    /// Drops `refs/devhub/pushed/<branch>` of each branch, in one git process: the master's word
+    /// for branches that landed or went away (a node holds no state of its own).
+    pub fn prune_pushed(&self, branches: &[&str]) -> Result<(), String> {
+        let input: String = branches.iter().map(|b| format!("delete {PUSHED}{b}\n")).collect();
+        run_with(None, Some(&self.git_dir), &[], &["update-ref", "--stdin"], Some(input.as_bytes())).map(|_| ())
+    }
+
     pub fn set_ref(&self, r: &str, sha: &str) -> Result<(), String> {
         self.git(&["update-ref", r, sha]).map(|_| ())
     }
@@ -164,10 +200,11 @@ impl Store {
     /// rewritten), and only tracked files it lacks are written (a tree a deploy script shipped
     /// had no dotfiles; an empty dir gets every file). A `.git` that is not ours: refused.
     pub fn link(&self, work: &Path, at: &str) -> Result<(), String> {
+        let root = if self.name() == "commercial" { work.parent().and_then(Path::parent).unwrap_or(work) } else { work };
         let dotgit = work.join(".git");
         if let Some(admin) = self.admin_of(work) {
             if admin.join("HEAD").exists() {
-                return Ok(());
+                return crate::ci_merge::install_merge_driver(work, root);
             }
         }
         if dotgit.exists() {
@@ -197,7 +234,8 @@ impl Store {
             let _ = std::fs::create_dir_all(self.git_dir.join("info"));
             let _ = std::fs::write(&exclude, format!("{ex}{}/FLEET-REVISION.txt\n", if ex.is_empty() || ex.ends_with('\n') { "" } else { "\n" }));
         }
-        self.read_index(work, at)
+        self.read_index(work, at)?;
+        crate::ci_merge::install_merge_driver(work, root)
     }
 
     /// The tree's index read from `at` and refreshed against the files (none is rewritten), then
@@ -220,31 +258,16 @@ impl Store {
     }
 
     /// The admin dir `work`'s `.git` file names when it is one of this store's worktrees.
-    fn admin_of(&self, work: &Path) -> Option<PathBuf> {
+    pub(crate) fn admin_of(&self, work: &Path) -> Option<PathBuf> {
         let text = std::fs::read_to_string(work.join(".git")).ok()?;
         let dir = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
         let common = std::fs::canonicalize(&self.git_dir).ok()?;
         std::fs::canonicalize(&dir).ok().filter(|d| d.starts_with(common.join("worktrees")))
     }
 
-    /// Whether the tree at `work` is this store's and holds `to` already (its HEAD and the
-    /// checkout ref): a lease on a warm box then moves nothing, with one git call.
-    pub fn holds(&self, work: &Path, to: &str) -> bool {
-        if !valid_sha(to) || !self.admin_of(work).is_some_and(|a| a.join("HEAD").exists()) {
-            return false;
-        }
-        run(Some(work), None, &[], &["rev-parse", "HEAD", CHECKOUT_REF]).is_ok_and(|o| {
-            let l: Vec<&str> = o.lines().map(str::trim).collect();
-            l == [to, to]
-        })
-    }
-
-    /// Moves the tree at `work` from `from` (None: an empty or missing dir) to `to`, in place:
-    /// only files that differ between the two commits are written (cargo fingerprints and the
-    /// JITs' watchers see exactly the change). Any two commits (a lease's pin, then landed work
-    /// again): whether a sync may move forward only is the caller's rule. A file with local edits
-    /// that the move changes, or an untracked file in the way, makes git refuse, and nothing moves
-    /// (leases clear the tree first: [`crate::lease::tree`]; a sync refuses and says so).
+    /// Moves the deployment checkout from `from` (None: empty or missing) to `to`. Only changed
+    /// files are written, keeping cargo and JIT caches warm. The caller checks forward movement;
+    /// local edits or untracked files blocking the move make it refuse.
     pub fn move_checkout(&self, work: &Path, from: Option<&str>, to: &str) -> Result<Moved, String> {
         let g = |args: &[&str]| run(Some(work), None, &[], args);
         let Some(from) = from else {
@@ -288,7 +311,12 @@ impl Store {
             return Ok(Vec::new());
         }
         let out = run(Some(work), None, &[("LC_ALL", Path::new("C"))], &["-c", "core.quotePath=false", "clean", "-fd", "-e", "target/"])?;
-        let kept: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("Skipping repository ")).collect();
+        // a nested worktree of one of devhub's own stores (the lane tree's apps/commercial) is
+        // part of the tree, not someone's repository: it is cleaned as its own store's tree
+        let ours = |rel: &str| {
+            std::fs::read_to_string(work.join(rel.trim_end_matches('/')).join(".git")).ok().and_then(|t| t.strip_prefix("gitdir: ").map(|g| PathBuf::from(g.trim()))).is_some_and(|g| g.starts_with(stores_dir()))
+        };
+        let kept: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("Skipping repository ")).filter(|r| !ours(r)).collect();
         if !kept.is_empty() {
             return Err(format!("nested repositories stay: {}", kept.join(" ")));
         }
@@ -306,16 +334,9 @@ impl Store {
         std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
         let bundle = out.join(format!("{tag}.bundle"));
         let b = bundle.to_string_lossy().into_owned();
-        let refs = g(&["for-each-ref", "--format=%(objectname)"]).unwrap_or_default();
-        let mut args = vec!["bundle", "create", "-q", &b, "HEAD"];
-        let shas: Vec<&str> = refs.lines().map(str::trim).filter(|s| !s.is_empty()).collect();
-        if !shas.is_empty() {
-            args.push("--not");
-            args.extend(shas);
-        }
-        g(&args)?;
+        g(&["bundle", "create", "-q", &b, "HEAD", "--not", "--glob=refs/*"])?;
+        // Recovery moves this worktree's HEAD only, never the main checkout ref.
         g(&["reset", "-q", "--hard", at])?;
-        self.set_ref(CHECKOUT_REF, at)?;
         Ok(bundle)
     }
 }
@@ -346,6 +367,15 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_git_says_how_it_ended() {
+        use std::os::unix::process::ExitStatusExt;
+        let (killed, exited) = (std::process::ExitStatus::from_raw(9), std::process::ExitStatus::from_raw(128 << 8));
+        assert_eq!(failure(killed, b""), "signal: 9 (SIGKILL)", "a signal leaves no stderr: its end is the reason");
+        assert_eq!(failure(exited, b"fatal: bad object x\n\n  hint: y\n"), "fatal: bad object x | hint: y (exit status: 128)");
+    }
 
     #[test]
     fn names_that_cannot_turn_into_options() {
@@ -397,6 +427,10 @@ mod tests {
         let bundle = base.join("x.bundle");
         sh(&src, &["bundle", "create", "-q", &bundle.to_string_lossy(), "refs/heads/work", "refs/heads/rc-x"]);
         assert_eq!(store.fetch_bundle(&bundle, "work").unwrap(), two);
+        assert_eq!(store.fetch_bundle(&bundle, "rc-x").unwrap(), lane);
+        // a landed lane's ref goes (a name the store never had is no error); work's stays
+        store.prune_pushed(&["rc-x", "rc-never"]).unwrap();
+        assert_eq!(store.refs().iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(), vec!["refs/devhub/pushed/work"]);
         assert_eq!(store.fetch_bundle(&bundle, "rc-x").unwrap(), lane);
 
         // a tree shipped at `one` by a deploy script: no .git, no dotfiles, a target and FLEET-REVISION

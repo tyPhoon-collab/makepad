@@ -147,7 +147,7 @@ pub const DEFAULT_CSM_CONFIG: CsmConfig = CsmConfig {
 
 const MIN_CSM_TILE_RESOLUTION: usize = 256;
 const MAX_CSM_TILE_RESOLUTION: usize = 4096;
-const MIN_CSM_FAR_RANGE: f32 = 10.0;
+const MIN_CSM_FAR_RANGE: f32 = 0.05;
 const MAX_CSM_FAR_RANGE: f32 = 4096.0;
 
 impl Default for CsmConfig {
@@ -323,6 +323,28 @@ pub struct CasterBlock {
 pub struct CasterSlice<'a> {
     pub casters: &'a [GpuBakeMesh],
     pub blocks: &'a [CasterBlock],
+}
+
+/// Casters a host draws itself: geometry the renderer holds no mesh of. The cascade pass asks
+/// them per cascade, after its own casters.
+pub trait CascadeCasters {
+    /// Changes when what they draw changes: the cascades are kept while this and their fit hold.
+    fn revision(&self) -> u64;
+    /// Draws into one cascade's tile of the open pass; how many draws it added.
+    fn draw_cascade(&mut self, cx: &mut CxDraw, at: &CascadeTile) -> usize;
+}
+
+/// One cascade of the pass being drawn. With z01 the cascade's own depth, a caster's clip position
+/// is `(ndc_x * tile.x + tile.z, ndc_y * tile.y + tile.w, z01 * depth.0 + depth.1, 1)`.
+pub struct CascadeTile<'a> {
+    pub cascade: &'a crate::shadow_csm::CsmCascade,
+    /// The next finer cascade, which may already hold a caster's whole shadow
+    /// ([`crate::shadow_csm::cascade_holds_shadow`]).
+    pub finer: Option<&'a crate::shadow_csm::CsmCascade>,
+    pub tile: Vec4f,
+    pub depth: (f32, f32),
+    /// The tile in target pixels, where the backend applies it.
+    pub scissor: Option<[u32; 4]>,
 }
 
 /// Runs of up to 32 consecutive casters.
@@ -615,7 +637,7 @@ fn zero_rect(cx: &mut CxDraw, d: &mut DrawLmZero, rect: LmRect, size: usize, fil
     d.quad_a = rect.uv_remap(size);
     d.fill_a = fill;
     if d.draw_vars.can_instance() {
-        cx.add_instance(&d.draw_vars);
+        cx.add_instance(&mut d.draw_vars);
     }
 }
 
@@ -721,6 +743,8 @@ pub struct GpuLightmapBaker {
     csm_policy: CsmPolicy,
     /// See [`GpuLightmapBaker::set_csm_far_reach`].
     csm_far_reach: f32,
+    /// See [`GpuLightmapBaker::set_csm_near_bounds`].
+    csm_near: Option<(Vec3f, Vec3f)>,
     /// A job scheduled by the renderer, realized on the next draw.
     pending: Option<GpuBakeJob>,
     /// Keep the previous completed atlas visible until every new region is
@@ -777,6 +801,9 @@ pub struct GpuLightmapBaker {
     /// This frame's fitted cascades (Realtime), for the renderer's material
     /// uniforms. None in OnChange.
     csm_last: Option<CsmFrame>,
+    /// The cascade filter's rotation seed for the frames that follow
+    /// ([`CsmFrame::seed`]).
+    csm_seed: f32,
     /// The last announced `(static, live)` caster counts. A scene can upload
     /// after the first empty Realtime frame, so count changes announce again
     /// instead of leaving the log permanently claiming zero casters.
@@ -803,6 +830,30 @@ pub struct GpuLightmapBaker {
     /// A 1x1 sampled depth texture parked in the `csm_map` slot while the
     /// tier is off: the slot is a depth texture in every material family.
     csm_fallback: Option<Texture>,
+    /// The host's per-element lookup, read by the cascades' casters
+    /// (`Renderer::set_element_lookup`), and the host's key of what the
+    /// casters read in it.
+    element_lookup: Option<(Texture, [f32; 4])>,
+    element_lookup_casters: u64,
+    /// What the cascade target holds: the inputs it was drawn from and the
+    /// repaint it was recorded at. While they stay the same the target is
+    /// kept instead of drawn again (a part dragged that casts no cascade
+    /// shadow, a settled view drawn for anything else). Anything that
+    /// changes what a caster draws clears it ([`Self::csm_casters_changed`]).
+    csm_drawn: Option<(CsmDrawn, u64)>,
+    /// What the host draws into the cascades itself.
+    cascade_casters: Option<std::rc::Rc<std::cell::RefCell<dyn CascadeCasters>>>,
+}
+
+/// The inputs of one cascade drawing, compared whole: the fitted cascades
+/// (sun, camera, scene bounds, resolution all land in them) and the element
+/// lookup the casters read.
+#[derive(Clone, Copy, PartialEq)]
+struct CsmDrawn {
+    frame: [crate::shadow_csm::CsmCascade; CSM_CASCADES],
+    res: usize,
+    lookup: Option<(TextureId, [u32; 4], u64)>,
+    casters: u64,
 }
 
 
@@ -812,6 +863,7 @@ impl Default for GpuLightmapBaker {
             mode: GpuLightmapMode::default(),
             csm_policy: CsmPolicy::default(),
             csm_far_reach: 0.0,
+            csm_near: None,
             pending: None,
             pending_delivery: None,
             state: None,
@@ -829,6 +881,7 @@ impl Default for GpuLightmapBaker {
             bake_passes: 0,
             bake_us: 0,
             csm_last: None,
+            csm_seed: 0.0,
             csm_logged: None,
             rt_frames: 0,
             rt_us: 0,
@@ -839,6 +892,10 @@ impl Default for GpuLightmapBaker {
             csm_mover_order: Vec::new(),
             csm_tiles: CsmFrame::default(),
             csm_fallback: None,
+            element_lookup: None,
+            element_lookup_casters: 0,
+            csm_drawn: None,
+            cascade_casters: None,
         }
     }
 }
@@ -1328,7 +1385,18 @@ impl GpuLightmapBaker {
     /// `far_range * FAR_REACH`). The detail cascades are unchanged.
     pub fn set_csm_far_reach(&mut self, metres: f32) {
         let metres = if metres.is_finite() { metres.clamp(0.0, 16384.0) } else { 0.0 };
-        if metres != self.csm_far_reach { self.csm_far_reach = metres; self.csm_last = None; }
+        if metres != self.csm_far_reach { self.csm_far_reach = metres; self.csm_last = None; self.csm_drawn = None; }
+    }
+
+    /// The cascade filter's rotation seed ([`CsmFrame::seed`]).
+    pub fn set_csm_seed(&mut self, seed: f32) {
+        self.csm_seed = seed;
+    }
+
+    /// Fit the near cascade to these world bounds when they are tighter than its slice or ring
+    /// ([`crate::shadow_csm::fit_near`]); `None`: the ladder alone.
+    pub fn set_csm_near_bounds(&mut self, bounds: Option<(Vec3f, Vec3f)>) {
+        if bounds != self.csm_near { self.csm_near = bounds; self.csm_last = None; self.csm_drawn = None; }
     }
 
     pub fn set_csm_config(&mut self, tile_resolution: usize, far_range: f32) -> CsmConfig {
@@ -1373,6 +1441,7 @@ impl GpuLightmapBaker {
         self.bake_passes = 0;
         self.bake_us = 0;
         self.csm_last = None;
+        self.csm_drawn = None;
         self.csm_logged = None;
         self.rt_frames = 0;
         self.rt_us = 0;
@@ -1383,6 +1452,18 @@ impl GpuLightmapBaker {
     /// GPU device (`Renderer::gpu_reset`), whose targets came back empty.
     pub fn debug_redirty(&mut self) {
         self.dirty = true;
+        self.csm_drawn = None;
+    }
+
+    pub(crate) fn set_cascade_casters(&mut self, casters: Option<std::rc::Rc<std::cell::RefCell<dyn CascadeCasters>>>) {
+        self.cascade_casters = casters;
+        self.csm_drawn = None;
+    }
+
+    /// A caster the cascades draw changed (the static caster lists, a
+    /// streamed caster set): the next Realtime frame draws them again.
+    pub(crate) fn csm_casters_changed(&mut self) {
+        self.csm_drawn = None;
     }
 
     /// DEBUG: `(regions, lamps)` of the realized layout — the probe waits
@@ -1439,6 +1520,7 @@ impl GpuLightmapBaker {
                 let edge = res * CSM_GRID;
                 self.csm_tex = Some(render_tex_rf32(cx, edge, edge));
                 self.csm_depth = Some(depth_tex_sampled(cx, edge, edge));
+                self.csm_drawn = None;
             }
         } else {
             // Dropping the last handles lets the backend reclaim ~128 MiB per
@@ -1446,8 +1528,14 @@ impl GpuLightmapBaker {
             self.csm_tex = None;
             self.csm_depth = None;
             self.csm_last = None;
+            self.csm_drawn = None;
             self.csm_gpu_ms = 0.0;
         }
+    }
+
+    pub(crate) fn set_element_lookup(&mut self, lookup: Option<(Texture, [f32; 4])>, casters: u64) {
+        self.element_lookup = lookup;
+        self.element_lookup_casters = casters;
     }
 
     /// The off-tier `csm_map` binding (1x1 sampled depth), created once.
@@ -1509,7 +1597,8 @@ impl GpuLightmapBaker {
     }
 
     /// Caster instances the last cascade pass drew, summed over cascades
-    /// (after per-cascade culling; each caster counts once per cascade).
+    /// (after per-cascade culling; each caster counts once per cascade);
+    /// 0 on a frame that kept the drawing before.
     pub fn csm_draws(&self) -> usize {
         self.csm_draws
     }
@@ -1524,6 +1613,7 @@ impl GpuLightmapBaker {
         if let (Some(frame), Some(depth)) = (self.csm_last, self.csm_depth.as_ref()) {
             let mut frame = frame;
             frame.on = true;
+            frame.seed = self.csm_seed;
             return Some((frame, depth.clone(), 1.0 / self.csm_res.max(1) as f32));
         }
         Some((CsmFrame::default(), self.csm_fallback.clone()?, 0.001))
@@ -1557,6 +1647,8 @@ impl GpuLightmapBaker {
     /// occluder boxes, upload the heightfield, dirty everything.
     fn realize(&mut self, cx: &mut Cx, job: GpuBakeJob) -> Option<GpuLmDelivery> {
         self.pending_delivery = None;
+        // the atlas layout's region meshes cast into the cascades too
+        self.csm_drawn = None;
         let (size, rects) = plan_atlas(&job.scene);
         let mesh_count = job.scene.meshes.len();
         let mut regions = Vec::new();
@@ -1894,7 +1986,7 @@ impl GpuLightmapBaker {
                     v3(eye.x + range, eye.y + range, eye.z + range),
                 ),
             };
-            crate::shadow_csm::fit_cascades_reach(
+            let mut frame = crate::shadow_csm::fit_cascades_reach(
                 csm_view,
                 eye,
                 sun_dir,
@@ -1903,7 +1995,11 @@ impl GpuLightmapBaker {
                 range,
                 self.csm_far_reach,
                 self.csm_res as f32,
-            )
+            );
+            if let Some((lo, hi)) = self.csm_near {
+                crate::shadow_csm::fit_near(&mut frame, csm_view, lo, hi, sun_dir, scene_min, scene_max, range, self.csm_res as f32);
+            }
+            frame
         });
         if batch.is_empty() && csm.is_none() {
             return take_completed_delivery(&mut self.pending_delivery, self.dirty, self.bake_queue.len());
@@ -1919,10 +2015,33 @@ impl GpuLightmapBaker {
             passes += self.encode_batch(cx, sun_dir, &batch);
         }
         if let Some(frame) = &csm {
-            // Every tile is rendered from a clear every frame. (Keeping far
-            // tiles across frames drew stale, misplaced shadow blocks on
-            // Metal while the camera moved.)
-            passes += self.encode_cascades(cx, static_casters, movers, frame);
+            // The tiles are drawn whole from a clear, or kept whole: a frame
+            // whose cascades, casters and element lookup are those of the
+            // last drawing keeps it (live movers always draw). Tiles are
+            // never kept piecemeal: keeping far tiles while the near ones
+            // redrew showed stale, misplaced shadow blocks on Metal while the
+            // camera moved.
+            let drawn = CsmDrawn {
+                frame: frame.cascades,
+                res: self.csm_res,
+                lookup: self.element_lookup.as_ref().map(|(t, c)| (t.texture_id(), c.map(f32::to_bits), self.element_lookup_casters)),
+                casters: self.cascade_casters.as_ref().map_or(0, |c| c.borrow().revision()),
+            };
+            let kept = movers.is_empty() && self.csm_drawn.as_ref().is_some_and(|(d, _)| *d == drawn);
+            if kept {
+                // Not painted whole yet (the GPU is behind, or a draw was left
+                // out while its pipeline compiled): the recording stays
+                // attached, so the platform paints it again when it can.
+                if let (Some((_, repaint)), Some(bp)) = (&self.csm_drawn, self.csm_pool.first()) {
+                    if !bp.pass.painted_whole_since(cx.cx, *repaint) {
+                        cx.make_child_pass(&bp.pass);
+                    }
+                }
+                self.csm_draws = 0;
+            } else {
+                passes += self.encode_cascades(cx, static_casters, movers, frame);
+                self.csm_drawn = movers.is_empty().then(|| (drawn, cx.cx.repaint_id()));
+            }
         }
         let us = ((Cx::monotonic_now() - t0) * 1_000_000.0) as u64;
         if let Some(frame) = &csm {
@@ -2086,7 +2205,7 @@ impl GpuLightmapBaker {
                         d.draw_vars.set_texture(0, &state.tex.lamp_depth);
                         d.draw_vars.geometry_id = Some(m.geometry);
                         if d.draw_vars.can_instance() {
-                            cx.add_instance(&d.draw_vars);
+                            cx.add_instance(&mut d.draw_vars);
                         }
                     }
                     RegionKind::Ground => {
@@ -2104,7 +2223,7 @@ impl GpuLightmapBaker {
                         d.draw_vars.set_texture(0, &state.tex.lamp_depth);
                         d.draw_vars.set_texture(1, &g.heights_tex);
                         if d.draw_vars.can_instance() {
-                            cx.add_instance(&d.draw_vars);
+                            cx.add_instance(&mut d.draw_vars);
                         }
                     }
                 }
@@ -2157,14 +2276,14 @@ impl GpuLightmapBaker {
                     d.transform = m.transform;
                     d.draw_vars.geometry_id = Some(m.geometry);
                     if d.draw_vars.can_instance() {
-                        cx.add_instance(&d.draw_vars);
+                        cx.add_instance(&mut d.draw_vars);
                     }
                 }
                 if let Some(g) = &state.box_geometry {
                     d.transform = Mat4f::identity();
                     d.draw_vars.geometry_id = Some(g.geometry_id());
                     if d.draw_vars.can_instance() {
-                        cx.add_instance(&d.draw_vars);
+                        cx.add_instance(&mut d.draw_vars);
                     }
                 }
                 seq.close(cx, idx);
@@ -2210,7 +2329,7 @@ impl GpuLightmapBaker {
                         d.draw_vars.set_texture(0, &state.tex.sun_depth);
                         d.draw_vars.geometry_id = Some(m.geometry);
                         if d.draw_vars.can_instance() {
-                            cx.add_instance(&d.draw_vars);
+                            cx.add_instance(&mut d.draw_vars);
                         }
                     }
                     RegionKind::Ground => {
@@ -2237,7 +2356,7 @@ impl GpuLightmapBaker {
                         d.draw_vars.set_texture(0, &state.tex.sun_depth);
                         d.draw_vars.set_texture(1, &g.heights_tex);
                         if d.draw_vars.can_instance() {
-                            cx.add_instance(&d.draw_vars);
+                            cx.add_instance(&mut d.draw_vars);
                         }
                     }
                 }
@@ -2263,7 +2382,7 @@ impl GpuLightmapBaker {
                 };
                 d.draw_vars.set_texture(0, &state.tex.mask_a);
                 if d.draw_vars.can_instance() {
-                    cx.add_instance(&d.draw_vars);
+                    cx.add_instance(&mut d.draw_vars);
                 }
                 seq.close(cx, idx);
             }
@@ -2299,7 +2418,7 @@ impl GpuLightmapBaker {
                 };
                 d.draw_vars.set_texture(0, &state.tex.mask_b);
                 if d.draw_vars.can_instance() {
-                    cx.add_instance(&d.draw_vars);
+                    cx.add_instance(&mut d.draw_vars);
                 }
                 seq.close(cx, idx);
             }
@@ -2348,14 +2467,14 @@ impl GpuLightmapBaker {
                         d.transform = m.transform;
                         d.draw_vars.geometry_id = Some(m.geometry);
                         if d.draw_vars.can_instance() {
-                            cx.add_instance(&d.draw_vars);
+                            cx.add_instance(&mut d.draw_vars);
                         }
                     }
                     if let Some(g) = &state.box_geometry {
                         d.transform = Mat4f::identity();
                         d.draw_vars.geometry_id = Some(g.geometry_id());
                         if d.draw_vars.can_instance() {
-                            cx.add_instance(&d.draw_vars);
+                            cx.add_instance(&mut d.draw_vars);
                         }
                     }
                 }
@@ -2412,7 +2531,7 @@ impl GpuLightmapBaker {
                             d.draw_vars.set_texture(0, &state.tex.lamp_depth);
                             d.draw_vars.geometry_id = Some(m.geometry);
                             if d.draw_vars.can_instance() {
-                                cx.add_instance(&d.draw_vars);
+                                cx.add_instance(&mut d.draw_vars);
                             }
                         }
                         RegionKind::Ground => {
@@ -2428,7 +2547,7 @@ impl GpuLightmapBaker {
                             d.draw_vars.set_texture(0, &state.tex.lamp_depth);
                             d.draw_vars.set_texture(1, &g.heights_tex);
                             if d.draw_vars.can_instance() {
-                                cx.add_instance(&d.draw_vars);
+                                cx.add_instance(&mut d.draw_vars);
                             }
                         }
                     }
@@ -2475,7 +2594,7 @@ impl GpuLightmapBaker {
                 // the interior — see DrawLmLampDilate.
                 d.draw_vars.set_texture(1, &state.tex.cov);
                 if d.draw_vars.can_instance() {
-                    cx.add_instance(&d.draw_vars);
+                    cx.add_instance(&mut d.draw_vars);
                 }
             }
             seq.close(cx, idx);
@@ -2516,7 +2635,7 @@ impl GpuLightmapBaker {
                 d.draw_vars.set_texture(0, &state.tex.cov);
                 d.draw_vars.set_texture(1, src);
                 if d.draw_vars.can_instance() {
-                    cx.add_instance(&d.draw_vars);
+                    cx.add_instance(&mut d.draw_vars);
                 }
             }
             seq.close(cx, idx);
@@ -2579,7 +2698,7 @@ impl GpuLightmapBaker {
                 d.draw_vars.set_texture(1, &state.tex.cov);
                 d.draw_vars.set_texture(2, &state.tex.lamp_b);
                 if d.draw_vars.can_instance() {
-                    cx.add_instance(&d.draw_vars);
+                    cx.add_instance(&mut d.draw_vars);
                 }
             }
             seq.close(cx, idx);
@@ -2640,14 +2759,14 @@ impl GpuLightmapBaker {
                         d.transform = m.transform;
                         d.draw_vars.geometry_id = Some(m.geometry);
                         if d.draw_vars.can_instance() {
-                            cx.add_instance(&d.draw_vars);
+                            cx.add_instance(&mut d.draw_vars);
                         }
                     }
                     if let Some(gb) = &state.box_geometry {
                         d.transform = Mat4f::identity();
                         d.draw_vars.geometry_id = Some(gb.geometry_id());
                         if d.draw_vars.can_instance() {
-                            cx.add_instance(&d.draw_vars);
+                            cx.add_instance(&mut d.draw_vars);
                         }
                     }
                     seq.close(cx, idx);
@@ -2689,7 +2808,7 @@ impl GpuLightmapBaker {
                     d.draw_vars.set_texture(1, &state.tex.sun_far);
                     d.draw_vars.set_texture(2, &g.heights_tex);
                     if d.draw_vars.can_instance() {
-                        cx.add_instance(&d.draw_vars);
+                        cx.add_instance(&mut d.draw_vars);
                     }
                     seq.close(cx, idx);
                 }
@@ -2723,7 +2842,7 @@ impl GpuLightmapBaker {
                     };
                     d.draw_vars.set_texture(0, src);
                     if d.draw_vars.can_instance() {
-                        cx.add_instance(&d.draw_vars);
+                        cx.add_instance(&mut d.draw_vars);
                     }
                     seq.close(cx, idx);
                 }
@@ -2813,6 +2932,7 @@ impl GpuLightmapBaker {
         self.csm_mover_bounds.extend(
             movers.iter().map(|m| crate::lightmap::world_bounds(&m.transform, (m.min, m.max))),
         );
+        let host_casters = self.cascade_casters.clone();
         let mut draws_n = 0usize;
         // Casters that reach past their cascade's tile (drawn after the rest
         // through the discarding pipeline), by index.
@@ -2830,6 +2950,21 @@ impl GpuLightmapBaker {
         const CASCADE_NAMES: [&str; 8] = ["shadow csm cascade 0", "shadow csm cascade 1", "shadow csm cascade 2", "shadow csm cascade 3",
             "shadow csm cascade 4", "shadow csm cascade 5", "shadow csm cascade 6", "shadow csm cascade 7"];
         let outer_owner = cx.enter_draw_name(CASCADE_NAMES[0]);
+        // The casters take the table the picture takes, bound by name in each pipeline.
+        let elem_ctl = self.element_lookup.as_ref().map_or(Vec4f::default(), |(_, c)| vec4(c[0], c[1], c[2], c[3]));
+        if let Some((map, _)) = &self.element_lookup {
+            for vars in [&mut draws.sun_depth.draw_vars, &mut draws.sun_depth_inside.depth.draw_vars, &mut draws.sun_depth_cutout.depth.draw_vars, &mut draws.sun_depth_impostor.cutout.depth.draw_vars] {
+                let shader = vars.draw_shader_id;
+                let slot = shader.and_then(|s| cx.cx.draw_shaders[s.index].mapping.textures.iter().position(|t| t.id == live_id!(elem_map)));
+                if let Some(slot) = slot {
+                    vars.set_texture(slot, map);
+                }
+            }
+        }
+        draws.sun_depth.elem_ctl = elem_ctl;
+        draws.sun_depth_inside.depth.elem_ctl = elem_ctl;
+        draws.sun_depth_cutout.depth.elem_ctl = elem_ctl;
+        draws.sun_depth_impostor.cutout.depth.elem_ctl = elem_ctl;
         for (ci, casc) in frame.cascades.iter().enumerate() {
             cx.exit_draw_label(outer_owner);
             cx.enter_draw_name(CASCADE_NAMES[ci.min(CASCADE_NAMES.len() - 1)]);
@@ -2865,14 +3000,14 @@ impl GpuLightmapBaker {
                     d.transform = m.transform;
                     d.draw_vars.geometry_id = Some(m.geometry);
                     if d.draw_vars.can_instance() {
-                        cx.add_instance(&d.draw_vars);
+                        cx.add_instance(&mut d.draw_vars);
                     }
                 }
                 if let Some(g) = &state.box_geometry {
                     d.transform = Mat4f::identity();
                     d.draw_vars.geometry_id = Some(g.geometry_id());
                     if d.draw_vars.can_instance() {
-                        cx.add_instance(&d.draw_vars);
+                        cx.add_instance(&mut d.draw_vars);
                     }
                 }
             }
@@ -2916,7 +3051,7 @@ impl GpuLightmapBaker {
                 di.transform = m.transform;
                 di.draw_vars.geometry_id = Some(m.geometry);
                 if di.draw_vars.can_instance() {
-                    cx.add_instance(&di.draw_vars);
+                    cx.add_instance(&mut di.draw_vars);
                 }
             }
             let d = &mut draws.sun_depth;
@@ -2924,7 +3059,7 @@ impl GpuLightmapBaker {
                 d.transform = m.transform;
                 d.draw_vars.geometry_id = Some(m.geometry);
                 if d.draw_vars.can_instance() {
-                    cx.add_instance(&d.draw_vars);
+                    cx.add_instance(&mut d.draw_vars);
                 }
             }
             // Cut-out layers after every opaque caster: their pipeline
@@ -2956,7 +3091,7 @@ impl GpuLightmapBaker {
                 d.depth.draw_vars.geometry_id = Some(m.geometry);
                 if let (Some(t), Some(slot)) = (&m.cutout, slot) { d.depth.draw_vars.set_texture(slot, t); }
                 if d.depth.draw_vars.can_instance() {
-                    cx.add_instance(&d.depth.draw_vars);
+                    cx.add_instance(&mut d.depth.draw_vars);
                 }
             }
             let d = &mut draws.sun_depth;
@@ -2992,7 +3127,7 @@ impl GpuLightmapBaker {
                             dm.draw_vars.set_texture(slot, &mat.texture);
                         }
                         if dm.draw_vars.can_instance() {
-                            cx.add_instance(&dm.draw_vars);
+                            cx.add_instance(&mut dm.draw_vars);
                         }
                         continue;
                     }
@@ -3001,7 +3136,7 @@ impl GpuLightmapBaker {
                     di.transform = mv.transform;
                     di.draw_vars.geometry_id = Some(mv.geometry);
                     if di.draw_vars.can_instance() {
-                        cx.add_instance(&di.draw_vars);
+                        cx.add_instance(&mut di.draw_vars);
                     }
                     continue;
                 }
@@ -3009,7 +3144,7 @@ impl GpuLightmapBaker {
                 d.transform = mv.transform;
                 d.draw_vars.geometry_id = Some(mv.geometry);
                 if d.draw_vars.can_instance() {
-                    cx.add_instance(&d.draw_vars);
+                    cx.add_instance(&mut d.draw_vars);
                 }
             }
             for (mv, (lo, hi)) in movers.iter().zip(&self.csm_mover_bounds) {
@@ -3041,13 +3176,18 @@ impl GpuLightmapBaker {
                 ds.draw_vars.set_texture(0, &skin.joint_tex);
                 ds.draw_vars.geometry_id = Some(mv.geometry);
                 if ds.draw_vars.can_instance() {
-                    cx.add_instance(&ds.draw_vars);
+                    cx.add_instance(&mut ds.draw_vars);
                 }
+            }
+            if let Some(casters) = &host_casters {
+                let finer = (ci > 0).then(|| &frame.cascades[ci - 1]);
+                draws_n += casters.borrow_mut().draw_cascade(cx, &CascadeTile { cascade: casc, finer, tile, depth: CSM_DEPTH_WINDOW, scissor });
             }
         }
         cx.exit_draw_label(outer_owner);
         seq.close(cx, idx);
-        // The depth drawers are shared with the atlas passes (whole target).
+        // The depth drawers are shared with the atlas passes (whole target, no lookup).
+        draws.sun_depth.elem_ctl = Vec4f::default();
         draws.sun_depth.draw_vars.options.scissor = None;
         draws.sun_depth_cutout.depth.draw_vars.options.scissor = None;
         draws.sun_depth_impostor.cutout.depth.draw_vars.options.scissor = None;

@@ -1,5 +1,7 @@
 workspace.members = [
+    "tools/ci_merge",
     "tools/private_check",
+    "tools/uv_unwrap_corpus",
     # === app ===
     "apps/browser",
     "apps/browser_host",
@@ -45,6 +47,7 @@ workspace.members = [
     "libs/relax_api",
     "libs/relax_api/macro",
     "libs/relax_api/macro_impl",
+    "libs/relax_api/phase",
     "libs/civil_time",
     "libs/wm_api",
     "libs/shell_kit",
@@ -77,12 +80,10 @@ workspace.members = [
     "apps/ai-hub",
     "apps/aihub",
     "apps/devhub",
+    "apps/devhub_panel",
     "apps/mixer",
     "apps/storybook",
-    # The tiled-RTS map generator, shared by the importer and the sandbox.
-    "libs/rtsmap",
     "libs/texcomp",
-    "libs/skyline",
     "libs/ai/hub_ui",
     "libs/ai/hub_panel",
     "libs/ai/services",
@@ -97,9 +98,14 @@ workspace.members = [
     "libs/ai/llm",
     "libs/ai/models/*",
     "libs/ai/hub",
+    # Long-running Splash compute programs (in-process and on hub nodes).
+    "libs/compute_program",
+    "libs/compute_program_gpu",
     "libs/ai/livepipe",
     # Constructive solid geometry.
     "libs/csg/csg",
+    "libs/csg/csg_brep",
+    "libs/csg/csg_brep_model",
     "libs/csg/csg_cad",
     "libs/csg/csg_graph",
     "libs/csg/csg_boolean",
@@ -134,16 +140,18 @@ workspace.members = [
     "libs/strict_json",
     "libs/cell_width",
     "libs/source_slice",
-    "libs/loader_bundle",
     "libs/change_report",
+    "libs/toolchain",
     # === remesh (FaithC port) / xatlas (jpcy port) ===
     "libs/remesh",
     "libs/xatlas",
     # Editable polygon topology and worker-owned model documents.
     "libs/mesh_edit",
+    "libs/uv_unwrap",
     "libs/model",
     # === examples ===
     "examples/teamtalk",
+    "examples/spritelab",
     "examples/app_host_probe",
     "examples/browser_capture_probe",
     "examples/layout_probe",
@@ -191,6 +199,7 @@ workspace.members = [
     "examples/cad",
     "examples/box3d",
     "examples/hello_world",
+    "examples/hello_3d",
     "examples/render_to_texture",
     "examples/depth_mix",
     "examples/sdf_atlas",
@@ -270,7 +279,6 @@ workspace.members = [
     "platform/video",
     "tools/cargo_makepad",
     "tools/cef_fetch",
-    "tools/makepad_builder",
     "libs/win_resource",
     # === OSM PBF -> tile archive + nav artifact bake passes (CLI + in-app) ===
     "libs/map_build",
@@ -278,11 +286,12 @@ workspace.members = [
     "tools/map_bake",
     "libs/remote",
     "libs/devhub",
+    "libs/devhub_conf",
     "libs/stack",
     "tools/service_host",
     "tools/agents",
-    "tools/ci",
     "tools/ci_leg",
+    "libs/ci_judge",
     # === makepad run: the app-VM host (tools/run, package makepad-run, binary makepad)
     # and its host crates; Relax's Rust JIT library crates live in libs/relax ===
     "tools/run",
@@ -290,11 +299,13 @@ workspace.members = [
     "tools/run/boot",
     "tools/run/fixture/diffpkg",
     "tools/run/fixture/diffpkg/tables",
+    "tools/run/fixture/cli_exit",
     "tools/run/android_host",
     "tools/run/android_exe",
     "tools/run/android_host/fixture",
     "libs/gpu_trace",
     "libs/prof_stream",
+    "libs/prof_view",
     "libs/relax/compiler",
     "libs/relax/base",
     "libs/relax/backend",
@@ -306,12 +317,11 @@ workspace.members = [
     "libs/relax/types",
     "tools/run/fixture",
     "tools/run/fixture/park_view",
+    "tools/run/fixture/script_ops",
     "libs/relax/lex",
     "libs/system_speech",
     # Relax run-time benchmark: real-world workloads (rustc --release vs makepad run)
     "libs/relax/compiler/rwbench",
-    # Relax data-structure microbenchmarks (Vec, iterators, HashMap, BTreeMap, sort, strings, bounds loops)
-    "libs/relax/compiler/dsbench",
     # Send feedback: caption icon + panel (Amp, Scope)
     "widgets/feedback",
     # === tests ===
@@ -319,6 +329,7 @@ workspace.members = [
     "platform/script/test",
     "platform/script/audio_aot",
     "platform/hal",
+    "platform/cpu_budget",
     "platform/script/compute",
     "platform/script/imports",
     "platform/script/compute_sched",
@@ -366,6 +377,9 @@ workspace.exclude = [
     "libs/relax/compiler/tests",
     "libs/relax/types/tests",
     "libs/relax/attr",
+    # The vendored brotli crates (and their allocators): dependencies, not members, so their
+    # own test suites (which read upstream test corpora not vendored here) are not ours to run
+    "libs/brotli",
     # Private repositories cloned into apps/<name> are members through
     # apps/*/src/.. above: Source Library, and the commercial products at
     # apps/commercial (a members package at its root naming Stage's and
@@ -470,6 +484,7 @@ unicode-segmentation = { path = "libs/unicode/unicode-segmentation" }
 # Paths of Relax's JIT libraries (libs/relax), the host crates (tools/run), and their makepad dependencies:
 # members say `name = { workspace = true }`.
 [workspace.dependencies]
+makepad-cpu-budget = { path = "platform/cpu_budget", version = "1.0.0" }
 relax-lex = { path = "libs/relax/lex", version = "0.1.0" }
 makepad-relax = { path = "libs/relax/attr", version = "1.0.0" }
 relax-base = { path = "libs/relax/base", version = "0.1.0" }
@@ -488,6 +503,7 @@ makepad-remote = { path = "libs/remote", version = "0.1.0" }
 makepad-strict-json = { path = "libs/strict_json", version = "0.1.0" }
 makepad-gpu-trace = { path = "libs/gpu_trace", version = "1.0.0" }
 makepad-prof-stream = { path = "libs/prof_stream", version = "1.0.0" }
+makepad-prof-view = { path = "libs/prof_view", version = "0.1.0" }
 makepad-relax-api = { path = "libs/relax_api", version = "1.0.0" }
 makepad-relax-api-macro-impl = { path = "libs/relax_api/macro_impl", version = "1.0.0" }
 makepad-live-id-macros-impl = { path = "libs/live_id/id_macros_impl", version = "1.0.0" }
@@ -534,10 +550,14 @@ lto = "off"
 # Output goes to target/host/ (or target/<triple>/host/), never over target/release: release stays the
 # distributable build and the build every gate, A/B and timing series uses.
 # local/agent_state/relax-campaign/build-host.sh adds -Ctarget-cpu=native and the PGO profile.
+# lto = false: LTO within each crate, no whole-program link step. On a 16-core Linux box (2026-11-05,
+# against thin LTO) a relax-compiler edit rebuilds in 33 s instead of 59 s, a relax-types edit in 47 s
+# instead of 70 s, a tools/run edit in 3 s instead of 39 s and a clean build in 73 s instead of 87 s;
+# the JIT compiles about 1.5% slower (selftest CPU 61.5 s -> 62.5 s), settles the same.
 [profile.host]
 inherits = "release"
 opt-level = 3
-lto = "thin"
+lto = false
 codegen-units = 16
 incremental = false
 

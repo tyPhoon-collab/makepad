@@ -1593,7 +1593,7 @@ impl Predecoded {
         let this = Arc::new(Self { parts, slots: relax_session::sync::Mutex::new(slots), done: relax_session::sync::Condvar::new() });
         for _ in 0..workers.min(this.parts.len()) {
             let this = this.clone();
-            std::thread::Builder::new().name("run-namespace-decode".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+            relax_base::run_threads::spawn("run-namespace-decode", move || { let _z = crate::zone_alloc::compiler_thread();
                 while let Some(ci) = this.claim(None) { this.decode(ci); }
             }).expect("namespace decode worker");
         }
@@ -1622,7 +1622,7 @@ impl Predecoded {
             match std::mem::replace(&mut slots[ci], Slot::Taken) {
                 Slot::Done(image) => return image,
                 Slot::Taken => return None,
-                busy => { slots[ci] = busy; slots = self.done.wait(slots).unwrap(); }
+                busy => { slots[ci] = busy; slots = crate::pool::wait(&self.done, &self.slots, slots).unwrap(); }
             }
         }
     }

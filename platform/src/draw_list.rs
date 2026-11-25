@@ -639,6 +639,19 @@ impl Cx {
         }
     }
 
+    /// The instances a draw call draws this frame: 0 for one that is not drawn (no instance
+    /// slots, no instances or no geometry).
+    pub(crate) fn drawn_instances(&self, draw_item: &CxDrawItem, draw_call: &CxDrawCall) -> usize {
+        let instance_slots = self.draw_shaders[draw_call.draw_shader_id.index].mapping.instances.total_slots;
+        if instance_slots == 0 || draw_call.geometry_id.is_none() {
+            return 0;
+        }
+        draw_item.retained_instances.as_ref().map_or_else(
+            || draw_item.instances.as_ref().map_or(0, |instances| instances.len() / instance_slots),
+            |_| draw_item.retained_instance_count,
+        )
+    }
+
     fn collect_gpu_metrics_for_draw_list(
         &self,
         draw_list_id: DrawListId,
@@ -669,28 +682,14 @@ impl Cx {
             let Some(draw_call) = draw_item.kind.draw_call() else {
                 continue;
             };
-
-            let sh = &self.draw_shaders[draw_call.draw_shader_id.index];
-            let instance_slots = sh.mapping.instances.total_slots;
-            if instance_slots == 0 {
-                continue;
-            }
-            let instance_count = draw_item.retained_instances.as_ref().map_or_else(
-                || {
-                    draw_item
-                        .instances
-                        .as_ref()
-                        .map_or(0, |instances| instances.len() / instance_slots)
-                },
-                |_| draw_item.retained_instance_count,
-            );
+            let instance_count = self.drawn_instances(draw_item, draw_call);
             if instance_count == 0 {
                 continue;
             }
-
             let Some(geometry_id) = draw_call.geometry_id else {
                 continue;
             };
+            let sh = &self.draw_shaders[draw_call.draw_shader_id.index];
             let geometry = &self.geometries[geometry_id];
             let index_count = geometry.index_count as u64;
 
@@ -847,8 +846,7 @@ impl<P: Send + 'static> RetirementBatches<P> {
         }
         if !self.initialized {
             if self.preparing.is_none() {
-                if let Ok(slot) = pool.reserve(crate::thread::Lane::Heavy) {
-                    self.preparing = Some(slot.submit_internal_named("retirement batch storage", || {
+                    self.preparing = pool.submit_internal(crate::thread::Class::Background, || {
                         (0..16)
                             .map(|_| {
                                 PreparedDrawBox::new().initialize(RetirementBatch {
@@ -856,8 +854,7 @@ impl<P: Send + 'static> RetirementBatches<P> {
                                 })
                             })
                             .collect()
-                    }));
-                }
+                    }).ok();
             }
             return false;
         }
@@ -965,9 +962,7 @@ impl CxDrawListPool {
         // bounded worker jobs. Larger prepared envelopes drain retired scene
         // inventories without increasing UI time or flooding completion queues.
         for _ in 0..4 {
-            let Ok(slot) = pool.reserve(crate::thread::Lane::Heavy) else {
-                break;
-            };
+            if !pool.is_open() { break; }
             let Some(mut batch) = batches.available.pop() else {
                 break;
             };
@@ -1051,7 +1046,7 @@ impl CxDrawListPool {
             let returned = batches.returned_tx.clone();
             let counter = self.1.retirements.clone();
             counter.fetch_add(1, Ordering::AcqRel);
-            slot.submit_internal_named("retained draw storage retirement", move || {
+            if let Ok(handle) = pool.submit_internal(crate::thread::Class::Background, move || {
                 for item in &mut batch.items {
                     drop(item.take());
                 }
@@ -1060,8 +1055,7 @@ impl CxDrawListPool {
                 let _ = returned.try_send(batch);
                 counter.fetch_sub(1, Ordering::AcqRel);
                 crate::thread::SignalToUI::set_internal_signal();
-            })
-            .detach();
+            }) { handle.detach(); }
         }
         // Settlement includes rotating scans and completion/metadata debt,
         // not just the queue of freed CPU publications. Otherwise a view can
@@ -1740,6 +1734,8 @@ pub struct CxDrawCall {
     pub dyn_uniforms: Vec<f32>,
     pub texture_slots: [Option<Texture>; DRAW_CALL_TEXTURE_SLOTS],
     pub uniform_buffer_slots: [Option<UniformBuffer>; DRAW_CALL_UNIFORM_BUFFER_SLOTS],
+    #[cfg(not(target_arch = "wasm32"))]
+    pub storage_buffers: Vec<(LiveId, crate::GpuBuffer)>,
     /// Replaced with a process-wide generation whenever either uniform block
     /// owned by this draw call changes.
     pub uniforms_gen: u64,
@@ -1794,6 +1790,8 @@ impl CxDrawCall {
         self.draw_call_uniforms = DrawCallUniforms::default();
         sized_dyn_uniforms(&mut self.dyn_uniforms, &draw_vars.dyn_uniforms, mapping.dyn_uniforms.total_slots);
         self.texture_slots.clone_from(&draw_vars.texture_slots);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.storage_buffers.clone_from(&draw_vars.storage_buffers);
         self.uniform_buffer_slots
             .clone_from(&draw_vars.uniform_buffer_slots);
         self.instance_dirty = true;
@@ -1821,6 +1819,8 @@ impl CxDrawCall {
                 sized_dyn_uniforms(&mut u, &draw_vars.dyn_uniforms, mapping.dyn_uniforms.total_slots);
                 u
             },
+            #[cfg(not(target_arch = "wasm32"))]
+            storage_buffers: draw_vars.storage_buffers.clone(),
             texture_slots: draw_vars.texture_slots.clone(),
             uniform_buffer_slots: draw_vars.uniform_buffer_slots.clone(),
             instance_dirty: true,
@@ -1921,6 +1921,26 @@ pub struct DrawItemInstanceCounters {
     pub dirty_bytes: usize,
     pub upload_pending: bool,
     pub recording_refused: bool,
+}
+
+/// A publication leaves a draw slot. Another reader (its producer, or the
+/// same publication recorded again) keeps it alive, so this lease is only a
+/// count and drops here. The last lease of a superseded publication goes to
+/// worker retirement, so freeing its storage never runs on the UI thread.
+/// Queueing shared leases too pinned every re-recorded publication in the
+/// queue (millions at rest in a retained-heavy app, faster than retirement
+/// drains it), and with them the superseded ones that only the queue held.
+fn retire_publication(
+    queue: &Option<std::rc::Rc<RetiredDrawInstances>>,
+    publication: crate::retained_instances::RetainedInstances,
+) {
+    if publication.readers() > 1 {
+        return;
+    }
+    if let Some(queue) = queue {
+        queue.values.borrow_mut().push(publication);
+        queue.pending.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Default)]
@@ -2027,6 +2047,11 @@ impl CxDrawItems {
             .draw_call_mut()
             .expect("retained presentation requires a draw call");
         assert_eq!(Some(call.draw_shader_id), vars.draw_shader_id);
+        #[cfg(not(target_arch = "wasm32"))]
+        if call.storage_buffers != vars.storage_buffers {
+            call.storage_buffers.clone_from(&vars.storage_buffers);
+            call.mark_uniforms_dirty(generation);
+        }
         if dyn_uniforms_differ(&call.dyn_uniforms, &vars.dyn_uniforms)
             || call.texture_slots != vars.texture_slots
             || call.uniform_buffer_slots != vars.uniform_buffer_slots
@@ -2262,7 +2287,9 @@ impl CxDrawItems {
     }
     /// Discard bindings from calls omitted by this recording. Keep their
     /// reusable instance/backend storage, but never keep a shared framebuffer
-    /// leased through a spare slot that the renderer no longer visits.
+    /// or a CPU publication leased through a spare slot that the renderer no
+    /// longer visits (the backend keys its buffer by publication id, so the
+    /// same publication drawn here again uploads nothing).
     pub fn finish_recording(&mut self) {
         if self.used < self.bindings_used {
             for item in &mut self.buffer[self.used..self.bindings_used] {
@@ -2273,6 +2300,9 @@ impl CxDrawItems {
                     call.geometry_id = None;
                 }
                 item.shared = None;
+                if let Some(old) = item.retained_instances.take() {
+                    retire_publication(&self.retired_instances, old);
+                }
             }
         }
         // Only newly discarded slots need cleanup on the next recording.
@@ -2352,11 +2382,8 @@ impl CxDrawItems {
             if draw_item.retained_instances.is_none() {
                 draw_item.retained_instance_id = 0;
             }
-            if let Some(retired) = draw_item.retained_instances.take() {
-                if let Some(queue) = &self.retired_instances {
-                    queue.values.borrow_mut().push(retired);
-                    queue.pending.store(true, Ordering::Release);
-                }
+            if let Some(old) = draw_item.retained_instances.take() {
+                retire_publication(&self.retired_instances, old);
             }
             draw_item.retained_schema = 0;
             draw_item.consumed_serial = 0;
@@ -2660,6 +2687,10 @@ impl CxDrawList {
                         )
                     });
                 } else if draw_call.append_group_id == target_group {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if draw_call.storage_buffers != draw_vars.storage_buffers {
+                        if can_cross { continue; } else { break; }
+                    }
                     // lets compare uniforms and textures..
                     if !sh.mapping.flags.draw_call_nocompare {
                         if draw_call.geometry_id != draw_vars.geometry_id {
@@ -3076,6 +3107,36 @@ mod retained_sub_list_tests {
         assert!(items[0].retained_upload_needed());
     }
 
+    /// Re-recording a slot with the publication its producer still holds
+    /// queues nothing for retirement. Only the last lease of a superseded
+    /// publication, or of one left in a spare slot, is queued (every
+    /// re-recorded lease was, which pinned superseded ones behind them).
+    #[test]
+    fn re_recorded_publications_queue_only_their_last_lease() {
+        use crate::retained_instances::RetainedInstances;
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let list = DrawList::new(&mut cx);
+        let kept = RetainedInstances::new(4, vec![1.0; 16].into()).unwrap();
+        for _ in 0..8 {
+            let items = &mut cx.draw_lists[list.id()].draw_items;
+            items.clear();
+            items.push_item(1, CxDrawKind::Empty).retained_instances = Some(kept.clone());
+            items.push_item(1, CxDrawKind::Empty).retained_instances =
+                Some(RetainedInstances::new(4, vec![2.0; 16].into()).unwrap());
+            items.finish_recording();
+        }
+        let queued = |cx: &Cx| cx.draw_lists.3.values.borrow().iter().map(|p| p.data()[0]).collect::<Vec<_>>();
+        assert_eq!(queued(&cx), vec![2.0; 7], "seven superseded publications, never the kept one");
+        assert_eq!(kept.readers(), 2, "the producer and the slot");
+        let items = &mut cx.draw_lists[list.id()].draw_items;
+        items.clear();
+        items.push_item(1, CxDrawKind::Empty).retained_instances = Some(kept.clone());
+        items.finish_recording();
+        assert!(cx.draw_lists[list.id()].draw_items.buffer[1].retained_instances.is_none());
+        assert_eq!(queued(&cx), vec![2.0; 8], "the spare slot's publication is queued too");
+        assert_eq!(kept.readers(), 2);
+    }
+
     /// The retained-sub-list contract: a parent list may keep naming a child
     /// list that its owner dropped (a map tile evicted at event time, a hidden
     /// page). The dropped id stays dead — before AND after the pool hands its
@@ -3182,7 +3243,7 @@ mod retained_sub_list_tests {
             .push_item(1, CxDrawKind::Empty)
             .retained_instances = Some(retained);
         // Two multi-slot hosts can disappear on each atlas frame. Retirement
-        // must drain this small backlog without hundreds of idle presents.
+        // drains this backlog in bounded per-frame slices.
         for _ in 1..8192 {
             cx.draw_lists[reused.id()]
                 .draw_items
@@ -3195,13 +3256,16 @@ mod retained_sub_list_tests {
         let mut backend_slots = std::collections::HashMap::from([((retired_id, 0), backend)]);
         drop(reused);
         let pool = cx.task_pool();
-        for frame in 0..100 {
+        // How many frames this takes is not checked: a frame's slice is cut at
+        // 200 us of work and waits on the pool's workers, so the count follows
+        // the machine's speed and load. The bound only catches a backlog that
+        // never drains (every working frame retires at least one item).
+        for frame in 0..16_384 {
             let pending = cx
                 .draw_lists
                 .retire_free_items_with_ids(&pool, frame, |id, item, _| {
                     backend_slots.remove(&(id, item))
                 });
-            let _ = (&pool, frame);
             if !pending {
                 break;
             }
@@ -3214,7 +3278,7 @@ mod retained_sub_list_tests {
         );
         assert!(
             !cx.draw_lists.has_pending_instance_retirements(),
-            "bounded retirement backlog must drain within 100 frames: workers={} allocations={} freed={} pool={}",
+            "the retirement backlog must drain: workers={} allocations={} freed={} pool={}",
             cx.draw_lists.1.retirements.load(Ordering::Acquire),
             cx.draw_lists.1.allocations.has_pending_retirements(), cx.draw_lists.0.has_pending_retirements(), pool.summary()
         );
@@ -3290,6 +3354,8 @@ mod uniform_generation_tests {
             draw_call_uniforms: DrawCallUniforms::default(),
             geometry_id: None,
             dyn_uniforms: vec![0.0; 4],
+            #[cfg(not(target_arch = "wasm32"))]
+            storage_buffers: Vec::new(),
             texture_slots: Default::default(),
             uniform_buffer_slots: Default::default(),
             instance_dirty: true,
@@ -3634,7 +3700,11 @@ mod uniform_generation_tests {
             append_group_id: 0,
             draw_shader_id: Some(call.draw_shader_id),
             geometry_id: None,
+            shader_gen: 0,
+            shader_default: None,
             dyn_uniforms: call.dyn_uniforms.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            storage_buffers: call.storage_buffers.clone(),
             texture_slots: call.texture_slots.clone(),
             uniform_buffer_slots: call.uniform_buffer_slots.clone(),
             dyn_instances_pad: Default::default(),

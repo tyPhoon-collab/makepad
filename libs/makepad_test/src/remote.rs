@@ -26,6 +26,8 @@ pub struct WindowInfo {
     pub width: f64,
     pub height: f64,
     pub dpi: f64,
+    /// The scale its main pass last rasterised at; 0 before it first drew.
+    pub pass_dpi: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +91,9 @@ pub struct MouseInput {
     /// A scroll's trackpad gesture phase (`began`, `changed`, `ended`, `momentum`,
     /// `momentum_ended`, `touched`; `None` is a mouse wheel), or a touch's phase.
     pub phase: Option<&'static str>,
+    /// The event's own time in seconds, for a gesture that goes by its speed; `None` is when it
+    /// arrives.
+    pub time: Option<f64>,
 }
 
 impl MouseInput {
@@ -104,6 +109,7 @@ impl MouseInput {
             modifiers: KeyModifiers::default(),
             wait: true,
             phase: None,
+            time: None,
         }
     }
 }
@@ -112,6 +118,7 @@ impl MouseInput {
 pub struct RemoteClient {
     socket: PathBuf,
     client: Client,
+    pub(crate) jit: bool,
 }
 
 impl std::fmt::Debug for RemoteClient {
@@ -130,7 +137,36 @@ impl RemoteClient {
                 socket.display()
             ))
         })?;
-        Ok(Self { socket, client })
+        Ok(Self { socket, client, jit: false })
+    }
+
+    /// The program is waiting on the JIT right now. Background work (the queues ahead of the
+    /// program, tier-ups, the cache's writes) goes on beside a test and is not a reason to wait.
+    pub(crate) fn jit_foreground(&self) -> TestResult<bool> {
+        let fail = |what: &str| TestError::new(format!("app remote JIT state: {what}"));
+        let reply = self.get_text("owner", &[])?;
+        let json = reply.lines().find(|line| line.contains("\"queued\"")).ok_or_else(|| fail("the owner's reply carries no queue state"))?;
+        let json = parse_json(json)?;
+        let queued = json.key("queued");
+        let count = |key: &str| json_f64(queued.and_then(|queued| queued.key(key))).ok_or_else(|| fail("the owner's queue state is not a count"));
+        Ok(count("foreground")? + count("main")? > 0.0)
+    }
+
+    /// Under the JIT, the app's state captured before teardown (the host's `capture`: stacks
+    /// with tiers, compile queue, waits, flight recording): its likely cause and the report's
+    /// path. None for a native app or without an answer.
+    pub(crate) fn jit_capture(&self, why: &str) -> Option<String> {
+        if !self.jit {
+            return None;
+        }
+        let line = makepad_remote::app::request_line(&["capture".to_string()], &[("why".to_string(), why.to_string())]);
+        for line in self.client.cmd(&line).ok()? {
+            let Ok(json) = JsonValue::deserialize_json(line.ok()?.trim()) else { continue };
+            if let (Some(cause), Some(path)) = (json.key("cause").and_then(JsonValue::string), json.key("path").and_then(JsonValue::string)) {
+                return Some(format!("{cause} [report {path}]"));
+            }
+        }
+        None
     }
 
     /// The socket path this client dials, for diagnostics.
@@ -215,6 +251,10 @@ impl RemoteClient {
         }
         if let Some(phase) = input.phase {
             params.push(("phase", phase));
+        }
+        let time = input.time.map(format_num);
+        if let Some(time) = &time {
+            params.push(("time", time.as_str()));
         }
         push_modifier_params(&mut params, &input.modifiers);
         if let Some(window) = &window {
@@ -304,8 +344,20 @@ impl RemoteClient {
             .map_err(|err| fail(format!("link lost: {err}")))?;
         let mut pending = String::new();
         let mut lines = Vec::new();
+        let mut jit_wait = makepad_remote::jit::Wait::default();
         loop {
-            match channel.recv_timeout(RESPONSE_TIMEOUT) {
+            let event = match channel.recv_timeout(RESPONSE_TIMEOUT) {
+                Err(true) if self.jit => {
+                    let wait = jit_wait.keep_waiting(&self.client).map_err(|err| fail(err.to_string()))?;
+                    // The app may have answered while inspect sampled the JIT.
+                    match channel.try_recv() {
+                        Err(true) if wait => continue,
+                        event => event,
+                    }
+                }
+                event => event,
+            };
+            match event {
                 Ok(Event::Data(data)) => {
                     pending.push_str(&String::from_utf8_lossy(&data));
                     let mut ended = false;
@@ -419,6 +471,7 @@ pub fn parse_windows(json: &JsonValue) -> TestResult<Vec<WindowInfo>> {
             width: json_f64(size.first()).unwrap_or(0.0),
             height: json_f64(size.get(1)).unwrap_or(0.0),
             dpi: json_f64(item.key("dpi")).unwrap_or(1.0),
+            pass_dpi: json_f64(item.key("pass_dpi")).unwrap_or(0.0),
         });
     }
     Ok(windows)
@@ -580,7 +633,8 @@ mod tests {
                 title: "Counter [remote]".to_string(),
                 width: 800.0,
                 height: 600.0,
-                dpi: 2.0
+                dpi: 2.0,
+                pass_dpi: 0.0,
             }]
         );
         let json = parse_json(r#"{"n":7,"pool":"","l":["a","b"]}"#).unwrap();
@@ -607,7 +661,7 @@ mod tests {
         server.route("help", "makepad-remote  app=fake pid=1\nstatus  this sheet");
         server.route(
             "status",
-            r#"{"app":"fake","pid":1,"w":[{"i":0,"t":"Fake [remote]","sz":[640,480],"px":[1280,960],"dpi":2,"pos":[0,0]}]}"#,
+            r#"{"app":"fake","pid":1,"w":[{"i":0,"t":"Fake [remote]","sz":[640,480],"px":[1280,960],"dpi":2,"pass_dpi":2,"pos":[0,0]}]}"#,
         );
         server.route("ui", &semantic_reply());
         server.route("click", r#"{"ok":1,"f":12}"#);

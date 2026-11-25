@@ -108,9 +108,7 @@ impl Invite {
 /// This machine's address on the LAN, as the route to a private address
 /// would use it. No packet is sent.
 pub fn lan_address() -> Option<String> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("192.0.2.1:9").ok()?;
-    let ip = socket.local_addr().ok()?.ip();
+    let ip = makepad_ai_hub::hub_order::own_lan_ip()?;
     (!ip.is_loopback() && !ip.is_unspecified()).then(|| ip.to_string())
 }
 

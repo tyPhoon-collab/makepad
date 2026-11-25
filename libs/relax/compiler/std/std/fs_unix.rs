@@ -4,8 +4,9 @@ use alloc::ffi::CString;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int, c_void, CStr};
 use core::fmt;
+use core::mem::MaybeUninit;
 
 use crate::ffi::{OsStr, OsString};
 use crate::io::{self, Read, Seek, SeekFrom, Write};
@@ -27,11 +28,46 @@ pub(crate) fn vfs_stat(k: &vfs::Kind) -> stat_t {
     }
 }
 
-/// Path -> nul-terminated C string; an interior NUL is InvalidInput (real std's message).
-pub(crate) fn cstr(path: &Path) -> io::Result<CString> {
-    match CString::new(path.as_os_str().as_encoded_bytes()) {
-        Ok(c) => Ok(c),
-        Err(_) => Err(io::const_error!(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte")),
+// Keep the stack buffer below the size that needs a probe frame (real std).
+const MAX_STACK_ALLOCATION: usize = 384;
+const NUL_ERR: io::Error = io::const_error!(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte");
+
+#[inline]
+pub(crate) fn run_path_with_cstr<T>(path: &Path, f: &dyn Fn(&CStr) -> io::Result<T>) -> io::Result<T> {
+    run_with_cstr(path.as_os_str().as_encoded_bytes(), f)
+}
+
+#[inline]
+pub(crate) fn run_with_cstr<T>(bytes: &[u8], f: &dyn Fn(&CStr) -> io::Result<T>) -> io::Result<T> {
+    // Erase the closure type so each caller does not duplicate the conversion.
+    if bytes.len() >= MAX_STACK_ALLOCATION {
+        run_with_cstr_allocating(bytes, f)
+    } else {
+        unsafe { run_with_cstr_stack(bytes, f) }
+    }
+}
+
+/// # Safety
+/// `bytes` must be shorter than `MAX_STACK_ALLOCATION` to leave room for the NUL.
+unsafe fn run_with_cstr_stack<T>(bytes: &[u8], f: &dyn Fn(&CStr) -> io::Result<T>) -> io::Result<T> {
+    let mut buf = MaybeUninit::<[u8; MAX_STACK_ALLOCATION]>::uninit();
+    let buf_ptr = buf.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr, bytes.len());
+        buf_ptr.add(bytes.len()).write(0);
+    }
+    match CStr::from_bytes_with_nul(unsafe { core::slice::from_raw_parts(buf_ptr, bytes.len() + 1) }) {
+        Ok(c) => f(c),
+        Err(_) => Err(NUL_ERR),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn run_with_cstr_allocating<T>(bytes: &[u8], f: &dyn Fn(&CStr) -> io::Result<T>) -> io::Result<T> {
+    match CString::new(bytes) {
+        Ok(c) => f(&c),
+        Err(_) => Err(NUL_ERR),
     }
 }
 
@@ -64,13 +100,45 @@ fn needs_write() -> io::Error {
 
 pub struct File {
     fd: OwnedFd,
-    /// a virtual file's bytes and read position (its fd is /dev/null's)
-    mem: Option<Box<Mem>>,
+    virtual_len: Option<u64>,
 }
 
-struct Mem {
-    data: Arc<Vec<u8>>,
-    pos: core::sync::atomic::AtomicU64,
+fn virtual_fd() -> io::Result<OwnedFd> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let fd = cvt_r(|| unsafe { sys::os::memfd_create(b"relax-vfs\0".as_ptr() as *const c_char, sys::os::MFD_CLOEXEC) })?;
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        let path = crate::env::temp_dir().join("relax-vfs-XXXXXX");
+        let mut name = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| NUL_ERR)?.into_bytes_with_nul();
+        let fd = cvt(unsafe { sys::os::mkstemp(name.as_mut_ptr() as *mut c_char) })?;
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        cvt_r(|| unsafe { sys::unlink(name.as_ptr() as *const c_char) })?;
+        cvt_r(|| unsafe { sys::fcntl(fd.as_raw_fd(), sys::F_SETFD, sys::FD_CLOEXEC) })?;
+        Ok(fd)
+    }
+}
+
+/// A folder fd that names no folder: a fresh empty folder in the temp folder, removed once it is
+/// open (the fd stays a folder's: fstat and fsync work on it, reads fail EISDIR).
+fn virtual_dir_fd() -> io::Result<OwnedFd> {
+    static NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let pid = unsafe { sys::getpid() };
+    loop {
+        let n = NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let path = crate::env::temp_dir().join(alloc::format!("relax-vfs-dir-{pid}-{n}"));
+        let c = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| NUL_ERR)?;
+        if let Err(e) = cvt(unsafe { sys::mkdir(c.as_ptr(), 0o700) }) {
+            // a folder left by an earlier process of the same pid: the next name
+            if e.kind() == io::ErrorKind::AlreadyExists { continue; }
+            return Err(e);
+        }
+        let fd = cvt_r(|| unsafe { sys::open(c.as_ptr(), sys::O_RDONLY | sys::os::O_DIRECTORY | sys::os::O_CLOEXEC, 0 as core::ffi::c_uint) });
+        unsafe { sys::rmdir(c.as_ptr()) };
+        return Ok(unsafe { OwnedFd::from_raw_fd(fd?) });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -124,22 +192,35 @@ impl OpenOptions {
             if self.write || self.append || self.truncate || self.create || self.create_new {
                 // the run's edits folder, if it has one (else read-only)
                 let how = if self.truncate || (self.create_new && matches!(k, vfs::Kind::Missing)) || (!self.append && matches!(k, vfs::Kind::Missing)) { vfs::Edit::Replace } else { vfs::Edit::Keep };
-                let disk = vfs::edit_target(&abs, how).unwrap_or_else(|| Err(vfs::read_only()))?;
-                return self.open_c(&cstr(&disk)?);
+                let disk = vfs::edit_target(&*abs, how).unwrap_or_else(|| Err(vfs::read_only()))?;
+                return run_path_with_cstr(&disk, &|c| self.open_c(c));
             }
             return match k {
                 vfs::Kind::File(_) => {
-                    let data = vfs::read(&abs)?;
-                    let null = cstr(Path::new("/dev/null"))?;
-                    let fd = cvt_r(|| unsafe { sys::open(null.as_ptr(), sys::os::O_CLOEXEC | sys::O_RDONLY, 0) })?;
-                    Ok(File { fd: unsafe { OwnedFd::from_raw_fd(fd) }, mem: Some(Box::new(Mem { data: Arc::new(data), pos: core::sync::atomic::AtomicU64::new(0) })) })
+                    let data = vfs::read(&*abs)?;
+                    let mut file = File { fd: virtual_fd()?, virtual_len: None };
+                    cvt_r(|| unsafe { sys::fchmod(file.raw(), 0o644 as sys::mode_t) })?;
+                    file.write_all(&data)?;
+                    file.seek(SeekFrom::Start(0))?;
+                    file.virtual_len = Some(data.len() as u64);
+                    Ok(file)
                 }
-                vfs::Kind::Dir => Err(io::const_error!(io::ErrorKind::IsADirectory, "is a directory")),
+                // open(2) of a folder for reading succeeds on the disk (its reads fail EISDIR; a
+                // folder's fd is fsync'd to make its entries durable): the run's edits copy of the
+                // folder when there is one, else a folder fd of its own
+                vfs::Kind::Dir => {
+                    self.access_mode()?;
+                    if let Some(Ok(disk)) = vfs::edit_target(&*abs, vfs::Edit::Existing) {
+                        if let Ok(file) = run_path_with_cstr(&disk, &|c| self.open_c(c)) {
+                            return Ok(file);
+                        }
+                    }
+                    Ok(File { fd: virtual_dir_fd()?, virtual_len: None })
+                }
                 vfs::Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
             };
         }
-        let path = cstr(path.as_ref())?;
-        self.open_c(&path)
+        run_path_with_cstr(path.as_ref(), &|c| self.open_c(c))
     }
 
     fn access_mode(&self) -> io::Result<c_int> {
@@ -182,11 +263,11 @@ impl OpenOptions {
         })
     }
 
-    fn open_c(&self, path: &CString) -> io::Result<File> {
+    fn open_c(&self, path: &CStr) -> io::Result<File> {
         let flags = sys::os::O_CLOEXEC | self.access_mode()? | self.creation_mode()? | (self.custom_flags & !3);
         let mode = self.mode;
         let fd = cvt_r(|| unsafe { sys::open(path.as_ptr(), flags, mode as core::ffi::c_uint) })?;
-        Ok(File { fd: unsafe { OwnedFd::from_raw_fd(fd) }, mem: None })
+        Ok(File { fd: unsafe { OwnedFd::from_raw_fd(fd) }, virtual_len: None })
     }
 }
 
@@ -246,6 +327,9 @@ impl File {
         self.sync_all()
     }
     pub fn set_len(&self, size: u64) -> io::Result<()> {
+        if self.virtual_len.is_some() {
+            return Err(vfs::read_only());
+        }
         if size > i64::MAX as u64 {
             return Err(io::Error::from_raw_os_error(sys::os::EINVAL));
         }
@@ -253,16 +337,15 @@ impl File {
         Ok(())
     }
     pub fn metadata(&self) -> io::Result<Metadata> {
-        if let Some(m) = &self.mem {
-            return Ok(Metadata { st: vfs_stat(&vfs::Kind::File(m.data.len() as u64)) });
+        if let Some(len) = self.virtual_len {
+            return Ok(Metadata { st: vfs_stat(&vfs::Kind::File(len)) });
         }
         let mut st = stat_t::zeroed();
         cvt(unsafe { sys::os::fstat(self.raw(), &mut st as *mut stat_t) })?;
         Ok(Metadata { st })
     }
     pub fn try_clone(&self) -> io::Result<File> {
-        let mem = self.mem.as_ref().map(|m| Box::new(Mem { data: m.data.clone(), pos: core::sync::atomic::AtomicU64::new(m.pos.load(core::sync::atomic::Ordering::Relaxed)) }));
-        Ok(File { fd: self.fd.try_clone()?, mem })
+        Ok(File { fd: self.fd.try_clone()?, virtual_len: self.virtual_len })
     }
     pub fn set_permissions(&self, perm: Permissions) -> io::Result<()> {
         cvt_r(|| unsafe { sys::fchmod(self.raw(), perm.mode as sys::mode_t) })?;
@@ -315,13 +398,6 @@ impl File {
         Ok(())
     }
     fn read_raw(&self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Some(m) = &self.mem {
-            let pos = (m.pos.load(core::sync::atomic::Ordering::Relaxed) as usize).min(m.data.len());
-            let n = buf.len().min(m.data.len() - pos);
-            buf[..n].copy_from_slice(&m.data[pos..pos + n]);
-            m.pos.store((pos + n) as u64, core::sync::atomic::Ordering::Relaxed);
-            return Ok(n);
-        }
         let len = if buf.len() > crate::os::unix::fs::READ_LIMIT { crate::os::unix::fs::READ_LIMIT } else { buf.len() };
         let r = unsafe { sys::read(self.raw(), buf.as_mut_ptr() as *mut c_void, len) };
         if r < 0 {
@@ -331,7 +407,7 @@ impl File {
         }
     }
     fn write_raw(&self, buf: &[u8]) -> io::Result<usize> {
-        if self.mem.is_some() {
+        if self.virtual_len.is_some() {
             return Err(vfs::read_only());
         }
         let len = if buf.len() > crate::os::unix::fs::READ_LIMIT { crate::os::unix::fs::READ_LIMIT } else { buf.len() };
@@ -343,19 +419,6 @@ impl File {
         }
     }
     fn seek_raw(&self, pos: SeekFrom) -> io::Result<u64> {
-        if let Some(m) = &self.mem {
-            let cur = m.pos.load(core::sync::atomic::Ordering::Relaxed) as i64;
-            let to = match pos {
-                SeekFrom::Start(o) => o as i64,
-                SeekFrom::End(o) => m.data.len() as i64 + o,
-                SeekFrom::Current(o) => cur + o,
-            };
-            if to < 0 {
-                return Err(io::Error::from_raw_os_error(sys::os::EINVAL));
-            }
-            m.pos.store(to as u64, core::sync::atomic::Ordering::Relaxed);
-            return Ok(to as u64);
-        }
         let (whence, off) = match pos {
             SeekFrom::Start(o) => (sys::SEEK_SET, o as i64),
             SeekFrom::End(o) => (sys::SEEK_END, o),
@@ -370,9 +433,6 @@ impl File {
     }
     /// Buffer sized from the file length for read_to_end (as real std does).
     fn size_hint(&self) -> Option<usize> {
-        if let Some(m) = &self.mem {
-            return Some(m.data.len().saturating_sub(m.pos.load(core::sync::atomic::Ordering::Relaxed) as usize));
-        }
         let mut st = stat_t::zeroed();
         if unsafe { sys::os::fstat(self.raw(), &mut st as *mut stat_t) } != 0 {
             return None;
@@ -466,7 +526,7 @@ impl AsFd for File {
 }
 impl FromRawFd for File {
     unsafe fn from_raw_fd(fd: RawFd) -> File {
-        File { fd: OwnedFd::from_raw_fd(fd), mem: None }
+        File { fd: OwnedFd::from_raw_fd(fd), virtual_len: None }
     }
 }
 impl IntoRawFd for File {
@@ -481,7 +541,7 @@ impl From<File> for OwnedFd {
 }
 impl From<OwnedFd> for File {
     fn from(fd: OwnedFd) -> File {
-        File { fd, mem: None }
+        File { fd, virtual_len: None }
     }
 }
 impl crate::io::IsTerminal for File {
@@ -584,9 +644,9 @@ struct FutimensSpec {
     nsec: i64,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const UTIME_OMIT: i64 = -2;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 const UTIME_OMIT: i64 = (1 << 30) - 2;
 
 extern "C" {
@@ -801,9 +861,10 @@ impl DirBuilder {
         }
     }
     fn mkdir(&self, path: &Path) -> io::Result<()> {
-        let c = cstr(path)?;
-        cvt(unsafe { sys::mkdir(c.as_ptr(), self.mode as sys::mode_t) })?;
-        Ok(())
+        run_path_with_cstr(path, &|c| {
+            cvt(unsafe { sys::mkdir(c.as_ptr(), self.mode as sys::mode_t) })?;
+            Ok(())
+        })
     }
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         if path == Path::new("") {
@@ -846,6 +907,9 @@ impl Default for DirBuilder {
 // ---- free functions
 
 pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
+    if let Some((abs, vfs::Kind::File(_))) = vfs::kind(path.as_ref()) {
+        return vfs::read(&*abs);
+    }
     let mut file = File::open(path.as_ref())?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
@@ -853,6 +917,9 @@ pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 }
 
 pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
+    if let Some((abs, vfs::Kind::File(_))) = vfs::kind(path.as_ref()) {
+        return String::from_utf8(vfs::read(&*abs)?).map_err(|_| io::Error::INVALID_UTF8);
+    }
     let mut file = File::open(path.as_ref())?;
     let mut s = String::new();
     file.read_to_string(&mut s)?;
@@ -870,20 +937,22 @@ pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
             k => Ok(Metadata { st: vfs_stat(&k) }),
         };
     }
-    let c = cstr(path.as_ref())?;
-    let mut st = stat_t::zeroed();
-    cvt(unsafe { sys::os::stat(c.as_ptr(), &mut st as *mut stat_t) })?;
-    Ok(Metadata { st })
+    run_path_with_cstr(path.as_ref(), &|c| {
+        let mut st = stat_t::zeroed();
+        cvt(unsafe { sys::os::stat(c.as_ptr(), &mut st as *mut stat_t) })?;
+        Ok(Metadata { st })
+    })
 }
 
 pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     if vfs::kind(path.as_ref()).is_some() {
         return metadata(path);
     }
-    let c = cstr(path.as_ref())?;
-    let mut st = stat_t::zeroed();
-    cvt(unsafe { sys::os::lstat(c.as_ptr(), &mut st as *mut stat_t) })?;
-    Ok(Metadata { st })
+    run_path_with_cstr(path.as_ref(), &|c| {
+        let mut st = stat_t::zeroed();
+        cvt(unsafe { sys::os::lstat(c.as_ptr(), &mut st as *mut stat_t) })?;
+        Ok(Metadata { st })
+    })
 }
 
 pub fn exists<P: AsRef<Path>>(path: P) -> io::Result<bool> {
@@ -901,13 +970,15 @@ pub fn exists<P: AsRef<Path>>(path: P) -> io::Result<bool> {
 
 pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     if let Some(disk) = vfs::edit_target(path.as_ref(), vfs::Edit::Existing) {
-        let c = cstr(&disk?)?;
-        cvt(unsafe { sys::unlink(c.as_ptr()) })?;
-        return Ok(());
+        return run_path_with_cstr(&disk?, &|c| {
+            cvt(unsafe { sys::unlink(c.as_ptr()) })?;
+            Ok(())
+        });
     }
-    let c = cstr(path.as_ref())?;
-    cvt(unsafe { sys::unlink(c.as_ptr()) })?;
-    Ok(())
+    run_path_with_cstr(path.as_ref(), &|c| {
+        cvt(unsafe { sys::unlink(c.as_ptr()) })?;
+        Ok(())
+    })
 }
 
 pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
@@ -920,17 +991,21 @@ pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> 
         Some(d) => d?,
         None => to.as_ref().to_path_buf(),
     };
-    let a = cstr(&from)?;
-    let b = cstr(&to)?;
-    cvt(unsafe { sys::rename(a.as_ptr(), b.as_ptr()) })?;
-    Ok(())
+    run_path_with_cstr(&from, &|a| {
+        run_path_with_cstr(&to, &|b| {
+            cvt(unsafe { sys::rename(a.as_ptr(), b.as_ptr()) })?;
+            Ok(())
+        })
+    })
 }
 
 pub fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
-    let a = cstr(original.as_ref())?;
-    let b = cstr(link.as_ref())?;
-    cvt(unsafe { sys::link(a.as_ptr(), b.as_ptr()) })?;
-    Ok(())
+    run_path_with_cstr(original.as_ref(), &|a| {
+        run_path_with_cstr(link.as_ref(), &|b| {
+            cvt(unsafe { sys::link(a.as_ptr(), b.as_ptr()) })?;
+            Ok(())
+        })
+    })
 }
 
 pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
@@ -964,9 +1039,10 @@ pub fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
 }
 
 pub fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
-    let c = cstr(path.as_ref())?;
-    cvt(unsafe { sys::rmdir(c.as_ptr()) })?;
-    Ok(())
+    run_path_with_cstr(path.as_ref(), &|c| {
+        cvt(unsafe { sys::rmdir(c.as_ptr()) })?;
+        Ok(())
+    })
 }
 
 pub fn remove_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
@@ -1013,7 +1089,7 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
     if let Some((abs, k)) = vfs::kind(path) {
         return match k {
             vfs::Kind::Dir => {
-                let mut virt = vfs::list(&abs)?;
+                let mut virt = vfs::list(&*abs)?;
                 virt.reverse();
                 // entries name the path as given (a relative path stays relative, as with the disk)
                 Ok(ReadDir { dir: core::ptr::null_mut(), root: Arc::new(path.to_path_buf()), end: false, virt })
@@ -1022,12 +1098,13 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
             vfs::Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
         };
     }
-    let c = cstr(path)?;
-    let dir = unsafe { sys::opendir(c.as_ptr()) };
-    if dir.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(ReadDir { dir, root: Arc::new(path.to_path_buf()), end: false, virt: Vec::new() })
+    run_path_with_cstr(path, &|c| {
+        let dir = unsafe { sys::opendir(c.as_ptr()) };
+        if dir.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ReadDir { dir, root: Arc::new(path.to_path_buf()), end: false, virt: Vec::new() })
+    })
 }
 
 pub fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
@@ -1048,39 +1125,42 @@ pub fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
         }
         return Ok(out);
     }
-    let c = cstr(path.as_ref())?;
-    let r = unsafe { sys::realpath(c.as_ptr(), core::ptr::null_mut()) };
-    if r.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    let bytes = unsafe { core::slice::from_raw_parts(r as *const u8, sys::strlen(r)) }.to_vec();
-    unsafe { sys::free(r as *mut c_void) };
-    Ok(PathBuf::from(OsString::from_bytes_vec(bytes)))
+    run_path_with_cstr(path.as_ref(), &|c| {
+        let r = unsafe { sys::realpath(c.as_ptr(), core::ptr::null_mut()) };
+        if r.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(r as *const u8, sys::strlen(r)) }.to_vec();
+        unsafe { sys::free(r as *mut c_void) };
+        Ok(PathBuf::from(OsString::from_bytes_vec(bytes)))
+    })
 }
 
 pub fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
-    let c = cstr(path.as_ref())?;
-    let mut buf: Vec<u8> = Vec::with_capacity(256);
-    loop {
-        let cap = buf.capacity();
-        buf.resize(cap, 0);
-        let n = unsafe { sys::readlink(c.as_ptr(), buf.as_mut_ptr() as *mut c_char, cap) };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
+    run_path_with_cstr(path.as_ref(), &|c| {
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        loop {
+            let cap = buf.capacity();
+            buf.resize(cap, 0);
+            let n = unsafe { sys::readlink(c.as_ptr(), buf.as_mut_ptr() as *mut c_char, cap) };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let n = n as usize;
+            if n < cap {
+                buf.truncate(n);
+                return Ok(PathBuf::from(OsString::from_bytes_vec(buf)));
+            }
+            buf.reserve(cap);
         }
-        let n = n as usize;
-        if n < cap {
-            buf.truncate(n);
-            return Ok(PathBuf::from(OsString::from_bytes_vec(buf)));
-        }
-        buf.reserve(cap);
-    }
+    })
 }
 
 pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> io::Result<()> {
-    let c = cstr(path.as_ref())?;
-    cvt_r(|| unsafe { sys::chmod(c.as_ptr(), perm.mode as sys::mode_t) })?;
-    Ok(())
+    run_path_with_cstr(path.as_ref(), &|c| {
+        cvt_r(|| unsafe { sys::chmod(c.as_ptr(), perm.mode as sys::mode_t) })?;
+        Ok(())
+    })
 }
 
 /// Deprecated alias of `os::unix::fs::symlink` (rustc library/std/src/fs.rs `soft_link`).
@@ -1090,8 +1170,10 @@ pub fn soft_link<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Re
 }
 
 pub(crate) fn symlink_raw(original: &Path, link: &Path) -> io::Result<()> {
-    let a = cstr(original)?;
-    let b = cstr(link)?;
-    cvt(unsafe { sys::symlink(a.as_ptr(), b.as_ptr()) })?;
-    Ok(())
+    run_path_with_cstr(original, &|a| {
+        run_path_with_cstr(link, &|b| {
+            cvt(unsafe { sys::symlink(a.as_ptr(), b.as_ptr()) })?;
+            Ok(())
+        })
+    })
 }

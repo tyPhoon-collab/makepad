@@ -288,6 +288,7 @@ pub(crate) fn shared() -> &'static (Endpoint, crate::watch::WatchSink) {
         let ep = Endpoint::new("makepad-remote-test");
         ep.register_cmd(app_dispatch);
         ep.register("frames", 1, fake_frames());
+        ep.register("app", 1, fake_app());
         let w = ep.register_watch();
         ep.register_stream();
         ep.listen_unix(",\"extra\":\"x\"").unwrap();
@@ -295,16 +296,53 @@ pub(crate) fn shared() -> &'static (Endpoint, crate::watch::WatchSink) {
     })
 }
 
+/// A handler that waits long can see that its client has gone.
+#[test]
+fn a_request_sees_its_client_go() {
+    let ep = Endpoint::new("makepad-remote-client-gone");
+    let (told, gone) = std::sync::mpsc::channel();
+    let told = std::sync::Mutex::new(told);
+    ep.register("slow", 1, crate::lines::service("slow", std::sync::Arc::new(move |_, _| {
+        while !crate::lines::client_gone() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        told.lock().unwrap().send(()).unwrap();
+    })));
+    let conn = pair(&ep);
+    let ch = conn.open("slow", "").unwrap();
+    ch.send(b"wait\n".to_vec()).unwrap();
+    assert!(gone.recv_timeout(Duration::from_millis(100)).is_err(), "the client is still there");
+    conn.close("client ended");
+    gone.recv_timeout(WAIT).unwrap();
+    assert!(!crate::lines::client_gone(), "no request on this thread");
+}
+
+/// A late follower gets what came before it only when it asks from there, and once.
+#[test]
+fn a_feed_from_a_record_gets_what_came_before_it() {
+    let _turn = WATCH_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, watch) = shared();
+    let early = watch.emit("{\"event\":\"early\"}");
+    let client = Client::connect(&std::process::id().to_string()).unwrap();
+    let mut now = client.watch();
+    assert!(now.next(Duration::from_millis(100), 3).unwrap().is_none());
+    let mut from = client.feed_from("watch", early - 1);
+    assert_eq!(from.next(WAIT, 3).unwrap().unwrap().1, b"{\"event\":\"early\"}");
+    client.conn().unwrap().close("test drop");
+    watch.emit("{\"event\":\"later\"}");
+    assert_eq!(from.next(WAIT, 20).unwrap().unwrap().1, b"{\"event\":\"later\"}");
+}
+
 #[test]
 fn unix_end_to_end_with_discovery_and_reconnect() {
     let _turn = WATCH_TURN.lock().unwrap_or_else(|e| e.into_inner());
     let (_, watch) = shared();
     let me = std::process::id();
-    let app = crate::discovery::find(&me.to_string()).expect("discovery file");
+    let app = crate::discovery::by_pid(me).expect("discovery file");
     assert_eq!(app.app, "makepad-remote-test");
     assert!(app.serves("cmd") && app.serves("watch") && app.serves("stream"));
     assert_eq!(app.text("extra").as_deref(), Some("x"));
-    let client = Client::connect("makepad-remote-test").unwrap();
+    let client = Client::connect(&std::process::id().to_string()).unwrap();
     assert!(client.caps().contains(&"cmd/1".to_string()));
     let mut lines = client.cmd("ping").unwrap();
     assert!(lines.next().unwrap().unwrap().starts_with("{\"pong\":1"));
@@ -432,7 +470,7 @@ fn tcp_both_ends_send_8mb_at_once() {
 fn app_dispatch(req: &Req, out: &mut Out) {
     match req.cmd.as_str() {
         "ping" => out.line(&format!("{{\"pong\":1,\"pid\":{},\"app\":\"makepad-remote-test\"}}", std::process::id())),
-        "status" => out.line("{\"app\":\"x\",\"pid\":1,\"w\":[{\"i\":0,\"t\":\"say \\\"i\\\":9\",\"sz\":[4,3]},{\"i\":2,\"t\":\"b\"}],\"closed\":[{\"i\":7}]}"),
+        "status" => out.line("{\"app\":\"x\",\"pid\":1,\"w\":[{\"i\":0,\"t\":\"say \\\"i\\\":9\",\"sz\":[4,3],\"pass_dpi\":2},{\"i\":1,\"t\":\"never drew\",\"pass_dpi\":0},{\"i\":2,\"t\":\"b\",\"pass_dpi\":1.5}],\"closed\":[{\"i\":7}]}"),
         "quit" => out.line("{\"ok\":1}"),
         "echo" => out.line(&format!("{{\"cmd\":{},\"pos\":{},\"t\":{}}}", crate::json_str(&req.cmd), req.pos.len(), crate::json_str(req.get("t").unwrap_or("")))),
         _ => dispatch(req, out),
@@ -463,9 +501,35 @@ fn fake_frames() -> Factory {
     })
 }
 
+/// An `app` service that answers each request with the request it was asked, then ends.
+fn fake_app() -> Factory {
+    Arc::new(|_, open| {
+        std::thread::spawn(move || {
+            let _ = open.channel.send(format!("{{\"asked\":{}}}\n", crate::json_str(&open.args)).into_bytes());
+            open.channel.close(crate::conn::CLOSE_NORMAL, "");
+        });
+        Ok(())
+    })
+}
+
+/// `call` and `tools` are the app's AI tools (its `app` service), not `cmd` commands: a JSON
+/// argument keeps its spaces, and a `call` without its tool says how it goes.
+#[test]
+fn call_and_tools_ask_the_app_service() {
+    let (lines, err) = run_app(&["call", "demo.support", "plate", "{\"at\": [1, 2]}"]);
+    assert_eq!((lines, err), (vec![r#"{"asked":"call demo.support plate\n{\"at\": [1, 2]}"}"#.to_string()], false));
+    assert_eq!(run_app(&["tools"]).0, vec![r#"{"asked":"list"}"#.to_string()]);
+    assert_eq!(run_app(&["call"]), (vec![r#"{"err":"call <service>.<tool> [<instance>] [<json args>]"}"#.to_string()], true));
+    assert_eq!(crate::app::app_request_of("call demo.x {\"a\": \"b c\"}"), Some(Ok("call demo.x\n{\"a\": \"b c\"}".to_string())));
+    assert_eq!(crate::app::app_request_of("call demo.x"), Some(Ok("call demo.x\n{}".to_string())));
+    assert_eq!(crate::app::app_request_of("ui tree"), None);
+    let typed: Vec<String> = ["call", "demo.x", "{\"t\": \"a = b\"}"].map(String::from).into();
+    assert_eq!(crate::app::typed_line(&typed), "call demo.x {\"t\": \"a = b\"}");
+}
+
 fn run_app(argv: &[&str]) -> (Vec<String>, bool) {
     shared();
-    let client = Client::connect("makepad-remote-test").unwrap();
+    let client = Client::connect(&std::process::id().to_string()).unwrap();
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     let mut lines = Vec::new();
     let err = crate::app::run(&client, &argv, &mut |l| {
@@ -525,8 +589,8 @@ fn app_commands_split_words_from_arguments_and_keep_spaces() {
     let req = Req::parse(&crate::app::request_line(&["text".to_string()], &[("t".to_string(), "a\tb\u{1b}c \"q\"".to_string())]));
     assert_eq!(req.get("t"), Some("a\tb\u{1b}c \"q\""));
     // a window id is told from a window title that mentions one
-    assert_eq!(crate::app::window_ids("{\"app\":\"x\",\"w\":[{\"i\":0,\"t\":\"say \\\"i\\\":9\"},{\"i\":12}],\"closed\":[{\"i\":7}]}"), [0, 12]);
-    assert!(crate::app::window_ids("{\"err\":\"x\"}").is_empty());
+    assert_eq!(crate::app::drawn_window_ids("{\"app\":\"x\",\"w\":[{\"i\":0,\"t\":\"say \\\"i\\\":9\",\"pass_dpi\":1.5},{\"i\":7,\"pass_dpi\":0},{\"i\":12,\"pass_dpi\":2}],\"closed\":[{\"i\":3,\"pass_dpi\":2}]}"), vec![0, 12]);
+    assert!(crate::app::drawn_window_ids("{\"err\":\"x\"}").is_empty());
 }
 
 #[test]
@@ -590,7 +654,7 @@ fn gq_grabs_every_window_then_quits() {
     let (lines, err) = run_app(&["gq"]);
     assert!(!err, "{lines:?}");
     assert!(lines[0].starts_with("{\"png\":[") && lines[0].ends_with("],\"quit\":1}"), "{lines:?}");
-    // the two windows of `status` (0 and 2), not the title or the closed one
+    // the two windows of `status` that drew (0 and 2), not the title, the one that never drew or the closed one
     assert_eq!(lines[0].matches("grab-w").count(), 2, "{lines:?}");
     let files: Vec<String> = lines[0].split('"').filter(|s| s.contains("grab-w")).map(str::to_string).collect();
     assert!(files[0].contains("grab-w0-") && files[1].contains("grab-w2-"));
@@ -626,6 +690,44 @@ fn loopback_carrier_requires_its_token_and_end_lines_carry_host_fields() {
 }
 
 #[test]
+fn an_ask_given_up_closes_its_request_at_the_far_end() {
+    // a routed request that answers only `quick` at once and holds anything else open, as a `watch` does
+    let ep = Endpoint::new("ask-while-test");
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+    let closed_tx = Arc::new(Mutex::new(closed_tx));
+    ep.register("route", 1, Arc::new(move |_, open| {
+        let closed = closed_tx.clone();
+        std::thread::spawn(move || {
+            while let Some(ev) = open.channel.recv() {
+                match ev {
+                    Event::Data(d) if d == b"quick" => {
+                        let _ = open.channel.send(b"{\"fast\":1}\n{\"end\":1}\n".to_vec());
+                    }
+                    Event::Closed(..) => break,
+                    _ => {}
+                }
+            }
+            let _ = closed.lock().unwrap().send(());
+        });
+        Ok(())
+    }));
+    let token = crate::carrier::loopback::new_token().unwrap();
+    let addr = crate::carrier::loopback::serve(&ep, &token).unwrap().to_string();
+    let client = Client::new(Target::Loopback(addr, token), "t");
+    let mut lines = Vec::new();
+    let answered = crate::hub::ask_while(&client, "box:1", "cmd", "", "quick", &mut |l| { lines.push(l.to_string()); true }, &|| true);
+    assert_eq!(answered, Ok(Some(false)));
+    assert_eq!(lines, ["{\"fast\":1}"]);
+    closed_rx.recv_timeout(WAIT).expect("the answered request closed");
+    // the far end holds this one: once `keep` says no the ask ends and the far end sees its close
+    let t = std::time::Instant::now();
+    let answered = crate::hub::ask_while(&client, "box:1", "cmd", "", "watch", &mut |_| true, &|| t.elapsed() < Duration::from_millis(100));
+    assert_eq!(answered, Ok(None));
+    assert!(t.elapsed() < Duration::from_secs(2), "gave up after {:?}", t.elapsed());
+    closed_rx.recv_timeout(WAIT).expect("the given-up request closed at the far end");
+}
+
+#[test]
 fn a_request_past_its_timeout_is_closed_and_the_connection_goes_on() {
     let ep = Endpoint::new("timeout-test");
     ep.register_cmd(|req, out| match req.cmd.as_str() {
@@ -652,19 +754,33 @@ fn a_request_past_its_timeout_is_closed_and_the_connection_goes_on() {
     assert_eq!(client.cmd("slow").unwrap().next().unwrap().unwrap(), "{\"late\":1}");
 }
 
-/// The fds this process holds now (Linux).
+/// The served ends of connections to the Unix socket at `path` this process holds (Linux): an
+/// accepted socket carries its listener's path in /proc/net/unix, and this process holds it when
+/// one of its descriptors names its inode. A served end closes on its client's EOF: one still
+/// open is a descriptor this side kept, or one its client did.
 #[cfg(target_os = "linux")]
-fn open_fds() -> usize {
-    std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0)
+fn served_on(path: &std::path::Path) -> usize {
+    const ACCEPTING: u32 = 1 << 16; // __SO_ACCEPTCON: the listener itself
+    let held: std::collections::HashSet<String> = std::fs::read_dir("/proc/self/fd").unwrap().flatten()
+        .filter_map(|e| std::fs::read_link(e.path()).ok()?.to_str()?.strip_prefix("socket:[")?.strip_suffix(']').map(str::to_string))
+        .collect();
+    std::fs::read_to_string("/proc/net/unix").unwrap().lines().skip(1).filter(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        f.len() >= 8 && f[7] == path.to_str().unwrap() && u32::from_str_radix(f[3], 16).is_ok_and(|flags| flags & ACCEPTING == 0) && held.contains(f[6])
+    }).count()
 }
 
 /// The master's control socket serves thousands of short requests (a lease client's beat, the
-/// CLI): every connection's descriptors must go when the client does.
+/// CLI): every connection's descriptors must go when the client does. Counted on a socket of its
+/// own, never the process's descriptors, which every test running beside it opens and closes:
+/// that count failed with no descriptor of this test kept (11-06).
 #[cfg(target_os = "linux")]
 #[test]
 fn served_connections_release_their_descriptors() {
-    let (_, _) = shared();
-    let sock = crate::carrier::unix::paths(std::process::id()).0;
+    let ep = Endpoint::new("makepad-remote-fd-test");
+    ep.register_cmd(app_dispatch);
+    let sock = std::env::temp_dir().join(format!("mpr-fd-{}.sock", std::process::id()));
+    crate::carrier::unix::listen_at(&ep, &sock).unwrap();
     let round = |n: usize| {
         for _ in 0..n {
             let c = Client::new(Target::Unix(sock.clone()), "fd-test");
@@ -674,17 +790,23 @@ fn served_connections_release_their_descriptors() {
             drop(c);
         }
     };
-    round(50); // thread and allocator warm-up
-    std::thread::sleep(Duration::from_millis(500));
-    let before = open_fds();
+    let closed = || {
+        // the server side closes on the peer's EOF, on its own threads
+        let t = std::time::Instant::now();
+        while served_on(&sock) > 0 && t.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        served_on(&sock)
+    };
+    // a connection held open is counted, and its end goes with it
+    let held = Client::new(Target::Unix(sock.clone()), "fd-test");
+    assert!(held.cmd("ping").unwrap().next().unwrap().unwrap().starts_with("{\"pong\":1"));
+    assert_eq!(served_on(&sock), 1, "an open connection's served end");
+    drop(held);
+    assert_eq!(closed(), 0, "one request");
     round(3000);
-    // the server side closes on the peer's EOF, on its own threads
-    let t = std::time::Instant::now();
-    while open_fds() > before + 8 && t.elapsed() < Duration::from_secs(20) {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let after = open_fds();
-    assert!(after <= before + 8, "fds before {before}, after 3000 requests {after}");
+    assert_eq!(closed(), 0, "3000 requests");
+    let _ = std::fs::remove_file(&sock);
 }
 
 #[test]
@@ -696,4 +818,92 @@ fn req_wire_round_trip() {
     assert_eq!((b.cmd.as_str(), b.pos.clone(), b.kv.clone()), (r.cmd.as_str(), r.pos.clone(), r.kv.clone()));
     assert!(Req::from_wire(&w[..w.len() - 1]).is_none());
     assert!(Req::from_wire(b"2:ui").is_none());
+}
+
+/// A run whose TMPDIR is deep is still reached: a test's own home under a lease's scratch dir
+/// made one 121 bytes long, its socket there could not be bound, and a capture of its JIT waited
+/// a jitlegs leg out to twice its time (11-05). A child of this test binary listens with such a
+/// TMPDIR and says where.
+#[test]
+fn a_run_with_a_deep_tmpdir_is_reached() {
+    use std::io::BufRead;
+    if std::env::var_os("MAKEPAD_REMOTE_DEEP_CHILD").is_some() {
+        let ep = Endpoint::new("makepad-remote-deep");
+        ep.register_cmd(dispatch);
+        let sock = ep.listen_unix("").unwrap();
+        println!("deep socket {}", sock.display());
+        // serves until the parent says so (a line, or its stdin's end)
+        let _ = std::io::stdin().read_line(&mut String::new());
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("makepad-remote-deep-{}", std::process::id()));
+    let (deep, registry) = (base.join("lease").join("d".repeat(120)).join("tmp"), base.join("registry"));
+    for d in [&deep, &registry] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::a_run_with_a_deep_tmpdir_is_reached", "--nocapture", "--test-threads=1"])
+        .env("MAKEPAD_REMOTE_DEEP_CHILD", "1")
+        .env("TMPDIR", &deep)
+        .env("MAKEPAD_REMOTE_REGISTRY", &registry)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // every wait on the child has a deadline: a hang is a failure that says where (one held a lane's
+    // test lease idle until it was cancelled). Its lines come over a thread of their own.
+    let (lines_to, lines) = std::sync::mpsc::channel::<String>();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for l in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+            if lines_to.send(l).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let said = loop {
+        match lines.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            // (after libtest's "test <name> ... ", on the same line: the child runs with one thread)
+            Ok(l) => match l.split_once("deep socket ") {
+                Some((_, s)) => break Some(s.to_string()),
+                None => continue,
+            },
+            Err(_) => break None,
+        }
+    };
+    let Some(said) = said else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the child named no socket within 60 s");
+    };
+    let sock = std::path::PathBuf::from(said);
+    assert!(!sock.starts_with(&deep) && sock.starts_with(crate::carrier::unix::socket_dir()), "{}", sock.display());
+    let app = crate::discovery::apps_in(&registry).into_iter().find(|a| a.pid == child.id()).expect("its discovery file");
+    assert_eq!((app.socket.as_str(), app.unreachable()), (sock.to_str().unwrap(), None));
+    let lines: Vec<String> = Client::new(Target::Unix(sock.clone()), "deep-test").cmd("ping").unwrap().map_while(Result::ok).collect();
+    assert_eq!(lines.first().map(String::as_str), Some("{\"pong\":1}"));
+    // a line ends it, not the pipe's end alone: a process another test spawned meanwhile can hold a
+    // copy of the pipe's write end until it execs
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = writeln!(stdin, "end");
+    drop(stdin);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the child still ran 30 s after it was told to end");
+    };
+    assert!(status.success());
+    assert!(!sock.exists(), "its socket goes with it");
+    std::fs::remove_dir_all(&base).unwrap();
 }

@@ -68,6 +68,18 @@ fn why_hung_leads_with_the_deadlock_and_keeps_the_parked_panic() {
 }
 
 #[test]
+fn a_stack_walk_cut_short_says_where_and_why() {
+    let r = render(
+        "why-hung",
+        &lines(r#"{"measured":"49 threads","at_ms":1,"source":"x","partial":[]}
+{"verdict":"idle","why":"main is not stuck: 0% CPU, waiting for events or sleeping in libc.so.6+0x7c952","findings":[{"kind":"idle","why":"main is not stuck: 0% CPU, waiting for events or sleeping in libc.so.6+0x7c952"}],"owner":{"serving":"idle","queued":{"total":0}}}
+{"thread":"makepad","id":"T1","state":"waiting","cpu_pct":0,"stops":"walk stops at 0x7f3a1c27c952: its caller is found through the frame pointer","frames":[{"fn":"libc.so.6+0x7c952","in":"libc.so.6"},{"fn":"__poll","in":"libc.so.6"}]}"#),
+    );
+    let stop = r.find("\n  walk stops at 0x7f3a1c27c952: its caller is found through the frame pointer\n").expect(&r);
+    assert!(r.find("__poll").is_some_and(|p| p < stop), "{}", r);
+}
+
+#[test]
 fn heap_sites_merge_their_stacks_and_say_growth_or_churn() {
     let r = render(
         "heap top by=alloc",
@@ -109,4 +121,73 @@ fn thread_pools_fold_into_one_row() {
     let r = render("threads", &lines(&l));
     assert!(r.contains("| T2..T5 | makepad-pool* (4 threads) | program | 0 running | 0.04 |"), "{}", r);
     assert!(r.starts_with("6 threads: 5 of the program, 1 of makepad run."), "{}", r);
+}
+
+#[test]
+fn the_owner_answer_says_mains_waits_then_tables_the_holds() {
+    let r = render(
+        "owner since=2",
+        &lines(r#"{"measured":"owner thread","at_ms":1,"source":"x","partial":[]}
+{"seq":3,"since":2,"s":1.5,"serving":"idle","queued":{"total":0,"foreground":0,"main":0},"main_requests":{"n":120,"wait_ms":40.5,"queue_ms":12.1,"wake_ms":1.2,"by_wait":{"<20us":[10,0.1],"<200us":[90,5],"<2ms":[18,20],">=2ms":[2,15.4]}},"main_queued_behind":{"job":[0,0],"publish":[30,2.5],"program":[12,9.1],"idle":[60,0.4]},"pure_census":{}}
+{"holds":"per request site","sites":1,"shown":1}
+{"site":"run.rs:2963","class":"program","n":40,"ms":12.5,"over_1ms":0,"hist_ms":{"<0.1":10,"0.1-0.5":30},"waiting_ms":2.5,"main_behind":[3,0.9]}
+{"waits":"the owner's waits inside requests","sites":1,"shown":1}
+{"wait":"jit.rs:10579","in":"jit.rs:7815","n":4,"ms":8.25,"serving_ms":1.5}
+{"next":"owner since=3"}"#),
+    );
+    assert!(r.contains("Snapshot 3: the 1.5 s since snapshot 2."), "{r}");
+    assert!(r.contains("main's program requests: 120 waited 40.5 ms") && r.contains(">=2ms 2x 15.4 ms"), "{r}");
+    assert!(r.contains("behind: job 0x 0 ms, publish 30x 2.5 ms, program 12x 9.1 ms, idle 60x 0.4 ms."), "{r}");
+    assert!(r.contains("| run.rs:2963 | program | 40 | 12.5 | - | <0.1: 10, 0.1-0.5: 30 | 2.5 | 3x 0.9 ms |"), "{r}");
+    assert!(r.contains("| jit.rs:10579 | jit.rs:7815 | 4 | 8.25 | 1.5 | - |"), "{r}");
+    assert!(r.contains("owner since=3") && !r.contains("pure_census"), "{r}");
+}
+
+/// An idle app's capture: no frame drew; its timer's wakes are said apart, by what woke them
+/// (an 80-"frame" answer for 16 timer wakes sent two agents after a redraw that did not exist).
+#[test]
+fn timeline_frames_of_an_idle_app_name_its_wakes_not_frames() {
+    let r = render(
+        "timeline frames",
+        &lines(r#"{"measured":"0 frames drew on the UI thread, 16 wakes drew nothing, 9 threads recorded","at_ms":1,"source":"timeline rings","partial":[]}
+{"event_only_beats":{"n":16,"per_s":2.0,"woken_by":[["Timer",16]],"phases":[["platform-ops",32],["Timer",16],["submit",16],["tasks",16]],"ui_busy_ms":{"median":0.25,"max":0.8},"more":["trace topics=frame_sources","log"]}}
+{"frame_ms":{"n":0,"median":0.00,"p95":0.00,"max":0.00},"series_ms":[]}
+{"ui_busy_ms":{"median":0.00,"p95":0.00},"ui_wait_ms":{"median":0.00,"p95":0.00},"frames_listed":"slowest first"}"#),
+    );
+    assert!(r.starts_with("No frame drew: 16 wakes of the UI thread drew nothing (woken by Timer 16)."), "{}", r);
+    assert!(r.contains("wakes that drew nothing (not frames): 16 (2/s), woken by Timer 16; they ran platform-ops 32, Timer 16, submit 16, tasks 16"), "{}", r);
+    assert!(!r.contains("slowest frames"), "{}", r);
+    assert!(r.contains("trace topics=frame_sources"), "{}", r);
+}
+
+/// `why-slow` says the UI thread's frames that drew apart from its wakes that drew nothing, and
+/// over how many of the wakes it names what woke them.
+#[test]
+fn why_slow_says_the_ui_wakes_apart_from_its_frames() {
+    let finding = r#"{"finding":"main thread busy 2% of the time (60 ms CPU in 3000 ms)"}"#;
+    let r = render("why-slow", &lines(&format!("{finding}\n{}", r#"{"ui_frames_drew":0,"wakes_drew_nothing":6,"woken_by":[["Timer",6]],"s":3.0}"#)));
+    assert!(r.contains("UI in 3 s: 0 frames drew, 6 wakes drew nothing (woken by Timer 6)"), "{}", r);
+    let r = render("why-slow", &lines(&format!("{finding}\n{}", r#"{"ui_frames_drew":180,"wakes_drew_nothing":90,"woken_by":[["platform-ops",60],["Timer",4]],"s":3.0}"#)));
+    assert!(r.contains("UI in 3 s: 180 frames drew, 90 wakes drew nothing (the last 64 woken by platform-ops 60, Timer 4)"), "{}", r);
+}
+
+#[test]
+fn a_hosted_apps_heap_is_its_domain_arena_by_resident_pages() {
+    // a hosted app: the domain arena's committed bytes (whole chunks made writable) are 4x its
+    // resident pages; malloc holds makepad run's own blocks
+    let r = render(
+        "memory",
+        &lines(r#"{"freed_by_domain_teardown_bytes":0}
+{"domain":1,"package":"makepad-calc","state":"Running","arena_in_use_bytes":305500000,"arena_resident_bytes":302900000,"arena_committed_bytes":1244921856,"arena_touched_small_bytes":112027216,"arena_live_slot_bytes":83978032,"arena_large_bytes":227803136,"static_committed_bytes":163840,"threads":19,"thread_names":["domain-1-makepad-calc"]}
+{"measured":"memory now","at_ms":1,"source":"x","partial":[]}
+{"rss_mb":2271.8,"peak_rss_mb":5398.2,"footprint_mb":1690.2,"peak_footprint_mb":4218.0,"compressed_mb":0.0,"malloc_in_use_mb":372.3,"malloc_held_free_mb":103.6}
+{"trims":57,"last_trim_ms":221295}
+{"split":{"routing":"compiler arena","program_heap":"domain 1 arena","program_heap_in_use_mb":291.4,"program_heap_held_free_mb":0.0,"program_heap_resident_mb":288.9,"compiler_arena_committed_mb":1929.8,"compiler_arena_touched_mb":927.6,"compiler_arena_large_mb":191.8,"slots_arena_committed_mb":271.7,"slots_arena_touched_mb":98.1,"slots_arena_large_mb":61.7,"jit_code_mb":47.4,"jit_ro_data_mb":4.5,"burst_arena_committed_mb":24.0}}
+{"findings":[],"more":[]}"#),
+    );
+    assert!(r.contains("Program heap (domain 1 arena) 289 MB resident, 291 MB in use"), "{}", r);
+    assert!(r.contains("| app domain 1 arena (makepad-calc) | 289 |"), "{}", r);
+    assert!(r.contains("resident; 291 MB in use, 1.16 GB committed address space, 19 threads"), "{}", r);
+    assert!(r.contains("| malloc (makepad run, provided crates), in use | 372 |"), "{}", r);
+    assert!(!r.contains("program heap (malloc"), "{}", r);
 }

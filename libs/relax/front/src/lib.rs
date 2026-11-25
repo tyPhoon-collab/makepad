@@ -47,6 +47,7 @@ pub mod builtins;
 pub mod crates;
 pub mod unitgraph;
 pub mod native;
+pub mod native_stub;
 pub mod macro_reg;
 pub mod census;
 pub mod surface;
@@ -70,3 +71,20 @@ pub mod features;
 
 // This crate's source stamp (build.rs, libs/relax/self_stamp.rs): relax-compiler folds it into the codegen identity.
 include!(concat!(env!("OUT_DIR"), "/src_stamp.rs"));
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub unsafe fn reset_statics() {
+    builtins::reset_statics();
+    crates::reset_statics();
+    exec_profile::reset_statics();
+    load_profile::reset_statics();
+    macro_reg::reset_statics();
+    macros::reset_statics();
+    native::reset_statics();
+    parser::reset_statics();
+    preload::reset_statics();
+    program::reset_statics();
+    source::reset_statics();
+    source_context::reset_statics();
+    unitgraph::reset_statics();
+}

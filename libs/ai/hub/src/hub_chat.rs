@@ -492,6 +492,7 @@ fn fleet_provider(
     excluded: Vec<String>,
 ) -> Result<(FleetQwenChatProvider<HttpFleetTransport>, ChatRoute), String> {
     let discovery = crate::discovery::start_listener();
+    let patience = if matches!(&discovery, crate::discovery::Discovery::Available(_)) { FLEET_PATIENCE } else { Duration::ZERO };
     fleet_provider_with(
         send,
         preferred_model,
@@ -500,7 +501,7 @@ fn fleet_provider(
         excluded,
         || chat_bases(&discovery),
         || HttpFleetTransport,
-        FLEET_PATIENCE,
+        patience,
         FLEET_POLL,
     )
 }
@@ -575,7 +576,7 @@ pub fn probe_fleet_inventory(mut update: impl FnMut(&[HubOffer])) -> Result<Vec<
         if grew {
             update(&offers);
         }
-        if started.elapsed() >= FLEET_PATIENCE {
+        if !matches!(&discovery, crate::discovery::Discovery::Available(_)) || started.elapsed() >= FLEET_PATIENCE {
             break;
         }
         std::thread::sleep(FLEET_POLL);

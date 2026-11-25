@@ -263,9 +263,8 @@ impl Renderer {
     /// The environment's IBL atlas on the skin lane's detail slot (found by
     /// name: the slot follows the mixins), and the control the surface path
     /// branches on (`ibl_lane_ctl`, a stock lane's: x the switch, y the
-    /// lane's scale, z the fill from the map unless the world authors one
-    /// or GI gathers one; it reads the `gi_on` on `vars`, so the GI is
-    /// bound first). No environment: the call binds nothing and writes the
+    /// lane's scale, z the fill from the map unless the world authors one).
+    /// No environment: the call binds nothing and writes the
     /// control all zero, so the lane shades exactly as before. It does not
     /// clear the slot: after an environment is dropped the atlas bound last
     /// stays on it, unread (the switch is off) and alive, until the next
@@ -285,7 +284,7 @@ impl Renderer {
             }
             _ => false,
         };
-        let ctl = if bound { self.ibl_lane_ctl(cx, vars, true) } else { [0.0; 4] };
+        let ctl = if bound { self.ibl_lane_ctl(true) } else { [0.0; 4] };
         vars.set_uniform(cx, live_id!(ibl_ctl), &ctl);
     }
 
@@ -311,6 +310,7 @@ impl Renderer {
         // features, and parts that cut no pixel through the one without
         // `clip` (variants.rs): a discarding pipeline costs the tile GPU its
         // hidden-surface removal for every character it draws.
+        batch.skinned.draw_vars.refresh_after_reload(cx.cx);
         let stock = batch.skinned.draw_vars.draw_shader_id;
         let (full, opaque) = self.lane_shaders(cx.cx, variants::ModelLane::SkinnedGpu, stock);
         let opaque = opaque.filter(|id| cx.cx.draw_shader_ready(*id, self.hdr_output));
@@ -321,6 +321,7 @@ impl Renderer {
         batch.skinned.draw_vars.set_uniform(cx.cx, live_id!(eye), &[eye.x, eye.y, eye.z]);
         self.clustered.bind(cx.cx, &mut batch.skinned.draw_vars, self.clustered_enabled);
         self.gi.bind(cx.cx, &mut batch.skinned.draw_vars);
+        self.bind_output_dither(cx.cx, &mut batch.skinned.draw_vars);
         self.bind_skin_ibl(cx.cx, &mut batch.skinned.draw_vars);
         sun.write_uniforms(cx.cx, &mut batch.skinned.draw_vars);
         batch.skinned.draw_vars.set_uniform(cx.cx, live_id!(light_dir), &[sun.dir.x, sun.dir.y, sun.dir.z]);
@@ -509,7 +510,7 @@ impl Renderer {
                         for layer in 0..=shells {
                             batch.skinned.fur_layer.x = layer as f32 / shells.max(1) as f32;
                             batch.skinned.draw_vars.draw_shader_id = if layer == 0 && !cuts { opaque.or(full) } else { full };
-                            let area = cx.add_instance(&batch.skinned.draw_vars);
+                            let area = cx.add_instance(&mut batch.skinned.draw_vars);
                             batch.skinned.draw_vars.area = cx.update_area_refs(batch.skinned.draw_vars.area, area);
                         }
                         batch.skinned.draw_vars.draw_shader_id = full;
@@ -523,7 +524,7 @@ impl Renderer {
             if batch.skinned.draw_vars.can_instance() {
                 // No material, no fur: nothing cuts a pixel.
                 batch.skinned.draw_vars.draw_shader_id = opaque.or(full);
-                let new_area = cx.add_instance(&batch.skinned.draw_vars);
+                let new_area = cx.add_instance(&mut batch.skinned.draw_vars);
                 batch.skinned.draw_vars.area =
                     cx.update_area_refs(batch.skinned.draw_vars.area, new_area);
                 batch.skinned.draw_vars.draw_shader_id = full;
@@ -588,7 +589,6 @@ impl Renderer {
 mod tests {
     use super::*;
     use makepad_draw::makepad_platform::makepad_script::script_eval;
-    use makepad_draw::makepad_platform::thread::ShutdownMode;
     use makepad_render_material::ibl::EnvMap;
     use makepad_scene::{Environment, Ibl, IblSource, TextureRef};
 
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(flag(&cx, &skin), [0.0; 4], "no environment: the flag off");
 
         // A closed pool prepares on the spot: the call binds the texture.
-        cx.task_pool().close(ShutdownMode::CancelPending);
+        cx.use_closed_task_pool();
         renderer.register_environment(TextureRef(1), std::sync::Arc::new(EnvMap::constant(16, [0.25; 3])));
         let env = Environment { ibl: Some(Ibl { source: IblSource::Hdri(TextureRef(1)), intensity: 1.0, rotation_deg: 0.0 }), ..Default::default() };
         renderer.resolve_ibl(&mut cx, &env);

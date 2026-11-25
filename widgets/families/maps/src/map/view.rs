@@ -3753,8 +3753,8 @@ impl DrawMapVector {
         self.draw_super.draw_depth = draw_depth;
         stamp_map_uniforms(&mut self.draw_super.draw_vars, slots, uniforms, env);
         self.draw_super.draw_vars.geometry_id = Some(geometry_id);
-        cx.new_draw_call(&self.draw_super.draw_vars);
-        let Some(mut instances) = cx.begin_many_aligned_instances(&self.draw_super.draw_vars)
+        cx.new_draw_call(&mut self.draw_super.draw_vars);
+        let Some(mut instances) = cx.begin_many_aligned_instances(&mut self.draw_super.draw_vars)
         else {
             return Area::Empty;
         };
@@ -3934,8 +3934,8 @@ impl DrawMapIcon {
         });
         stamp_map_uniforms(&mut self.draw_vars, slots, uniforms, env);
         self.draw_vars.geometry_id = Some(geometry.geometry_id());
-        cx.new_draw_call(&self.draw_vars);
-        let Some(mut instances) = cx.begin_many_aligned_instances(&self.draw_vars) else {
+        cx.new_draw_call(&mut self.draw_vars);
+        let Some(mut instances) = cx.begin_many_aligned_instances(&mut self.draw_vars) else {
             return Area::Empty;
         };
         for record in group.data.chunks_exact(ICON_INSTANCE_FLOATS) {
@@ -3992,8 +3992,8 @@ impl DrawMapProp {
         self.draw_depth = draw_depth;
         stamp_map_uniforms(&mut self.draw_vars, slots, uniforms, env);
         self.draw_vars.geometry_id = Some(geometry_id);
-        cx.new_draw_call(&self.draw_vars);
-        let Some(mut instances) = cx.begin_many_aligned_instances(&self.draw_vars) else {
+        cx.new_draw_call(&mut self.draw_vars);
+        let Some(mut instances) = cx.begin_many_aligned_instances(&mut self.draw_vars) else {
             return Area::Empty;
         };
         for record in records {
@@ -4056,8 +4056,8 @@ impl DrawMapWall {
         }
         self.draw_depth = draw_depth;
         stamp_map_uniforms(&mut self.draw_vars, slots, uniforms, env);
-        cx.new_draw_call(&self.draw_vars);
-        let Some(mut instances) = cx.begin_many_aligned_instances(&self.draw_vars) else {
+        cx.new_draw_call(&mut self.draw_vars);
+        let Some(mut instances) = cx.begin_many_aligned_instances(&mut self.draw_vars) else {
             return Area::Empty;
         };
         for record in records {
@@ -4113,8 +4113,8 @@ impl DrawMapShadow {
         }
         self.draw_depth = draw_depth;
         stamp_map_uniforms(&mut self.draw_vars, slots, uniforms, env);
-        cx.new_draw_call(&self.draw_vars);
-        let Some(mut instances) = cx.begin_many_aligned_instances(&self.draw_vars) else {
+        cx.new_draw_call(&mut self.draw_vars);
+        let Some(mut instances) = cx.begin_many_aligned_instances(&mut self.draw_vars) else {
             return Area::Empty;
         };
         for record in records {
@@ -4157,8 +4157,8 @@ impl DrawMapShadowDisc {
             return Area::Empty;
         }
         stamp_map_uniforms(&mut self.draw_vars, slots, uniforms, env);
-        cx.new_draw_call(&self.draw_vars);
-        let Some(mut instances) = cx.begin_many_aligned_instances(&self.draw_vars) else {
+        cx.new_draw_call(&mut self.draw_vars);
+        let Some(mut instances) = cx.begin_many_aligned_instances(&mut self.draw_vars) else {
             return Area::Empty;
         };
         for record in records.chunks_exact(SHADOW_DISC_INSTANCE_FLOATS) {
@@ -4248,17 +4248,13 @@ fn release_uploaded_staging(cx: &mut Cx2d, state: &TileLoadState) {
         .chain(stalk_template_geometry.iter())
         .chain(stoplight_template_geometry.iter())
     {
-        if !pool.is_open() {
-            break;
-        }
         let Some((indices, vertices)) = geometry.take_cpu_buffers_if_uploaded(cx.cx) else {
             continue;
         };
-        match pool.submit(Lane::Light, move || drop((indices, vertices))) {
+        match pool.submit(Class::Visible, move || drop((indices, vertices))) {
             Ok(handle) => handle.detach(),
             Err(_) => {
-                // The pool is full: keep the staging until a later frame
-                // can hand it over.
+                // Shutdown stops further retirement submissions.
                 break;
             }
         }
@@ -4579,7 +4575,7 @@ pub struct MapView {
     /// Tile parses/bakes staged newest-first in front of the runtime pool's
     /// light lane; a re-request replaces the staged job for its key and a pan
     /// prunes what has not been handed over yet.
-    #[rust(TaskQueue::new(Lane::Light, 1, 1024))]
+    #[rust(TaskQueue::new(Class::Visible, 1, 1024))]
     tile_queue: TaskQueue<TileKey>,
     #[rust]
     local_requested_tiles: HashMap<TileKey, f64>,
@@ -9055,13 +9051,16 @@ impl MapView {
                 });
             }
         };
-        let pool = cx.task_pool();
-        if pool.is_open() {
+        #[cfg(not(all(target_arch = "wasm32", not(target_feature = "atomics"))))]
+        {
+            let pool = cx.task_pool();
             let window = self.bake_window(cx, &pool);
             self.tile_queue.set_in_flight_limit(window);
             self.tile_queue
                 .push(&pool, key, true, QueueOrder::Lifo, guarded_job)
-        } else {
+        }
+        #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+        {
             // Pure parsing/tessellation has an explicit serial fallback when
             // wasm was built without atomics.
             guarded_job();
@@ -9069,17 +9068,17 @@ impl MapView {
         }
     }
 
-    /// Hand staged tile jobs over as workers free up: after every request
-    /// pass and on the UI signal each pool completion raises.
-    /// Bakes in flight at once: the idle workers, capped by the memory
-    /// budget's bake slots so a burst of arrivals cannot park seven bakes'
-    /// working sets in memory at the same time on a small heap.
+    /// Bakes in flight at once: a window of the pool's width, capped by the
+    /// memory budget's bake slots so a burst of arrivals cannot park seven
+    /// bakes' working sets in memory at the same time on a small heap.
     fn bake_window(&self, cx: &Cx, pool: &TaskPool) -> usize {
         pool_window(pool, self.tile_queue.in_flight())
             .min(MapMemoryBudgets::from_cx(cx).bake_slots)
             .max(1)
     }
 
+    /// Hand staged tile jobs over as workers free up: after every request
+    /// pass and on the UI signal each pool completion raises.
     fn pump_tile_queue(&mut self, cx: &mut Cx) {
         if self.tile_queue.staged_len() == 0 {
             return;
@@ -13665,7 +13664,7 @@ mod tests {
         for _ in 0..thread_count {
             let reached = reached.clone();
             let release = release.clone();
-            pool.submit(Lane::Light, move || {
+            pool.submit(Class::Visible, move || {
                 reached.wait();
                 release.wait();
             })
@@ -13685,6 +13684,33 @@ mod tests {
             .copied()
             .collect::<HashSet<_>>();
         assert!(!requested_before.is_empty());
+        // Builds the queue still holds, however wide the pool's window: tiles
+        // far from both views.
+        let staged = [TileKey { z: 3, x: 0, y: 0 }, TileKey { z: 3, x: 1, y: 0 }];
+        map.tile_queue.set_in_flight_limit(map.tile_queue.in_flight());
+        for key in staged {
+            map.tile_queue.push(&pool, key, true, QueueOrder::Lifo, || {}).unwrap();
+            map.local_requested_tiles.insert(key, 0.0);
+            map.tiles.insert(
+                key,
+                TileEntry {
+                    state: TileLoadState::LoadingLocal,
+                    last_used: 0,
+                    attempts: 0,
+                    retry_after: 0,
+                    bytes: 0,
+                    bucket: 3,
+                    baked_3d: false,
+                    baked_fringe: true,
+                    road_core_cached: false,
+                    road_icon_indices: Vec::new(),
+                    road_icon_vertices: Vec::new(),
+                    fade: None,
+                    draw: TileDrawLists::default(),
+                },
+            );
+        }
+        assert_eq!(map.tile_queue.staged_len(), staged.len());
 
         map.set_center(&mut cx, 0.0, 0.0);
         map.ensure_visible_tiles(&mut cx, rect);
@@ -13693,10 +13719,15 @@ mod tests {
             .filter(|key| !map.visible_tiles.contains(key))
             .collect::<Vec<_>>();
         assert!(!stale.is_empty());
-        // With every worker parked the queue hands over at most one job (its
-        // window never closes below one); everything staged is pruned.
+        // The queue hands one window over whatever the pool is doing, and that
+        // much is out of reach; everything staged is pruned.
+        for key in staged {
+            assert!(!map.local_requested_tiles.contains_key(&key));
+            assert!(!map.tiles.contains_key(&key));
+        }
         let handed_over = map.tile_queue.in_flight();
-        assert!(handed_over <= 1, "saturated pool, yet {handed_over} tile jobs were handed over");
+        let window = map.bake_window(&cx, &pool);
+        assert!(handed_over <= window, "a window of {window}, yet {handed_over} tile jobs were handed over");
         let leaked = stale
             .iter()
             .filter(|key| map.local_requested_tiles.contains_key(key))

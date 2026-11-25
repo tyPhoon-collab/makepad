@@ -12,6 +12,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "GPU bytes by session, kind and owner, reconciled against the device",
     ),
     (
+        "gpu device",
+        "",
+        "the current HAL backend, device name and whether it is a software device",
+    ),
+    (
         "gpu top",
         "[by=bytes|owner|site|churn] [n=15]",
         "largest allocations or allocating owners/sites",
@@ -26,6 +31,16 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "hal pump",
         "",
         "each session's pump turns and wake causes, totals and per second since the last call",
+    ),
+    (
+        "hal pace",
+        "",
+        "the WM-hosted shell's frame pacing: frame asked and not granted, Tick open, Ticks/TickDones/requests and requests sent mid-Tick, per window requested/awaiting/in flight",
+    ),
+    (
+        "hal shell",
+        "",
+        "the shell backend, WM connection and windows, without asking the shell thread",
     ),
     (
         "gpu diff",
@@ -53,19 +68,25 @@ fn key(item: &ReportItem) -> String {
 
 fn item(item: &ReportItem, out: &mut Out) {
     out.line(&format!(
-        "{{\"id\":{},\"session\":{},\"kind\":{},\"bytes\":{},\"owner\":{},\"site\":{},\"created_frame\":{},\"last_used_frame\":{}}}",
-        json_str(&key(item)), item.session, json_str(item.detail), item.bytes, json_str(&item.owner),
-        json_str(&item.site), item.created_frame, item.last_used_frame,
+        "{{\"id\":{},\"session\":{},\"kind\":{},\"bytes\":{},\"objects\":{},\"owner\":{},\"site\":{},\"created_frame\":{},\"last_used_frame\":{}{}}}",
+        json_str(&key(item)), item.session, json_str(item.detail), item.bytes, item.objects, json_str(&item.owner),
+        json_str(&item.site), item.created_frame, item.last_used_frame, note(item.note),
     ));
+}
+
+/// A row's note (`ledger::NO_SIZE`) as a trailing field, or nothing.
+fn note(note: &str) -> String {
+    if note.is_empty() { String::new() } else { format!(",\"note\":{}", json_str(note)) }
 }
 
 fn groups(groups: &[Group], n: usize, out: &mut Out) {
     for g in groups.iter().take(n) {
         out.line(&format!(
-            "{{\"name\":{},\"bytes\":{},\"count\":{}}}",
+            "{{\"name\":{},\"bytes\":{},\"count\":{}{}}}",
             json_str(&g.key),
             g.bytes,
-            g.count
+            g.count,
+            note(g.note)
         ));
     }
 }
@@ -78,15 +99,43 @@ fn fresh(req: &Req) -> Report {
     crate::Hal::global().report_all(idle)
 }
 
+fn gpu(out: &mut Out) {
+    use crate::{backend_id, device_kind};
+    let Some(info) = crate::Hal::global().backend_info() else {
+        return out.err("GPU backend is not initialized");
+    };
+    let backend = match info.backend {
+        backend_id::METAL => "metal",
+        backend_id::VULKAN => "vulkan",
+        backend_id::D3D11 => "d3d11",
+        backend_id::GL => "gl",
+        backend_id::HEADLESS => "headless",
+        backend_id::NONE => "none",
+        _ => "unknown",
+    };
+    out.line(&format!(
+        "{{\"backend\":{},\"device\":{},\"software\":{}}}",
+        json_str(backend), json_str(&info.device_name()), info.device_kind == device_kind::SOFTWARE
+    ));
+}
+
 /// True when this is a GPU or HAL command. The endpoint thread reads the native ledger directly.
 pub fn dispatch(req: &Req, out: &mut Out) -> bool {
     if crate::framecap::dispatch(req, out) {
         return true;
     }
+    if matches!(req.cmd.as_str(), "gpu" | "hal") && req.pos.first().map(String::as_str) != Some("prof") {
+        let words = std::iter::once(req.cmd.as_str()).chain(req.pos.first().map(String::as_str)).collect::<Vec<_>>().join(" ");
+        if let Some(params) = makepad_remote::params::inspect(&words) {
+            if let Err(e) = req.validate_params(params) { out.err(&e); return true; }
+        }
+    }
     if req.cmd == "hal" {
         match req.pos.first().map(String::as_str) {
             Some("pump") => pump(out),
-            _ => out.err("hal pump"),
+            Some("pace") => pace(out),
+            Some("shell") => out.line(&crate::backend::shell::line()),
+            _ => out.err("hal pump|pace|shell"),
         }
         return true;
     }
@@ -97,6 +146,10 @@ pub fn dispatch(req: &Req, out: &mut Out) -> bool {
         return true;
     }
     let sub = req.pos.first().map(String::as_str).unwrap_or("");
+    if sub == "device" {
+        gpu(out);
+        return true;
+    }
     if sub == "diff" {
         diff(req, out);
         return true;
@@ -105,14 +158,16 @@ pub fn dispatch(req: &Req, out: &mut Out) -> bool {
     let n = req.get("n").and_then(|n| n.parse().ok()).unwrap_or(15);
     match sub {
         "" => {
-            let device = snap
-                .device_allocated
-                .map(|b| b.to_string())
-                .unwrap_or_else(|| "null".into());
+            let opt = |b: Option<u64>| b.map_or_else(|| "null".into(), |b| b.to_string());
+            // what a counter holds beyond the ledger (negative: the ledger counts more)
+            let signed = |b: Option<u64>, ledger: u64| b.map_or_else(|| "null".into(), |b| (b as i128 - ledger as i128).to_string());
             out.line(&format!(
-                "{{\"ledger_bytes\":{},\"device_bytes\":{},\"items\":{}}}",
+                "{{\"ledger_bytes\":{},\"device_bytes\":{},\"device_gap\":{},\"os_graphics_bytes\":{},\"os_gap\":{},\"items\":{}}}",
                 snap.total_bytes,
-                device,
+                opt(snap.device_allocated),
+                signed(snap.device_allocated, snap.total_bytes),
+                opt(snap.os_graphics),
+                signed(snap.os_graphics, snap.total_bytes),
                 snap.items.len()
             ));
             for session in &snap.by_session {
@@ -180,7 +235,7 @@ pub fn dispatch(req: &Req, out: &mut Out) -> bool {
             ));
             snaps.push((name.clone(), Arc::new(snap)));
         }
-        _ => out.err("gpu | gpu top | gpu idle | gpu snap | gpu diff | gpu path | gpu prof start|stop|status|frames|frame|lanes|top|util|diff"),
+        _ => out.err("gpu | gpu memory | gpu top | gpu idle | gpu snap | gpu diff | gpu path | gpu prof start|stop|status|frames|frame|lanes|top|util|diff"),
     }
     true
 }
@@ -252,6 +307,18 @@ fn diff(req: &Req, out: &mut Out) {
 /// The last `hal pump` answer, for the rates of the next one.
 static PUMP_LAST: Mutex<Option<(std::time::Instant, Vec<(u32, crate::PumpCounts)>)>> = Mutex::new(None);
 
+fn pace(out: &mut Out) {
+    #[cfg(target_os = "linux")]
+    {
+        let lines = crate::backend::linux::wm::pace_lines();
+        if !lines.is_empty() {
+            for line in lines { out.line(&line); }
+            return;
+        }
+    }
+    out.line("{\"pace\":\"no WM-hosted window in this process\"}");
+}
+
 fn pump(out: &mut Out) {
     let now = std::time::Instant::now();
     let counts = crate::Hal::global().pump_counts();
@@ -279,4 +346,56 @@ fn pump(out: &mut Out) {
         ));
     }
     *last = Some((now, counts));
+}
+
+/// (`hal::end_run`) The named reports and pump counts of the ended run.
+pub(crate) fn end_run() {
+    let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(snaps);
+    *PUMP_LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+#[cfg(test)]
+mod parameter_tests {
+    use super::*;
+
+    fn run(line: &str) -> String {
+        let mut bytes = Vec::new();
+        assert!(dispatch(&Req::parse(line), &mut Out::new(&mut bytes, usize::MAX)));
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn gpu_rejects_unknown_parameters() {
+        let error = run("gpu top count=0");
+        assert!(error.contains("unknown parameter \\\"count\\\"") && error.contains("known: by, n"), "{error}");
+        let ok = run("gpu top by=bytes n=0");
+        assert!(!ok.contains("\"err\""), "{ok}");
+        assert!(run("gpu device n=1").contains("unknown parameter"));
+    }
+
+    #[test]
+    fn hal_rejects_unknown_parameters() {
+        assert!(run("hal pace timeout=1").contains("unknown parameter"));
+        let ok = run("hal pace full=1");
+        assert!(!ok.contains("\"err\""), "{ok}");
+    }
+
+    #[test]
+    fn cap_rejects_unknown_parameters() {
+        let error = run("cap grab timeout_ms=1");
+        assert!(error.contains("unknown parameter") && error.contains("timeout,"), "{error}");
+        let ok = run("cap list full=1");
+        assert!(!ok.contains("\"err\""), "{ok}");
+        assert!(run("cap tex X0 mip=1").contains("unknown parameter"));
+    }
+
+    #[test]
+    fn gpu_prof_rejects_unknown_parameters() {
+        let error = run("gpu prof start seconds=1");
+        assert!(error.contains("unknown parameter") && error.contains("known: s, split"), "{error}");
+        let ok = run("gpu prof status as=md");
+        assert!(!ok.contains("\"err\""), "{ok}");
+        assert!(run("gpu prof frames split=1").contains("unknown parameter"));
+    }
 }

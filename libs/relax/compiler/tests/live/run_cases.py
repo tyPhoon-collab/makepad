@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Hot-reload cases for `makepad live` (local/plans/hotreload.md section 8).
 
-usage: run_cases.py --makepad <makepad binary> [--only name[,name..]] [--verbose] [--keep DIR]
+usage: run_cases.py --makepad <makepad binary> [--only name[,name..]] [--copies N] [--verbose] [--keep DIR]
+
+--copies N: each case runs N times at once, side by side (a busier box: N sessions' compiles beside
+each one's program); it passes only when every copy does.
 
 A case is a directory under tests/live/ (the files directly in tests/live/ are the case "body_edit"):
   v0.rs, v1.rs, ..           single-file crate: each edit replaces the crate root
@@ -19,6 +22,7 @@ A case is a directory under tests/live/ (the files directly in tests/live/ are t
   env (optional)             KEY=VALUE lines for both the live session and the oracle runs
                               MAKEPAD_RUN_LIVE_STREAM=1 feeds single-file edits through apply_stream, 17 ms apart.
   xfail (optional)           the case is expected to FAIL today; its first line names the gap (G1..G10)
+  timed (optional)           the case has a wall-time bound: it runs only when --only names it, on a quiet box
   forbid (optional)          substrings (one per line) that must not appear in the live session's output from the
                               first edit on
 
@@ -33,14 +37,14 @@ error" = half (a half-applied patch, never acceptable); else patch.
 Result per case: PASS, FAIL, XFAIL (fails and is marked xfail), XPASS (passes but is marked xfail:
 remove the marker). Exit status 1 on any FAIL or XPASS.
 """
-import os, re, shutil, subprocess, sys, tempfile
+import os, re, shutil, subprocess, sys, tempfile, threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_RE = re.compile(r"^(out |checksum )")
 
 
 def parse_args(argv):
-    a = {"relax": None, "only": None, "verbose": False, "keep": None, "timeout": 180}
+    a = {"relax": None, "only": None, "verbose": False, "keep": None, "timeout": 180, "copies": 1}
     i = 0
     while i < len(argv):
         k = argv[i]
@@ -52,6 +56,8 @@ def parse_args(argv):
             a["keep"] = argv[i + 1]; i += 2
         elif k == "--timeout":
             a["timeout"] = int(argv[i + 1]); i += 2
+        elif k == "--copies":
+            a["copies"] = max(1, int(argv[i + 1])); i += 2
         elif k in ("-v", "--verbose"):
             a["verbose"] = True; i += 1
         else:
@@ -286,8 +292,22 @@ def main():
     for name, d in cases():
         if a["only"] and name not in a["only"]:
             continue
-        tmp = tempfile.mkdtemp(prefix="live-%s-" % name, dir=a["keep"])
-        msgs, text = check_case(name, d, a, tmp)
+        if not a["only"] and os.path.exists(os.path.join(d, "timed")):
+            continue
+        tmps = [tempfile.mkdtemp(prefix="live-%s-" % name, dir=a["keep"]) for _ in range(a["copies"])]
+        if len(tmps) == 1:
+            msgs, text = check_case(name, d, a, tmps[0])
+        else:
+            runs = [None] * len(tmps)
+            def copy(k):
+                runs[k] = check_case(name, d, a, tmps[k])
+            threads = [threading.Thread(target=copy, args=(k,)) for k in range(len(tmps))]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            msgs = ["copy %d: %s" % (k + 1, m) for k, (ms, _) in enumerate(runs) for m in ms]
+            text = next((t for ms, t in runs if ms), runs[0][1])
         xf = os.path.join(d, "xfail")
         marked = os.path.exists(xf)
         gap = open(xf).readline().strip() if marked else ""
@@ -304,7 +324,8 @@ def main():
             for l in text.splitlines()[-12:]:
                 print("         | " + l)
         if not a["keep"]:
-            shutil.rmtree(tmp, ignore_errors=True)
+            for tmp in tmps:
+                shutil.rmtree(tmp, ignore_errors=True)
     print("live cases: %d pass, %d fail, %d xfail, %d xpass" % (counts["PASS"], counts["FAIL"], counts["XFAIL"], counts["XPASS"]))
     sys.exit(1 if counts["FAIL"] or counts["XPASS"] else 0)
 

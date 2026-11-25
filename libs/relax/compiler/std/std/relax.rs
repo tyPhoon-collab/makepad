@@ -8,6 +8,8 @@
 //! let frame: fn(&mut FxState, f32) = m.get("frame")?;
 //! ```
 
+pub use crate::sync::held_lock::held_lock;
+
 use crate::string::String;
 
 /// The harness `makepad test <package>` runs a crate's `#[test]` fns with (libtest's semantics).
@@ -33,6 +35,11 @@ extern "C" {
 extern "C" {
     fn __relax_realtime(root: usize, data: usize, meta: usize, wake: usize) -> u64;
     fn __relax_realtime_ready(ticket: u64) -> bool;
+    fn __relax_realtime_compiled(ticket: u64) -> bool;
+    fn __relax_realtime_lazy(ticket: u64) -> u32;
+    fn __relax_realtime_misses() -> u64;
+    fn __relax_realtime_thread();
+    fn __relax_realtime_arm(on: bool);
 }
 
 /// The type whose code `realtime` names (its address is the root's identity, not a call).
@@ -49,6 +56,53 @@ impl Realtime {
     pub fn ready(&self) -> bool {
         self.0 == 0 || unsafe { __relax_realtime_ready(self.0) }
     }
+
+    /// The strict `ready`: everything the mark reaches is compiled and nothing real-time code can
+    /// reach still compiles on its first call. Never true because a wait ran out: what gates arming
+    /// a machine. It turns false again while new code (a live patch, a new trait object of a type
+    /// the code calls through) has callees the compiler has not reached yet.
+    pub fn compiled(&self) -> bool {
+        self.0 == 0 || unsafe { __relax_realtime_compiled(self.0) }
+    }
+
+    /// How many fns real-time code can reach that would compile on their first call (0: none;
+    /// at least 1 until this mark's reach is done). The reach is shared by every mark, so this
+    /// counts what any real-time root still waits for.
+    pub fn lazy(&self) -> u32 {
+        if self.0 == 0 { 0 } else { unsafe { __relax_realtime_lazy(self.0) } }
+    }
+
+    /// Freezes live edits of real-time code while the guard lives: a patch that would replace
+    /// code real-time code can reach is held (the edit is answered "frozen") and applies once the
+    /// last guard is dropped. Edits of other code patch as usual.
+    pub fn arm(&self) -> RealtimeArmed {
+        unsafe { __relax_realtime_arm(true) };
+        RealtimeArmed(())
+    }
+}
+
+/// `Realtime::arm`'s guard: live edits of real-time code wait until it (and every other) is dropped.
+#[derive(Debug)]
+pub struct RealtimeArmed(());
+
+impl Drop for RealtimeArmed {
+    fn drop(&mut self) {
+        unsafe { __relax_realtime_arm(false) };
+    }
+}
+
+/// How many lazy compiles real-time threads met so far (each stalled its thread for the
+/// compile): 0 is the goal; a rise names a hole in what `realtime` reached.
+pub fn realtime_misses() -> u64 {
+    unsafe { __relax_realtime_misses() }
+}
+
+/// The calling thread is a real-time thread from now on: its lazy compiles count in
+/// `realtime_misses` (and are reported), as a thread with a real-time policy or one named in
+/// MAKEPAD_RUN_RT_THREADS. For a thread that runs real-time code without that policy (a box that
+/// refuses SCHED_FIFO, a test standing in for the device's thread).
+pub fn realtime_thread() {
+    unsafe { __relax_realtime_thread() }
 }
 
 /// The code reachable from `x` runs on a real-time thread (an audio device's callback, a
@@ -103,7 +157,9 @@ extern "C" {
     fn __relax_restart_reason(buf: *mut u8, cap: usize) -> usize;
     fn __relax_patched_files(since: u64, buf: *mut u8, cap: usize) -> usize;
     fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize;
+    fn __relax_restart_saved_ms() -> f64;
     fn __relax_restart_now(state: *const u8, len: usize);
+    fn __relax_hot_load_failed(why: *const u8, len: usize);
     fn __relax_live_stream(path: *const u8, plen: usize, text: *const u8, len: usize) -> u32;
     fn __relax_live_log(line: *const u8, len: usize);
     fn relax_store_file(u: *const u8, un: usize, c: *const u8, cn: usize, p: *const u8, pn: usize, out: *mut *const u8, out_len: *mut usize) -> u64;
@@ -253,7 +309,7 @@ pub fn engine_replies(after: u64) -> String {
 
 /// After a restart: when the edit that caused it was saved (unix ms), for save -> back on screen.
 pub fn restart_saved_ms() -> Option<f64> {
-    crate::env::var("MAKEPAD_RUN_RESTART_T0").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0)
+    Some(unsafe { __relax_restart_saved_ms() }).filter(|v| *v > 0.0)
 }
 
 // ---- state-preserving restart (live sessions: an edit Relax cannot patch in place)
@@ -289,10 +345,19 @@ pub fn restart_reason() -> String {
     }
 }
 
-/// The source files live patches changed since `*seen` (start it at 0; the call advances it).
-/// The patched fns run the new code at their next call; what the program built from code at run
-/// time (makepad's `script_mod!` designs, evaluated once) it builds again for these files.
-pub fn patched_files(seen: &mut u64) -> crate::vec::Vec<String> {
+/// What live patches changed since a program last asked ([`patched`]).
+pub struct Patched {
+    /// The source files they changed. The patched fns run the new code at their next call.
+    pub files: crate::vec::Vec<String>,
+    /// The items whose bodies they changed, by name (`script_mod`, `handle_event`); None when a
+    /// patch changed more than bodies (an item added or removed, a const, a layout): take every
+    /// item as changed. What the program built from code at run time (makepad's `script_mod!`
+    /// designs, evaluated once) it builds again when that code is among them.
+    pub items: Option<crate::vec::Vec<String>>,
+}
+
+/// What live patches changed since `*seen` (start it at 0; the call advances it).
+pub fn patched(seen: &mut u64) -> Patched {
     let text = unsafe {
         let mut v: crate::vec::Vec<u8> = crate::vec::Vec::new();
         loop {
@@ -305,18 +370,35 @@ pub fn patched_files(seen: &mut u64) -> crate::vec::Vec<String> {
         }
         String::from_utf8_lossy(&v).into_owned()
     };
+    // "<count> <1 when every item>", a path per line, a tab and an item name per line
     let mut lines = text.lines();
-    if let Some(n) = lines.next().and_then(|n| n.parse().ok()) {
-        *seen = n;
+    let mut every = false;
+    if let Some((n, all)) = lines.next().and_then(|l| l.split_once(' ')) {
+        if let Ok(n) = n.parse() { *seen = n; }
+        every = all == "1";
     }
-    lines.map(String::from).collect()
+    let mut files = crate::vec::Vec::new();
+    let mut items = crate::vec::Vec::new();
+    for line in lines {
+        match line.strip_prefix('\t') {
+            Some(item) => items.push(String::from(item)),
+            None => files.push(String::from(line)),
+        }
+    }
+    Patched { files, items: (!every).then_some(items) }
 }
 
-/// Restarts the program with `state`, which its fresh run reads with `restored_state`.
-/// A hosted app queues a domain relaunch and returns so its event loop can finish shutdown;
-/// a directly running program replaces its process and returns only on failure.
+/// Restarts the program with `state`, which its fresh run reads with `restored_state`: the
+/// process is replaced by a fresh run of the same command line. Returns only on failure.
 pub fn restart_now(state: &str) {
     unsafe { __relax_restart_now(state.as_ptr(), state.len()) }
+}
+
+/// Part of a live edit did not reach the running program: a value it built from the old code
+/// cannot take the new one. The edit counts as a failed hot load (recorded) and the app restarts
+/// with its state to apply it.
+pub fn hot_load_failed(why: &str) {
+    unsafe { __relax_hot_load_failed(why.as_ptr(), why.len()) }
 }
 
 /// The state the previous run passed to `restart_now`, if this run is such a restart.

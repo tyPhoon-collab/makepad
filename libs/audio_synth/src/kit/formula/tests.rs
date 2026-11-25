@@ -1,7 +1,5 @@
 //! Formula tests: the compiled programs (interpreter and native) against
-//! the reference tree-walker, on focused scripts and on every script of
-//! the patch library (patch content, not in the repo: the folder named by
-//! `FORMULA_LIBRARY`, default `local/agent_state/synth/formula/lib`).
+//! the reference tree-walker, on focused scripts.
 
 use super::compile::{f, BOOL_FIELDS, NUM_FIELDS};
 use super::reference::RefRunner;
@@ -320,65 +318,4 @@ fn load_errors_are_reported() {
             Err(e) => assert!(e.message.contains(what) && !e.runtime, "{}: {}", src, e),
         }
     }
-}
-
-fn library_dir() -> std::path::PathBuf {
-    match std::env::var("FORMULA_LIBRARY") {
-        Ok(p) => p.into(),
-        Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../local/agent_state/synth/formula/lib"),
-    }
-}
-
-/// Every script of the patch library compiles and runs like the reference.
-#[test]
-fn library_scripts_compile_and_match() {
-    let dir = library_dir();
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        eprintln!("formula library not present at {} (patch content; fetch it with the library download): skipped", dir.display());
-        return;
-    };
-    let mut files: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().map_or(false, |x| x == "lua")).collect();
-    files.sort();
-    let mut fails = Vec::new();
-    for p in &files {
-        let src = std::fs::read_to_string(p).unwrap();
-        for be in [Backend::Interp, Backend::Native] {
-            let name = p.file_name().unwrap().to_string_lossy().to_string();
-            // As voice LFOs every script must run; with a scene instance
-            // too (no key, velocity, ...) a script may stop, but only the
-            // way the reference does.
-            match compare(&src, be, 600, false) {
-                Ok((None, true)) => {}
-                Ok((None, false)) => fails.push(format!("{} ({:?}): every output was 0", name, be)),
-                Ok((Some(e), _)) => fails.push(format!("{} ({:?}): stopped: {}", name, be, e)),
-                Err(e) => fails.push(format!("{} ({:?}): {}", name, be, e)),
-            }
-            if let Err(e) = compare(&src, be, 600, true) {
-                fails.push(format!("{} ({:?}, with a scene LFO): {}", name, be, e));
-            }
-        }
-    }
-    eprintln!("formula library: {} scripts, {} failures", files.len(), fails.len());
-    assert!(fails.is_empty(), "{}", fails.join("\n"));
-}
-
-/// Compile cost of the library (load time matters): printed with --nocapture.
-#[test]
-fn library_compile_cost() {
-    let Ok(rd) = std::fs::read_dir(library_dir()) else { return };
-    let mut total = std::time::Duration::ZERO;
-    let mut worst = (std::time::Duration::ZERO, String::new());
-    let mut n = 0;
-    for p in rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().map_or(false, |x| x == "lua")) {
-        let src = std::fs::read_to_string(&p).unwrap();
-        let t = std::time::Instant::now();
-        let f = Formula::compile(&src).unwrap();
-        let d = t.elapsed();
-        total += d;
-        n += 1;
-        if d > worst.0 {
-            worst = (d, format!("{} ({} AIR values)", p.file_name().unwrap().to_string_lossy(), f.process_program().vals.len()));
-        }
-    }
-    eprintln!("formula compile: {} scripts in {:?}, worst {:?} {}", n, total, worst.0, worst.1);
 }

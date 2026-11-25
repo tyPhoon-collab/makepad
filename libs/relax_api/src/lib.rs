@@ -25,6 +25,74 @@
 
 pub use makepad_relax_api_macro::relax_api;
 
+static APP_CALL: std::sync::OnceLock<fn(unsafe extern "C" fn(*mut u8), *mut u8) -> bool> = std::sync::OnceLock::new();
+
+/// The host's way of calling code it compiled (`app_call`), once per process.
+pub fn set_app_call(call: fn(unsafe extern "C" fn(*mut u8), *mut u8) -> bool) {
+    let _ = APP_CALL.set(call);
+}
+
+/// How native code calls a function pointer JIT code gave it: a callback, a waker, a router. A host
+/// can end the app's run while the call is in there, or before it starts. The call then comes back
+/// with false, as if the callback had returned at once: every frame of the caller goes on, whatever
+/// it holds is released as usual. Forget the pointer then, it will never work again. Without such a
+/// host this is a plain call.
+pub fn app_call<F: FnOnce()>(f: F) -> bool {
+    let Some(call) = APP_CALL.get() else {
+        f();
+        return true;
+    };
+    unsafe extern "C" fn thunk<F: FnOnce()>(p: *mut u8) {
+        if let Some(f) = (*(p as *mut Option<F>)).take() {
+            f()
+        }
+    }
+    let mut f = Some(f);
+    call(thunk::<F>, &mut f as *mut Option<F> as *mut u8)
+}
+
+/// An op of a crate whose objects are the program's: what it allocates goes with the program's heap
+/// (`makepad_alloc_phase::run`). Only generated wrappers call this.
+#[cfg(feature = "host-shims")]
+#[inline(always)]
+pub fn run_op() -> impl Sized {
+    makepad_alloc_phase::run()
+}
+#[cfg(not(feature = "host-shims"))]
+#[inline(always)]
+pub fn run_op() {}
+
+/// An op of a crate that holds what outlives a program (the window, the GPU device, the CPU budget):
+/// the process's heap, and its own end frees what a program held. Only generated wrappers call this.
+#[cfg(feature = "host-shims")]
+#[inline(always)]
+pub fn host_op() -> impl Sized {
+    makepad_alloc_phase::kept()
+}
+#[cfg(not(feature = "host-shims"))]
+#[inline(always)]
+pub fn host_op() {}
+
+/// The locks a provided crate's process-lifetime data uses. On macOS std's lock allocates a block
+/// at its first use, on whatever thread and in whatever phase that is: in an op, that block would
+/// be the run's and go with it, and the lock with it. These keep their state inline.
+pub mod sync {
+    #[cfg(target_vendor = "apple")]
+    pub use makepad_alloc_phase::sync::{Condvar, Mutex, MutexGuard};
+    #[cfg(not(target_vendor = "apple"))]
+    pub use std::sync::{Condvar, Mutex, MutexGuard};
+}
+
+/// For a provided crate's statics: what `f` allocates is the process's, shared by every program,
+/// not the calling program's. A static of a crate in `run_op` fills its blocks in here, since the
+/// program whose op filled it can end while the static goes on.
+#[inline(always)]
+pub fn process_heap<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "host-shims")]
+    let _kept = makepad_alloc_phase::kept();
+    f()
+}
+
 /// A generated op wrapper: arguments moved out of `args[i]`, the result written to `ret`;
 /// 0 = returned, 1 = panicked (the text: [`last_panic`]).
 pub type ShimFn = unsafe extern "C" fn(*const *mut u8, *mut u8) -> u32;

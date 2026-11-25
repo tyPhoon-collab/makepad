@@ -134,6 +134,22 @@ mod imp {
     /// Runs one resolved command. `p` holds the request's key=value arguments (words after the
     /// command name count as flags set to `1`).
     pub fn command(r: &Resolved, p: &Params) -> Answer {
+        let schema = match r.key {
+            "design" => makepad_remote::params::design(r.sub.as_deref().unwrap_or("")),
+            "tweak" => makepad_remote::params::tweak("toggle"),
+            "tweak op" => match p.get(&["op"]) {
+                Some(op) => if let Some(op) = op.strip_prefix("design_") {
+                    makepad_remote::params::design(op)
+                } else { makepad_remote::params::tweak(op) },
+                None => return err("need op="),
+            },
+            key if key.starts_with("tweak ") => makepad_remote::params::tweak(&key[6..]),
+            key => COMMANDS.iter().find(|c| c.words == key).map(|c| c.params),
+        };
+        let Some(schema) = schema else { return err("unknown command operation"); };
+        if let Err(e) = makepad_remote::params::validate(p.0.iter().filter(|(k, _)| !(r.key == "tweak op" && k == "op")).map(|(k, _)| k.as_str()), schema) {
+            return err(&e);
+        }
         REQUEST_USER_SEQ.set(match p.get(&["if_user_seq"]) {
             Some(value) => match value.parse::<u64>() {
                 Ok(value) => Some(value),
@@ -150,12 +166,14 @@ mod imp {
             "activity" => reply_to_answer(ask(Cmd::Activity, ACTIVITY_WAIT_SECS)),
             "mouse" => route_mouse(p, None),
             "click" => route_mouse(p, Some("click")),
+            "move" => route_mouse(p, Some("move")),
             "key" => route_key(p),
             "text" => route_text(p),
             "drop" => route_drop(p),
             "trace" => route_trace(p),
             // read from the runtimes' ledgers, never through the UI thread: a stuck loop is what it shows
             "net" => Answer::Text(crate::makepad_network::ledger::report()),
+            "loop" => Answer::Text(crate::os::hal::loop_watch::report()),
             "step" => route_step(p),
             "settled" => reply_to_answer(ask(Cmd::Settled, 4)),
             "uicounts" => reply_to_answer(ask(Cmd::UiCounts, 4)),
@@ -277,6 +295,11 @@ mod imp {
                     4,
                 ))
             }
+            "gpu_inventory" => {
+                let n = p.get(&["n"]).and_then(|v| v.parse::<usize>().ok()).unwrap_or(15);
+                reply_to_answer(ask(move |tx| Cmd::GpuInventory { n, tx }, 4))
+            }
+            "quit" if p.get(&["force"]).is_some() => reply_to_answer(ask(|tx| Cmd::QuitForced(tx), 4)),
             "quit" => reply_to_answer(ask(|tx| Cmd::Quit(tx), 4)),
             // `cap start`, `cap stop`, `cursor`, `midi`, `log`: commands that
             // need platform state are answered by platform.
@@ -288,6 +311,7 @@ mod imp {
     fn platform_command(name: &str, p: &Params) -> Option<Answer> {
         Some(match name {
             "log" => route_log(p),
+            "cpu" => Answer::Text(crate::thread::cpu_summary()),
             "midi" => route_midi(p),
             "cap start" => route_capture_start(p),
             "cap stop" => route_capture_stop(p),
@@ -519,7 +543,7 @@ mod imp {
         {
             let _ = driven;
             register_with_host();
-            for (name, _, _, _) in APP_QUERIES.lock().unwrap().iter() {
+            for (name, _, _, _, _) in APP_QUERIES.lock().unwrap().iter() {
                 super::host_registration::register_with_host(name);
             }
             // held until ACTIVE is set, so a service registered meanwhile is not lost
@@ -593,7 +617,9 @@ mod imp {
                 answers,
                 service: if words.starts_with("ui") { "ui" } else { "inspect" },
                 risk: if matches!(*words, "ui act" | "ui type") { crate::remote_schema::CmdRisk::Act } else { crate::remote_schema::CmdRisk::Read },
-                params: if words.starts_with("ui") { crate::remote_schema::UI_PARAMS } else { "" },
+                params: if *words == "ui" || words.starts_with("ui ") {
+                    makepad_remote::params::ui(words.strip_prefix("ui").unwrap().trim()).unwrap_or("")
+                } else { makepad_remote::params::inspect(words).unwrap_or("") },
                 required: &[],
                 positional: if *words == "ui act" { &["action"] } else { &[] },
             })
@@ -691,16 +717,19 @@ mod imp {
     /// answer's JSON lines (an `{"err":..}` line for an error); words[0] is the command.
     pub type AppQueryFn = fn(&mut Cx, &[String], &[(String, String)]) -> Vec<String>;
 
-    static APP_QUERIES: Mutex<Vec<(&'static str, &'static str, &'static str, AppQueryFn)>> = Mutex::new(Vec::new());
+    /// JSON-schema properties for these command words, checked before queuing the callback.
+    pub type AppQueryParams = fn(&[String]) -> &'static str;
+
+    static APP_QUERIES: Mutex<Vec<(&'static str, &'static str, &'static str, AppQueryParams, AppQueryFn)>> = Mutex::new(Vec::new());
 
     /// Registers the app's inspect command `name` (`makepad inspect <app> game actors`): what a
     /// person or an agent asks the live app about its own state (a game's entities and actors).
     /// `args` and `answers` are its `help` line. Read-only by convention; a later registration of
-    /// the same name replaces the earlier one.
-    pub fn register_app_query(name: &'static str, args: &'static str, answers: &'static str, f: AppQueryFn) {
+    /// the same name replaces the earlier one. `params` selects its per-command JSON properties.
+    pub fn register_app_query(name: &'static str, args: &'static str, answers: &'static str, params: AppQueryParams, f: AppQueryFn) {
         let mut q = APP_QUERIES.lock().unwrap();
         q.retain(|x| x.0 != name);
-        q.push((name, args, answers, f));
+        q.push((name, args, answers, params, f));
         drop(q);
         #[cfg(relax)]
         if ACTIVE.load(Ordering::SeqCst) {
@@ -708,8 +737,8 @@ mod imp {
         }
     }
 
-    fn app_query(name: &str) -> Option<AppQueryFn> {
-        APP_QUERIES.lock().unwrap().iter().find(|x| x.0 == name).map(|x| x.3)
+    fn app_query(name: &str) -> Option<(AppQueryParams, AppQueryFn)> {
+        APP_QUERIES.lock().unwrap().iter().find(|x| x.0 == name).map(|x| (x.3, x.4))
     }
 
     extern "C" fn no_app_close(_handle: usize) {}
@@ -743,6 +772,9 @@ mod imp {
     /// The `cmd` service of this process: the remote commands (`help` lists them) and the GPU
     /// ledger's `gpu ...`.
     pub(crate) fn dispatch(req: &Req, out: &mut Out) {
+        if matches!(req.cmd.as_str(), "help" | "ping") {
+            if let Err(e) = req.validate_params("") { return out.err(&e); }
+        }
         REQUEST_START_USER_SEQ.set(activity::user_seq_now());
         match req.cmd.as_str() {
             "ping" => out.line(&format!(
@@ -753,7 +785,7 @@ mod imp {
             )),
             "help" => {
                 out.measured("commands", "static", &[]);
-                for (name, args, answers, _) in APP_QUERIES.lock().unwrap().iter() {
+                for (name, args, answers, _, _) in APP_QUERIES.lock().unwrap().iter() {
                     out.line(&format!(
                         "{{\"cmd\":{},\"args\":{},\"answers\":{},\"tool\":{},\"risk\":\"Read\"}}",
                         json_str(name),
@@ -775,9 +807,10 @@ mod imp {
             }
             "" => out.err("empty request"),
             c if app_query(c).is_some() => {
-                let f = app_query(c).unwrap();
+                let (params, f) = app_query(c).unwrap();
                 let mut words = vec![req.cmd.clone()];
                 words.extend(req.pos.iter().cloned());
+                if let Err(e) = req.validate_params(params(&words)) { return out.err(&e); }
                 let kv = req.kv.clone();
                 out.limit = usize::MAX;
                 match ask(move |tx| Cmd::Platform(Box::new(PlatformCmd::AppQuery { f, words, kv, tx })), 6) {
@@ -1039,6 +1072,12 @@ mod imp {
             return CAPTURE.with_borrow(|capture| capture.as_ref().map(|c| c.window)) == Some(window_id);
         }
         CAPTURES.with_borrow(|captures| captures.windows.get(&request_id).is_none_or(|want| *want == window_id))
+    }
+
+    /// The frame build took the snapshot of `ids` in frame `frame` (`Cx::repaint_id`), with
+    /// `patch` live patches applied: the grabs' records carry both.
+    pub(crate) fn note_grabs_drawn(ids: &[u64], frame: u64, patch: u64) {
+        grabs_drawn(ids, Drawn { frame, patch });
     }
 
     /// Hand a finished PNG to whichever grab requests asked for it. Returns the
@@ -1733,6 +1772,7 @@ mod imp {
                     && info.w == geom.inner_size.x
                     && info.h == geom.inner_size.y
                     && info.dpi == geom.dpi_factor
+                    && info.pass_dpi == main_pass_dpi(cx, window_id)
                     && info.x == geom.position.x
                     && info.y == geom.position.y
             });
@@ -1749,11 +1789,17 @@ mod imp {
                     w: geom.inner_size.x,
                     h: geom.inner_size.y,
                     dpi: geom.dpi_factor,
+                    pass_dpi: main_pass_dpi(cx, window_id),
                     x: geom.position.x,
                     y: geom.position.y,
                 }
             })
             .collect();
+    }
+
+    /// The scale the window's main pass last rasterised at; 0 before it has one.
+    fn main_pass_dpi(cx: &Cx, window_id: WindowId) -> f64 {
+        cx.windows[window_id].main_pass_id.and_then(|pass| cx.passes[pass].dpi_factor).unwrap_or(0.0)
     }
 
     fn resolve_window(cx: &Cx, want: Option<usize>) -> Result<WindowId, String> {
@@ -1784,7 +1830,7 @@ mod imp {
                 let _ = tx.send(Reply::Conflict(conflict));
                 return;
             }
-            if Instant::now() >= request.deadline {
+            if request.deadline.expired() {
                 let _ = tx.send(Reply::Err("expired command was not applied".into()));
                 return;
             }
@@ -1923,8 +1969,9 @@ mod imp {
                                 let id = crate::event::hal_intake::hal_window_id(window_id);
                                 let native = cx.windows[window_id].layout_vec2d_to_native_points(dvec2(x, y));
                                 let deadline = request.deadline;
+                                let input_deadline = deadline.clone();
                                 makepad_hal::backend::apple::media::native_click(sid, id, native.x, native.y,
-                                    move || std::time::Instant::now() < deadline && activity::user_seq_now() == user_seq,
+                                    move || !input_deadline.expired() && activity::user_seq_now() == user_seq,
                                     move |result| match result {
                                         Ok(true) => { let _ = tx.send(Reply::Text("{\"ok\":1,\"native\":1}".into())); }
                                         Ok(false) => {
@@ -2153,6 +2200,11 @@ mod imp {
                 cancelled,
                 tx,
             } => {
+                // its frame shows every live patch installed before it was asked for, the ones
+                // whose wake the loop has not served yet too (a look right after a patch got the
+                // frame from before it, 11-04)
+                #[cfg(relax)]
+                cx.take_in_live_patches(true);
                 let window = match resolve_window(cx, window) {
                     Ok(window) => window,
                     Err(err) => {
@@ -2389,11 +2441,11 @@ mod imp {
                     let _ = tx.send(Reply::Err("no capture is running".into()));
                 }
             },
-            Cmd::PoolSummary(tx) => {
-                let _ = tx.send(Reply::Text(cx.task_pool_summary()));
-            }
             Cmd::ShaderConsts { shader, tx } => {
                 let _ = tx.send(Reply::Text(shader_consts_json(cx, shader)));
+            }
+            Cmd::GpuInventory { n, tx } => {
+                let _ = tx.send(Reply::Text(cx.gpu_inventory().report_json_lines(n)));
             }
             Cmd::ShaderConstPatch {
                 shader,
@@ -2504,7 +2556,7 @@ mod imp {
                     }
                 }
             }
-            Cmd::Quit(tx) => {
+            Cmd::Quit(tx) | Cmd::QuitForced(tx) => {
                 let line = "[makepad-remote] remote quit".to_string();
                 println!("{line}");
                 let _ = std::io::stdout().flush();
@@ -2850,15 +2902,10 @@ mod imp {
     }
 
     fn route_log(p: &Params) -> Answer {
-        // Asked before the ring is locked: the answer comes from the UI thread.
-        let pool = match ask(Cmd::PoolSummary, 2) {
-            Reply::Text(text) => text,
-            _ => String::new(),
-        };
-        Answer::Json(log_json(p, &pool))
+        Answer::Json(log_json(p))
     }
 
-    fn log_json(p: &Params, pool: &str) -> String {
+    fn log_json(p: &Params) -> String {
         let since = p.get(&["since"]).and_then(|v| v.parse::<u64>().ok());
         let count = p
             .get(&["n", "count", "tail"])
@@ -2871,7 +2918,7 @@ mod imp {
             Some(since) => crate::log_ring::read_since(since, usize::MAX),
             None => crate::log_ring::read_since(0, count),
         };
-        let mut out = format!("{{\"n\":{newest},\"pool\":{},\"l\":[", json_str(pool));
+        let mut out = format!("{{\"n\":{newest},\"l\":[");
         for (index, line) in lines.iter().enumerate() {
             if index > 0 {
                 out.push(',');
@@ -2972,6 +3019,33 @@ mod imp {
         }
 
         #[test]
+        fn platform_and_app_reject_unknown_parameters() {
+            for line in ["tools typo=1", "call service.tool typo=1"] {
+                let error = makepad_remote::app::app_request_of(line).unwrap().unwrap_err();
+                assert!(error.contains("unknown parameter") && error.contains("known:"), "{line}: {error}");
+            }
+            for command in ["status", "resize", "cap start", "tweak apply", "design insert", "input replay"] {
+                let answer = answered(command, &[("typo", "1")]);
+                assert!(answer.contains("unknown parameter") && answer.contains("typo") && answer.contains("known:"), "{command}: {answer}");
+            }
+            for line in ["status typo=1", r#"{"cmd":"resize","typo":1}"#, "settled typo=1"] {
+                let (bytes, _) = makepad_remote::cmd::answer(dispatch, line);
+                let answer = String::from_utf8(bytes).unwrap();
+                assert!(answer.contains("unknown parameter") && answer.contains("known:"), "{line}: {answer}");
+            }
+            assert!(makepad_remote::params::validate(["path", "splash", "if_user_seq"], makepad_remote::params::tweak("apply").unwrap()).is_ok());
+            let cross = answered("design state", &[("type", "View")]);
+            assert!(cross.contains("unknown parameter"), "{cross}");
+            let cross = answered("tweak op", &[("op", "state"), ("splash", "{}")]);
+            assert!(cross.contains("unknown parameter"), "{cross}");
+            register_app_query("parameter_test", "[limit=]", "parameter validation", |_| r#""limit":{"type":"integer"}"#, |_, _, _| panic!("invalid request reached the UI"));
+            let (bytes, _) = makepad_remote::cmd::answer(dispatch, "parameter_test typo=1");
+            let answer = String::from_utf8(bytes).unwrap();
+            APP_QUERIES.lock().unwrap().retain(|q| q.0 != "parameter_test");
+            assert!(answer.contains("unknown parameter") && answer.contains("known: limit, full"), "{answer}");
+        }
+
+        #[test]
         fn arguments_are_checked_before_the_ui_thread_is_asked() {
             assert!(answered("drop", &[]).contains("drop requires path="));
             assert!(answered("resize", &[("w", "0"), ("h", "10")]).contains("layout points"));
@@ -3006,7 +3080,9 @@ mod imp {
             }
             assert!(help.contains("\"tool\":\"ui.cap_start\""), "help names each command's tool");
             assert!(help.contains("\"cmd\":\"gpu top\""), "help lists the GPU ledger's commands");
-            assert!(run("frobnicate").contains("unknown command `frobnicate`"));
+            let unknown = run("frobnicate");
+            assert!(unknown.contains("unknown command `frobnicate`"), "{unknown}");
+            assert!(unknown.contains(", move, "), "{unknown}");
             assert!(run("grab").contains("client-side"));
             assert!(run("ping").contains("\"pid\""));
             // the words of a command arrive as positional words or inside a JSON `cmd`
@@ -3066,8 +3142,9 @@ mod imp {
     use crate::cx::Cx;
 
     pub type AppQueryFn = fn(&mut Cx, &[String], &[(String, String)]) -> Vec<String>;
+    pub type AppQueryParams = fn(&[String]) -> &'static str;
     /// No remote endpoint on the web: nothing asks.
-    pub fn register_app_query(_name: &'static str, _args: &'static str, _answers: &'static str, _f: AppQueryFn) {}
+    pub fn register_app_query(_name: &'static str, _args: &'static str, _answers: &'static str, _params: AppQueryParams, _f: AppQueryFn) {}
 
     pub(crate) fn note_user_event(_cx: &mut Cx, _event: &crate::event::Event) {}
     /// There is no remote bridge on these targets, so nothing ever asked for one.

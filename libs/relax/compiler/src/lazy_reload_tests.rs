@@ -194,6 +194,91 @@ fn gandalf_live_edit_guard_and_reporting() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A panic in the background checker stays in that check and is reported; the query it left
+/// unfinished is not poisoned, so the app's compile of the same body runs that query itself. If
+/// that panics too, it is this compile's own failure with its own message, and the app runs on.
+/// (One Windows run: the check of a Drop body panicked, the app's first call of that body failed
+/// with `typeck query: Poisoned`, parked, and the run's restart failed.)
+#[test]
+fn a_background_check_panic_leaves_the_query_to_the_apps_compile() {
+    // The checker's worker and its panic counters are process-global: each case has its process.
+    const CHILD: &str = "MAKEPAD_RUN_CHECK_PANIC_TEST";
+    let Ok(case) = std::env::var(CHILD) else {
+        for (case, panics_in) in [("check", "target:gandalf"), ("both", "target")] {
+            // (its own home: the injected panics are no record for this machine's ledger)
+            let home = std::env::temp_dir().join(format!("relax-check-panic-home-{}-{case}", std::process::id()));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "lazy_reload_tests::a_background_check_panic_leaves_the_query_to_the_apps_compile", "--nocapture", "--test-threads=1"])
+                .env(CHILD, case).env("MAKEPAD_RUN_TEST_TYPECK_PANIC", panics_in).env("MAKEPAD_RUN_PANIC_PARK", "0").env("MAKEPAD_HOME", &home)
+                .output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{case}: {}\n{stderr}", String::from_utf8_lossy(&output.stdout));
+            std::fs::remove_dir_all(&home).unwrap();
+            // the check's panic is on the run's log when it happens
+            assert!(stderr.contains("thread 'gandalf'") && stderr.contains("forced panic type-checking `target`"), "{case}: {stderr}");
+        }
+        return;
+    };
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-check-panic-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"check_panic\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n").unwrap();
+    let root = dir.join("lib.rs").to_string_lossy().into_owned();
+    std::fs::write(&root, "pub fn target(out: &mut u32) { *out = 11; }\npub fn other(out: &mut u32) { *out = 3; }\n").unwrap();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &root, "check_panic", false).unwrap();
+    let named = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (target, other) = (named("target"), named("other"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    crate::borrowck::event::set_app_scope(vec![crate::vfs::normalize_path(&root)]);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    // The check gets there first, as discovery does for a body the app has not called yet.
+    let (target_entry, other_entry) = crate::owner::call(crate::owner::Class::Program, || {
+        let (t, o) = (u.fn_id(crate::jit::FnKey::Inst(target, vec![])), u.fn_id(crate::jit::FnKey::Inst(other, vec![])));
+        u.note_first_borrowck(t, None);
+        (u.entry(t), u.entry(o))
+    });
+    let epoch = u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
+    // no wall-clock limit (as lazy_tests): a worker that never delivers hangs the test
+    let why = loop {
+        match crate::borrowck::lazy::verdict(u.front.checker_id, target, &[], epoch) {
+            crate::borrowck::lazy::FnVerdict::Unchecked(why) if why.starts_with("checker failure") => break why,
+            _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    };
+    assert!(why.contains("forced panic type-checking `target`"), "{why}");
+    assert_eq!(crate::borrowck::lazy::PANICS.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(crate::borrowck::lazy::PANIC_NOTES.lock().unwrap()[0].contains("target"));
+    // devhub's ledger gets it, naming the body and what panicked, with no hot load counted
+    let records: Vec<_> = std::fs::read_dir(makepad_remote::hot::outbox()).unwrap().map(|f| std::fs::read_to_string(f.unwrap().path()).unwrap()).collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = makepad_remote::hot::Record::parse(&records[0]).unwrap();
+    assert_eq!(record.outcome, makepad_remote::hot::Outcome::CheckerPanic);
+    assert_eq!(record.reason, "checker panic in `check_panic::target`: MAKEPAD_RUN_TEST_TYPECK_PANIC: forced panic type-checking `target`");
+    assert!(!record.outcome.failure());
+    // call_jit returns a recovery status, so the function's output comes back via its argument.
+    let call = |entry| {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.map(|_| result)
+    };
+    if case == "check" {
+        let result = call(target_entry).unwrap_or_else(|p| panic!("the app's compile of the checked body failed: {}", p.message));
+        assert_eq!(result, 11);
+    } else {
+        let failed = call(target_entry).expect_err("the provider panics on the app's thread as well");
+        assert!(failed.message.contains("internal compiler error") && failed.message.contains("forced panic type-checking `target`"), "{}", failed.message);
+    }
+    assert_eq!(call(other_entry).unwrap_or_else(|p| panic!("another body after it: {}", p.message)), 3);
+    // Like settle_tests: process exit owns the runtime worker/executable-memory teardown.
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// SPEC-V: a patch runs before its verdict as baseline code with `noalias` dropped; a rejected one
 /// is never promoted, is reported and reverts; a clean one is promoted with its `noalias` facts.
 #[test]
@@ -452,18 +537,14 @@ fn specv_aliased_call_from_unverified_body() {
 /// (the Sandbox's frame path: ~550 lazy installs in one 70-560 ms frame). Now they run their twins'
 /// code until their own builds (background) are installed: no lazy compile on the program thread.
 /// The verdicts are held (SPECV_HOLD) so the first run is unverified whatever the checker's speed;
-/// case `off` (MAKEPAD_RUN_SPECV_BORROW=0) is the old behaviour: the repro makes the lazy compiles.
 #[test]
 fn specv_verified_rebuild_runs_twin_code_not_lazy_compiles() {
     const CHILD: &str = "MAKEPAD_RUN_SPECV_BORROW_TEST";
     let Ok(case) = std::env::var(CHILD) else {
-        for case in ["borrow", "off"] {
+        for case in ["borrow"] {
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
             cmd.args(["--exact", "lazy_reload_tests::specv_verified_rebuild_runs_twin_code_not_lazy_compiles", "--nocapture", "--test-threads=1", "--format=terse"])
                 .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", "0");
-            if case == "off" {
-                cmd.env("MAKEPAD_RUN_SPECV_BORROW", "0");
-            }
             let output = cmd.output().unwrap();
             assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         }
@@ -533,15 +614,102 @@ fn specv_verified_rebuild_runs_twin_code_not_lazy_compiles() {
     let lazy0 = crate::jit::LAZY_FRONTS.load(Ordering::Relaxed);
     run("verified");
     let lazy = crate::jit::LAZY_FRONTS.load(Ordering::Relaxed) - lazy0;
-    if case == "off" {
-        assert!(lazy >= 1, "the old behaviour: the base slots compile on the calling thread");
-    } else {
-        assert_eq!(lazy, 0, "no lazy compile on the calling thread: mid runs its twin's code");
-        assert!(u.fns[mid as usize].borrowed || u.fns[mid as usize].compiled, "mid borrows its twin's code (or got its own build)");
-        // a patch-free rerun stays on code
-        run("again");
-        assert_eq!(crate::jit::LAZY_FRONTS.load(Ordering::Relaxed) - lazy0, 0);
+    assert_eq!(lazy, 0, "no lazy compile on the calling thread: mid runs its twin's code");
+    assert!(u.fns[mid as usize].borrowed || u.fns[mid as usize].compiled, "mid borrows its twin's code (or got its own build)");
+    // a patch-free rerun stays on code
+    run("again");
+    assert_eq!(crate::jit::LAZY_FRONTS.load(Ordering::Relaxed) - lazy0, 0);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// SPEC-V (lane JITLIVEO3): a twin runs in its base's place until the base's verdict is clean, so
+/// the base's own record and counters saw none of that run. The twin gets a counted build (its
+/// unverified baseline code is its code for good), and the base's O3 build takes the twin's counts,
+/// mapped onto its own blocks by source position. Before, a base reached O3 with static
+/// frequencies (the twin's heat thrown away) or waited for counts of its own.
+#[test]
+fn specv_base_o3_takes_its_twins_counts() {
+    const CHILD: &str = "MAKEPAD_RUN_SPECV_TWIN_PGO_TEST";
+    let Ok(case) = std::env::var(CHILD) else {
+        for case in ["twinpgo"] {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "lazy_reload_tests::specv_base_o3_takes_its_twins_counts", "--nocapture", "--test-threads=1", "--format=terse"])
+                .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", "0");
+            let output = cmd.output().unwrap();
+            assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+        return;
+    };
+    use std::sync::atomic::Ordering;
+    crate::jit::CHECK_FIRST.store(false, Ordering::Relaxed);
+    crate::jit::set_ahead_level(crate::options::AheadLevel::AotMax);
+    crate::jit::SPECV_HOLD.store(1, Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-specv-twinpgo-{}-{}", case, std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    // mid's loop runs 12 times a call, its `leaf` arm 4 of them
+    let src = "#[inline(never)] pub fn leaf(a: &mut u32, b: &u32) -> u32 { *a += *b; *a }\n\
+        #[inline(never)] pub fn mid(a: &mut u32, b: &u32) -> u32 { let mut s = 0u32; let mut i = 0u32; while i < 12 { if i % 3 == 0 { s = s.wrapping_add(leaf(a, b)); } else { s = s.wrapping_add(i); } i += 1; } s }\n\
+        pub fn root(out: &mut u32) { let mut x = 1u32; let y = 2u32; *out = mid(&mut x, &y); }\n";
+    std::fs::write(dir.join("app/src/lib.rs"), src).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "specv_twinpgo", false).unwrap();
+    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display(), crate::diag::quote(&app));
+    let roots = crate::reload::gandalf_app_roots(&crate::unitgraph::Units::from_json(graph.as_bytes()).unwrap(), dir.join("app").to_str().unwrap());
+    let find = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (leaf_def, mid_def, root_def) = (find("leaf"), find("mid"), find("root"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    crate::borrowck::event::set_app_scope(roots);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    crate::syms::set_unit(up);
+    let (leaf, mid, root, root_entry) = crate::owner::call(crate::owner::Class::Program, || {
+        let l = u.fn_id(crate::jit::FnKey::Inst(leaf_def, vec![]));
+        let m = u.fn_id(crate::jit::FnKey::Inst(mid_def, vec![]));
+        let r = u.fn_id(crate::jit::FnKey::Inst(root_def, vec![]));
+        (l, m, r, u.entry(r))
+    });
+    // x = 1 + 2k at the k-th leaf call: s = 3 + 5 + 7 + 9 + (1 + 2 + 4 + 5 + 7 + 8 + 10 + 11)
+    let run = || {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, root_entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        assert_eq!(result, 72);
+    };
+    // held verdicts: root's call runs mid's twin
+    run();
+    let twin = u.plain_twin_of(mid).expect("mid's twin");
+    assert!(u.fns[twin as usize].compiled && !u.fns[mid as usize].compiled, "the twin ran, the base never did");
+    // the twin's counted build: its unverified code is the twin's code for good
+    assert!(unsafe { crate::jit::counted_build(up, twin, false) }, "the twin gets a counted build");
+    const RUNS: u32 = 5;
+    for _ in 0..RUNS {
+        run();
     }
+    // the release: mid's verdict is clean, its own (verified) RIR differs from the twin's
+    crate::jit::specv_release();
+    let t0 = std::time::Instant::now();
+    loop {
+        crate::borrowck::settle().recv().unwrap();
+        if [leaf, mid, root].iter().all(|&i| u.verdict_clean(i)) { break; }
+        assert!(t0.elapsed().as_secs() < 20, "no clean verdicts");
+    }
+    assert!(u.refresh_verified(mid));
+    unsafe { crate::jit::build_normal(up, mid) }.unwrap();
+    let r = u.fns[mid as usize].rir.clone().expect("mid's RIR");
+    assert!(!r.baseline, "verified: mid's own RIR");
+    // its O3 input gets the twin's counts: the loop's blocks ran 12 per call, the leaf arm 4
+    let counts = u.pgo_counts_for(mid, &r).expect("the base's O3 build takes its twin's counts");
+    let top = counts.iter().copied().fold(0.0f32, f32::max);
+    assert!(top >= (12 * RUNS) as f32, "the loop's counts reach the base: {counts:?}\n{}", r.dump());
+    assert!(counts.iter().any(|&c| c >= (4 * RUNS) as f32 && c < (12 * RUNS) as f32), "the leaf arm ran a third of the loop: {counts:?}\n{}", r.dump());
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -680,7 +848,7 @@ fn gandalf_scope_uses_package_source_and_project_boundaries() {
 fn app_scope_live_layout_edits() {
     const CHILD: &str = "MAKEPAD_RUN_APP_LAYOUT_TEST";
     let Ok(case) = std::env::var(CHILD) else {
-        for case in ["app_lib", "path_crate", "framework", "embedded", "generic_embedded", "pointer", "bound_template", "bound_template_embedded"] {
+        for case in ["app_lib", "path_crate", "framework", "embedded", "generic_embedded", "pointer", "bound_template", "bound_template_embedded", "derive_default"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::app_scope_live_layout_edits", "--nocapture", "--test-threads=1"])
                 .env(CHILD, case).output().unwrap();
@@ -703,7 +871,9 @@ fn app_scope_live_layout_edits() {
         pub fn name(out: &mut &str) { *out = std::any::type_name::<State>(); }
     "#;
     std::fs::write(&path, before).unwrap();
-    let session = Arc::new(crate::Session::default());
+    let mut session = crate::Session::default();
+    if case == "derive_default" { session.options.live = true; }
+    let session = Arc::new(session);
     let (mut prog, core, lib) = crate::load_with_std(&session, path.to_str().unwrap(), "app_lib", false).unwrap();
     let cfg = crate::cfg::CfgSet::host(&session, &[]);
     let bin_path = dir.join("main.rs");
@@ -767,6 +937,23 @@ fn app_scope_live_layout_edits() {
     let name = entry(&mut u, name);
     let layout = u.layout_of(ty).clone();
     assert_eq!(layout.ext.is_some(), case != "framework");
+    if case == "derive_default" {
+        let after = before.replace("pub value: u64 }", "pub value: u64, #[rust(make(vm))] pub later: u64 }")
+            .replace("State { value: 41 }", "State { value: 41, later: 5 }")
+            + "\nfn make(_: u32) -> u64 { 5 }\n";
+        let restart = unsafe { reload::apply(up, vec![Edit { file: u.prog.def(state).file, path: path.to_string_lossy().into_owned(), src: after.as_bytes().to_vec() }]) };
+        assert_eq!(restart.rung, Rung::Restart, "{:?}", restart.lines);
+        assert!(restart.lines.iter().any(|l| l.contains("#[rust(..)]") && l.contains("restart the app")), "{:?}", restart.lines);
+        let after = after.replace("make(vm)", "make(3)");
+        let patch = unsafe { reload::apply(up, vec![Edit { file: u.prog.def(state).file, path: path.to_string_lossy().into_owned(), src: after.as_bytes().to_vec() }]) };
+        assert_eq!(patch.rung, Rung::Patch, "{:?}", patch.lines);
+        let after = after + "\npub struct Fresh { #[rust(make(vm))] pub n: u64 }\n";
+        let patch = unsafe { reload::apply(up, vec![Edit { file: u.prog.def(state).file, path: path.to_string_lossy().into_owned(), src: after.into_bytes() }]) };
+        assert_eq!(patch.rung, Rung::Patch, "{:?}", patch.lines);
+        std::mem::forget(u);
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    }
     let mut old_value = vec![0u64; (layout.size as usize + 7) / 8];
     let call = |entry, arg| unsafe { jit::call_jit(up, entry, arg) }.unwrap_or_else(|p| panic!("JIT: {}", p.message));
     call(init, old_value.as_mut_ptr() as u64);
@@ -845,7 +1032,7 @@ fn gandalf_carry_keeps_only_crates_that_cannot_see_the_edit() {
     assert!(gandalf_keeps(&p, &visible, def("h")), "a crate that cannot see the edit keeps its verdicts");
     let plan_of = |src: &str| {
         let v = p.parse_snapshot(file, &a_path).parse(src.as_bytes().to_vec()).unwrap();
-        classify(&p, file, &v.pf, &a_path)
+        classify(&p, file, &v.pf, &a_path, &Default::default())
     };
     let body = plan_of(&a_src.replace("{ 1 }", "{ 7 }")).unwrap();
     assert!(gandalf_carries(&body.changes, [&body].into_iter()), "a body edit carries");
@@ -878,9 +1065,14 @@ fn restored_images_take_live_edits() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"restored\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
     let path = dir.join("src/lib.rs").to_string_lossy().into_owned();
-    std::fs::write(&path, "pub struct S { pub a: u32 }\nimpl S { pub fn get(&self) -> u32 { self.a } }\npub fn value(out: &mut u32) { *out = S { a: 11 }.get(); }\n").unwrap();
+    // (a `global_asm!` block: a restore runs no collection, so the image must carry it -- a warm
+    // run of a crate with one could not resolve the labels it defines)
+    const ASM: &str = "std::arch::global_asm!(\".p2align 2\", \"restored_asm_label:\", \"  ret\");\n";
+    const W0: &str = "pub struct W<T>(pub T);\nimpl<T> W<T> { pub fn gone(&self) -> usize { std::mem::size_of::<T>() } pub fn kept(&self) {} }\n";
+    std::fs::write(&path, format!("pub struct S {{ pub a: u32 }}\nimpl S {{ pub fn get(&self) -> u32 {{ self.a }} }}\npub fn value(out: &mut u32) {{ *out = S {{ a: 11 }}.get(); }}\n{W0}{ASM}")).unwrap();
     let session = Arc::new(crate::Session::default());
     let (mut prog, core, app) = crate::load_with_std(&session, &path, "restored", false).unwrap();
+    assert!(prog.global_asms.iter().any(|g| prog.file_crate[g.0 as usize] == app), "the app's global_asm! block is collected");
     let mut tcx = crate::tcx::Tcx::new();
     tcx.collect(&prog);
     // the store hands out 8-byte aligned payloads
@@ -898,6 +1090,7 @@ fn restored_images_take_live_edits() {
     let restored_tcx = crate::tcx::Tcx::restore_collected(types, restored.files.len(), restored.crates.len()).expect("Tcx restore");
     assert_eq!(restored.defs.len(), prog.defs.len());
     assert!(restored.syms.names().eq(prog.syms.names()));
+    assert_eq!(restored.global_asms, prog.global_asms);
     let def = restored.defs.iter().enumerate().find_map(|(i, d)| {
         let id = crate::program::DefId(i as u32);
         (d.krate == app && restored.name(id) == "value").then_some(id)
@@ -917,15 +1110,880 @@ fn restored_images_take_live_edits() {
     };
     run(11);
     let edit = |src: &str| unsafe {
-        crate::reload::apply(up, vec![crate::reload::Edit { file: (*up).prog.def(def).file, path: path.clone(), src: src.as_bytes().to_vec() }])
+        crate::reload::apply(up, vec![crate::reload::Edit { file: (*up).prog.def(def).file, path: path.clone(), src: format!("{src}{ASM}").into_bytes() }])
     };
-    let body = edit("pub struct S { pub a: u32 }\nimpl S { pub fn get(&self) -> u32 { self.a + 1 } }\npub fn value(out: &mut u32) { *out = S { a: 22 }.get(); }\n");
+    // the restored image's first edit removes a method from a generic impl and adds items ahead of
+    // it: the def of `gone` stays in the version before (no definition collection recorded its
+    // calls since the restore, so the legacy-call pass walks it), its impl's moves on, and the pass
+    // reads the impl's generics in `gone`'s own version -- not at the new version's item number,
+    // outside that tree (an internal compiler error)
+    let w1: String = (0..16).map(|i| format!("pub fn more{i}() {{}}\n")).collect::<String>() + "pub struct W<T>(pub T);\nimpl<T> W<T> { pub fn kept(&self) {} }\n";
+    let removed = edit(&format!("pub struct S {{ pub a: u32 }}\nimpl S {{ pub fn get(&self) -> u32 {{ self.a }} }}\npub fn value(out: &mut u32) {{ *out = S {{ a: 11 }}.get(); }}\n{w1}"));
+    assert!(removed.failure.is_none(), "{:?}", removed.lines);
+    assert_eq!(removed.rung, crate::reload::Rung::Patch, "{:?}", removed.lines);
+    run(11);
+    let body = edit(&format!("pub struct S {{ pub a: u32 }}\nimpl S {{ pub fn get(&self) -> u32 {{ self.a + 1 }} }}\npub fn value(out: &mut u32) {{ *out = S {{ a: 22 }}.get(); }}\n{w1}"));
     assert_eq!(body.rung, crate::reload::Rung::Patch, "{:?}", body.lines);
     run(23);
-    let added = edit("pub struct S { pub a: u32 }\nimpl S { pub fn get(&self) -> u32 { self.a + extra() } }\npub fn extra() -> u32 { 9 }\npub fn value(out: &mut u32) { *out = S { a: 22 }.get(); }\n");
+    const S2: &str = "pub struct S { pub a: u32 }\nimpl S { pub fn get(&self) -> u32 { self.a + extra() } }\npub fn extra() -> u32 { 9 }\npub fn value(out: &mut u32) { *out = S { a: 22 }.get(); }\n";
+    let added = edit(&format!("{S2}{w1}"));
     assert_eq!(added.rung, crate::reload::Rung::Patch, "{:?}", added.lines);
     run(31);
     // Like settle_tests: process exit owns the runtime worker/executable-memory teardown.
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// std::relax::realtime for arming a machine (the Fab arms experiment): `compiled` is the strict ready (the whole
+/// reach compiled, never "the wait ran out"), `lazy` counts what would still compile on a call, and
+/// an armed root freezes live edits of real-time code (refused "frozen", applied at the disarm)
+/// while edits of other code patch as usual.
+#[test]
+fn realtime_strict_ready_lazy_and_patch_freeze() {
+    const CHILD: &str = "MAKEPAD_RUN_RT_FREEZE_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::realtime_strict_ready_lazy_and_patch_freeze", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use crate::reload::{apply, Edit, Rung};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-rt-freeze-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    let src = |gain: u32, other: u32| format!("pub fn value(out: &mut u32) {{ *out = gain(); }}\n#[inline(never)]\npub fn gain() -> u32 {{ {gain} }}\npub fn other(out: &mut u32) {{ *out = {other}; }}\n");
+    std::fs::write(dir.join("app/src/lib.rs"), src(11, 5)).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_freeze_app", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (value, other) = (def("value"), def("other"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let (root, value_entry, other_entry) = crate::owner::call(crate::owner::Class::Program, || {
+        let root = u.fn_id(crate::jit::FnKey::Inst(value, vec![]));
+        let o = u.fn_id(crate::jit::FnKey::Inst(other, vec![]));
+        (root, u.entry(root), u.entry(o))
+    });
+    let run = |entry| {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        result
+    };
+    // the strict ready: false (lazy > 0) until the reach is compiled, then true with nothing lazy
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
+    loop {
+        // (in this order: the reach finishing between the two reads is no failure)
+        let lazy = crate::jit::__relax_realtime_lazy(ticket);
+        if crate::jit::__relax_realtime_compiled(ticket) {
+            break;
+        }
+        assert!(lazy > 0, "not compiled, yet nothing lazy");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(crate::jit::__relax_realtime_lazy(ticket), 0, "compiled with lazy fns left");
+    assert_eq!(run(value_entry), 11);
+    let file = u.prog.def(value).file;
+    let edit = |text: String| unsafe { apply(up, vec![Edit { file, path: app.clone(), src: text.into_bytes() }]) };
+    // armed: an edit of real-time code (`gain`, which `value` calls) is held, nothing installs
+    crate::jit::__relax_realtime_arm(true);
+    let o = edit(src(12, 5));
+    assert_eq!(o.rung, Rung::Refuse, "an armed root's code was patched: {:?}", o.lines);
+    assert!(o.lines.iter().any(|l| l.starts_with("frozen:") && l.contains("gain")), "{:?}", o.lines);
+    assert_eq!(run(value_entry), 11, "the frozen edit changed real-time code");
+    // ... an edit of other code patches as usual
+    let o = edit(src(11, 6));
+    assert_eq!(o.rung, Rung::Patch, "an edit of non-real-time code was held: {:?}", o.lines);
+    assert_eq!(run(other_entry), 6);
+    // disarmed: the held edit applies
+    crate::jit::__relax_realtime_arm(false);
+    let o = edit(src(12, 6));
+    assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
+    assert_eq!(run(value_entry), 12);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// std::relax::realtime_thread marks the calling thread only, for good: is_realtime_thread
+/// (what counts a lazy compile in realtime_misses) answers so there, not on other threads.
+#[test]
+fn realtime_thread_marks_the_calling_thread() {
+    let marked = std::thread::spawn(|| {
+        let before = crate::jit::is_realtime_thread();
+        crate::jit::__relax_realtime_thread();
+        (before, crate::jit::is_realtime_thread())
+    }).join().unwrap();
+    assert_eq!(marked, (false, true));
+    assert!(!std::thread::spawn(crate::jit::is_realtime_thread).join().unwrap(), "another thread is not marked");
+}
+
+/// A Fab arms run's hole: the marked root calls through `dyn Route` (its value holds no trait object),
+/// and other code makes the first `Box<Ded> -> Box<dyn Route>` after the mark, and a second type's
+/// after the reach is done. The root's lowering names the trait object it calls through, so the
+/// reach follows its vtables: the strict ready is false the moment a new one is made (polled
+/// right after the unsizing code ran), true once its methods are compiled, and the real-time
+/// thread then meets no lazy compile.
+#[test]
+fn realtime_reach_follows_vtables_made_after_the_mark() {
+    const CHILD: &str = "MAKEPAD_RUN_RT_DYN_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::realtime_reach_follows_vtables_made_after_the_mark", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-rt-dyn-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(dir.join("app/src/lib.rs"), "pub trait Route { fn next(&mut self) -> u32; }\n\
+        pub struct Ded(pub u32);\n\
+        impl Route for Ded { fn next(&mut self) -> u32 { self.0 += 3; self.0 } }\n\
+        pub struct Arc2(pub u32);\n\
+        impl Route for Arc2 { fn next(&mut self) -> u32 { self.0 * 7 } }\n\
+        #[repr(C)]\n\
+        pub struct Cell { pub route: Option<Box<dyn Route>>, pub out: u32 }\n\
+        pub fn run(c: &mut Cell) { if let Some(r) = c.route.as_mut() { c.out = r.next(); } }\n\
+        pub fn start(c: &mut Cell) { c.route = Some(Box::new(Ded(1))); }\n\
+        pub fn switch(c: &mut Cell) { c.route = Some(Box::new(Arc2(6))); }\n").unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_dyn_app", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (run_d, start_d, switch_d) = (def("run"), def("start"), def("switch"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let upn = up as usize;
+    let (root, [run_e, start_e, switch_e]) = crate::owner::call(crate::owner::Class::Program, || {
+        let ids = [run_d, start_d, switch_d].map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
+        (ids[0], ids.map(|id| u.entry(id)))
+    });
+    // the Cell (#[repr(C)]: the Option<Box<dyn Route>> as data and vtable words, then `out`), None
+    let mut cell = [0u64; 3];
+    let cp = cell.as_mut_ptr() as u64;
+    let call = |entry: u64| unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, entry, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    // `run` on a real-time thread: its result and the lazy compiles it met
+    let run_rt = move |cp: u64| std::thread::spawn(move || {
+        crate::jit::__relax_realtime_thread();
+        let before = crate::jit::__relax_realtime_misses();
+        unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        (unsafe { *((cp + 16) as *const u32) }, crate::jit::__relax_realtime_misses() - before)
+    }).join().unwrap();
+    // the method `next` of the vtable the cell holds now (its second word): compiled?
+    let next_built = || crate::owner::call(crate::owner::Class::Program, || {
+        let vtable = unsafe { *((cp + 8) as *const u64) };
+        let id = u.thunk_slot(unsafe { *((vtable + 24) as *const u64) });
+        id.is_some_and(|id| u.fns[id as usize].compiled)
+    });
+    let compiled = |t| crate::jit::__relax_realtime_compiled(t);
+    let wait = |t| {
+        for _ in 0..5000 {
+            if compiled(t) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("the real-time reach was not compiled in 10 s");
+    };
+    // the mark, then at once the first unsizing (a Fab arms run's order), polled right after it ran
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
+    call(start_e);
+    assert!(!compiled(ticket) || next_built(), "compiled right after the first `Box<Ded> -> Box<dyn Route>`, with `<Ded as Route>::next` lazy");
+    wait(ticket);
+    assert!(next_built(), "compiled, with `<Ded as Route>::next` lazy");
+    assert_eq!(run_rt(cp), (4, 0), "the real-time thread met a lazy compile");
+    // a second type's vtable, made after the reach is done: false at once, until it is compiled
+    call(switch_e);
+    assert!(!compiled(ticket) || next_built(), "compiled right after the first `Box<Arc2> -> Box<dyn Route>`, with `<Arc2 as Route>::next` lazy");
+    wait(ticket);
+    assert_eq!(run_rt(cp), (42, 0), "the real-time thread met a lazy compile");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The reach follows the trait objects its root is handed however deep they are held: the root's
+/// `&mut Cell` holds a `Vec<Stage>`, each stage a `Box<dyn Route>` (in a struct, in a vector's
+/// buffer behind its raw pointer). Other code makes the vtable after the mark; the real-time
+/// thread meets no lazy compile.
+#[test]
+fn realtime_reach_follows_trait_objects_held_deep_in_the_roots_value() {
+    const CHILD: &str = "MAKEPAD_RUN_RT_DEEP_DYN_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::realtime_reach_follows_trait_objects_held_deep_in_the_roots_value", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-rt-deep-dyn-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(dir.join("app/src/lib.rs"), "pub trait Route { fn next(&mut self) -> u32; }\n\
+        pub struct Ded(pub u32);\n\
+        impl Route for Ded { fn next(&mut self) -> u32 { self.0 += 3; self.0 } }\n\
+        pub struct Stage { pub k: u32, pub route: Box<dyn Route> }\n\
+        #[repr(C)]\n\
+        pub struct Cell { pub out: u32, pub stages: Vec<Stage> }\n\
+        pub fn run(c: &mut Cell) { let mut n = 0; for s in c.stages.iter_mut() { n += s.k * s.route.next(); } c.out = n; }\n\
+        pub fn start(c: &mut Cell) { unsafe { std::ptr::write(&mut c.stages, vec![Stage { k: 2, route: Box::new(Ded(1)) }]) } }\n").unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_deep_dyn_app", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (run_d, start_d) = (def("run"), def("start"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let upn = up as usize;
+    let (root, [run_e, start_e]) = crate::owner::call(crate::owner::Class::Program, || {
+        let ids = [run_d, start_d].map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
+        (ids[0], ids.map(|id| u.entry(id)))
+    });
+    // the Cell (#[repr(C)]: `out`, then the Vec's words)
+    let mut cell = [0u64; 8];
+    let cp = cell.as_mut_ptr() as u64;
+    // the mark, then the first `Box<Ded> -> Box<dyn Route>` (made by other code, after it)
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
+    unsafe { crate::jit::call_jit(up, start_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    for _ in 0..5000 {
+        if crate::jit::__relax_realtime_compiled(ticket) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(crate::jit::__relax_realtime_compiled(ticket), "the real-time reach was not compiled in 10 s");
+    let (out, misses) = std::thread::spawn(move || {
+        crate::jit::__relax_realtime_thread();
+        let before = crate::jit::__relax_realtime_misses();
+        unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        (unsafe { *(cp as *const u32) }, crate::jit::__relax_realtime_misses() - before)
+    }).join().unwrap();
+    assert_eq!((out, misses), (8, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The fast bucket's red Sandbox present (`<ScriptErrorRecord as Debug>` built ahead, not provided):
+/// the reach followed every vtable of every trait-object type real-time code calls through, and
+/// std's own are the whole program (a formatter's `dyn Write`, derived Debug's `dyn Debug`, a
+/// `Once`'s `dyn FnMut`, a table's hasher, a thread's `dyn FnOnce`). Here the root passes its own
+/// closure as `&mut dyn FnMut(u32)`, and other code made a `Box<dyn FnMut(u32)>` of another
+/// closure before the mark: that closure is no real-time code (its callee stays out of the reach),
+/// and the real-time thread still meets no lazy compile.
+#[test]
+fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
+    const CHILD: &str = "MAKEPAD_RUN_RT_OWN_DYN_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::realtime_reach_skips_trait_objects_it_only_makes_itself", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-rt-own-dyn-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(dir.join("app/src/lib.rs"), "#[inline(never)]\n\
+        pub fn each(f: &mut dyn FnMut(u32), n: u32) { for i in 0..n { f(i) } }\n\
+        #[inline(never)]\n\
+        pub fn helper(i: u32) -> u32 { i * 9 }\n\
+        #[repr(C)]\n\
+        pub struct Cell { pub out: u32 }\n\
+        pub fn run(c: &mut Cell) { let mut s = 0; each(&mut |i| s += i, 4); c.out = s; }\n\
+        pub fn make(c: &mut Cell) { let f: Box<dyn FnMut(u32)> = Box::new(|i| { c_out(helper(i)); }); c.out = 1; std::mem::forget(f); }\n\
+        #[inline(never)]\n\
+        pub fn c_out(_: u32) {}\n").unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_own_dyn_app", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (run_d, make_d, helper_d) = (def("run"), def("make"), def("helper"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let upn = up as usize;
+    let (root, run_e, make_e, helper) = crate::owner::call(crate::owner::Class::Program, || {
+        let [r, m, h] = [run_d, make_d, helper_d].map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
+        (r, u.entry(r), u.entry(m), h)
+    });
+    let mut cell = [0u32];
+    let cp = cell.as_mut_ptr() as u64;
+    // the other closure's `Box<dyn FnMut(u32)>`: its vtable exists before the mark
+    unsafe { crate::jit::call_jit(up, make_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    assert_eq!(cell[0], 1);
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
+    for _ in 0..5000 {
+        if crate::jit::__relax_realtime_compiled(ticket) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(crate::jit::__relax_realtime_compiled(ticket), "the real-time reach was not compiled in 10 s");
+    assert!(!crate::jit::realtime_reached(helper), "the reach took in `helper`, which only a closure of other code calls (every vtable of `dyn FnMut(u32)` followed)");
+    let (out, misses) = std::thread::spawn(move || {
+        crate::jit::__relax_realtime_thread();
+        let before = crate::jit::__relax_realtime_misses();
+        unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        (unsafe { *(cp as *const u32) }, crate::jit::__relax_realtime_misses() - before)
+    }).join().unwrap();
+    assert_eq!((out, misses), (6, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A Fab run's misses on a node (24 lazy compiles on the real-time thread, drop glue of generic
+/// containers and core::fmt's float path): code ran before the mark (the planner's simulation), so
+/// the reach found slots compiled already whose RIR was dropped after their install. A drop glue's
+/// references were never read again (only fns' RIR was rebuilt), and with a disk cache a lookup
+/// that missed left the last entry's references in place. Here `warm` compiles `take` and the drop
+/// glue of `Option<Item>` (dropping `None`: the glue of `Item`, its `Vec` and its `Weak` stay
+/// lazy) and formats an integer; the marked `run` drops a `Some` and formats a float.
+#[test]
+fn realtime_reach_walks_code_that_ran_before_the_mark() {
+    const CHILD: &str = "MAKEPAD_RUN_RT_WARM_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::realtime_reach_walks_code_that_ran_before_the_mark", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-rt-warm-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(dir.join("app/src/lib.rs"), "use std::rc::{Rc, Weak};\n\
+        pub struct Item(pub Vec<u32>, pub Weak<u32>);\n\
+        #[inline(never)]\n\
+        pub fn take(o: Option<Item>) -> u32 { match &o { Some(i) => i.0.len() as u32, None => 0 } }\n\
+        #[repr(C)]\n\
+        pub struct Cell { pub x: u32, pub out: u32 }\n\
+        pub fn warm(c: &mut Cell) { c.out = take(None) + format!(\"{}\", c.x).len() as u32; }\n\
+        pub fn run(c: &mut Cell) {\n\
+            let rc = Rc::new(c.x);\n\
+            let n = take(Some(Item(vec![c.x, 2, 3], Rc::downgrade(&rc))));\n\
+            let s = format!(\"{:.3}\", c.x as f64 * 1.5);\n\
+            c.out = n + s.len() as u32;\n\
+        }\n").unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_warm_app", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (run_d, warm_d) = (def("run"), def("warm"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let upn = up as usize;
+    let (root, [run_e, warm_e]) = crate::owner::call(crate::owner::Class::Program, || {
+        let ids = [run_d, warm_d].map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
+        (ids[0], ids.map(|id| u.entry(id)))
+    });
+    let mut cell = [2u32, 0];
+    let cp = cell.as_mut_ptr() as u64;
+    // what ran before the mark
+    unsafe { crate::jit::call_jit(up, warm_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    assert_eq!(cell[1], 1);
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
+    for _ in 0..5000 {
+        if crate::jit::__relax_realtime_compiled(ticket) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(crate::jit::__relax_realtime_compiled(ticket), "the real-time reach was not compiled in 10 s");
+    let (out, misses) = std::thread::spawn(move || {
+        crate::jit::__relax_realtime_thread();
+        let before = crate::jit::__relax_realtime_misses();
+        unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        (unsafe { *((cp + 4) as *const u32) }, crate::jit::__relax_realtime_misses() - before)
+    }).join().unwrap();
+    assert_eq!((out, misses), (3 + 5, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// What a Fab run's misses on a node were, on a cold store: the marked root formats floats
+/// (core::fmt's float path is reached through the formatter fn pointer an `Argument` holds, data the
+/// reach reads) and drops containers (`Vec`, `vec::IntoIter`, `array::IntoIter`, `Weak`: drop glue
+/// of generic types). Nothing else ran before the mark: the reach alone compiles them, and the
+/// real-time thread meets no lazy compile (the narrowed trait-object reach keeps this).
+#[test]
+fn realtime_reach_covers_float_formatting_and_container_drops() {
+    const CHILD: &str = "MAKEPAD_RUN_RT_FMT_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::realtime_reach_covers_float_formatting_and_container_drops", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-rt-fmt-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(dir.join("app/src/lib.rs"), "use std::rc::Rc;\n\
+        #[repr(C)]\n\
+        pub struct Cell { pub x: u32, pub out: u32 }\n\
+        pub fn run(c: &mut Cell) {\n\
+            let s = format!(\"{:.3} {}\", c.x as f64 * 1.5, c.x as f32 / 3.0);\n\
+            let v: Vec<u32> = vec![c.x, 2, 3];\n\
+            let mut n = 0;\n\
+            for a in v.clone().into_iter() { n += a; }\n\
+            for a in [c.x, 7] { n += a; }\n\
+            let rc = Rc::new(c.x);\n\
+            let w = Rc::downgrade(&rc);\n\
+            drop(rc);\n\
+            drop(w);\n\
+            drop(v);\n\
+            c.out = s.len() as u32 + n;\n\
+        }\n").unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_fmt_app", false).unwrap();
+    let run_d = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == "run").then_some(id)
+    }).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let upn = up as usize;
+    let (root, run_e) = crate::owner::call(crate::owner::Class::Program, || {
+        let id = u.fn_id(crate::jit::FnKey::Inst(run_d, vec![]));
+        (id, u.entry(id))
+    });
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
+    for _ in 0..5000 {
+        if crate::jit::__relax_realtime_compiled(ticket) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(crate::jit::__relax_realtime_compiled(ticket), "the real-time reach was not compiled in 10 s");
+    let mut cell = [2u32, 0];
+    let cp = cell.as_mut_ptr() as u64;
+    let (out, misses) = std::thread::spawn(move || {
+        crate::jit::__relax_realtime_thread();
+        let before = crate::jit::__relax_realtime_misses();
+        unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        (unsafe { *((cp + 4) as *const u32) }, crate::jit::__relax_realtime_misses() - before)
+    }).join().unwrap();
+    let want = format!("{:.3} {}", 2f64 * 1.5, 2f32 / 3.0).len() as u32 + (2 + 2 + 3) + (2 + 7);
+    assert_eq!((out, misses), (want, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Fab's live edit on a node (ICEs "key in collected table", "variance declaration"): a new module
+/// file whose structs (a `#[cfg(relax)]` field of a std type among them) an existing struct holds
+/// in `Option` fields, filled through `get_or_insert_with`. The edit patches, the new code runs.
+#[test]
+fn live_new_module_types_edit() {
+    const CHILD: &str = "MAKEPAD_RUN_NEW_MODULE_EDIT_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::live_new_module_types_edit", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use crate::reload::{apply, Edit, Rung};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-new-module-edit-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    let v1 = r#"pub struct App { pub n: u32 }
+impl App { pub fn step(&mut self) -> u32 { self.n += 1; self.n } }
+pub fn value(out: &mut u32) {
+    let mut a = App { n: 10 };
+    *out = a.step();
+}
+"#;
+    let v2 = r#"pub mod extra;
+pub struct App { pub n: u32, pub rt: Option<extra::RtPath>, pub armed: Option<extra::RtArmed> }
+impl App {
+    pub fn step(&mut self) -> u32 {
+        let rt = self.rt.get_or_insert_with(|| extra::RtPath::mark(Some(wake)));
+        match rt.arm_for(extra::Mode::Real) {
+            Ok(armed) => self.armed = armed,
+            Err(_) => return 0,
+        }
+        self.n += rt.lazy() + 10 + self.armed.is_some() as u32;
+        self.n
+    }
+}
+extern "C" fn wake() {}
+pub fn value(out: &mut u32) {
+    let mut a = App { n: 10, rt: None, armed: None };
+    *out = a.step();
+}
+"#;
+    let extra = r#"pub enum Mode { Sim, Real }
+pub struct RtPath {
+    #[cfg(relax)]
+    ticket: u64,
+    wake: Option<extern "C" fn()>,
+}
+pub struct RtArmed {
+    #[cfg(relax)]
+    _guard: Vec<u8>,
+}
+impl RtPath {
+    pub fn mark(wake: Option<extern "C" fn()>) -> RtPath {
+        #[cfg(relax)]
+        { RtPath { ticket: 1, wake } }
+        #[cfg(not(relax))]
+        { RtPath { wake } }
+    }
+    pub fn lazy(&self) -> u32 { if self.wake.is_some() { 0 } else { 1 } }
+    pub fn arm(&self) -> Option<RtArmed> {
+        #[cfg(relax)]
+        { Some(RtArmed { _guard: vec![self.ticket as u8] }) }
+        #[cfg(not(relax))]
+        { Some(RtArmed {}) }
+    }
+    pub fn arm_for(&self, mode: Mode) -> Result<Option<RtArmed>, String> {
+        match mode {
+            Mode::Sim => Ok(None),
+            Mode::Real => self.arm().map(Some).ok_or_else(|| format!("{} lazy", self.lazy())),
+        }
+    }
+}
+"#;
+    std::fs::write(dir.join("app/src/lib.rs"), v1).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "new_module_edit_app", false).unwrap();
+    // a live session of this app (its structs take field edits in place)
+    crate::borrowck::event::set_app_scope(vec![app.clone()]);
+    crate::layout::set_root_crate(app_crate);
+    crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
+    let value = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == "value").then_some(id)
+    }).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let entry = crate::owner::call(crate::owner::Class::Program, || { let f = u.fn_id(crate::jit::FnKey::Inst(value, vec![])); u.entry(f) });
+    let run = || {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        result
+    };
+    assert_eq!(run(), 11);
+    let file = u.prog.def(value).file;
+    std::fs::write(dir.join("app/src/extra.rs"), extra).unwrap();
+    let o = unsafe { apply(up, vec![Edit { file, path: app.clone(), src: v2.as_bytes().to_vec() }]) };
+    assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
+    assert_eq!(run(), 21);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A live edit that renames a struct field finds the fns using it from the field uses typeck
+/// resolved. A generic fn whose body names the old field's name (`window`'s local `plans`, fab
+/// slice's `FieldPlans::window`) is read as typeck left it: instantiating it at its own
+/// parameters for codegen has no answer (`<impl IntoIterator as IntoIterator>::IntoIter`), and
+/// the edit failed as an internal compiler error (NoSolution).
+#[test]
+fn a_renamed_field_reads_generic_fns_as_typeck_left_them() {
+    const CHILD: &str = "MAKEPAD_RUN_RENAMED_FIELD_EDIT_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::a_renamed_field_reads_generic_fns_as_typeck_left_them", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use crate::reload::{apply, Edit, Rung};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-renamed-field-edit-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    let v1 = r#"pub struct Boundary { pub plans: bool }
+pub fn window(layers: impl IntoIterator<Item = u32>) -> u32 {
+    let mut plans = 0;
+    for l in layers { plans += l; }
+    plans
+}
+pub fn value(out: &mut u32) {
+    let b = Boundary { plans: true };
+    *out = if b.plans { window([1u32, 2, 3]) } else { 0 };
+}
+"#;
+    let v2 = v1.replace("pub plans: bool", "pub ready: bool").replace("Boundary { plans: true }", "Boundary { ready: true }")
+        .replace("if b.plans { window([1u32, 2, 3]) }", "if b.ready { window([1u32, 2, 3]) + 10 }");
+    std::fs::write(dir.join("app/src/lib.rs"), v1).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "renamed_field_edit_app", false).unwrap();
+    crate::borrowck::event::set_app_scope(vec![app.clone()]);
+    crate::layout::set_root_crate(app_crate);
+    crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
+    let value = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == "value").then_some(id)
+    }).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let entry = crate::owner::call(crate::owner::Class::Program, || { let f = u.fn_id(crate::jit::FnKey::Inst(value, vec![])); u.entry(f) });
+    let run = || {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        result
+    };
+    assert_eq!(run(), 6);
+    let file = u.prog.def(value).file;
+    let o = unsafe { apply(up, vec![Edit { file, path: app.clone(), src: v2.into_bytes() }]) };
+    assert!(o.failure.is_none() && o.rung == Rung::Patch, "{:?}", o.lines);
+    assert_eq!(run(), 16);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `--lib` tests of a package whose dev-dependency depends back on it (M50): the harness crate
+/// and the plain library the dependency links are two crates of one file. A live edit of that
+/// file patches both, so a call through the dependency runs the new body too.
+#[test]
+fn a_live_edit_reaches_both_crates_of_a_lib_test_root() {
+    const CHILD: &str = "MAKEPAD_RUN_TWIN_CRATE_EDIT_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::a_live_edit_reaches_both_crates_of_a_lib_test_root", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use crate::reload::{apply, Edit, Rung};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-twin-crate-edit-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("twinlib/src")).unwrap();
+    std::fs::create_dir_all(dir.join("twinuser/src")).unwrap();
+    let v1 = "pub fn f() -> u32 { 1 }\n#[cfg(test)]\npub fn value(out: &mut u32) { *out = f() * 100 + twinuser::through(); }\n";
+    std::fs::write(dir.join("twinlib/src/lib.rs"), v1).unwrap();
+    std::fs::write(dir.join("twinuser/src/lib.rs"), "pub fn through() -> u32 { twinlib::f() }\n").unwrap();
+    let lib = dir.join("twinlib/src/lib.rs").to_string_lossy().into_owned();
+    let user = dir.join("twinuser/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    crate::pmhost::install();
+    let mut prog = Program::new(&session);
+    let (core, std_deps) = crate::load_std_crates(&session, &mut prog).unwrap();
+    let plain = prog.load_crate_deferred("twinlib", &lib, 2021, crate::program_cfg(&session, &[]), std_deps.clone()).unwrap();
+    let mut deps = std_deps.clone();
+    deps.push((prog.syms.intern("twinlib"), plain));
+    let through = prog.load_crate_deferred("twinuser", &user, 2021, crate::program_cfg(&session, &[]), deps).unwrap();
+    let mut cfg = crate::program_cfg(&session, &[]);
+    cfg.set.push("test".to_string());
+    let mut deps = std_deps;
+    deps.push((prog.syms.intern("twinuser"), through));
+    let harness = prog.load_crate_deferred("twinlib", &lib, 2021, cfg, deps).unwrap();
+    prog.prelude_crate = Some(core);
+    prog.resolve_imports();
+    assert!(prog.errors.is_empty(), "{:?}", prog.errors);
+    crate::borrowck::event::set_app_scope(vec![lib.clone(), user.clone()]);
+    crate::layout::set_root_crate(harness);
+    crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
+    let value = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == harness && prog.name(id) == "value").then_some(id)
+    }).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let entry = crate::owner::call(crate::owner::Class::Program, || { let f = u.fn_id(crate::jit::FnKey::Inst(value, vec![])); u.entry(f) });
+    let run = || {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        result
+    };
+    assert_eq!(run(), 101);
+    let file = u.prog.def(value).file;
+    let o = unsafe { apply(up, vec![Edit { file, path: lib.clone(), src: v1.replace("{ 1 }", "{ 2 }").into_bytes() }]) };
+    assert!(o.failure.is_none() && o.rung == Rung::Patch, "{:?}", o.lines);
+    // the harness copy's f and the plain copy's f (reached through twinuser) both changed
+    assert_eq!(run(), 202);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A closure stored by the running version (a boxed handler) runs every later edit of its body,
+/// and an edit's work stays flat however many came before: a patch installs at most two
+/// forwarders per closure (the lineage's cell jumps to the newest version, the previous newest to
+/// the cell) and copies no code into the older versions; every older version reaches the newest in
+/// at most two jumps; a build of an older version's own body never lands in it (a tier-up would
+/// bring back old code); a rolled-back patch brings back the forwarders it replaced.
+#[test]
+fn stored_closure_follows_edits_with_flat_work() {
+    const CHILD: &str = "MAKEPAD_RUN_STORED_CLOSURE_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::stored_closure_follows_edits_with_flat_work", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use crate::jit::{FnKey, Unit};
+    use crate::reload::{apply, Edit, Rung};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-stored-closure-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    let src = |i: u32| format!(r#"use std::cell::RefCell;
+thread_local! {{ static H: RefCell<Option<Box<dyn Fn(u32) -> u32>>> = RefCell::new(None); }}
+fn make() -> Box<dyn Fn(u32) -> u32> {{
+    let k = 3;
+    Box::new(move |x| x * k + {i})
+}}
+pub fn value(out: &mut u32) {{
+    H.with(|h| {{
+        if h.borrow().is_none() {{ *h.borrow_mut() = Some(make()); }}
+        *out = (h.borrow().as_ref().unwrap())(5);
+    }});
+}}
+"#);
+    std::fs::write(dir.join("app/src/lib.rs"), src(1)).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "stored_closure_app", false).unwrap();
+    let def = |prog: &Program, name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (value, make) = (def(&prog, "value"), def(&prog, "make"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    let (entry, make_slot) = crate::owner::call(crate::owner::Class::Program, || {
+        let f = u.fn_id(FnKey::Inst(value, vec![]));
+        (u.entry(f), u.fn_id(FnKey::Inst(make, vec![])))
+    });
+    let run = || {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        result
+    };
+    // the versions of make's closure, oldest first, and where each one's calls end up
+    let versions = |u: &Unit| -> Vec<u32> { (0..u.fns.len() as u32).filter(|&id| matches!(u.fns[id as usize].key, FnKey::Closure(_, _, p) if p == make_slot) && u.fns[id as usize].compiled).collect() };
+    let reaches = |u: &Unit, mut s: u32| -> u32 {
+        for _ in 0..2 {
+            match u.forward_of(s) { Some((t, _)) => s = t, None => return s }
+        }
+        assert!(u.forward_of(s).is_none(), "more than two jumps from an older version to the newest");
+        s
+    };
+    assert_eq!(run(), 16);
+    let first = versions(&u)[0];
+    let mut files = vec![u.prog.def(value).file];
+    let mut undo = None;
+    let mut names_first: Option<Vec<String>> = None;
+    for i in 2..=6u32 {
+        let before = u.forwards.len();
+        let o = unsafe { apply(up, vec![Edit { file: *files.last().unwrap(), path: app.clone(), src: src(i).into_bytes() }]) };
+        assert_eq!(o.rung, Rung::Patch, "edit {i}: {:?}", o.lines);
+        // (make, and value's closure while it inlines make)
+        let first_names = names_first.get_or_insert_with(|| o.names.clone());
+        assert!(o.names.iter().all(|n| first_names.contains(n)), "edit {i}: more fns installed than by the first edit: {:?}", o.names);
+        files.push(o.files[0]);
+        assert_eq!(run(), 15 + i, "edit {i}: the box stored at the first run runs the edited closure");
+        assert_eq!(u.forwards.len() - before, if i == 2 { 1 } else { 2 }, "edit {i}: forwarders installed (the cell, the previous version)");
+        let vs = versions(&u);
+        let newest = *vs.last().unwrap();
+        assert!(vs[..vs.len() - 1].iter().all(|&v| reaches(&u, v) == newest), "edit {i}: every older version reaches the newest");
+        assert_eq!(u.forward_of(first), Some((newest, true)), "edit {i}: the first version is the lineage's cell");
+        undo = o.undo;
+    }
+    // the old version's own body, built and installed as a tier-up would, does not replace its
+    // forwarder; nor does it get an O3 build
+    let at = u.fns[first as usize].code;
+    let (code, map, relocs) = unsafe { crate::jit::compile_fn(up, first) }.unwrap();
+    crate::owner::call(crate::owner::Class::Program, || u.install(first, &code, &relocs, map, 0)).unwrap();
+    assert_eq!(u.fns[first as usize].code, at, "a build of the cell's own body was installed");
+    assert!(!unsafe { crate::jit::compile_tier1(up, first) }, "an O3 build of a forwarder");
+    assert_eq!(run(), 21);
+    // edit 6 rolled back: the cell jumps to edit 5's closure again, which runs its own code
+    let previous = versions(&u)[versions(&u).len() - 2];
+    unsafe { crate::reload::rollback(up, undo.take().unwrap(), "test") };
+    files.pop();
+    assert_eq!(run(), 20, "after the rollback the stored box runs edit 5's closure");
+    assert_eq!(u.forward_of(first), Some((previous, true)));
+    assert_eq!(u.forward_of(previous), None, "edit 5's closure runs its own code again");
+    let o = unsafe { apply(up, vec![Edit { file: *files.last().unwrap(), path: app.clone(), src: src(7).into_bytes() }]) };
+    assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
+    assert_eq!(run(), 22, "an edit after the rollback reaches the stored box");
+    assert_eq!(u.forward_of(previous), Some((first, false)), "edit 5's closure forwards to the cell");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }

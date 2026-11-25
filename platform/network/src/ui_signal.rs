@@ -58,11 +58,12 @@ pub struct SignalToUI(Arc<AtomicBool>);
 
 static UI_SIGNAL: AtomicBool = AtomicBool::new(false);
 
-/// `MAKEPAD_FRAME_TRACE=1`: who raised the app signal, by source line, for the
-/// platform's frame-source report (`take_signal_sources`).
+/// `MAKEPAD_FRAME_TRACE=1` or the `frame_sources` trace topic: who raised the app
+/// signal, by source line, for the platform's frame-source report (`take_signal_sources`).
 fn signal_trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MAKEPAD_FRAME_TRACE").is_some_and(|v| v != "0" && !v.is_empty()))
+        || makepad_error_log::trace_enabled("frame_sources")
 }
 
 type SignalSources = std::collections::HashMap<&'static std::panic::Location<'static>, u32>;
@@ -84,6 +85,16 @@ pub fn take_signal_sources() -> Vec<(&'static std::panic::Location<'static>, u32
 static INTERNAL_SIGNAL: AtomicBool = AtomicBool::new(false);
 static ACTION_SIGNAL: AtomicBool = AtomicBool::new(false);
 
+#[cfg(not(target_arch = "wasm32"))]
+static SIGNAL_RAISED_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+fn signal_clock_ns() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
 impl SignalToUI {
     /// An app-facing channel has something for the UI thread. The next beat
     /// dispatches `Event::Signal` to the whole widget tree, so raise this only
@@ -93,6 +104,8 @@ impl SignalToUI {
     pub fn set_ui_signal() {
         note_signal_source();
         if !UI_SIGNAL.swap(true, Ordering::AcqRel) {
+            #[cfg(not(target_arch = "wasm32"))]
+            SIGNAL_RAISED_NS[0].store(signal_clock_ns(), Ordering::Relaxed);
             wake_ui_loop();
         }
     }
@@ -102,12 +115,16 @@ impl SignalToUI {
     /// services those without waking every widget with an `Event::Signal`.
     pub fn set_internal_signal() {
         if !INTERNAL_SIGNAL.swap(true, Ordering::AcqRel) {
+            #[cfg(not(target_arch = "wasm32"))]
+            SIGNAL_RAISED_NS[1].store(signal_clock_ns(), Ordering::Relaxed);
             wake_ui_loop();
         }
     }
 
     pub fn set_action_signal() {
         if !ACTION_SIGNAL.swap(true, Ordering::AcqRel) {
+            #[cfg(not(target_arch = "wasm32"))]
+            SIGNAL_RAISED_NS[2].store(signal_clock_ns(), Ordering::Relaxed);
             wake_ui_loop();
         }
     }
@@ -117,6 +134,21 @@ impl SignalToUI {
         UI_SIGNAL.load(Ordering::Acquire)
             || INTERNAL_SIGNAL.load(Ordering::Acquire)
             || ACTION_SIGNAL.load(Ordering::Acquire)
+    }
+
+    /// Lets an inspector see a wake the event loop has slept through.
+    pub fn pending_signal_ages_ms() -> [Option<u64>; 3] {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let now = signal_clock_ns();
+            std::array::from_fn(|i| {
+                [&UI_SIGNAL, &INTERNAL_SIGNAL, &ACTION_SIGNAL][i]
+                    .load(Ordering::Acquire)
+                    .then(|| now.saturating_sub(SIGNAL_RAISED_NS[i].load(Ordering::Relaxed)) / 1_000_000)
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        { [None; 3] }
     }
 
     pub fn check_and_clear_ui_signal() -> bool {

@@ -28,7 +28,10 @@ pub fn ir_to_spirv(m: &IrModule, entry: FuncId, xr: bool) -> Result<Vec<u32>, St
         Some(e) => e.stage,
         None => return Err("not an entry point".to_string()),
     };
-    let compute = if stage == IrStage::Compute { Some(compute_layout(m)?) } else { None };
+    let compute = if stage == IrStage::Compute { Some(compute_layout(m)?) }
+        else if m.globals.iter().any(|g| matches!(g.kind, IrGlobalKind::Io(IrIo::Storage(_)))) {
+            Some(crate::shader_ir_compute::draw_storage_layout(m, crate::shader_ir_compute::ComputeTarget::Spirv)?)
+        } else { None };
     let cooperative = m.reachable(entry).iter().any(|fi| {
         let f = &m.functions[*fi as usize];
         let matrix = |ty| matches!(m.get(ty), IrTy::CooperativeMatrix(_));
@@ -38,10 +41,14 @@ pub fn ir_to_spirv(m: &IrModule, entry: FuncId, xr: bool) -> Result<Vec<u32>, St
     if cooperative && stage != IrStage::Compute {
         return err("cooperative matrices exist only in compute kernels");
     }
+    // a kernel's params past the push constants every device has: a storage buffer instead
+    let param_block = compute.as_ref().filter(|l| stage == IrStage::Compute && l.push_size > crate::shader_ir_compute::MAX_PUSH_PARAMS)
+        .map(|_| crate::shader_ir_compute::kernel_spirv_binding(m, None));
     let mut g = Gen {
         m,
         b: SpvBuilder::new(),
         compute,
+        param_block,
         pc_var: 0,
         builtin_vars: Vec::new(),
         buffer_wrappers: Vec::new(),
@@ -130,6 +137,7 @@ struct FnCx {
     locals: Vec<u32>,
     params: Vec<u32>,
     open: bool,
+    label: u32,
     loops: Vec<(u32, u32)>,
     entry_in: Vec<u32>,
     entry_out: Vec<u32>,
@@ -163,6 +171,9 @@ struct Gen<'a> {
     f: FnCx,
     /// A compute kernel's push-constant block (buffer addresses, params).
     compute: Option<ComputeLayout>,
+    /// The binding of the storage buffer that holds that block instead, when its params are
+    /// past the push constants' 128 bytes.
+    param_block: Option<u32>,
     pc_var: u32,
     /// Compute builtin input variables, by builtin.
     builtin_vars: Vec<(u32, u32)>,
@@ -362,6 +373,7 @@ impl<'a> Gen<'a> {
 
     fn label(&mut self, id: u32) {
         self.emit(OP_LABEL, &[id]);
+        self.f.label = id;
         self.f.open = true;
     }
 
@@ -445,6 +457,9 @@ impl<'a> Gen<'a> {
     // ---- globals ----
 
     fn global_sc(&self, g: GlobalId) -> u32 {
+        if matches!(self.m.globals[g as usize].kind, IrGlobalKind::Io(IrIo::Storage(_))) {
+            return SC_PHYSICAL_STORAGE_BUFFER;
+        }
         if self.stage == IrStage::Compute {
             match self.m.globals[g as usize].kind {
                 IrGlobalKind::Io(IrIo::Storage(_)) => return SC_PHYSICAL_STORAGE_BUFFER,
@@ -509,8 +524,10 @@ impl<'a> Gen<'a> {
             }
         };
         if sc != SC_PRIVATE {
+            // a kernel's textures and samplers bind after its storage images
+            let binding = if self.stage == IrStage::Compute { crate::shader_ir_compute::kernel_spirv_binding(self.m, Some(g)) } else { glob.binding.unwrap_or(0) };
             self.b.decorate(id, DECO_DESCRIPTOR_SET, &[0]);
-            self.b.decorate(id, DECO_BINDING, &[glob.binding.unwrap_or(0)]);
+            self.b.decorate(id, DECO_BINDING, &[binding]);
         }
         if matches!(glob.kind, IrGlobalKind::ViewId) {
             self.uses_view_index = true;
@@ -524,7 +541,8 @@ impl<'a> Gen<'a> {
         let ty = self.m.globals[g as usize].ty;
         if sc == SC_PUSH_CONSTANT {
             let (pc, member) = self.push_constant_member(g);
-            let p = self.ptr_ty(SC_PUSH_CONSTANT, ty);
+            let sc = self.block_sc();
+            let p = self.ptr_ty(sc, ty);
             let k = self.b.const_u32(member);
             let id = self.ins_id(OP_ACCESS_CHAIN, p, &[pc, k]);
             return Ptr { id, ty, sc };
@@ -534,7 +552,7 @@ impl<'a> Gen<'a> {
             let (pc, member) = self.push_constant_member(g);
             let writable = self.m.globals[g as usize].kind == IrGlobalKind::Io(IrIo::Storage(true));
             let (wrapper_ptr, _) = self.buffer_pointer_ty(ty, writable);
-            let pp = self.b.type_pointer(SC_PUSH_CONSTANT, wrapper_ptr);
+            let pp = self.b.type_pointer(self.block_sc(), wrapper_ptr);
             let k = self.b.const_u32(member);
             let at = self.ins_id(OP_ACCESS_CHAIN, pp, &[pc, k]);
             let base = self.ins_id(OP_LOAD, wrapper_ptr, &[at]);
@@ -584,6 +602,11 @@ impl<'a> Gen<'a> {
         (self.b.type_pointer(SC_PHYSICAL_STORAGE_BUFFER, wrapper), wrapper)
     }
 
+    /// Where the push-constant block lives: push constants, or the parameter block's buffer.
+    fn block_sc(&self) -> u32 {
+        if self.param_block.is_some() { SC_STORAGE_BUFFER } else { SC_PUSH_CONSTANT }
+    }
+
     /// The push-constant block variable and the member index of global `g`.
     fn push_constant_member(&mut self, g: GlobalId) -> (u32, u32) {
         let layout = self.compute.clone().unwrap_or_default();
@@ -610,8 +633,14 @@ impl<'a> Gen<'a> {
             for (k, slot) in layout.slots.iter().enumerate() {
                 self.b.member_decorate(st, k as u32, DECO_OFFSET, &[slot.offset]);
             }
-            let p = self.b.type_pointer(SC_PUSH_CONSTANT, st);
-            self.pc_var = self.b.global_variable(p, SC_PUSH_CONSTANT, 0);
+            let sc = self.block_sc();
+            let p = self.b.type_pointer(sc, st);
+            self.pc_var = self.b.global_variable(p, sc, 0);
+            if let Some(binding) = self.param_block {
+                self.b.decorate(self.pc_var, DECO_DESCRIPTOR_SET, &[0]);
+                self.b.decorate(self.pc_var, DECO_BINDING, &[binding]);
+                self.b.decorate(self.pc_var, DECO_NON_WRITABLE, &[]);
+            }
         }
         let member = layout.slots.iter().position(|s| s.global == g).unwrap_or(0) as u32;
         (self.pc_var, member)
@@ -774,6 +803,8 @@ impl<'a> Gen<'a> {
             locals.push(self.local_var(l.ty));
         }
         self.f.locals = locals;
+        let label = self.b.id();
+        self.f.label = label;
         self.stmts(&func.body)?;
         if self.f.open {
             if func.ret == TY_VOID || self.f.is_entry {
@@ -783,7 +814,6 @@ impl<'a> Gen<'a> {
             }
             self.f.open = false;
         }
-        let label = self.b.id();
         let out = &mut self.b.functions;
         out.extend_from_slice(&header);
         spv_inst(out, OP_LABEL, &[label]);
@@ -1067,6 +1097,27 @@ impl<'a> Gen<'a> {
             return err("a missing value (an earlier shader error)");
         }
         let ty = self.ety(e);
+        if let ExprKind::Global(g) = self.func().exprs[e as usize].kind.clone() {
+            if let IrGlobalKind::StorageTexture(format) = self.m.globals[g as usize].kind {
+                let scalar = self.scalar(format.scalar());
+                let image = self.b.type_storage_image(scalar, format.spirv_format());
+                let var = if self.global_ids[g as usize] != 0 { self.global_ids[g as usize] } else {
+                    // StorageImageExtendedFormats includes the narrow single-channel formats.
+                    if matches!(format, crate::shader_ir_compute::StorageTextureFormat::R16f | crate::shader_ir_compute::StorageTextureFormat::R8unorm) {
+                        self.b.capability(CAP_STORAGE_IMAGE_EXTENDED_FORMATS);
+                    }
+                    let p = self.b.type_pointer(SC_UNIFORM_CONSTANT, image);
+                    let var = self.b.global_variable(p, SC_UNIFORM_CONSTANT, 0);
+                    let index = self.m.globals[..g as usize].iter().filter(|g| matches!(g.kind, IrGlobalKind::StorageTexture(_))).count() as u32;
+                    self.b.decorate(var, DECO_DESCRIPTOR_SET, &[0]);
+                    self.b.decorate(var, DECO_BINDING, &[index]);
+                    self.b.decorate(var, DECO_NON_READABLE, &[]);
+                    self.global_ids[g as usize] = var;
+                    var
+                };
+                return Ok(self.ins_id(OP_LOAD, image, &[var]));
+            }
+        }
         if self.is_place(e) {
             let p = self.place(e)?;
             return Ok(self.load(p));
@@ -1134,6 +1185,21 @@ impl<'a> Gen<'a> {
             }
             ExprKind::Binary(op, a, b) => {
                 let av = self.value(a)?;
+                if ty == TY_BOOL && matches!(op, BinOp::LogicAnd | BinOp::LogicOr) && !self.func().trivially_pure(b) {
+                    let left = self.f.label;
+                    let rhs = self.b.id();
+                    let merge = self.b.id();
+                    let (yes, no) = if op == BinOp::LogicAnd { (rhs, merge) } else { (merge, rhs) };
+                    self.emit(OP_SELECTION_MERGE, &[merge, 0]);
+                    self.emit(OP_BRANCH_CONDITIONAL, &[av, yes, no]);
+                    self.label(rhs);
+                    let bv = self.value(b)?;
+                    // A nested logical expression can end in a different block.
+                    let right = self.f.label;
+                    self.branch(merge);
+                    self.label(merge);
+                    return Ok(self.ins(OP_PHI, TY_BOOL, &[av, left, bv, right]));
+                }
                 let bv = self.value(b)?;
                 let at = self.ety(a);
                 let bt = self.ety(b);
@@ -1720,9 +1786,21 @@ impl<'a> Gen<'a> {
                 self.compute_builtin(bi, ty)
             }
             Builtin::Barrier => {
+                // The workgroup's storage writes are published to the workgroup too, as Metal's
+                // threadgroup_barrier(mem_device | mem_threadgroup) does: workgroup scope, never a
+                // device-wide fence (no barrier synchronizes workgroups; across them, atomics).
                 let scope = self.b.const_u32(SCOPE_WORKGROUP);
-                let sem = self.b.const_u32(SEMANTICS_ACQUIRE_RELEASE | SEMANTICS_WORKGROUP_MEMORY);
+                let sem = self.b.const_u32(SEMANTICS_ACQUIRE_RELEASE | SEMANTICS_WORKGROUP_MEMORY | SEMANTICS_UNIFORM_MEMORY);
                 self.emit(OP_CONTROL_BARRIER, &[scope, scope, sem]);
+                0
+            }
+            Builtin::StorageTextureWrite => {
+                let image = self.value(args[0])?;
+                let coord = self.value(args[1])?;
+                let value = self.value(args[2])?;
+                let scalar = self.m.scalar_of(self.ety(args[2])).unwrap();
+                let value = if self.m.lanes(self.ety(args[2])) <= 1 { self.splat(scalar, 4, value) } else { value };
+                self.emit(OP_IMAGE_WRITE, &[image, coord, value]);
                 0
             }
             Builtin::SubgroupAdd | Builtin::SubgroupMin | Builtin::SubgroupMax => {
@@ -1790,9 +1868,9 @@ impl<'a> Gen<'a> {
                 let b = self.value(args[1])?;
                 self.ins_id(OP_U_DOT, t, &[a, b, PACKED_VECTOR_FORMAT_4X8_BIT])
             }
-            Builtin::AtomicAdd => {
+            Builtin::AtomicAdd | Builtin::AtomicMin | Builtin::AtomicMax => {
                 if args.len() != 2 || !self.is_place(args[0]) {
-                    return err("atomic_add takes a buffer element and a value");
+                    return err("atomic_add, atomic_min and atomic_max take a buffer element and a value");
                 }
                 let p = self.place(args[0])?;
                 let v = self.value(args[1])?;
@@ -1803,7 +1881,13 @@ impl<'a> Gen<'a> {
                 }
                 let scope = self.b.const_u32(SCOPE_DEVICE);
                 let sem = self.b.const_u32(0);
-                self.ins(OP_ATOMIC_I_ADD, p.ty, &[p.id, scope, sem, v])
+                let signed = matches!(self.m.scalar_of(p.ty), Some(IrScalar::I32));
+                let code = match (op, signed) {
+                    (Builtin::AtomicMin, true) => OP_ATOMIC_S_MIN, (Builtin::AtomicMin, false) => OP_ATOMIC_U_MIN,
+                    (Builtin::AtomicMax, true) => OP_ATOMIC_S_MAX, (Builtin::AtomicMax, false) => OP_ATOMIC_U_MAX,
+                    _ => OP_ATOMIC_I_ADD,
+                };
+                self.ins(code, p.ty, &[p.id, scope, sem, v])
             }
             Builtin::CooperativeLoad | Builtin::CooperativeStore => {
                 let p = self.place(args[0])?;
@@ -1898,7 +1982,8 @@ impl<'a> Gen<'a> {
         let f32t = self.b.type_f32();
         let r = match s.kind {
             SampleKind::Implicit => {
-                if self.stage == IrStage::Vertex {
+                // only a fragment has derivatives: a vertex or a kernel reads the top level
+                if self.stage != IrStage::Fragment {
                     let zero = self.b.const_f32(0.0);
                     self.ins_id(OP_IMAGE_SAMPLE_EXPLICIT_LOD, v4, &[si, coord, IMAGE_OPERAND_LOD, zero])
                 } else {

@@ -2,17 +2,26 @@
 //!
 //! Frame: TRACE (per batch probe: place it off geometry, 64 rotated rays
 //! through the voxel clipmap) -> RELIGHT (shade each hit: sun through the
-//! voxels, clustered lights, sky on miss, last frame's field for further
-//! bounces) -> GATHER (L1 irradiance + 8x8 octahedral distance moments,
-//! blended with the probe's history) -> SCATTER (copy the updated probe
-//! rows into the persistent field; untouched probes are never rewritten).
+//! voxels, clustered lights, last frame's field for further bounces; a miss
+//! is marked, not lit) -> GATHER (L1 irradiance + 8x8 octahedral distance
+//! moments, blended with the probe's history) -> SCATTER (copy the updated
+//! probe rows into the persistent field; untouched probes are never
+//! rewritten).
 //!
 //! Field: an RGBA16F atlas, per cascade and probe slot an 8x8 irradiance
-//! tile (6x6 octahedral interior + guard ring, cosine-weighted radiance),
-//! a 10x10 moment tile (8x8 interior + guard, E[d] and E[d^2]) and one info
-//! texel (relocation offset in cells, state). Receivers read 3 texels per
-//! probe with hardware bilinear filtering. state > 0 is valid (ramping in
-//! over the first updates), < 0 inside geometry, 0 not traced.
+//! tile (6x6 octahedral interior + guard ring: rgb the cosine-weighted
+//! radiance the scene's surfaces send, a the cosine-weighted share of rays
+//! that left the scene), a 10x10 moment tile (8x8 interior + guard, E[d]
+//! and E[d^2]) and one info texel (relocation offset in cells, state).
+//! Receivers read 3 texels per probe with hardware bilinear filtering.
+//! state > 0 is valid (ramping in over the first updates), < 0 inside
+//! geometry, 0 not traced.
+//!
+//! The sky is not in the field: a receiver's ambient is its OWN ambient
+//! (the environment it lights with GI off: a hemisphere, a map's SH) times
+//! the field's open share, plus the field's bounce. Open space therefore
+//! looks exactly as with GI off; a cavity darkens; a coloured neighbour
+//! adds its reflected light, never more than it receives.
 use makepad_draw::*;
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -49,6 +58,9 @@ script_mod! {
         // ordinary ambient (1: never darker than GI off). Producers leave 0:
         // an uncertain probe must not inject sky into the bounce feedback.
         gi_fallback_floor: uniform(0.0)
+        // 1: receivers leave out probes behind their own surface
+        // (`GiConfig::thin_walls`).
+        gi_back_cut: uniform(0.0)
         gi_debug: uniform(0.0)
         // Atlas: width, height, tiles per row, tile rows per cascade.
         gi_atlas: uniform(vec4(640.0,1824.0,64.0,32.0))
@@ -84,8 +96,9 @@ script_mod! {
             // At the texel's centre, level zero: its exact value.
             return self.gi_field.sample_lod(p/self.gi_atlas.xy,0.0)
         }
-        // One probe's contribution: vec4(irradiance*weight, weight).
-        gi_probe: fn(k:float,cell:vec3,info:vec4,wp:vec3,n:vec3,w:float)->vec4 {
+        // One probe's contribution under the receiver's own ambient
+        // `fallback`: vec4((bounce + open share x fallback)*weight, weight).
+        gi_probe: fn(k:float,cell:vec3,info:vec4,wp:vec3,n:vec3,w:float,fallback:vec3)->vec4 {
             if w<=0.0 {return vec4(0.0,0.0,0.0,0.0)}
             let slot=self.gi_slot(cell)
             let s=self.gi_cascade(k).w
@@ -99,20 +112,32 @@ script_mod! {
             let distance=length(delta)
             let moments=self.gi_tile_sample(k,slot,1.0,delta/max(distance,0.00001)).xy
             let mean=moments.x
-            let difference=max(distance-mean-s*0.05,0.0)
-            let variance=max(moments.y-mean*mean,0.0001)
+            // The moments are distances to the voxel proxy (a cascade's
+            // voxels are a quarter of its spacing, voxels.rs Layout), the
+            // receiver is the true surface: its own proxy can sit up to a
+            // voxel diagonal in front of it. A smaller allowance let a part
+            // shadow itself in patches cut by the voxel faces.
+            let difference=max(distance-mean-s*0.4330127,0.0)
+            let variance=max(moments.y-mean*mean,s*s*0.0001)
             var visibility=variance/(variance+difference*difference)
             if mean<=0.0 {visibility=1.0}
             // Facing uses the UNBIASED receiver, bounded to a sub-cell
             // footprint so a probe almost on a wall makes no weight spike.
             let facing=pow(clamp(dot(n,to_probe)/max(probe_distance,s*0.25)*0.5+0.5,0.0,1.0),2.0)
-            let weight=w*visibility*visibility*max(facing,0.02)
-            var light=max(self.gi_tile_sample(k,slot,0.0,n).xyz,vec3(0.0,0.0,0.0))
+            var weight=w*visibility*visibility*max(facing,0.02)
+            // A host with walls thinner than the voxels leaves out the
+            // probes behind the receiver's own plane: they see the inside.
+            // Their weight ramps to zero AT the plane: a cut there printed
+            // each probe's crossing of a curved surface's tangent planes as
+            // a seam (a vertical line down a vase, a circle round a belly).
+            if self.gi_back_cut>0.5 {weight=weight*smoothstep(0.0,0.3,dot(n,to_probe)/max(probe_distance,s*0.25))}
+            let t=self.gi_tile_sample(k,slot,0.0,n)
+            var light=max(t.xyz,vec3(0.0,0.0,0.0))+fallback*clamp(t.w,0.0,1.0)
             if self.gi_debug>2.5 && self.gi_debug<3.5 {light=self.gi_hash(vec3(slot,k,1.0))}
             return vec4(light*weight,weight)
         }
-        // One cascade: vec4(irradiance, confidence incl. the window fade).
-        gi_cascade_sample: fn(k:float,wp:vec3,n:vec3)->vec4 {
+        // One cascade: vec4(ambient, confidence incl. the window fade).
+        gi_cascade_sample: fn(k:float,wp:vec3,n:vec3,fallback:vec3)->vec4 {
             let c=self.gi_cascade(k)
             if c.w<=0.0 {return vec4(0.0,0.0,0.0,0.0)}
             // Interpolate on the AIR side of the receiver.
@@ -136,7 +161,7 @@ script_mod! {
                 let info=self.gi_info(k,cell)
                 let w=tw.x*tw.y*tw.z*max(info.w,0.0)
                 available=available+w
-                sum=sum+self.gi_probe(k,cell,info,wp,n,w)
+                sum=sum+self.gi_probe(k,cell,info,wp,n,w,fallback)
             }
             if available<=0.000001 {return vec4(0.0,0.0,0.0,0.0)}
             if sum.w<=0.00000001 {return vec4(0.0,0.0,0.0,0.0)}
@@ -160,7 +185,7 @@ script_mod! {
                 // Cascade 0 always; a coarser one while weight remains and
                 // the volume has it.
                 if kf<0.5 || (remain>0.002 && self.gi_home.w>kf+0.5) || weights>0.5 {
-                    let sc=self.gi_cascade_sample(kf,wp,n)
+                    let sc=self.gi_cascade_sample(kf,wp,n,fallback)
                     acc=acc+sc.xyz*(sc.w*remain)
                     w=w+vec3(1.0-step(0.5,kf),step(0.5,kf)-step(1.5,kf),step(1.5,kf))*(sc.w*remain)
                     remain=remain*(1.0-sc.w)
@@ -170,19 +195,25 @@ script_mod! {
             let gi=acc+fallback*(self.gi_fallback_floor*remain)
             return mix(fallback,gi,min(self.gi_on,1.0))
         }
+        // What a host's screen cache (`FastGiScreen`) stores for one surface
+        // point: the ambient `gi_ambient` returns there under `fallback`, the
+        // ambient the host's receivers pass for it.
+        gi_screen_value: fn(wp:vec3,n:vec3,view_distance:float,fallback:vec3)->vec4 {
+            return vec4(self.gi_gather(wp,normalize(n),fallback,0.0),view_distance)
+        }
         gi_ambient: fn(wp:vec3,normal:vec3,fallback:vec3)->vec3 {
             if self.gi_on<=0.0 {return fallback}
             return self.gi_gather(wp,normalize(normal),fallback,0.0)
         }
-        // Last operation before writing DISPLAY colour into an 8-bit scene
-        // target. One quantization step of zero-mean world-space noise
-        // breaks broad dark gradient contours.
+        // Display receivers supply output_dither; debug views keep their exact colour.
         gi_display: fn(color:vec4,wp:vec3,n:vec3)->vec4 {
-            if self.gi_on<=0.0 || color.w<0.999 {return color}
+            if color.w<0.999 {return color}
+            if self.gi_on<=0.0 {return vec4(self.output_dither(color.xyz,wp),color.w)}
             if self.gi_debug>0.5 {
                 let nn=normalize(n)
-                // Each cascade's share (views 1, 2) or the GI alone (3, 4).
-                let g=self.gi_gather(wp,nn,vec3(0.0,0.0,0.0),1.0-step(2.5,self.gi_debug))
+                // Each cascade's share (views 1, 2), or the GI under a
+                // uniform grey ambient (3, 4): bounce + open share x 0.5.
+                let g=self.gi_gather(wp,nn,vec3(0.5,0.5,0.5),1.0-step(2.5,self.gi_debug))
                 if self.gi_debug<2.5 {
                     let w=g
                     if self.gi_debug>1.5 {return vec4(w,1.0)}
@@ -204,13 +235,73 @@ script_mod! {
                     let info=self.gi_info(0.0,cell)
                     if info.w<0.0 {return vec4(1.0,0.4,0.0,1.0)}
                     if info.w==0.0 {return vec4(0.1,0.1,0.1,1.0)}
-                    if self.gi_debug>5.5 {return vec4(max(self.gi_tile_sample(0.0,self.gi_slot(cell),0.0,nn).xyz,vec3(0.0,0.0,0.0)),1.0)}
+                    if self.gi_debug>5.5 {
+                        let t=self.gi_tile_sample(0.0,self.gi_slot(cell),0.0,nn)
+                        return vec4(max(t.xyz,vec3(0.0,0.0,0.0))+vec3(0.5,0.5,0.5)*clamp(t.w,0.0,1.0),1.0)
+                    }
                     return vec4(0.0,0.8*info.w,0.1,1.0)
                 }
                 return vec4(g,1.0)
             }
-            let noise=fract(sin(dot(wp,vec3(127.1,311.7,74.7)))*43758.5453)-0.5
-            return vec4(max(color.xyz+vec3(noise,noise,noise)*(1.0/255.0),vec3(0.0,0.0,0.0)),color.w)
+            return vec4(self.output_dither(color.xyz,wp),color.w)
+        }
+    }
+    // A host's screen cache of the field for its own receivers, beside
+    // `FastGiSampling` (after it: its `gi_ambient` reads the cache where it
+    // answers). Not in the renderer's scene shaders: their families have no
+    // texture slot to spare (see the texture budget tests).
+    let FastGiScreen = {
+        // The field gathered once per pixel of a lower-resolution view
+        // (`FastGiSampling::gi_screen_value`, a host's pass over its G-buffer): x = on, yz =
+        // its size in pixels. RGB the ambient `gi_ambient` returns there, A
+        // the view distance it holds (0: nothing there).
+        gi_screen: texture_2d(float)
+        gi_screen_ctl: uniform(vec4(0.0,0.0,0.0,0.0))
+        // The cache's ambient at wp (normal n): its four texels around the
+        // pixel, those off this surface left out: at another depth, or (a
+        // crease: the bed under a wall) off this point's tangent plane; w 0
+        // where it cannot answer (an edge).
+        gi_screen_fetch: fn(wp:vec3,n:vec3)->vec4 {
+            let vp=self.draw_pass.camera_view*vec4(wp,1.0)
+            let cp=self.draw_pass.camera_projection*vp
+            let uv=vec2(cp.x/cp.w*0.5+0.5,0.5-cp.y/cp.w*0.5)
+            let d=length(vp.xyz)
+            let nv=(self.draw_pass.camera_view*vec4(n,0.0)).xyz
+            // the projection's scale and centre (its columns 0, 1, 2) for the texels' view rays
+            let c0=self.draw_pass.camera_projection*vec4(1.0,0.0,0.0,0.0)
+            let c1=self.draw_pass.camera_projection*vec4(0.0,1.0,0.0,0.0)
+            let c2=self.draw_pass.camera_projection*vec4(0.0,0.0,1.0,0.0)
+            let px=uv*self.gi_screen_ctl.yz-vec2(0.5,0.5)
+            let b=floor(px)
+            let f=px-b
+            var sum=vec3(0.0,0.0,0.0)
+            var wsum=0.0
+            for i in 0..4 {
+                let q=float(i)
+                let o=vec2(fract(q*0.5)*2.0,floor(q*0.5))
+                let tuv=(b+o+vec2(0.5,0.5))/self.gi_screen_ctl.yz
+                let t=self.gi_screen.sample_lod(tuv,0.0)
+                let tw=mix(vec2(1.0,1.0)-f,f,o)
+                let near=clamp(1.0-abs(t.w-d)/(d*0.015),0.0,1.0)
+                // the texel's point: its view ray at the distance it holds
+                let ndc=vec2(tuv.x*2.0-1.0,1.0-tuv.y*2.0)
+                let ray=normalize(vec3((ndc.x-c2.x*c2.w)/c0.x,(ndc.y-c2.y*c2.w)/c1.y,c2.w))
+                let plane=clamp(1.0-abs(dot(nv,ray*t.w-vp.xyz))/(d*0.002),0.0,1.0)
+                let w=tw.x*tw.y*near*plane
+                sum=sum+t.xyz*w
+                wsum=wsum+w
+            }
+            if wsum<0.2 {return vec4(0.0,0.0,0.0,0.0)}
+            return vec4(sum/wsum,1.0)
+        }
+        gi_ambient: fn(wp:vec3,normal:vec3,fallback:vec3)->vec3 {
+            if self.gi_on<=0.0 {return fallback}
+            if self.gi_screen_ctl.x>0.5 {
+                // the cache holds what the gather below returns
+                let c=self.gi_screen_fetch(wp,normalize(normal))
+                if c.w>0.5 {return c.xyz}
+            }
+            return self.gi_gather(wp,normalize(normal),fallback,0.0)
         }
     }
     // This frame's probe list: row r = (slot, cascade, hysteresis, -),
@@ -429,6 +520,7 @@ script_mod! {
         gi_ground: uniform(vec3(0.1,0.1,0.1))
         // feedback, linear albedo, emission gain, sun ray length
         gi_relight: uniform(vec4(0.85,0.0,0.0,48.0))
+        gi_bounce: uniform(1.0)
         gi_light_ids0: uniform(vec4(-1.0,-1.0,-1.0,-1.0))
         gi_light_ids1: uniform(vec4(-1.0,-1.0,-1.0,-1.0))
         hit_at: fn(ray:float,row:float)->vec4 {return self.gi_hits.sample_nearest(vec2((ray+0.5)/65.0,(row+0.5)/self.gi_pass.y))}
@@ -462,11 +554,12 @@ script_mod! {
             let ray=min(floor(self.pos.x*64.0),63.0)
             let probe=self.hit_at(64.0,row)
             let hit=self.hit_at(ray,row)
-            // radiance: (rgb, distance); w = -1 backface, -2 invalid.
+            // radiance: (rgb, distance); w = -1 backface, -2 invalid; x = -1
+            // a miss (the sky: the receivers light it with their own ambient).
             if probe.w<0.0 || hit.y<(-1.5) {return vec4(0.0,0.0,0.0,-2.0)}
+            if hit.y<(-0.5) {return vec4(-1.0,0.0,0.0,hit.x)}
             let a=self.batch_a(row)
             let rd=self.gi_ray(ray,a)
-            if hit.y<(-0.5) {return vec4(mix(self.gi_ground,self.gi_sky,clamp(rd.y*0.5+0.5,0.0,1.0)),hit.x)}
             if hit.z<0.0 {return vec4(0.0,0.0,0.0,-1.0)}
             var albedo=min(self.gi_unpack(hit.y),vec3(0.9,0.9,0.9))
             if self.gi_relight.y>0.5 {albedo=srgb_to_linear(albedo)}
@@ -495,11 +588,13 @@ script_mod! {
             light=light+self.local_bounce(p,n,self.gi_light_ids0.z)+self.local_bounce(p,n,self.gi_light_ids0.w)
             light=light+self.local_bounce(p,n,self.gi_light_ids1.x)+self.local_bounce(p,n,self.gi_light_ids1.y)
             light=light+self.local_bounce(p,n,self.gi_light_ids1.z)+self.local_bounce(p,n,self.gi_light_ids1.w)
-            // Further bounces: last frame's field AT THE HIT, no recursion.
+            // Further bounces: last frame's field AT THE HIT, no recursion,
+            // its open share under the rig's hemisphere.
             if self.gi_relight.x>0.0 {
-                light=light+min(self.gi_ambient(p,n,vec3(0.0,0.0,0.0)),vec3(64.0,64.0,64.0))*self.gi_relight.x
+                let hemisphere=mix(self.gi_ground,self.gi_sky,clamp(n.y*0.5+0.5,0.0,1.0))
+                light=light+min(self.gi_ambient(p,n,hemisphere),vec3(64.0,64.0,64.0))*self.gi_relight.x
             }
-            return vec4(min(albedo*light+emission,vec3(64.0,64.0,64.0)),hit.x)
+            return vec4(min(albedo*light*self.gi_bounce+emission,vec3(64.0,64.0,64.0)),hit.x)
         }
         fragment: fn(){self.fb0=self.pixel()}
     }
@@ -525,9 +620,11 @@ script_mod! {
             if d.z<0.0 {d=vec3((1.0-abs(f.y))*sign(f.x),(1.0-abs(f.x))*sign(f.y),d.z)}
             return normalize(d)
         }
-        // Cosine-weighted radiance around d (E/pi): irradiance texel.
+        // Around d, cosine-weighted: the radiance the surfaces send (E/pi)
+        // and the share of rays that left the scene. w < 0: no ray.
         irradiance: fn(d:vec3,row:float,a:vec4)->vec4 {
             var sum=vec3(0.0,0.0,0.0)
+            var open=0.0
             var total=0.0
             var r=0.0
             loop {
@@ -535,13 +632,13 @@ script_mod! {
                 let sample=self.radiance(r,row)
                 if sample.w>=0.0 {
                     let w=max(dot(d,self.gi_ray(r,a)),0.0)
-                    sum=sum+sample.xyz*w
+                    if sample.x<0.0 {open=open+w} else {sum=sum+sample.xyz*w}
                     total=total+w
                 }
                 r=r+1.0
             }
             if total<=0.0001 {return vec4(0.0,0.0,0.0,-1.0)}
-            return vec4(sum/total,1.0)
+            return vec4(sum/total,open/total)
         }
         // Filtered (E[d], E[d^2]) around d from this update's rays.
         moments: fn(d:vec3,row:float,a:vec4,s:float)->vec4 {
@@ -609,7 +706,7 @@ script_mod! {
                     if h>0.0 {return old}
                     return vec4(0.0,0.0,0.0,0.0)
                 }
-                return vec4(mix(v.xyz,old.xyz,h),1.0)
+                return mix(v,old,h)
             }
             let c=col-64.0
             let x=c-floor(c/10.0)*10.0
@@ -643,6 +740,7 @@ script_mod! {
         fragment: fn(){self.fb0=self.pixel()}
     }
 
+    mod.draw.FastGiScreen = FastGiScreen
     mod.draw.FastGiSampling = FastGiSampling
 }
 #[derive(Script,ScriptHook)] #[repr(C)] pub struct DrawGiTrace {#[deref] pub quad:DrawQuad}

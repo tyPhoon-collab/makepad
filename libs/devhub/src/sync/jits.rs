@@ -40,10 +40,15 @@ pub fn list() -> Vec<Jit> {
     out
 }
 
-/// Whether `pid` announced itself (its discovery file exists).
+/// Whether `pid` announced itself (a discovery file answers to it): what started a run holds a pid
+/// that on Windows is the parent the run stands behind.
 pub fn announced(pid: u32) -> Option<String> {
-    let f = discovery::registry_dir().join(format!("makepad-remote-{pid}.json"));
-    std::fs::read_to_string(f).ok().and_then(|t| discovery::parse(&t)).map(|a| a.app)
+    let dir = std::fs::read_dir(discovery::registry_dir()).ok()?;
+    dir.flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("makepad-remote-"))
+        .filter_map(|e| discovery::parse(&std::fs::read_to_string(e.path()).ok()?))
+        .find(|a| a.answers_to(pid))
+        .map(|a| a.app)
 }
 
 fn environ(pid: u32, key: &str) -> Option<String> {
@@ -181,6 +186,26 @@ impl Ticker {
         }
         found.ok_or_else(|| format!("JIT {pid}: `{}` answered no tick", self.cmd))
     }
+}
+
+/// Asks the JIT `pid` for `session relaunch`: the edits waiting for a restart apply (the app
+/// starts again in place). Its answer, or why not.
+pub fn relaunch(pid: u32) -> Result<String, String> {
+    let client = Client::connect(&pid.to_string()).map_err(|e| format!("JIT {pid}: {e}"))?;
+    client.set_timeout(Some(Duration::from_secs(5)));
+    let answer = client.cmd("session relaunch").map_err(|e| format!("JIT {pid}: {e}")).and_then(|lines| {
+        let mut said = Vec::new();
+        for l in lines {
+            let l = l.map_err(|e| format!("JIT {pid}: {e}"))?;
+            if l.starts_with("{\"err\":") {
+                return Err(format!("JIT {pid}: {}", crate::proto::clean(&l, 200)));
+            }
+            said.push(l);
+        }
+        Ok(crate::proto::clean(&said.join(" "), 200))
+    });
+    client.close();
+    answer
 }
 
 pub fn tick_of(line: &str) -> Option<u64> {

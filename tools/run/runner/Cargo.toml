@@ -25,4 +25,4 @@ makepad-remote = { workspace = true }
 # system's HTTP stack
 relax-light-http = { workspace = true }
 makepad-network = { path = "../../../platform/network" }
-makepad-devhub = { path = "../../../libs/devhub" }
+makepad-core-util = { path = "../../../libs/core_util" }

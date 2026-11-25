@@ -16,8 +16,8 @@ pub use makepad_studio_protocol::{
 };
 pub use makepad_test_macros::makepad_test;
 pub use remote::{WindowInfo, NodeMatch, UiSnapshot, LogTail};
-pub use makepad_a11y::{Node, NodeId, Role, States, Actions, Toggle};
-pub use runtime::{run_with_config, Locator, TestApp, TestConfig};
+pub use makepad_a11y::{Node, NodeId, Rect, Role, States, Actions, Toggle};
+pub use runtime::{run_with_config, Locator, PointerDrag, TestApp, TestConfig};
 pub use selector::Selector;
 
 #[doc(hidden)]

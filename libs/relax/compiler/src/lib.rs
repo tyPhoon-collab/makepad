@@ -95,9 +95,11 @@ pub mod sandbox;
 pub mod stale;
 pub mod invalid;
 pub mod domain;
+mod sections;
+pub(crate) mod domain_res;
 pub(crate) mod domain_threads;
 pub mod jit;
-pub mod guards;
+pub mod program_os;
 pub mod web;
 pub mod web32;
 pub mod coverage;
@@ -109,6 +111,7 @@ pub mod postframe;
 mod nounwind;
 pub mod os;
 pub mod lower;
+pub mod simd;
 pub mod cabi;
 pub use relax_types::*;
 // This crate's own source stamp (build.rs, libs/relax/self_stamp.rs), the codegen identity's
@@ -116,10 +119,18 @@ pub use relax_types::*;
 // glob above to relax-types' stamp, and the compiler's own source was left out of the identity.
 include!(concat!(env!("OUT_DIR"), "/src_stamp.rs"));
 pub mod run;
+mod first_frame;
+pub mod hot_failure;
+#[cfg(any(windows, test))]
+pub mod restart_parent;
+pub mod run_end;
 mod harness;
 mod test_pkg;
 pub mod tui;
 pub mod check;
+mod check_order;
+mod check_reuse;
+mod typeck_bg;
 mod gandalf_out;
 pub mod serve;
 mod serve_rpc;
@@ -143,9 +154,6 @@ pub mod mainprof;
 pub mod inspect;
 pub mod memreport;
 pub mod registry_net;
-
-#[cfg(test)]
-mod parse_work_bench;
 
 /// The system allocator (Relax's own malloc zone once a program swaps the default zone:
 /// zone_alloc.rs), with per-subsystem accounting when MAKEPAD_RUN_MEM_REPORT is set (memstat.rs).
@@ -182,10 +190,10 @@ pub const RUSTC_VERSION: &str = "1.98.0";
 /// --filter-platform` runs) answer from Relax's own target model (print_as_rustc). Returns whether
 /// it answered.
 pub fn relax_as_rustc() -> bool {
-    if std::env::var_os("MAKEPAD_RUN_AS_RUSTC").is_none() {
+    let args: Vec<String> = os::proc::args_bytes().iter().skip(1).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    if std::env::var_os("MAKEPAD_RUN_AS_RUSTC").is_none() && !native::is_target_rustc_probe(&args) {
         return false;
     }
-    let args: Vec<String> = os::proc::args_bytes().iter().skip(1).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
     // the script's own run (and a nested script's) is a Relax command, not a RUSTC question
     if args.first().is_some_and(|a| a == "run") {
         return false;
@@ -193,7 +201,7 @@ pub fn relax_as_rustc() -> bool {
     let sess = &session_from_env(&args);
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["--version"] | ["-V"] => println!("rustc {} (makepad run {})", RUSTC_VERSION, PROVENANCE),
-        ["-vV"] | ["--version", "--verbose"] => {
+        ["-vV"] | ["--version", "--verbose"] | ["--verbose", "--version"] | ["-V", "--verbose"] | ["--verbose", "-V"] => {
             println!("rustc {} (makepad run {})", RUSTC_VERSION, PROVENANCE);
             println!("binary: rustc");
             println!("commit-hash: unknown");
@@ -285,6 +293,7 @@ pub fn print_as_rustc(sess: &std::sync::Arc<crate::Session>, args: &[String], in
                 C::LinuxX64 => crate::cfg::CfgSet::linux_x64(sess, &[]),
                 C::WindowsX64 => crate::cfg::CfgSet::windows_x64(sess, &[]),
                 C::AndroidArm64 => crate::cfg::CfgSet::android_arm64(sess, &[]),
+                C::IosArm64 => crate::cfg::CfgSet::ios_arm64(sess, &[]),
                 C::Web(w) => crate::cfg::CfgSet::web(sess, w, &[]),
                 C::Host => unreachable!("from_triple names a target"),
             }
@@ -303,7 +312,7 @@ pub fn print_as_rustc(sess: &std::sync::Arc<crate::Session>, args: &[String], in
     // rustc_target spec: (dll prefix, dll suffix, exe suffix, staticlib prefix, staticlib suffix,
     // split-debuginfo kinds, only_cdylib)
     let (dll_pre, dll_suf, exe_suf, st_pre, st_suf, split, only_cdylib): (&str, &str, &str, &str, &str, &[&str], bool) = match triple {
-        "aarch64-apple-darwin" => ("lib", ".dylib", "", "lib", ".a", &["off", "packed", "unpacked"], false),
+        "aarch64-apple-darwin" | "aarch64-apple-ios" => ("lib", ".dylib", "", "lib", ".a", &["off", "packed", "unpacked"], false),
         "x86_64-unknown-linux-gnu" | "aarch64-linux-android" => ("lib", ".so", "", "lib", ".a", &["off", "packed", "unpacked"], false),
         "x86_64-pc-windows-gnu" => ("", ".dll", ".exe", "lib", ".a", &["off"], false),
         "wasm32-unknown-unknown" | "wasm64-unknown-unknown" => ("", ".wasm", ".wasm", "lib", ".a", &["off"], true),
@@ -368,6 +377,7 @@ pub fn print_as_rustc(sess: &std::sync::Arc<crate::Session>, args: &[String], in
 /// Construct the invocation inputs before parsing; CLI overrides replace environment values.
 /// rustc: compiler/rustc_session/src/config.rs:2428, session.rs:90-93.
 pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
+    crate::pool::thread_start(crate::jit::ensure_altstack);
     let mut options = crate::options::Options::from_env();
     // `--no-asm` / `--allow-c` anywhere before `--`, for every command (run, test, check, the
     // relax runner): the environment carries them to the processes this one starts (build
@@ -389,29 +399,22 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
     if args.get(1).map(String::as_str) == Some("fix") {
         options.relaxed = Some("all".to_string());
     }
-    options.cpu = relax_backend::x64::detect_cpu(&options);
-    options.spec_hot = Some(options.spec_hot.unwrap_or_else(crate::jit::on_battery));
-    options.spec_jobs = Some(options.spec_jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(1).clamp(1, 6)));
-    options.tier1_profile_data = options.tier1_profile.as_ref().and_then(|p| p.to_str()).and_then(|p| std::fs::read_to_string(p).ok());
-    // deterministic O3 (record and replay): every body is borrow-checked before its first code
-    // (--check-first), so no code is lowered unverified (SPEC-V baseline code and twins depend on
-    // when verdicts arrive) and both runs lower the same verified bodies
-    // ... and no baseline startup tier (MAKEPAD_RUN_O1=0): whether a body's first code is baseline or
-    // O1 depends on when it is first compiled (before or after the first present), and baseline
-    // code's O2 upgrade on this run's cost checks; first code is O1, O2/O3 as recorded
-    if options.tier1_profile.is_some() {
-        crate::jit::CHECK_FIRST.store(true, std::sync::atomic::Ordering::Relaxed);
-        options.t0_baseline = crate::options::Tier0Baseline::Off;
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        options.cpu = relax_backend::x64::detect_cpu(&options);
     }
+    options.spec_hot = Some(options.spec_hot.unwrap_or_else(crate::jit::on_battery));
     let mut session = crate::Session { options, runtime: crate::options::RuntimeOptions::from_env() };
     session.options.target = match session.options.check_target {
         crate::options::CheckTarget::WindowsX64 => "x86_64-pc-windows-gnu",
         crate::options::CheckTarget::MacosArm64 => "aarch64-apple-darwin",
         crate::options::CheckTarget::LinuxX64 => "x86_64-unknown-linux-gnu",
         crate::options::CheckTarget::AndroidArm64 => "aarch64-linux-android",
+        crate::options::CheckTarget::IosArm64 => "aarch64-apple-ios",
         crate::options::CheckTarget::Web(w) => crate::options::CheckTarget::web_triple(w),
         _ if cfg!(target_os = "android") => "aarch64-linux-android",
         _ if cfg!(all(target_os = "macos", target_arch = "aarch64")) => "aarch64-apple-darwin",
+        _ if cfg!(target_os = "ios") => "aarch64-apple-ios",
         _ if cfg!(windows) => "x86_64-pc-windows-gnu",
         _ => "x86_64-unknown-linux-gnu",
     }.to_string();
@@ -457,11 +460,11 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
             let code = run::cmd_run(sess, &args[2..]);
             os::proc::exit(code);
         }
-        // `makepad check [--json] [--units u.json] <package>`: type/borrow check and compile, run
-        // nothing; `--watch`: the warm session (type/borrow check only unless --deep), re-checking
-        // what each edit invalidates
+        // `makepad check [--json] [--units u.json] <package> [target flags]`: type/borrow check and
+        // compile, run nothing; the target flags are cargo check's (`--lib`, `--bins`, `--bin <name>`,
+        // `--tests`, `--test <name>`: resolve.rs parse_check_flags); `--watch`: the warm session
+        // (type/borrow check only unless --deep), re-checking what each edit invalidates
         "check" => {
-            crate::lexer::set_validation(true);
             // rustc_interface util.rs `init_stack_size`: a batch compiler rejects a RUST_MIN_STACK that
             // is set (not blank) but no number of bytes, before it reads any input
             if let Some(v) = std::env::var_os("RUST_MIN_STACK") {
@@ -496,11 +499,12 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
             let mut a = vec!["--check".to_string()];
             a.extend_from_slice(&args[3..]);
             let code = run::cmd_run(sess, &a);
-            std::process::exit(code);
+            os::proc::exit(code);
         }
         // `makepad test <file.rs>`: one file's tests; `makepad test <package>`: the package's
         // lib and integration tests, each a harness program (run.rs `--harness`)
-        "test" if !args[2..].iter().any(|a| a.ends_with(".rs")) => {
+        "test" if args[2..].iter().take_while(|a| a.as_str() != "--").any(|a| a == "--live")
+            || !args[2..].iter().any(|a| a.ends_with(".rs")) => {
             let code = test_pkg::cmd_test_package(&args[2..]);
             os::proc::exit(code);
         }
@@ -513,12 +517,14 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
             std::process::exit(code);
         }
         "lex" => {
-            let code = source_context::cmd_lex(&args[2..]);
+            let mut a = args[2..].to_vec();
+            a[0] = workspace_file_path(&a[0]);
+            let code = source_context::cmd_lex(&a);
             std::process::exit(code);
         }
         "file" => {
             let ed = if args.len() > 3 { args[3].parse::<u16>().unwrap_or(2021) } else { 2021 };
-            let src = std::fs::read(&args[2]).expect("read");
+            let src = crate::vfs::read(workspace_file_path(&args[2])).expect("read");
             match parser::parse_source(sess, &src, ed) {
                 Ok(p) => println!("ok: {} items, {} exprs", p.ast.items.len(), p.ast.exprs.len()),
                 Err((pos, msg)) => {
@@ -594,7 +600,9 @@ fn cmd_parse(sess: &std::sync::Arc<crate::Session>, units_path: &str, threads: u
     let t0 = Instant::now();
     let mut cfgs = Vec::new();
     for c in &crates {
-        cfgs.push(cfg::CfgSet::host(sess, &c.features));
+        let mut cs = cfg::CfgSet::host(sess, &c.features);
+        if c.harness { cs.set.push("test".into()); }
+        cfgs.push(cs);
     }
     let (files, missing, errors) = crates::discover(sess, &crates, &cfgs, threads);
     let discover_s = t0.elapsed().as_secs_f64();
@@ -788,8 +796,10 @@ pub fn std_dir() -> String {
     concat!(env!("CARGO_MANIFEST_DIR"), "/std").to_string()
 }
 
-/// Where std's sources may be, in order: the workspace's own (when it is a makepad checkout),
-/// beside the binary's target dir, under <dir>/src, and the tree the binary was built from.
+/// Where std's sources may be, in order: the workspace's own or that of the makepad checkout it
+/// lies in (apps/commercial builds against the tree around it), beside the binary's target dir,
+/// under <dir>/src, and the tree the binary was built from. The workspace's tree comes first: a
+/// lease's binary matches the lease's tree, and the tree beside it may have moved on since.
 pub fn std_candidates(workspace: Option<&str>) -> Vec<String> {
     let mut d = std::env::current_exe().unwrap_or_default();
     for _ in 0..3 {
@@ -797,12 +807,27 @@ pub fn std_candidates(workspace: Option<&str>) -> Vec<String> {
     }
     let mut v: Vec<String> = Vec::new();
     if let Some(w) = workspace {
-        v.push(format!("{}/libs/relax/compiler/std", w));
+        for dir in std::path::Path::new(w).ancestors() {
+            v.push(format!("{}/libs/relax/compiler/std", dir.display()));
+        }
     }
     v.push(format!("{}/libs/relax/compiler/std", d.display()));
     v.push(format!("{}/src/libs/relax/compiler/std", d.display()));
     v.push(concat!(env!("CARGO_MANIFEST_DIR"), "/std").to_string());
     v
+}
+
+#[cfg(test)]
+#[test]
+fn a_workspace_inside_a_checkout_takes_that_checkouts_std_before_the_one_beside_the_binary() {
+    let v = std_candidates(Some("/t/lane/apps/commercial"));
+    let at = |c: &str| v.iter().position(|x| x == c);
+    let mut beside = std::env::current_exe().unwrap();
+    for _ in 0..3 {
+        beside.pop();
+    }
+    assert_eq!(at("/t/lane/apps/commercial/libs/relax/compiler/std"), Some(0));
+    assert!(at("/t/lane/libs/relax/compiler/std").unwrap() < at(&format!("{}/libs/relax/compiler/std", beside.display())).unwrap(), "{v:?}");
 }
 
 /// Loads core, alloc (when present) and std; returns core and the dependency list user crates
@@ -937,7 +962,7 @@ pub fn load_with_std(sess: &std::sync::Arc<crate::Session>, root: &str, name: &s
     }
     // a single file is edition 2021 unless its header says otherwise (`//@ edition: 2024`,
     // the compiletest directive; rustc takes it as --edition)
-    let edition = std::fs::read_to_string(root).ok().and_then(|src| {
+    let edition = crate::vfs::read_to_string(root).ok().and_then(|src| {
         src.lines().take_while(|l| l.starts_with("//")).find_map(|l| l.strip_prefix("//@ edition:").and_then(|e| e.trim().parse::<u16>().ok()))
     });
     let krate = match prog.load_crate_deferred(name, root, edition.unwrap_or(2021), cfgset, deps) {
@@ -950,6 +975,15 @@ pub fn load_with_std(sess: &std::sync::Arc<crate::Session>, root: &str, name: &s
         return Err(prog.errors.clone());
     }
     Ok((prog, core, krate))
+}
+
+/// Resolve file arguments against the program's workspace, including virtual workspaces.
+fn workspace_file_path(path: &str) -> String {
+    if std::path::Path::new(path).is_absolute() {
+        path.to_string()
+    } else {
+        std::path::Path::new(&crate::run::workspace_dir()).join(path).to_string_lossy().into_owned()
+    }
 }
 
 fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
@@ -976,7 +1010,8 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     pa.extend(args[1..].iter().filter(|a| a.as_str() != "--").map(|a| a.clone().into_bytes()));
     jit::set_program_args(pa);
     let t0 = Instant::now();
-    let (prog, core, krate) = match load_with_std(sess, root, "test_crate", true) {
+    let path = workspace_file_path(root);
+    let (mut prog, core, krate) = match load_with_std(sess, &path, "test_crate", true) {
         Ok(x) => x,
         Err(e) => {
             for m in e {
@@ -988,9 +1023,20 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     // the crate under test is the program's own crate (run.rs): its #![recursion_limit] and
     // #![type_length_limit] govern monomorphization (TypingEnv::fully_monomorphized)
     crate::layout::set_root_crate(krate);
+    // the file is checked whole before any test runs, as `rustc --test` compiles it first (the
+    // package form's up-front check, run.rs test_subjects); marked before collection
+    crate::borrowck::event::set_check_scope();
+    let mut own = vec![false; prog.crates.len()];
+    own[krate as usize] = true;
+    prog.crates[krate as usize].validate = true;
+    prog.own_crates = own.clone();
+    relax_types::lint::enable();
+    prog.run_import_sim(&own);
     let t1 = Instant::now();
     let mut tcx = tcx::Tcx::new();
-    tcx.collect(&prog);
+    // (coherence evaluates the constants of impl headers, which needs the unit's evaluator: it runs
+    // in the up-front check below, as in the package form)
+    tcx.collect_declarations(&prog);
     if !tcx.errors.is_empty() {
         for m in &tcx.errors {
             eprintln!("error: {}", m);
@@ -1004,6 +1050,11 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     if !enum_errors.is_empty() {
         for error in enum_errors { eprintln!("error: {}", error); }
         return 1;
+    }
+    let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true);
+    if check_errors > 0 {
+        eprintln!("error: could not compile `{root}` (test) due to {check_errors} previous error{}: no test ran", if check_errors == 1 { "" } else { "s" });
+        return 101;
     }
     jit::enable_pipelining(options);
     println!(
@@ -1022,6 +1073,11 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         }
     }
     let total_runs = runs.len();
+    // the platform's start code runs the program's constructors before the harness (sections.rs)
+    if let Err(e) = unsafe { crate::sections::run_constructors(&mut *u, krate, None) } {
+        eprintln!("error: {e}");
+        return 101;
+    }
     for (ri, d) in runs.into_iter().enumerate() {
         let last_round = ri + tests.len() >= total_runs;
         let name = u.prog.def_path(d);
@@ -1046,6 +1102,13 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             // the same test at the same time in N domains of this unit (domain 0 + N-1 new
             // blocks), each on its own thread: a static shared between them fails its asserts
             let bases: Vec<u64> = std::iter::once(u.syms.dom0()).chain((1..runtime.test_domains).map(|_| crate::owner::call(crate::owner::Class::Program, || crate::domain::create(&u)))).collect();
+            // a new domain's statics are their initial images: its constructors run in it too
+            for &b in &bases[1..] {
+                if let Err(e) = unsafe { crate::sections::run_constructors(up, krate, Some(b)) } {
+                    eprintln!("error: {e}");
+                    return 101;
+                }
+            }
             let upa = up as usize;
             let rs: Vec<_> = std::thread::scope(|sc| {
                 let hs: Vec<_> = bases.iter().map(|&b| sc.spawn(move || unsafe { jit::call_jit_in(upa as *mut jit::Unit, b, entry, 0) })).collect();
@@ -1147,11 +1210,13 @@ fn cmd_resolve(sess: &std::sync::Arc<crate::Session>, units_path: &str) {
             let s = prog.syms.intern(n);
             deps.push((s, crate_of[*i]));
         }
-        let cs = program_cfg(sess, &c.features);
+        let mut cs = program_cfg(sess, &c.features);
+        if c.harness { cs.set.push("test".into()); }
         match prog.load_crate_deferred(&c.name, &c.src_path, c.edition, cs, deps) {
             Ok(k) => {
                 prog.crates[k as usize].proc_macro = c.proc_macro;
                 prog.crates[k as usize].is_bin = c.bin;
+                prog.crates[k as usize].harness = c.harness;
                 crate_of[ci] = k;
             }
             Err(e) => {
@@ -1234,6 +1299,20 @@ mod lazy_reload_tests;
 mod calls_tests;
 
 #[cfg(test)]
+mod reload_async_tests;
+#[cfg(test)]
+mod reload_items_tests;
+
+#[cfg(test)]
+mod value_tests;
+
+#[cfg(test)]
+mod check_lint_tests;
+
+#[cfg(test)]
+mod check_reuse_tests;
+
+#[cfg(test)]
 #[test]
 fn round18_rpit_diagnostic() {
     // `makepad test` is process-global (it installs the runtime and exits): run it in a child of
@@ -1252,4 +1331,40 @@ fn round18_rpit_diagnostic() {
     eprintln!("{all}");
     assert!(output.status.success());
     assert!(all.contains("test result: 10 passed; 0 failed"), "{all}");
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub unsafe fn reset_statics() {
+    cache::reset_statics();
+    check::reset_statics();
+    coverage::reset_statics();
+    domain::reset_statics();
+    domain_res::reset_statics();
+    first_frame::reset_statics();
+    front::reset_statics();
+    harness::reset_statics();
+    hot_failure::reset_statics();
+    inspect::reset_statics();
+    invalid::reset_statics();
+    jit::reset_statics();
+    lower::reset_statics();
+    mainprof::reset_statics();
+    modules::reset_statics();
+    native_macros::reset_statics();
+    os::reset_statics();
+    owner::reset_statics();
+    pmhost::reset_statics();
+    postframe::reset_statics();
+    provided::reset_statics();
+    reload::reset_statics();
+    run::reset_statics();
+    sandbox::reset_statics();
+    stale::reset_statics();
+    store::reset_statics();
+    syms::reset_statics();
+    tui::reset_statics();
+    typeck_bg::reset_statics();
+    wasm_export::reset_statics();
+    web::reset_statics();
+    web32::reset_statics();
 }

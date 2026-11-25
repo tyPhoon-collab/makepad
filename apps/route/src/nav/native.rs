@@ -118,7 +118,7 @@ pub fn start_nav_load(
     chargers: PathBuf,
 ) {
     let rejected_sender = sender.clone();
-    match pool.submit(Lane::Heavy, move || {
+    match pool.submit(Class::Background, move || {
         let maps_root = basenames
             .first()
             .and_then(|basename| Path::new(basename).parent())
@@ -370,7 +370,7 @@ pub fn start_radar_worker(
                             let display_frames = (0..frames.len())
                                 .map(|_| std::sync::OnceLock::new())
                                 .collect::<Vec<_>>();
-                            pool.fan_out(Lane::Heavy, frames.len(), |index| {
+                            pool.fan_out(frames.len(), |index| {
                                 let rgba = projection.frame_to_rgba(&frames[index]);
                                 let _ = display_frames[index].set(
                                     makepad_geodata::radar_raster::rgba_to_bgra_texels(&rgba),
@@ -503,53 +503,5 @@ impl RadarGrid {
         }
         let dbz = 0.5 * v as f64 - 32.0;
         Some((10.0_f64.powf(dbz / 10.0) / 200.0).powf(1.0 / 1.6))
-    }
-}
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
-    use super::*;
-
-    /// Offline check against a real maps root: `ROUTE_MAPS_ROOT=<dir> cargo
-    /// test --release -p makepad-app-route nav_regions -- --ignored --nocapture`.
-    /// Searches and routes in every region, with whatever network the
-    /// process has (none of it is used).
-    #[test]
-    #[ignore]
-    fn nav_regions_search_and_route_offline() {
-        let root = PathBuf::from(std::env::var("ROUTE_MAPS_ROOT").expect("ROUTE_MAPS_ROOT"));
-        let basenames = nav_basenames(&root);
-        println!("regions: {basenames:?}");
-        let regions = load_regions(&basenames).unwrap();
-        let mut data = NavData {
-            regions,
-            searchdb: None,
-            places: None,
-            major_graph: None,
-            major_graph_attempted: true,
-            chargers: None,
-            maps_root: root,
-        };
-        let top = |data: &NavData, q: &str| {
-            let r = data.search(q, None, 3);
-            println!("search {q:?}: {:?}", r.first().map(|r| (&r.name, r.pos)));
-            r.into_iter().next().unwrap_or_else(|| panic!("no result for {q}")).pos
-        };
-        let dam = top(&data, "Amsterdam Centraal");
-        let schiphol = top(&data, "Schiphol");
-        let szn = top(&data, "深圳北站");
-        let szn_en = top(&data, "Shenzhen North Railway Station");
-        let futian = top(&data, "Futian");
-        let peak = top(&data, "Victoria Peak");
-        let tst = top(&data, "尖沙咀");
-        for (name, a, b, mode) in [
-            ("amsterdam", dam, schiphol, TravelMode::Car),
-            ("shenzhen", szn, futian, TravelMode::Car),
-            ("hong kong", peak, tst, TravelMode::Car),
-            ("shenzhen-hong kong (foot)", szn_en, tst, TravelMode::Foot),
-        ] {
-            let route = data.route_pair(a, b, mode).unwrap_or_else(|| panic!("no route {name}"));
-            println!("route {name}: {:.1} km, {:.0} min", route.length_m / 1000.0, route.duration_s / 60.0);
-        }
     }
 }

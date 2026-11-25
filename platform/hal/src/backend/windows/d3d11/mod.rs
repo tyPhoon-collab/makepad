@@ -11,6 +11,8 @@ pub(crate) mod dcomp;
 pub(crate) mod device;
 mod frame;
 mod pipeline;
+mod compute;
+mod leases;
 mod readback;
 pub(crate) mod resources;
 pub mod share_copy;
@@ -24,7 +26,7 @@ use crate::ledger::{Kind, LedgerEntry};
 use crate::session::*;
 use crate::types::*;
 use complete::{Completion, Event, Mailbox, Token};
-use device::{Device, Worker};
+use device::{CompilePool, Device};
 use pipeline::{PipeSrc, PipeState};
 use resources::{Arena, Buffer, Texture};
 use std::collections::HashMap;
@@ -47,14 +49,19 @@ struct Pipe {
     announced: bool,
 }
 
+/// How often the device's memory count is read.
+const COUNT_NS: u64 = 250_000_000;
+
 pub struct D3d11 {
     shell: Option<&'static win32::Shared>,
     a11y_update: Option<win32::a11y::Update>,
+    leases: Arc<leases::Pool>,
     dev: Arc<Device>,
     info: HalInfo,
     tex: HashMap<(u32, u32), Tex>,
     buf: HashMap<(u32, u32), Buf>,
     pipe: HashMap<(u32, u32), Pipe>,
+    compute: HashMap<(u32, u32), compute::Pipe>,
     /// compiled pipelines shared by identical sources and layouts (by `PipeSrc::hash_key`)
     programs: HashMap<u64, Vec<Weak<PipeState>>>,
     /// windows' retained images, by (owner, index)
@@ -69,7 +76,7 @@ pub struct D3d11 {
     pick_ids: HashMap<(u32, Id), Id>,
     pick_pending: std::collections::HashSet<(u32, Id)>,
     /// window capture textures (recording), reused once no sink holds them
-    captures: Vec<([u32; 2], makepad_windows_sys::Win32::Graphics::Direct3D11::ID3D11Texture2D)>,
+    captures: Vec<([u32; 2], makepad_windows_sys::Win32::Graphics::Direct3D11::ID3D11Texture2D, crate::ledger::Charge)>,
     /// cross-process images this pass holds (keyed mutex), given back when it is encoded
     acquired: Vec<Arc<Texture>>,
     fallback: HashMap<u32, Arc<Texture>>,
@@ -89,13 +96,18 @@ pub struct D3d11 {
     batch: complete::Batch,
     cb_arena: Arena,
     word_arena: Arena,
+    /// the device's count of this process's video memory (`Device::usage`), read every
+    /// `COUNT_NS` (when idle staging is trimmed too)
+    device_bytes: Option<u64>,
+    counted_at: u64,
     /// one pass's draw lists, reused pass after pass
     scratch: frame::PassScratch,
+    /// the pass being encoded of a frame the GPU profiler records: its draws and attachments
+    prof: Option<frame::ProfRecords>,
     mailbox: Mailbox,
     complete: Completion,
     /// HLSL compiles in parallel (FXC is single-threaded per call; a cold start compiles dozens)
-    compilers: Vec<Worker>,
-    next_compiler: usize,
+    compilers: CompilePool,
     /// video, audio, MIDI, camera, game input (`backend/windows/media`)
     media: super::media::Media,
     /// the sessions heard `DeviceLost` and the replacement device is not made yet
@@ -127,7 +139,10 @@ impl D3d11 {
             msaa: 1,
             dpi: shell.map_or_else(win32::system_dpi, |s| s.dpi()),
             // offscreen too: a badge layer is composed into the retained image's copy either way
-            flags: info_flags::GPU_TIMESTAMPS | info_flags::WINDOW_BADGES,
+            flags: info_flags::GPU_TIMESTAMPS | info_flags::WINDOW_BADGES | info_flags::WINDOW_LAYERS | info_flags::COMPUTE | info_flags::DRAW_STORAGE_BUFFERS | info_flags::DEVICE_RESET,
+            max_workgroup_size: [1024, 1024, 64],
+            max_workgroup_invocations: 1024,
+            storage_formats: (0..format::COUNT).filter(|f| device::dxgi(*f).is_some_and(|fmt| unsafe { dev.device.CheckFormatSupport(fmt.resource) }.unwrap_or(0) & 0x02000000 != 0)).fold(0, |bits, f| bits | (1u64 << f)),
             max_texture: 16384,
             max_window: [16384, 16384],
             max_buffer: (u32::MAX as u64) & !15,
@@ -140,22 +155,36 @@ impl D3d11 {
         }
         crate::gpu_limits::set_max_gpu_buffer_bytes(info.max_buffer);
         crate::gpu_limits::set_gpu_working_set_bytes(info.working_set);
-        let mailbox = Mailbox::new(wake);
+        let mailbox = Mailbox::new(wake.clone());
         let complete = Completion::new(dev.clone(), mailbox.clone())?;
+        crate::gpu_prof::set_device(crate::gpu_prof::DeviceInfo {
+            name: dev.adapter_name.clone(),
+            counter_sets: vec!["timestamp (D3D11 timestamp queries inside a disjoint query per frame)".into()],
+            sampling: vec!["pass boundary".into(), "completion-time clock anchor".into()],
+            notes: vec![
+                "render passes are timed whole with timestamp queries (no vertex / fragment lanes, no per-shader split)".into(),
+                "GPU times are placed on the host clock where each frame's completion event was seen (late by the completion thread's wake-up)".into(),
+            ],
+        });
         if win32::log_enabled() {
             eprintln!("[hal-d3d11] device on \"{}\": formats {:#x} renderable {:#x} offscreen={}", dev.adapter_name, dev.formats, dev.renderable, shell.is_none());
         }
         Ok(Self {
+            leases: leases::Pool::new(dev.clone(), wake.clone()),
             shell,
             a11y_update: None,
             cb_arena: Arena::new(&dev, 256 * 1024, true)?,
             word_arena: Arena::new(&dev, 256 * 1024, false)?,
+            device_bytes: None,
+            counted_at: 0,
             scratch: Default::default(),
+            prof: None,
             dev,
             info,
             tex: HashMap::new(),
             buf: HashMap::new(),
             pipe: HashMap::new(),
+            compute: HashMap::new(),
             programs: HashMap::new(),
             win: HashMap::new(),
             badged: HashMap::new(),
@@ -176,11 +205,7 @@ impl D3d11 {
             batch: complete::Batch::default(),
             mailbox,
             complete,
-            compilers: {
-                let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 8));
-                (0..n).map(|i| Worker::new(&format!("makepad-d3d11-compile-{i}"))).collect::<Result<Vec<_>, _>>()?
-            },
-            next_compiler: 0,
+            compilers: CompilePool::new("makepad-d3d11-compile", std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 8)))?,
             media: super::media::Media::new(),
             lost_posted: false,
             retry_ns: 0,
@@ -189,19 +214,18 @@ impl D3d11 {
         })
     }
 
-    /// Queues the compile of `state`'s program on a worker (round robin); it wakes the HAL when done.
+    /// Queues the compile of `state`'s program on the compile threads; it wakes the HAL when done.
     fn compile(&mut self, state: &Arc<PipeState>) {
         let job = state.clone();
         let dev = self.dev.clone();
         let wake = self.mailbox.wake.clone();
-        self.next_compiler = (self.next_compiler + 1) % self.compilers.len();
-        self.compilers[self.next_compiler].push(move || {
+        self.compilers.push(Arc::as_ptr(state) as usize, move || {
             let t0 = std::time::Instant::now();
             let src = &job.src;
             if win32::log_enabled() {
                 eprintln!("[hal-d3d11] compiling `{}` ({} bytes of HLSL)", src.name, src.code.source.len());
             }
-            let program = pipeline::build(&dev, &src.code, src.desc, src.bindings.clone(), src.layout.clone(), &src.name);
+            let program = pipeline::build(&dev, &src.code, src.desc, src.bindings.clone(), src.layout.clone(), src.storage.clone(), &src.name);
             if win32::log_enabled() || t0.elapsed() > std::time::Duration::from_secs(2) {
                 eprintln!("[hal-d3d11] compiled `{}` in {:.0} ms", src.name, t0.elapsed().as_secs_f64() * 1e3);
             }
@@ -271,12 +295,14 @@ impl D3d11 {
     }
 
     fn drain(&mut self, world: &mut World) {
+        leases::drain();
         for done in self.mailbox.take() {
             let sid = done.token.sid;
             if !world.session(sid).is_some_and(|s| Arc::ptr_eq(&s.font_frames, &done.token.incarnation)) {
                 continue;
             }
             match done.event {
+                Event::DispatchTime { name, gpu_ns } => world.to_session(sid, |q| q.dispatch_time(name.as_bytes(), gpu_ns)),
                 Event::Frame { target, kind, frame, window, gpu_ns, gpu_span } => {
                     if let Some(s) = world.session_mut(sid) {
                         s.stats.frames += 1;
@@ -291,6 +317,7 @@ impl D3d11 {
                     }
                     world.frame_done(sid, target, kind, frame, gpu_ns, done.time, gpu_span);
                 }
+                Event::BufferLeases { req, status, leases } => world.to_session(sid, |q| q.buffer_leases(req, status, leases)),
                 Event::Readback { req, status, rect, pixels } => world.to_session(sid, |q| q.readback(req, status, rect, &pixels)),
                 Event::Pick { req, ids } => world.to_session(sid, |q| q.pick_result(req, &ids.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>())),
             }
@@ -315,18 +342,37 @@ impl D3d11 {
                 world.to_session(*sid, |q| q.pipeline_ready(id));
             }
         }
-        let allocated = self.dev.allocated.load(Ordering::Relaxed);
+        self.announce_compute(world);
+        let now = crate::clock_ns();
+        if now >= self.counted_at {
+            self.counted_at = now + COUNT_NS;
+            self.leases.trim(now);
+            self.device_bytes = self.dev.usage();
+        }
+        let device = self.device_bytes;
         if let Some(host) = world.session_mut(HOST) {
-            for ((sid, index), t) in &self.win {
-                if *sid == HOST && host.ledger.get(Kind::Window, *index).is_none_or(|r| r.gen != t.gen || r.bytes != t.tex.bytes
-                    || r.width != t.tex.desc.w || r.height != t.tex.desc.h) {
-                    host.ledger.add(window_row(Id::new(*index, t.gen), &t.tex, crate::clock_ns(), host.frame));
-                }
+            let frame = host.frame;
+            host.ledger.set_pools(&self.dev.pools, frame, now);
+        }
+        // a window's row: its retained image and its swapchain's back buffers
+        for ((sid, index), t) in &self.win {
+            let id = Id::new(*index, t.gen);
+            let back = self.chains.back_buffers((*sid, id));
+            if *sid != HOST && back.is_none() { continue; }
+            let Some(owner) = world.session_mut(*sid) else { continue };
+            let (back_bytes, back_count) = back.unwrap_or_default();
+            let (bytes, objects) = (t.tex.bytes + back_bytes, 1 + back_count as u64);
+            if owner.ledger.get(Kind::Window, *index).is_none_or(|r| r.gen != t.gen || r.bytes != bytes || r.objects != objects
+                || r.width != t.tex.desc.w || r.height != t.tex.desc.h) {
+                let mut row = window_row(id, &t.tex, now, owner.frame);
+                row.bytes = bytes;
+                row.objects = objects;
+                owner.ledger.add(row);
             }
         }
         for sid in world.session_ids() {
             if let Some(s) = world.session_mut(sid) {
-                s.ledger.device_allocated = Some(allocated);
+                s.ledger.device_allocated = device;
             }
         }
     }
@@ -346,8 +392,11 @@ impl Backend for D3d11 {
     fn before_exit(&mut self) {
         let batch = std::mem::take(&mut self.batch);
         self.complete.submit(batch);
-        for compiler in &mut self.compilers { compiler.stop(); }
+        self.compilers.stop();
         self.complete.stop();
+        // No receiver remains: dropping completion guards queues their unmaps here.
+        drop(self.mailbox.take());
+        leases::drain();
     }
     fn submit(&mut self, world: &mut World, sid: u32, view: &CmdView) {
         self.recover(world);
@@ -388,7 +437,7 @@ impl Backend for D3d11 {
         self.media.session_closed(sid);
         self.tex.retain(|k, _| k.0 != sid);
         self.buf.retain(|k, _| k.0 != sid);
-        self.pipe.retain(|k, _| k.0 != sid);
+        self.pipe.retain(|k, _| k.0 != sid); self.compute.retain(|k, _| k.0 != sid);
         self.win.retain(|k, _| k.0 != sid);
         self.segments.retain(|k, _| k.0 != sid);
         self.segment_depths.retain(|k, _| k.0 != sid);
@@ -450,6 +499,7 @@ impl exec::DeviceReset for D3d11 {
         self.media.device_reset(world);
         self.cb_arena = cb_arena;
         self.word_arena = word_arena;
+        self.leases = leases::Pool::new(dev.clone(), self.mailbox.wake.clone());
         self.dev = dev;
         self.info.working_set = self.dev.budget().map_or(0, |b| b.0);
         crate::gpu_limits::set_gpu_working_set_bytes(self.info.working_set);
@@ -457,6 +507,20 @@ impl exec::DeviceReset for D3d11 {
     }
 
     fn rebuild_pipelines(&mut self, world: &mut World) {
+        let kernels: Vec<_> = self.compute.iter().map(|(key, pipe)| (*key, pipe.gen, pipe.announced)).collect();
+        self.compute.clear();
+        for ((sid, index), gen, announced) in kernels {
+            let Some(s) = world.session_mut(sid) else { continue; };
+            let id = Id::new(index, gen);
+            let Ok(entry) = s.pipelines.get(sid, id) else { continue; };
+            let bytes = entry.val.blob.clone();
+            let Some(blob) = PipelineBlob::parse(&bytes) else { continue; };
+            if announced { s.pipelines_pending += 1; }
+            if let PipeStatus::Failed(error) = self.create_compute(s, id, &blob) {
+                s.pipelines_pending = s.pipelines_pending.saturating_sub(1);
+                s.events.pipeline_failed(id, error.as_bytes());
+            }
+        }
         self.programs.clear();
         let mut rebuilt: HashMap<*const PipeState, Arc<PipeState>> = HashMap::new();
         let keys: Vec<(u32, u32)> = self.pipe.keys().copied().collect();
@@ -534,6 +598,7 @@ impl Gpu for D3d11 {
     }
 
     fn badges(&self) -> bool { true }
+    fn layer_copy(&mut self, s: &mut Session, window: Id, layer: Id, _now: u64) -> bool { self.copy_into_layer(s, window, layer) }
     fn badge_layer(&mut self, window: Id, on: bool) {
         if on { self.badged.entry(window.index).or_insert(None); } else { self.badged.remove(&window.index); }
     }
@@ -589,6 +654,11 @@ impl Gpu for D3d11 {
     }
     fn buffer_create(&mut self, s: &mut Session, id: Id, b: &mut BufferObj) -> Result<(), String> {
         let buf = Buffer::new(self.dev.clone(), b.kind, b.size)?;
+        // A retained buffer reads as zero where nothing wrote it, as on Vulkan and Metal. D3D11
+        // leaves a new buffer's bytes undefined (the driver hands out memory the process freed),
+        // so a storage buffer is cleared on the GPU here; the other kinds are read only where
+        // uploaded (a uniform buffer is written whole).
+        if let Some(uav) = &buf.uav { unsafe { self.dev.ctx.ClearUnorderedAccessViewUint(uav, &[0; 4]) } }
         b.bytes = buf.bytes;
         self.buf.insert((s.id, id.index), Buf { gen: id.gen, buf, evictable: b.evictable });
         Ok(())
@@ -605,6 +675,7 @@ impl Gpu for D3d11 {
             }
         }
     }
+    fn buffer_readbacks(&mut self, s: &mut Session, req: u32, ranges: &[BufferReadRange]) { self.read_compute_buffers(s, req, ranges); }
     fn buffer_destroy(&mut self, sid: u32, id: Id) {
         if self.buf.get(&(sid, id.index)).is_some_and(|b| b.gen <= id.gen) {
             self.buf.remove(&(sid, id.index));
@@ -619,6 +690,7 @@ impl Gpu for D3d11 {
         if dialect != self::dialect::HLSL {
             return PipeStatus::Failed("D3D11 takes the HLSL payload".into());
         }
+        if blob.desc.compute.len != 0 { return self.create_compute(s, id, blob); }
         let code = match HlslPipeline::decode(blob.code) {
             Ok(c) => c,
             Err(e) => return PipeStatus::Failed(e),
@@ -628,6 +700,7 @@ impl Gpu for D3d11 {
             desc: blob.desc,
             bindings: blob.bindings.clone(),
             layout: blob.vertex_layout.clone(),
+            storage: crate::compute::records(blob.raw, blob.desc.storage_buffers).unwrap_or_default(),
             name: s.string(blob.desc.name).unwrap_or("").to_owned(),
         };
         let key = src.hash_key();
@@ -643,7 +716,15 @@ impl Gpu for D3d11 {
         self.pipe.insert((s.id, id.index), Pipe { gen: id.gen, state, epoch: 0, announced: false });
         PipeStatus::Pending
     }
+    fn pipeline_wanted(&mut self, sid: u32, id: Id) {
+        if let Some(p) = self.pipe.get(&(sid, id.index)).filter(|p| p.gen == id.gen) {
+            self.compilers.hurry(Arc::as_ptr(&p.state) as usize);
+        } else if let Some(p) = self.compute.get(&(sid, id.index)).filter(|p| p.gen == id.gen) {
+            self.compilers.hurry(p.compile_key());
+        }
+    }
     fn pipeline_destroy(&mut self, sid: u32, id: Id) -> bool {
+        if self.compute.get(&(sid, id.index)).is_some_and(|p| p.gen <= id.gen) { return self.compute.remove(&(sid, id.index)).is_some_and(|p| !p.announced); }
         if self.pipe.get(&(sid, id.index)).is_some_and(|p| p.gen <= id.gen) {
             return self.pipe.remove(&(sid, id.index)).is_some_and(|p| !p.announced);
         }
@@ -703,5 +784,7 @@ fn window_row(id: Id, t: &Texture, now: u64, frame: u64) -> LedgerEntry {
         created_frame: frame,
         last_used_frame: frame,
         last_used_ns: now,
+        objects: 1,
+        note: "",
     }
 }

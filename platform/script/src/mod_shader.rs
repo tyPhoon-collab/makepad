@@ -52,6 +52,15 @@ pub const SHADER_COOPERATIVE_MATRIX: ShaderIoType = ShaderIoType(32);
 pub const SHADER_IO_FRAGMENT_DEPTH_ANY: ShaderIoType = ShaderIoType(33);
 pub const SHADER_IO_FRAGMENT_DEPTH_GREATER: ShaderIoType = ShaderIoType(34);
 pub const SHADER_IO_FRAGMENT_DEPTH_LESS: ShaderIoType = ShaderIoType(35);
+// 36..41: the storage texture formats (`texture_2d_rw`)
+/// `shader.fragment_position()`: the fragment's own position, read in the fragment stage
+/// (`ShaderIoKind::FragmentPosition`).
+pub const SHADER_IO_FRAGMENT_POSITION: ShaderIoType = ShaderIoType(42);
+
+pub fn storage_texture_format(io_type: ShaderIoType) -> Option<crate::shader_ir_compute::StorageTextureFormat> {
+    use crate::shader_ir_compute::StorageTextureFormat::*;
+    [R16f, R8unorm, R32f, R32uint, Rgba8unorm, Rgba16f].get(io_type.0.checked_sub(36)? as usize).copied()
+}
 
 /// The depth mode of a fragment depth io type (`FRAG_DEPTH_*`), if it is one.
 pub fn fragment_depth_mode(io_type: ShaderIoType) -> Option<u8> {
@@ -61,6 +70,17 @@ pub fn fragment_depth_mode(io_type: ShaderIoType) -> Option<u8> {
 
 pub fn define_shader_module(heap: &mut ScriptHeap, native: &mut ScriptNative) {
     let shader = heap.new_module(id!(shader));
+
+    native.add_method(heap, shader, id_lut!(texture_2d_rw), script_args!(format = NIL), |vm, args| {
+        let format = script_value!(vm, args.format);
+        let formats = [id!(r16f), id!(r8unorm), id!(r32f), id!(r32uint), id!(rgba8unorm), id!(rgba16f)];
+        let Some(index) = formats.iter().position(|f| Some(*f) == format.as_id()) else {
+            return script_err_invalid_args!(vm.bx.threads.cur_ref().trap, "texture_2d_rw needs @r16f, @r8unorm, @r32f, @r32uint, @rgba8unorm or @rgba16f");
+        };
+        let obj = vm.bx.heap.new_with_proto(NIL);
+        vm.bx.heap.set_shader_io(obj, ShaderIoType(36 + index as u32));
+        obj.into()
+    });
 
     // Narrow integer components are matrix-only; memory may be packed in
     // u32/vec4u arrays. Offsets and strides use the array's element units.
@@ -405,6 +425,18 @@ pub fn define_shader_module(heap: &mut ScriptHeap, native: &mut ScriptNative) {
         },
     );
 
+    // `at: fragment_position()`: `self.at` in `fragment` (or a fn it calls) is the fragment's
+    // position: x and y in pixels of the render target from its top-left corner (a pixel's
+    // centre at .5), z its window-space depth (0..1, what `depth_of` gives) and w the
+    // reciprocal of its clip w, the same on every backend and per eye in XR. It costs no
+    // varying.
+    native.add_method(heap, shader, id_lut!(fragment_position), script_args!(), |vm, _args| {
+        let vec4_ty = vm.bx.heap.pod_type_ref(vm.bx.code.builtins.pod.pod_vec4f).object;
+        let obj = vm.bx.heap.new_with_proto(vec4_ty.into());
+        vm.bx.heap.set_shader_io(obj, SHADER_IO_FRAGMENT_POSITION);
+        obj.into()
+    });
+
     #[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
     define_shader_compile_natives(heap, native, shader);
 }
@@ -502,10 +534,10 @@ fn define_shader_compile_natives(heap: &mut ScriptHeap, native: &mut ScriptNativ
                 "metal" => ShaderBackend::Metal,
                 "hlsl" => ShaderBackend::Hlsl,
                 "glsl" => ShaderBackend::Glsl,
-                "wgsl" => ShaderBackend::Wgsl,
+                "wgsl" | "wgsl_xr" => ShaderBackend::Wgsl,
                 // SPIR-V through the shader IR: the layout compile is GLSL,
-                // as the Vulkan renderer's.
-                "spirv" => ShaderBackend::Glsl,
+                // as the Vulkan renderer's (`_xr`: the multiview variant).
+                "spirv" | "spirv_xr" => ShaderBackend::Glsl,
                 other => {
                     return format!("unknown backend {}", other).script_to_value(vm);
                 }
@@ -536,19 +568,20 @@ fn define_shader_compile_natives(heap: &mut ScriptHeap, native: &mut ScriptNativ
                     }
                     "hlsl" => out.push_str(&crate::shader_ir_hlsl::hlsl_draw_source(&output, vm)),
                     "metal" => out.push_str(&crate::shader_ir_metal::metal_draw_source(&output, vm, false)),
-                    "wgsl" => match crate::shader_ir_wgsl::draw_wgsl(&output, vm, false) {
+                    "wgsl" | "wgsl_xr" => match crate::shader_ir_wgsl::draw_wgsl(&output, vm, backend_name == "wgsl_xr") {
                         Ok((wgsl, _)) => out.push_str(&wgsl),
                         Err(e) => return format!("ERRORS: {}", e).script_to_value(vm),
                     },
                     _ => match crate::shader_ir_draw::draw_spirv(&output, vm) {
-                        // The window variant's words, `v:` and `f:` lines of hex.
-                        Ok([window, _]) => {
+                        // The window (or XR) variant's words, `v:` and `f:` lines of hex.
+                        Ok([window, xr]) => {
+                            let variant = if backend_name == "spirv_xr" { xr } else { window };
                             out.push_str("v:");
-                            for w in &window.vertex {
+                            for w in &variant.vertex {
                                 out.push_str(&format!("{:08x}", w));
                             }
                             out.push_str("\nf:");
-                            for w in &window.fragment {
+                            for w in &variant.fragment {
                                 out.push_str(&format!("{:08x}", w));
                             }
                         }

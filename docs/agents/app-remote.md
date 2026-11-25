@@ -23,8 +23,11 @@ Capture the launch output using your process tool. The startup line contains
 everything needed to address and clean up that instance:
 
 ```text
-[makepad-remote] pid=9931 app=makepad-example-splash socket=/tmp/makepad-remote/9931.sock
+[makepad-remote] pid=9931 app=makepad-example-splash socket=/tmp/makepad-501/makepad-remote-9931.sock
 ```
+
+The socket is in the user's socket dir, `/tmp/makepad-<uid>` (0700), whatever the
+process's TMPDIR: a deep TMPDIR cannot hold a Unix socket's path.
 
 `--remote` (no value) or `MAKEPAD_REMOTE=1` opens a Unix-socket endpoint. No
 TCP port exists and nothing listens on the network. `--remote=PORT`,
@@ -41,13 +44,18 @@ P=9931   # the pid from your own launch's startup line
 ./target/release/makepad-remote app $P status
 ```
 
-`makepad-remote app <pid|app-name|socket> <command> [k=v ...]`; `makepad
-inspect <pid> <command>` speaks the same commands. The exit status is 1 when
-the answer has an error line and 2 when the app is unreachable.
+`makepad-remote app <pid|socket> <command> [k=v ...]`; `makepad inspect <pid>
+<command>` speaks the same commands. The exit status is 1 when the answer has an
+error line and 2 when the app is unreachable.
 
 Do not discover an instance by taking over another running one. Retain your
 own launch's PID and socket. On code changes, close that instance, rebuild,
 and relaunch before inspecting again.
+
+An app's name (and `makepad inspect all`) reaches only the apps of your own
+lease, or anything for someone typing at a terminal. Otherwise it is refused,
+with the pid it would have reached: on the user's Mac a name is their app, so
+name the pid you mean. `<node>:<name>` through the hub is refused the same way.
 
 ## Common commands
 
@@ -72,9 +80,11 @@ is a quoted shell argument. There is no HTTP, no status code and no POST body.
 | `ui speak [since=N] [node=ID]` / `ui lint` | Announcement stream or accessibility findings |
 | `mouse k=click x=X y=Y` | Mouse input; kinds also include move, down, up, scroll; `k=drag` sends its moves in one burst, which coalesce into one (a value field reads that as the start of a drag and does not change: use `ui act ... drag`) |
 | `click x=X y=Y` | Click alias |
+| `move x=X y=Y` | Mouse move alias (hover) |
 | `key k=press c=KeyA` | Key input; down/up are also supported |
 | `text t=TEXT`, `key t=TEXT` | Text/IME input |
 | `drop path=ABSOLUTE_PATH x=X y=Y` | One file through native drag, drop, and drag-end events |
+| `cpu` | Shared CPU budget and app pool: classes, queues, waits, running jobs and checkpoint warnings |
 | `log [n=50] [since=N]` | App log tail; `n` in the reply is the latest sequence |
 | `step [frames=K] [fps=60]` | Run K virtual-clock frames (needs `--virtual-clock`), see below |
 | `settled` | Whether anything is still pending: `{"settled":bool,"reasons":[...]}` |
@@ -116,10 +126,11 @@ With no window specified, commands generally use the first window.
 
 Mouse buttons: `b=0` left, `b=1` right, `b=2` middle. Scroll takes `dx`
 and `dy`. Add `hw=1` when testing the hardware pointer-lock/pin transform.
-Keyboard modifiers are `shift=1`, `ctrl=1`, `alt=1`, and `cmd=1`.
+Keyboard modifiers are `shift=1`, `ctrl=1`, `alt=1`, and `logo=1`.
 
-The input parser also accepts long names such as `window`, `kind`, `button`,
-`text`, and `code`. Quote values with spaces as ordinary shell arguments.
+Use the keys in each command’s schema (`w`, `k`, `b`, `t`, and `c` for
+input commands); unknown keys are rejected. Quote values with spaces as
+ordinary shell arguments.
 
 File drops require an absolute path (at most 4096 bytes) and finite,
 nonnegative `x`/`y` inside the window. Optional parameters are `w`/`window`

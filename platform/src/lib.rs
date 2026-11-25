@@ -200,7 +200,7 @@ pub use crate::app_main::{
 };
 // Working-tree startup instrumentation (`MAKEPAD_TRACE=startup`).
 pub use crate::cx::{
-    first_present_seen, launched_hidden_until_first_present,startup_trace_first_present,
+    first_present_seen, launched_hidden_until_first_present, relax_app_main, startup_trace_first_present,
     startup_acc, startup_since_exec_ms, startup_trace, startup_trace_enabled, startup_trace_flush,
 };
 pub use crate::cx_api::can_play_type;
@@ -402,8 +402,9 @@ pub use {
             unregister_media_playback_session, MediaPlaybackSessionId,
         },
         script::vm::*,
+        script::reload::ScriptVmReload,
         screen::{fit_window_rect_to_screens, linux_screen_names, screens, ScreenGeom, MIN_WINDOW_SIZE},
-        shared_bytes::{MappedBytes, SharedBytes, SharedBytesStats},
+        shared_bytes::{MappedBytes, HostBuf, HostBufStats, Scalar},
         storage::{
             StorageError, StorageHandle, StorageList, StorageOp, StorageRequestId,
             StorageEstimate, StorageResponse, StorageResult, StorageStat, DEFAULT_STORAGE_VALUE_CAP,
@@ -437,7 +438,7 @@ pub use {
     app_main::*,
     arc_string_mut::ArcStringMut,
     component_list::ComponentList,
-    component_map::ComponentMap,
+    component_map::{ComponentMap, FastHashMap, FastHashSet},
     //makepad_image_formats::image,
     log::*,
     makepad_math::makepad_micro_serde,
@@ -469,3 +470,8 @@ pub use crate::collect::{ScanEvent, Scanner};
 
 pub mod restart;
 pub mod engine_request;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod gpu_compute;
+#[cfg(not(target_arch = "wasm32"))]
+pub use gpu_compute::{GpuBuffer, GpuBufferFlags, ComputeKernel, ComputeParams, ComputePass};

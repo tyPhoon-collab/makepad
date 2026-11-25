@@ -7,7 +7,8 @@ pub(super) type Stamp = Option<(std::time::SystemTime, u64)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
-    Source(String),
+    Source,
+    SourceDirectory(String),
     Provided,
     Build,
     Manifest,
@@ -29,6 +30,8 @@ struct ResolvedGraph {
 pub struct Inputs {
     pub(super) paths: BTreeMap<String, (Stamp, Kind)>,
     graph: Option<ResolvedGraph>,
+    /// the folders of the graph's packages, downloaded ones aside
+    packages: BTreeSet<String>,
 }
 
 /// Whether `path` lies in another OS's source tree (`src/backend/linux/..`, `src/os/windows/..`):
@@ -62,10 +65,10 @@ impl Inputs {
 
     fn protected(&mut self, path: &Path, root: &Path, kind: Kind) {
         self.insert(path, kind.clone());
-        // Directory identities catch additions and atomic replacements of files that
-        // did not exist at boot. Native events, not a periodic tree walk, drive them.
+        // Watch directories below a package root: unrelated root-file replacements must not
+        // restart makepad. Std retains its whole-tree watch. Outside includes get no parents.
         let mut parent = path.parent();
-        while let Some(dir) = parent.filter(|p| p.starts_with(root)) {
+        while let Some(dir) = parent.filter(|p| p.starts_with(root) && (*p != root || kind == Kind::Std)) {
             self.insert(dir, if kind == Kind::Manifest { Kind::Provided } else { kind.clone() });
             parent = dir.parent();
         }
@@ -86,22 +89,32 @@ impl Inputs {
         for (dir, _, _) in graph.pkg.iter().chain(graph.raw.iter().map(|u| &u.pkg)) {
             if dir.is_empty() || dir.contains("/.cargo/registry/") || dir.contains("/.cargo/git/") || !dirs.insert(dir) { continue; }
             let provided = provided.contains(dir);
-            let mut files = Vec::new();
-            crate::srchash::files(Path::new(dir), "", &mut files);
+            let files = if provided { crate::srchash::compiled_files(Path::new(dir)) } else {
+                let mut files = Vec::new();
+                crate::srchash::files(Path::new(dir), "", &mut files);
+                files
+            };
             for (rel, path) in files {
-                let kind = if matches!(rel.as_str(), "Cargo.toml" | "Cargo.lock") {
+                let kind = if rel == "Cargo.toml" || (!provided && rel == "Cargo.lock") {
                     Kind::Manifest
                 } else if provided {
                     Kind::Provided
                 } else if path.extension().is_some_and(|x| x == "rs") {
-                    Kind::Source(dir.clone())
+                    Kind::Source
                 } else { continue };
                 if provided { inputs.protected(&path, Path::new(dir), kind); }
                 else { inputs.insert(&path, kind); }
             }
-            // Include an absent lockfile too: creating it changes the resolved graph.
-            inputs.insert(&Path::new(dir).join("Cargo.lock"), Kind::Manifest);
+            if provided {
+                let build = Path::new(dir).join("build.rs");
+                if crate::vfs::is_file(&build) { inputs.insert(&build, Kind::Provided); }
+            } else {
+                // Include an absent lockfile too: creating it changes the resolved graph.
+                inputs.insert(&Path::new(dir).join("Cargo.lock"), Kind::Manifest);
+                inputs.discover_source_dir(Path::new(dir), dir, &mut Vec::new());
+            }
         }
+        inputs.packages = dirs.into_iter().cloned().collect();
         for script in &graph.build_scripts {
             inputs.insert(Path::new(&script.src_path), Kind::Build);
         }
@@ -112,6 +125,47 @@ impl Inputs {
         crate::srchash::files(Path::new(std_dir), "", &mut files);
         for (_, path) in files { inputs.protected(&path, Path::new(std_dir), Kind::Std); }
         inputs
+    }
+
+    /// Directory stamps catch new modules even before a `mod` declaration is
+    /// saved. Walk children only when discovering a directory; later scans read
+    /// just the directories whose identities changed, including empty ones.
+    fn discover_source_dir(&mut self, dir: &Path, package: &str, added: &mut Vec<String>) {
+        if other_os(dir) { return; }
+        let path = dir.to_string_lossy().into_owned();
+        if !self.paths.contains_key(&path) {
+            self.insert(dir, Kind::SourceDirectory(package.into()));
+            added.push(path);
+        }
+        let Ok(entries) = crate::vfs::read_dir(dir) else { return };
+        for (name, is_dir) in entries {
+            if name.starts_with('.') || name == "target" { continue; }
+            let child = dir.join(name);
+            if other_os(&child) { continue; }
+            let path = child.to_string_lossy().into_owned();
+            if self.paths.contains_key(&path) { continue; }
+            if is_dir {
+                if !crate::vfs::is_file(child.join("Cargo.toml")) {
+                    self.discover_source_dir(&child, package, added);
+                }
+            } else if child.extension().is_some_and(|e| e == "rs") {
+                self.insert(&child, Kind::Source);
+                added.push(path);
+            }
+        }
+    }
+
+    pub(super) fn discover_sources<'a>(&mut self, changed: impl Iterator<Item = &'a str>) -> Vec<String> {
+        let dirs: Vec<_> = changed.filter_map(|path| match self.paths.get(path).map(|p| &p.1) {
+            Some(Kind::SourceDirectory(package)) if self.paths[path].0 != super::stamp(path) => Some((path.to_string(), package.clone())),
+            _ => None,
+        }).collect();
+        let mut added = Vec::new();
+        for (dir, package) in dirs {
+            self.paths.get_mut(&dir).unwrap().0 = super::stamp(&dir);
+            self.discover_source_dir(Path::new(&dir), &package, &mut added);
+        }
+        added
     }
 
     /// The graph `units` the app was resolved to (`graph_moved` resolves it again).
@@ -142,6 +196,7 @@ impl Inputs {
             let Some(exe) = super::host::loader() else { return Vec::new() };
             let built = std::fs::metadata(&exe).and_then(|m| m.modified()).ok();
             let target = super::host::target_dir(&exe);
+            let picked = exe.file_name().is_some_and(|n| n.to_string_lossy().starts_with("makepad.jit-"));
             let Ok(text) = std::fs::read_to_string(exe.with_extension("d")) else { return Vec::new() };
             let mut out = Vec::new();
             for path in dep_info_paths(&text) {
@@ -149,7 +204,11 @@ impl Inputs {
                 // the devhub linked into the binary (its CLI) is no part of a running app: no
                 // "Update ready" on every app for a devhub landing
                 if path.contains("/libs/devhub/") { continue; }
-                let stamp = super::stamp(&path).filter(|s| built.is_none_or(|b| s.0 <= b));
+                // a file newer than this binary: an edit it was built before, so its first look
+                // says changed. Not for a binary picked by the content of its inputs: there the
+                // time only says a checkout rewrote the file (CI flips a tree between pins, and
+                // every leg offered a restart for sources its JIT was built from)
+                let stamp = super::stamp(&path).filter(|s| picked || built.is_none_or(|b| s.0 <= b));
                 out.push((path, stamp));
             }
             out
@@ -162,14 +221,33 @@ impl Inputs {
 
     /// The inputs whose change needs a new makepad process (not a patch): provided crates,
     /// std, makepad's own sources, the Cargo graph and build scripts.
-    pub(super) fn process_paths(&self) -> Vec<String> {
-        self.paths.iter().filter(|(_, (_, k))| !matches!(k, Kind::Source(_))).map(|(p, _)| p.clone()).collect()
+    pub(super) fn process_paths(&self, keep: &dyn Fn(&str) -> bool) -> Vec<String> {
+        self.paths.iter().filter(|(p, (_, k))| !matches!(k, Kind::Source | Kind::SourceDirectory(_)) && keep(p)).map(|(p, _)| p.clone()).collect()
     }
 
-    /// More source files than this in one settled batch is a bulk change.
-    pub(super) const BULK_SOURCES: usize = 16;
-    /// Sources of more packages than this in one settled batch is a bulk change.
-    pub(super) const BULK_PACKAGES: usize = 4;
+    /// Files that can produce a reload event: unloaded sources are read only when loaded.
+    /// Keep absent inputs too (a deleted source or a lockfile that has not been created yet).
+    /// `keep` picks paths before any is looked at (a live session asks about its few saves).
+    pub(super) fn source_paths(&self, loaded: impl Iterator<Item = String>, keep: &dyn Fn(&str) -> bool) -> Vec<String> {
+        let workspace = self.graph.as_ref().map(|g| g.workspace.clone()).unwrap_or_else(crate::run::workspace_dir);
+        let workspace = crate::vfs::normalize_path(&workspace);
+        let roots: Vec<_> = Path::new(&workspace).ancestors().map(|p| p.to_string_lossy().into_owned()).collect();
+        let paths = self.process_paths(keep).into_iter().chain(loaded).chain(crate::native_macros::paths().into_iter().filter(|p| keep(p)));
+        paths.filter(|p| !crate::vfs::is_dir(p)).map(|p| {
+            // Dependencies outside the workspace use ../; another drive has no relative path.
+            roots.iter().enumerate().find_map(|(up, root)| {
+                crate::vfs::relative_path(&p, root).map(|rel| format!("{}{rel}", "../".repeat(up)))
+            }).unwrap_or_else(|| crate::vfs::normalize_path(&p))
+        }).collect::<BTreeSet<_>>().into_iter().collect()
+    }
+
+    /// Whether a workspace-relative path lies in no package of the app's graph, nor in std: no
+    /// crate's own folder holds it (a lane's scratch file in its worktree).
+    pub(super) fn outside_packages(&self, rel: &str, std_dir: &str) -> bool {
+        let workspace = self.graph.as_ref().map(|g| g.workspace.clone()).unwrap_or_else(crate::run::workspace_dir);
+        let path = format!("{workspace}/{rel}");
+        !self.packages.iter().map(String::as_str).chain([std_dir]).any(|dir| crate::vfs::relative_path(&path, dir).is_some())
+    }
 
     /// Native bindings and the compile unit's std are shared by every domain. A fresh app
     /// domain cannot replace them; keep the current app and report the host restart instead.
@@ -183,8 +261,6 @@ impl Inputs {
     }
 
     pub(super) fn restart_reason<'a>(&self, paths: impl Iterator<Item = &'a str>) -> Option<&'static str> {
-        let mut packages = BTreeSet::new();
-        let mut sources = 0usize;
         let mut reason = None;
         for path in paths {
             match self.paths.get(path).map(|x| &x.1) {
@@ -193,16 +269,12 @@ impl Inputs {
                 Some(Kind::Runner) => { if reason.is_none() { reason = Some("makepad run's own sources changed"); } }
                 Some(Kind::Manifest) => { if reason.is_none() { reason = Some("the Cargo graph changed"); } }
                 Some(Kind::Build) => { if reason.is_none() { reason = Some("a build script changed"); } }
-                Some(Kind::Source(package)) => { packages.insert(package); sources += 1; }
-                None => {}
+                Some(Kind::Source | Kind::SourceDirectory(_)) | None => {}
             }
         }
-        // A bulk change (a git checkout / ff / stash pop) rewrites many files across packages at
-        // once and can leave the tree between revisions; an editor or an agent saving a multi-file
-        // edit touches a few files of a few packages, which a patch handles. Keep running the old
-        // program on a bulk change; this is a reload policy, not a capacity limit.
-        let bulk = sources > Self::BULK_SOURCES || packages.len() > Self::BULK_PACKAGES;
-        reason.or_else(|| bulk.then_some("many sources changed at once (e.g. a git checkout)"))
+        // The watcher settles the whole tree, including git operations. Batch
+        // size alone is never a reason to refuse a source transaction.
+        reason
     }
 }
 
@@ -233,19 +305,19 @@ mod tests {
     #[test]
     fn package_boundary_and_non_patchable_inputs() {
         let mut inputs = Inputs::default();
-        inputs.insert(Path::new("app/a.rs"), Kind::Source("app".into()));
-        inputs.insert(Path::new("app/b.rs"), Kind::Source("app".into()));
-        inputs.insert(Path::new("dep/c.rs"), Kind::Source("dep".into()));
+        inputs.insert(Path::new("app/a.rs"), Kind::Source);
+        inputs.insert(Path::new("app/b.rs"), Kind::Source);
+        inputs.insert(Path::new("dep/c.rs"), Kind::Source);
         assert_eq!(inputs.restart_reason(["app/a.rs", "app/b.rs"].into_iter()), None);
         // a multi-package edit (app + its library) is patched
         assert_eq!(inputs.restart_reason(["app/a.rs", "dep/c.rs"].into_iter()), None);
-        // a checkout-sized batch is not
-        let many: Vec<String> = (0..=Inputs::BULK_SOURCES).map(|i| format!("bulk/{i}.rs")).collect();
-        for p in &many { inputs.insert(Path::new(p), Kind::Source("bulk".into())); }
-        assert!(inputs.restart_reason(many.iter().map(|s| s.as_str())).is_some());
-        let pkgs: Vec<String> = (0..=Inputs::BULK_PACKAGES).map(|i| format!("p{i}/a.rs")).collect();
-        for (i, p) in pkgs.iter().enumerate() { inputs.insert(Path::new(p), Kind::Source(format!("p{i}"))); }
-        assert!(inputs.restart_reason(pkgs.iter().map(|s| s.as_str())).is_some());
+        // a settled checkout-sized batch patches together too
+        let many: Vec<String> = (0..32).map(|i| format!("bulk/{i}.rs")).collect();
+        for p in &many { inputs.insert(Path::new(p), Kind::Source); }
+        assert_eq!(inputs.restart_reason(many.iter().map(|s| s.as_str())), None);
+        let pkgs: Vec<String> = (0..8).map(|i| format!("p{i}/a.rs")).collect();
+        for p in &pkgs { inputs.insert(Path::new(p), Kind::Source); }
+        assert_eq!(inputs.restart_reason(pkgs.iter().map(|s| s.as_str())), None);
         for kind in [Kind::Provided, Kind::Build, Kind::Manifest, Kind::Std, Kind::Runner] {
             inputs.insert(Path::new("changed"), kind);
             assert!(inputs.restart_reason(["changed"].into_iter()).is_some());

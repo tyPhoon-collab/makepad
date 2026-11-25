@@ -157,7 +157,7 @@ fn classify_path(path: &str, home: &str) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn os_regions(s: &mut Snap) {
     extern "C" {
         static mach_task_self_: u32;
@@ -166,9 +166,10 @@ fn os_regions(s: &mut Snap) {
         fn mach_vm_region_recurse(task: u32, addr: *mut u64, size: *mut u64, depth: *mut u32, info: *mut u32, count: *mut u32) -> i32;
     }
     let task = unsafe { mach_task_self_ };
-    // TASK_VM_INFO: resident 2, resident peak 3, internal 6, external 8, compressed 15, phys_footprint 18
-    let mut vm = [0u64; 24];
-    let mut count: u32 = 38;
+    // TASK_VM_INFO: resident 2, resident peak 3, internal 6, external 8, compressed 15, phys_footprint 18,
+    // ledger_phys_footprint_peak 21 (rev3: count 84)
+    let mut vm = [0u64; 48];
+    let mut count: u32 = 93;
     if unsafe { task_info(task, 22, vm.as_mut_ptr(), &mut count) } == 0 {
         // the resident size is the kernel's (the region walk below counts pages a file and other
         // processes share too, so its parts do not add up to it)
@@ -176,6 +177,11 @@ fn os_regions(s: &mut Snap) {
         s.add("footprint", vm[18]);
         s.add("peak_rss", vm[3]);
         s.add("compressed", vm[15]);
+        // the peak that counts on macOS: the peak resident size includes pages given back with
+        // MADV_FREE_REUSABLE (the arenas' release) that the kernel had not taken yet
+        if count >= 84 {
+            s.add("peak_footprint", vm[21]);
+        }
     }
     let page = unsafe { vm_page_size } as u64;
     let (mut addr, mut depth) = (0u64, 0u32);
@@ -253,27 +259,147 @@ fn os_regions(s: &mut Snap) {
     }
 }
 
-/// A macOS VM region tag (mach/vm_statistics.h VM_MEMORY_*) as a category.
-#[cfg(target_os = "macos")]
+/// The macOS VM region tags (mach/vm_statistics.h `VM_MEMORY_*`, macOS 26 SDK), each by its
+/// own name, so no large owner hides in one bucket. The numbers are the header's: tags 80/81
+/// once read as GPU and IOSurface here, which are CORPSEINFO and ASL; the GPU's own are
+/// IOACCELERATOR 100 and IOSURFACE 88.
+#[cfg(any(target_vendor = "apple", test))]
+const VM_TAGS: &[(u32, &str)] = &[
+    (0, "untagged (makepad run JIT code/data, burst arena, mapped files)"),
+    (1, "malloc"),
+    (2, "malloc small"),
+    (3, "malloc large"),
+    (4, "malloc huge"),
+    (5, "sbrk"),
+    (6, "realloc"),
+    (7, "malloc tiny"),
+    (8, "malloc large reusable"),
+    (9, "malloc large reused"),
+    (10, "analysis tool"),
+    (11, "malloc nano"),
+    (12, "malloc medium"),
+    (13, "malloc probabilistic guard"),
+    (20, "mach msg"),
+    (21, "IOKit"),
+    (30, "stacks"),
+    (31, "guard"),
+    (32, "shared pmap"),
+    (33, "dylib"),
+    (34, "Objective-C dispatchers"),
+    (35, "unshared pmap"),
+    (36, "libchannel"),
+    (40, "AppKit"),
+    (41, "Foundation"),
+    (42, "CoreGraphics"),
+    (43, "CoreServices"),
+    (44, "Java"),
+    (45, "CoreData"),
+    (46, "CoreData object ids"),
+    (50, "ATS (fonts)"),
+    (51, "layer kit (Core Animation)"),
+    (52, "CGImage"),
+    (53, "tcmalloc"),
+    (54, "CoreGraphics data"),
+    (55, "CoreGraphics shared"),
+    (56, "CoreGraphics framebuffers"),
+    (57, "CoreGraphics backing stores"),
+    (58, "CoreGraphics xalloc"),
+    (60, "dyld"),
+    (61, "dyld malloc"),
+    (62, "SQLite"),
+    (63, "JavaScriptCore"),
+    (64, "JavaScriptCore JIT"),
+    (65, "JavaScriptCore register file"),
+    (66, "GLSL"),
+    (67, "OpenCL"),
+    (68, "CoreImage"),
+    (69, "WebCore purgeable buffers"),
+    (70, "ImageIO"),
+    (71, "CoreProfile"),
+    (72, "assetsd"),
+    (73, "os_alloc_once"),
+    (74, "libdispatch"),
+    (75, "Accelerate"),
+    (76, "CoreUI"),
+    (77, "CoreUI file"),
+    (78, "genealogy"),
+    (79, "RawCamera"),
+    (80, "corpse info"),
+    (81, "ASL"),
+    (82, "Swift runtime"),
+    (83, "Swift metadata"),
+    (84, "DHMM"),
+    (85, "DFR"),
+    (86, "SceneKit"),
+    (87, "Skywalk"),
+    (88, "IOSurface"),
+    (89, "libnetwork"),
+    (90, "audio"),
+    (91, "video bitstream"),
+    (92, "CoreMedia XPC"),
+    (93, "CoreMedia RPC"),
+    (94, "CoreMedia memory pool"),
+    (95, "CoreMedia read cache"),
+    (96, "CoreMedia crabs"),
+    (97, "QuickLook thumbnails"),
+    (98, "accounts"),
+    (99, "sanitizer"),
+    (100, "GPU (IOAccelerator)"),
+    (101, "CoreMedia regwarp"),
+    (102, "EAR decoder"),
+    (103, "CoreUI cached image data"),
+    (104, "ColorSync"),
+    (105, "backtrace info"),
+    (106, "CoreMedia HLS"),
+    (107, "compositor services"),
+    (230, "Rosetta"),
+    (231, "Rosetta thread context"),
+    (232, "Rosetta indirect branch map"),
+    (233, "Rosetta return stack"),
+    (234, "Rosetta executable heap"),
+    (235, "Rosetta user LDT"),
+    (236, "Rosetta arena"),
+    (239, "Rosetta 10"),
+    (240, "application specific 1"),
+    (241, "application specific 2"),
+    (242, "application specific 3"),
+    (243, "application specific 4"),
+    (244, "application specific 5"),
+    (245, "application specific 6"),
+    (246, "application specific 7"),
+    (247, "application specific 8"),
+    (248, "application specific 9"),
+    (249, "application specific 10"),
+    (250, "application specific 11"),
+    (251, "application specific 12"),
+    (252, "application specific 13"),
+    (253, "application specific 14"),
+    (254, "application specific 15"),
+    (255, "application specific 16"),
+];
+
+/// A macOS VM region tag as its category (`VM_TAGS`).
+#[cfg(any(target_vendor = "apple", test))]
 fn tag_name(t: u32) -> &'static str {
-    match t {
-        0 => "untagged (makepad run JIT code/data, burst arena, mapped files)",
-        1 | 2 | 3 | 4 | 6 | 7 | 8 | 9 | 11 | 12 => "malloc",
-        5 => "sbrk",
-        20 => "mach msg",
-        21 => "IOKit",
-        30 => "stacks",
-        31 => "guard",
-        32 => "shared pmap",
-        33 | 60..=62 => "dylibs / dyld",
-        34 => "Objective-C",
-        35..=39 => "Foundation / CoreServices",
-        40..=49 => "CoreGraphics / CoreImage",
-        50..=59 => "CoreAudio / CoreMedia / JS",
-        63..=69 => "image IO / layer kit",
-        80 => "GPU (IOAccelerator)",
-        81 => "IOSurface",
-        _ => "other tagged",
+    VM_TAGS.iter().find(|(tag, _)| *tag == t).map_or("tag not in vm_statistics.h", |(_, name)| name)
+}
+
+#[cfg(test)]
+mod vm_tag_tests {
+    /// The tags a GPU-heavy app shows, pinned to the SDK header's numbers.
+    #[test]
+    fn vm_tags_follow_the_sdk_header() {
+        use super::tag_name;
+        assert_eq!(tag_name(100), "GPU (IOAccelerator)");
+        assert_eq!(tag_name(88), "IOSurface");
+        assert_eq!(tag_name(75), "Accelerate");
+        assert_eq!(tag_name(76), "CoreUI");
+        assert_eq!(tag_name(80), "corpse info");
+        assert_eq!(tag_name(81), "ASL");
+        assert_eq!(tag_name(30), "stacks");
+        assert_eq!(tag_name(7), "malloc tiny");
+        assert_eq!(tag_name(120), "tag not in vm_statistics.h");
+        assert!(super::VM_TAGS.windows(2).all(|w| w[0].0 < w[1].0), "one name per tag, in order");
     }
 }
 
@@ -306,7 +432,7 @@ fn malloc_stats(s: &mut Snap) {
     s.add("malloc/held free", m.fordblks as u64);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn malloc_stats(s: &mut Snap) {
     #[repr(C)]
     #[derive(Default)]
@@ -391,6 +517,15 @@ fn relax_parts(s: &mut Snap, compiler: bool, partial: &mut Vec<String>) {
     s.add("makepad-run/compiler arena/small live slots", slots as u64);
     s.add("makepad-run/compiler arena/large blocks", large as u64);
     s.add("makepad-run/compiler arena/chunks listed for reuse", listed as u64);
+    let (committed, live, chunks) = crate::zone_alloc::slots_stats();
+    s.add("makepad-run/slot arena committed", committed as u64);
+    s.add("makepad-run/slot arena live", live as u64);
+    s.add("makepad-run/slot arena/chunks (2 MB)", chunks as u64);
+    let (touched, slots, large, listed) = crate::zone_alloc::slots_detail();
+    s.add("makepad-run/slot arena/small chunks touched", touched as u64);
+    s.add("makepad-run/slot arena/small live slots", slots as u64);
+    s.add("makepad-run/slot arena/large blocks", large as u64);
+    s.add("makepad-run/slot arena/chunks listed for reuse", listed as u64);
     if crate::memstat::enabled() {
         for (i, name) in crate::memstat::TAG_NAMES.iter().enumerate() {
             let v = crate::memstat::live_of_index(i);
@@ -430,28 +565,41 @@ fn keep(name: &str, s: Snap) {
     v.push((name.to_string(), Snap { at_ms: s.at_ms, nodes: s.nodes.clone() }));
 }
 
+/// An arena's resident bytes from its chunk states (`arena_states`): its small chunks' rows and its
+/// large runs (the sparse and old rows count chunks of those rows again).
+fn arena_resident(a: &[usize; 29]) -> usize {
+    a[3] + a[7] + a[11] + a[15] + a[18]
+}
+
 /// `memory [compiler=1] [n=24]`: the snapshot as a ranked tree plus findings, and the growth since
 /// the previous `memory` (kept as snapshot `last`).
 pub fn cmd_memory(req: &Req, out: &mut Out) {
     out.line(&format!("{{\"freed_by_domain_teardown_bytes\":{}}}", crate::domain::freed_by_teardown()));
-    for d in crate::domain::list() {
-        out.line(&format!("{{\"domain\":{},\"package\":{},\"state\":{},\"arena_in_use_bytes\":{},\"arena_committed_bytes\":{},\"arena_touched_small_bytes\":{},\"arena_live_slot_bytes\":{},\"arena_large_bytes\":{},\"static_committed_bytes\":{},\"threads\":{},\"thread_names\":[{}]}}",
-            d.id, json_str(&d.package), json_str(&format!("{:?}", d.state)), d.arena_in_use, d.arena_committed, d.arena_detail.0, d.arena_detail.1, d.arena_detail.2, d.static_committed, d.threads,
+    // a domain heap's committed bytes are address space made writable a whole chunk at a time (each
+    // thread's current chunk per size class), not memory: its resident bytes are what the footprint
+    // counts (the chunk states' page query)
+    let heaps = crate::domain::heap_states();
+    let resident_of = |id: crate::domain::DomainId| heaps.iter().find(|h| h.0 == id).map_or(0, |h| arena_resident(&h.1));
+    let domains = crate::domain::list();
+    for d in &domains {
+        out.line(&format!("{{\"domain\":{},\"package\":{},\"state\":{},\"arena_in_use_bytes\":{},\"arena_resident_bytes\":{},\"arena_committed_bytes\":{},\"arena_touched_small_bytes\":{},\"arena_live_slot_bytes\":{},\"arena_large_bytes\":{},\"static_committed_bytes\":{},\"threads\":{},\"thread_names\":[{}]}}",
+            d.id, json_str(&d.package), json_str(&format!("{:?}", d.state)), d.arena_in_use, resident_of(d.id), d.arena_committed, d.arena_detail.0, d.arena_detail.1, d.arena_detail.2, d.static_committed, d.threads,
             d.thread_names.iter().map(|s| json_str(s)).collect::<Vec<_>>().join(",")));
     }
     // chunk states with resident bytes (MB): attached / listed / released / full, then large, then sparse
-    let st = |a: &[usize; 28]| {
+    let st = |a: &[usize; 29]| {
         let mb = |b: usize| format!("{:.1}", b as f64 / 1048576.0);
         let row = |r: usize| format!("{{\"chunks\":{},\"touched_mb\":{},\"live_slots_mb\":{},\"resident_mb\":{}}}", a[r * 4], mb(a[r * 4 + 1]), mb(a[r * 4 + 2]), mb(a[r * 4 + 3]));
-        format!("\"attached\":{},\"listed\":{},\"released\":{},\"full\":{},\"large\":{{\"runs\":{},\"committed_mb\":{},\"resident_mb\":{}}},\"sparse\":{{\"chunks\":{},\"resident_mb\":{}}},\"old\":{{\"chunks\":{},\"live_slots_mb\":{},\"resident_mb\":{}}},\"free_granules\":{{\"attached_mb\":{},\"listed_mb\":{}}},\"attached_use\":{{\"requested_mb\":{},\"remote_pending_mb\":{}}}",
-            row(0), row(1), row(2), row(3), a[16], mb(a[17]), mb(a[18]), a[19], mb(a[20]), a[21], mb(a[22]), mb(a[23]), mb(a[24]), mb(a[25]), mb(a[26]), mb(a[27]))
+        format!("\"attached\":{},\"listed\":{},\"released\":{},\"full\":{},\"large\":{{\"runs\":{},\"committed_mb\":{},\"resident_mb\":{},\"requested_mb\":{}}},\"sparse\":{{\"chunks\":{},\"resident_mb\":{}}},\"old\":{{\"chunks\":{},\"live_slots_mb\":{},\"resident_mb\":{}}},\"free_granules\":{{\"attached_mb\":{},\"listed_mb\":{}}},\"attached_use\":{{\"requested_mb\":{},\"remote_pending_mb\":{}}}",
+            row(0), row(1), row(2), row(3), a[16], mb(a[17]), mb(a[18]), mb(a[28]), a[19], mb(a[20]), a[21], mb(a[22]), mb(a[23]), mb(a[24]), mb(a[25]), mb(a[26]), mb(a[27]))
     };
-    for (id, a) in crate::domain::heap_states() {
-        out.line(&format!("{{\"arena_states\":\"domain {id:?}\",{}}}", st(&a)));
+    for (id, a) in &heaps {
+        out.line(&format!("{{\"arena_states\":\"domain {id:?}\",{}}}", st(a)));
     }
     let (cs, bs) = crate::zone_alloc::arena_states();
     out.line(&format!("{{\"arena_states\":\"compiler\",{}}}", st(&cs)));
     out.line(&format!("{{\"arena_states\":\"burst\",{}}}", st(&bs)));
+    out.line(&format!("{{\"arena_states\":\"slots\",{}}}", st(&crate::zone_alloc::slots_states())));
     let compiler = req.get("compiler") == Some("1");
     let n = req.num("n", 24) as usize;
     let mut partial = Vec::new();
@@ -461,7 +609,7 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
     let rss = snap.get("rss");
     let mut total = format!("{{\"rss_mb\":{},\"peak_rss_mb\":{}", mb(rss), mb(snap.get("peak_rss")));
     if snap.get("footprint") > 0 {
-        total.push_str(&format!(",\"footprint_mb\":{},\"compressed_mb\":{}", mb(snap.get("footprint")), mb(snap.get("compressed"))));
+        total.push_str(&format!(",\"footprint_mb\":{},\"peak_footprint_mb\":{},\"compressed_mb\":{}", mb(snap.get("footprint")), mb(snap.get("peak_footprint")), mb(snap.get("compressed"))));
     }
     let (inuse, free) = (snap.get("malloc/in use"), snap.get("malloc/held free"));
     total.push_str(&format!(",\"malloc_in_use_mb\":{},\"malloc_held_free_mb\":{}", mb(inuse), mb(free)));
@@ -473,15 +621,28 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
     out.line(&total);
     let ev = crate::zone_alloc::compiler_events();
     let jobs = crate::zone_alloc::job_stats();
-    // the three heaps apart (zone_alloc.rs): the program's malloc, the compiler's own arena, the JIT's mappings
+    // The program's heap: a hosted app's is its domain's arena (malloc then holds makepad run's own
+    // and its compiled-in crates' blocks), else the system malloc; held free = resident beyond use.
+    let app = crate::run::app_domain().and_then(|id| domains.iter().find(|d| d.id == id && heaps.iter().any(|h| h.0 == id)));
+    let (program, p_inuse, p_held, p_resident) = match app {
+        Some(d) => (format!("domain {} arena", d.id), d.arena_in_use as u64, (resident_of(d.id) as u64).saturating_sub(d.arena_in_use as u64), resident_of(d.id) as u64),
+        None => ("system malloc".to_string(), inuse, free, inuse + free),
+    };
+    // The program's malloc, the compiler's arenas and the JIT's mappings are accounted apart.
     out.line(&format!("{{\"trims\":{},\"last_trim_ms\":{}}}", crate::memstat::TRIMS.load(std::sync::atomic::Ordering::Relaxed), crate::memstat::LAST_TRIM_MS.load(std::sync::atomic::Ordering::Relaxed)));
     out.line(&format!(
-        "{{\"split\":{{\"routing\":{},\"program_heap_in_use_mb\":{},\"program_heap_held_free_mb\":{},\"compiler_arena_committed_mb\":{},\"compiler_arena_live_mb\":{},\"jit_code_mb\":{},\"jit_ro_data_mb\":{},\"program_statics_mb\":{},\"burst_arena_committed_mb\":{},\"compiler_arena_touched_mb\":{},\"compiler_arena_live_slots_mb\":{},\"compiler_arena_large_mb\":{},\"compiler_arena_chunks_listed\":{},\"compiler_arena_events\":{{\"contended_chunk\":{},\"contended_pool\":{},\"contended_warm\":{},\"contended_partial\":{},\"yields\":{},\"commits\":{},\"decommits\":{},\"pushes\":{},\"pops\":{}}},\"job_arena\":{{\"jobs\":{},\"survivor_jobs\":{},\"survivor_bytes\":{}}}}}}}",
+        "{{\"split\":{{\"routing\":{},\"program_heap\":{},\"program_heap_in_use_mb\":{},\"program_heap_held_free_mb\":{},\"program_heap_resident_mb\":{},\"compiler_arena_committed_mb\":{},\"compiler_arena_live_mb\":{},\"slots_arena_committed_mb\":{},\"slots_arena_live_mb\":{},\"slots_arena_touched_mb\":{},\"slots_arena_large_mb\":{},\"jit_code_mb\":{},\"jit_ro_data_mb\":{},\"program_statics_mb\":{},\"burst_arena_committed_mb\":{},\"compiler_arena_touched_mb\":{},\"compiler_arena_live_slots_mb\":{},\"compiler_arena_large_mb\":{},\"compiler_arena_chunks_listed\":{},\"compiler_arena_events\":{{\"contended_chunk\":{},\"contended_pool\":{},\"contended_warm\":{},\"contended_partial\":{},\"yields\":{},\"commits\":{},\"decommits\":{},\"pushes\":{},\"pops\":{}}},\"job_arena\":{{\"jobs\":{},\"survivor_jobs\":{},\"survivor_bytes\":{}}}}}}}",
         json_str(if crate::zone_alloc::compiler_arena_enabled() { "compiler arena" } else { "off (MAKEPAD_RUN_COMPILER_ARENA=0)" }),
-        mb(inuse),
-        mb(free),
+        json_str(&program),
+        mb(p_inuse),
+        mb(p_held),
+        mb(p_resident),
         mb(snap.get("makepad-run/compiler arena committed")),
         mb(snap.get("makepad-run/compiler arena live")),
+        mb(snap.get("makepad-run/slot arena committed")),
+        mb(snap.get("makepad-run/slot arena live")),
+        mb(snap.get("makepad-run/slot arena/small chunks touched")),
+        mb(snap.get("makepad-run/slot arena/large blocks")),
         mb(snap.get("makepad-run/JIT code (incl. thunks, stubs)")),
         mb(snap.get("makepad-run/JIT read-only data")),
         mb(snap.get("makepad-run/program statics")),
@@ -496,7 +657,7 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
     // the arenas' census: committed bytes by small chunk / large run, and how much of the small
     // chunks' touched pages a few surviving blocks pin
     let (cc, bc) = crate::zone_alloc::arena_census();
-    for (name, c) in [("compiler", cc), ("burst", bc)] {
+    for (name, c) in [("compiler", cc), ("burst", bc), ("slots", crate::zone_alloc::slots_census())] {
         out.line(&format!("{{\"arena\":{},\"small_chunks\":{},\"small_touched_mb\":{},\"small_live_blocks\":{},\"small_live_slots_mb\":{},\"pinned_by_le4_blocks_mb\":{},\"large_runs\":{},\"large_mb\":{},\"largest_mb\":[{},{},{},{}]}}",
             json_str(name), c[0], mb(c[1] as u64), c[2], mb(c[3] as u64), mb(c[4] as u64), c[5], mb(c[6] as u64), mb(c[7] as u64), mb(c[8] as u64), mb(c[9] as u64), mb(c[10] as u64)));
     }
@@ -516,7 +677,7 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
     }
     let relax: u64 = snap.nodes.iter().filter(|x| x.0.starts_with("makepad-run/") && !x.0["makepad-run/".len()..].contains('/') && !x.0.ends_with(" live")).map(|x| x.1).sum();
     if relax > 0 {
-        f.push((relax, format!("makepad run's own reservations in use: {} MB (JIT code + data + statics + burst and compiler arenas)", mb(relax))));
+        f.push((relax, format!("makepad run's own reservations in use: {} MB (JIT code + data + statics + burst, compiler and slot arenas)", mb(relax))));
     }
     if let Some(p) = &prev {
         let mut growth: Vec<(i64, &String)> = snap.nodes.iter().map(|(k, v)| (*v as i64 - p.iter().find(|x| &x.0 == k).map_or(0, |x| x.1 as i64), k)).filter(|x| x.0 >= 16 << 20 && x.1.contains('/')).collect();

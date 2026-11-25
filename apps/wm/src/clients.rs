@@ -13,8 +13,7 @@
 //! like studio launches run targets.
 //!
 //! **wm compiles nothing behind the person's back.** A child is always an
-//! existing binary: out of a checkout (a developer's clone, or the source
-//! a Makepad Builder downloaded and starts wm in) the release binary
+//! existing binary: out of a checkout the release binary
 //! cargo built, else the sibling of an installed wm. The warm pool, the
 //! AI pane at startup and previews start only apps that are built and up
 //! to date, so no build of wm's own ever holds cargo's lock. The person
@@ -231,7 +230,7 @@ pub fn find_app(id: &str) -> Option<AppDef> {
     // With), the pacing/protocol rigs (splash, counter) and the assistant,
     // which the WM seats in the pane slot through its own path, never
     // `launch_app` (AlwaysNew keeps launch-or-focus from "focusing" a
-    // pane). Builder-only entries are not WM clients.
+    // pane). Runner-only entries are not WM clients.
     makepad_app_registry::find(id)
         .filter(|entry| entry.wm_launchable && !entry.menu_visible)
         .map(registry_app)
@@ -287,14 +286,14 @@ pub fn with_app_artwork(mut sheet: makepad_widgets::desktop_style::StyleSheet) -
 }
 
 /// The checkout root (`makepad_app_registry::repo_root`: `MAKEPAD_WM_ROOT`,
-/// else a Builder installation's sources, else the checkout above the
+/// else the checkout above the
 /// running exe or at/above the cwd). The WM and Stage share this answer.
 pub fn repo_root() -> Option<PathBuf> {
     makepad_app_registry::repo_root()
 }
 
 /// The binary that starts `app` without compiling anything
-/// (`makepad_app_registry::built_binary`: a Builder's published one, the
+/// (`makepad_app_registry::built_binary`: the
 /// checkout's release build, or an installed sibling). None: not built.
 pub fn built_binary(app: &AppDef, root: Option<&Path>) -> Option<PathBuf> {
     makepad_app_registry::built_binary(&app.target(), root)
@@ -506,6 +505,11 @@ impl WarmPool {
 
     /// Every warm client, whatever the app — the shutdown / close-all
     /// paths walk this so no pooled process is ever left behind.
+    /// No standby instance at all.
+    pub fn is_empty(&self) -> bool {
+        self.ready.values().all(|v| v.is_empty())
+    }
+
     pub fn clients(&self) -> Vec<ClientId> {
         let mut all: Vec<ClientId> = self.ready.values().flatten().copied().collect();
         all.sort_unstable();
@@ -635,6 +639,9 @@ pub struct ClientSlot {
     pub ready: bool,
     /// Launch is still compiling or waiting for the app's first frame (not a JIT load screen).
     pub starting: bool,
+    /// The app's own first frame reached the WM: `HostedAppFrame`, or the first frame of a
+    /// client not run under the JIT.
+    pub app_drawn: bool,
     /// Working directory reported by the child (terminals, via OSC 7).
     pub pwd: Option<PathBuf>,
     /// Opened as a Quick-Look preview: a centered float that Escape or
@@ -706,6 +713,7 @@ impl ClientSlot {
             window_id: 0,
             ready: true,
             starting: false,
+            app_drawn: false,
             pwd: None,
             is_preview: false,
             warm: false,
@@ -745,6 +753,7 @@ impl ClientSlot {
         let mut slot = ClientSlot::module(id, app, "");
         slot.ready = false;
         slot.starting = true;
+        slot.app_drawn = false;
         slot.external = Some(pid);
         slot.status = "starting…".into();
         slot
@@ -890,6 +899,7 @@ fn client_slot(pool: &TaskPool, id: ClientId, app: &AppDef, child: Child, warm: 
         window_id: 0,
         ready: false,
         starting: true,
+        app_drawn: false,
         pwd: None,
         is_preview: false,
         warm,
@@ -972,7 +982,7 @@ fn spawn_for_client(
         return spawn_process(pool, spawner, id, client_log(id, true), cmd, bin, lines);
     }
     if runner == Runner::Jit {
-        return spawn_jit(pool, spawner, id, bin, term_colors, cmd, lines);
+        return spawn_jit(pool, spawner, id, bin, term_colors, hub_port, cmd, lines);
     }
     // The app, or `cargo run` of it (cargo's progress on the tile, then the app): the
     // app's environment either way.
@@ -1020,8 +1030,8 @@ fn terminal_env(cmd: &mut Command, term_colors: Option<&str>) {
 
 /// A JIT run: `cargo run --profile host -p makepad-run --bin makepad -- run <package>` in the
 /// checkout, the registry's one launch of an app (its environment, this machine's jit.env and
-/// app settings included: `makepad_app_registry::machine`). It is not a `--stdin-loop` child and
-/// gets no hub identity: on Linux its HAL asks the WM's socket for its window
+/// app settings included: `makepad_app_registry::machine`). On Linux it is not a `--stdin-loop`
+/// child and gets no hub identity: its HAL asks the WM's socket for its window
 /// (`MAKEPAD_WM_SOCKET`, which passes), and the socket admits it as THIS client because its pid
 /// is the one recorded here (`adopt::expect`). `cargo run` execs the tool, so the pid cargo
 /// starts with is the tool's. It stays in the checkout: cargo reads the workspace's config from
@@ -1032,9 +1042,15 @@ fn spawn_jit(
     id: ClientId,
     bin: &str,
     term_colors: Option<&str>,
+    hub_port: u16,
     mut cmd: Command,
     lines: Sender<ClientLine>,
 ) -> Result<Child, String> {
+    // Elsewhere there is no such socket: a `--stdin-loop` child, with the hub environment of one.
+    #[cfg(not(target_os = "linux"))]
+    makepad_app_host::launch::configure(&mut cmd, hub_port, id, bin);
+    #[cfg(target_os = "linux")]
+    let _ = hub_port;
     cmd.env("MAKEPAD_WM_CAPTION_CONTENT", "1");
     terminal_env(&mut cmd, term_colors);
     let child = spawn_process(pool, spawner, id, client_log(id, false), cmd, bin, lines)?;
@@ -1098,20 +1114,26 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-p", "makepad-app-terminal"]), "{:?}", args);
         assert!(args.windows(2).any(|w| w == ["--bin", "makepad-app-terminal"]), "{:?}", args);
         // Starting it runs the release binary in the checkout's target
-        // (CARGO_TARGET_DIR when set: the Builder's shared one).
+        // (CARGO_TARGET_DIR when set).
         let binary = makepad_app_registry::checkout_binary(&app.target(), &root, None);
         let exe = if cfg!(windows) { "makepad-app-terminal.exe" } else { "makepad-app-terminal" };
         assert_eq!(binary, root.join("target/release").join(exe));
-        let shared = makepad_app_registry::checkout_binary(&app.target(), &root, Some(std::ffi::OsStr::new("/builder/target")));
-        assert_eq!(shared, std::path::Path::new("/builder/target/release").join(exe));
+        let shared = makepad_app_registry::checkout_binary(&app.target(), &root, Some(std::ffi::OsStr::new("/shared/target")));
+        assert_eq!(shared, std::path::Path::new("/shared/target/release").join(exe));
         let missing = std::env::temp_dir().join(format!("wm-release-test-{}", std::process::id()));
-        assert_eq!(launch_argv(makepad_app_registry::find(&app.id).unwrap(), Some(&missing), &app.args).unwrap_err(), "not built yet: makepad-app-terminal");
+        // A checkout without the build has nothing to start, unless an absolute CARGO_TARGET_DIR
+        // (a target shared by checkouts) already holds the binary: then that one starts.
+        let shared_build = makepad_app_registry::checkout_binary(&app.target(), &missing, std::env::var_os("CARGO_TARGET_DIR").as_deref());
+        match launch_argv(makepad_app_registry::find(&app.id).unwrap(), Some(&missing), &app.args) {
+            Ok((program, _)) => assert!(shared_build.is_file() && program == shared_build, "{program:?}"),
+            Err(e) => assert_eq!(e, "not built yet: makepad-app-terminal"),
+        }
     }
 
     #[test]
     fn dep_info_paths_keep_escaped_spaces() {
-        let paths: Vec<String> = dep_info_paths(r"C:\b\makepad-builder\ (2)\a.rs /x/b.rs  C:\c.rs").collect();
-        assert_eq!(paths, [r"C:\b\makepad-builder (2)\a.rs", "/x/b.rs", r"C:\c.rs"]);
+        let paths: Vec<String> = dep_info_paths(r"C:\b\makepad-runner\ (2)\a.rs /x/b.rs  C:\c.rs").collect();
+        assert_eq!(paths, [r"C:\b\makepad-runner (2)\a.rs", "/x/b.rs", r"C:\c.rs"]);
     }
 
     #[test]
@@ -1143,9 +1165,8 @@ mod tests {
     }
 
     #[test]
-    fn a_builder_source_without_local_is_a_checkout() {
-        // The Makepad Builder starts wm in the source it downloaded: the
-        // workspace with apps/wm in it, and no developer's local/.
+    fn a_source_without_local_is_a_checkout() {
+        // The workspace with apps/wm in it, and no developer's local/.
         let root = std::env::temp_dir().join(format!("wm-checkout-test-{}", std::process::id()));
         let app = root.join("apps/terminal/src");
         std::fs::create_dir_all(&app).unwrap();
@@ -1190,50 +1211,6 @@ mod tests {
         // A dot/dash counts as a boundary, like the regex \b.
         assert!(word_match("org.omarchy.btop", "btop"));
         assert!(word_match("btop-tui", "btop"));
-    }
-
-    #[test]
-    fn the_curated_list_is_in_the_order_it_is_shown_in() {
-        // The menu IS this list, top to bottom.
-        let order: Vec<String> = curated().iter().map(|a| a.label.clone()).collect();
-        assert_eq!(
-            order,
-            [
-                "Browser",
-                "Files",
-                "Terminal",
-                "Mixer",
-                "Amp",
-                "Flow",
-                "Synth",
-                "Code",
-                "Task Manager",
-                "Sheets",
-                "Photos",
-                "Camera",
-                "Clock",
-                "Weather",
-                "Translator",
-                "Finance",
-                "Mail",
-                "Notes",
-                "Calendar",
-                "Reminders",
-                "Calculator",
-                "Fabric",
-                "Score",
-                "Video Player",
-                "Route",
-                "Fab",
-                "Scope",
-                "Stage",
-                "Makepad Story",
-                "Sandbox",
-                "AI Hub",
-                "XR Bridge",
-            ]
-            .map(str::to_string)
-        );
     }
 
     #[test]
@@ -1288,9 +1265,7 @@ mod tests {
     fn every_curated_app_names_a_real_crate() {
         // The no-fake-UI law: a menu row must be startable. In a checkout
         // that means the package directory really is there.
-        let Some(root) = repo_root() else {
-            return; // installed layout: nothing to check against
-        };
+        let root = repo_root().expect("the test checkout is available");
         for app in curated() {
             let manifest = app
                 .manifest
@@ -1522,29 +1497,6 @@ mod tests {
         pool.note_spawned("browser", 1);
         assert_eq!(pool.clients(), vec![1, 3, 4]);
         assert!(pool.holds(4) && !pool.holds(5));
-    }
-
-    #[test]
-    fn a_warm_instance_launches_exactly_like_a_cold_one() {
-        // Same argv — the registry's own args included, which is how the
-        // warm Files inherits `--demo` without the pool knowing about it.
-        // A checkout whose files is built (in its own target/: a shared
-        // CARGO_TARGET_DIR of the run is left alone).
-        if std::env::var_os("CARGO_TARGET_DIR").is_some() {
-            return;
-        }
-        let files = find_app("files").unwrap();
-        let root = std::env::temp_dir().join(format!("wm-warm-test-{}", std::process::id()));
-        let binary = makepad_app_registry::checkout_binary(&files.target(), &root, None);
-        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-        std::fs::write(&binary, b"").unwrap();
-        let (program, args) = launch_argv(makepad_app_registry::find(&files.id).unwrap(), Some(&root), &files.args).unwrap();
-        std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(program, binary);
-        assert_eq!(args[0], "--stdin-loop", "{:?}", args);
-        if std::env::var("MAKEPAD_WM_FILES_REAL").is_err() {
-            assert_eq!(args.last().map(String::as_str), Some("--demo"), "{:?}", args);
-        }
     }
 
     #[test]

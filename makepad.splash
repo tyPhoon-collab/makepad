@@ -56,6 +56,7 @@ let RunRelease = RunItem{
 
 hub.set_run_items([
     RunStudioRelease{name: "makepad-example-hello-world"}
+    RunStudioRelease{name: "makepad-example-hello-3d"}
     RunStudioRelease{name: "makepad-example-aichat"}
     RunStudioRelease{name: "makepad-example-box3d"}
     RunStudioRelease{name: "makepad-example-browser"}
@@ -70,6 +71,7 @@ hub.set_run_items([
     RunStudioRelease{name: "makepad-example-map"}
     RunStudioRelease{name: "makepad-app-route"}
     RunStudioRelease{name: "makepad-app-clock"}
+    RunStudioRelease{name: "makepad-app-devhub-panel"}
     RunStudioRelease{name: "makepad-app-desklink"}
     RunStudioRelease{name: "makepad-app-xr-bridge"}
     RunStudioRelease{name: "makepad-app-weather"}
@@ -86,7 +88,6 @@ hub.set_run_items([
     RunStudioRelease{name: "makepad-example-render-to-texture"}
     RunStudioRelease{name: "makepad-example-depth-mix"}
     RunStudioRelease{name: "makepad-example-sdf-atlas"}
-    RunStudioRelease{name: "makepad-example-sdf-bake"}
     RunStudioRelease{name: "makepad-example-raytrace"}
     RunStudioRelease{name: "makepad-example-audio-playback-decode-probe"}
     RunStudioRelease{name: "makepad-studio"}

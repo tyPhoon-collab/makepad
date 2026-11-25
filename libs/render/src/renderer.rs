@@ -38,13 +38,18 @@ mod gi_scene;
 /// The host widget's themed draw structs, lent to the renderer per frame.
 /// They stay `#[live]` fields on the widget so script-side styling applies.
 pub struct SceneDraws<'a> {
-    pub cube: &'a mut DrawSceneCube,
-    pub alpha: &'a mut DrawSceneAlpha,
+    /// A world's opaque boxes, parts and beams. Optional so a host whose worlds have none builds
+    /// no pipeline for them.
+    pub cube: Option<&'a mut DrawSceneCube>,
+    /// A world's blended boxes, blob shadows, and a mixed-reality stage's shadow catcher and box
+    /// edges. Optional the same way.
+    pub alpha: Option<&'a mut DrawSceneAlpha>,
     pub sky: &'a mut DrawSceneSky,
     /// The analytic (Preetham) sky + stars, drawn for default-sky worlds.
     /// Optional so a host that has not adopted it keeps the gradient dome.
     pub sky_analytic: Option<&'a mut DrawSceneSkyAnalytic>,
-    pub terrain: &'a mut DrawSceneTerrain,
+    /// A world's terrain. Optional the same way.
+    pub terrain: Option<&'a mut DrawSceneTerrain>,
     /// Silhouette shadow mesh (shadow_mesh.rs). Optional so a host that has
     /// not adopted it yet keeps the blob tier.
     pub shadow: Option<&'a mut DrawSceneShadow>,
@@ -418,6 +423,11 @@ pub struct Renderer {
     /// that hides or offsets elements through its static draw gets the same
     /// on the PBR lane.
     element_lookup: Option<(Texture, [f32; 4])>,
+    /// The host's clip plane (`host_clip`, see shaders/skinned.rs and
+    /// [`Self::set_clip_plane`]) for the model lanes.
+    clip_plane: Option<[f32; 4]>,
+    /// See [`Self::set_element_reach`].
+    element_reach: Option<(Vec3f, Vec3f)>,
     custom_draws: std::collections::BTreeMap<String, Box<CustomMaterial>>,
     /// Image-based lighting for Splash materials (renderer/ibl.rs).
     ibl: ibl::IblState,
@@ -496,6 +506,8 @@ pub struct Renderer {
     shadow_debug: bool,
     /// See [`Renderer::set_hdr_output`].
     hdr_output: bool,
+    /// Display dither on 8-bit targets (`bind_output_dither`); off for exact comparisons.
+    output_dither: bool,
     /// This frame's metered exposure (HDR output only).
     hdr_exposure: f32,
     /// See [`Renderer::set_fxaa`].
@@ -515,9 +527,9 @@ pub struct Renderer {
     /// turning it back on is instant, and the pair is a built-in A/B for
     /// exactly the baked-vs-provisional comparison a lighting bug needs.
     lightmap_enabled: bool,
-    /// Night-sky star panorama (equirectangular, decoded once via
-    /// set_star_map_png), uploaded lazily on the first sky draw.
-    star_map: Option<ImageBuffer>,
+    /// Whether the bound star texture is a worker-prepared panorama rather
+    /// than the black stand-in used while the analytic stars show.
+    star_map_loaded: bool,
     star_texture: Option<Texture>,
     /// The GPU-resident light bake (gpu_lightmap.rs): fragment-shader
     /// passes, zero readback — THE bake path. OnChange re-bakes on the
@@ -569,6 +581,8 @@ pub struct Renderer {
     light_grid: LightGrid,
     clustered: crate::clustered::ClusteredLights,
     gi: crate::fast_gi::FastGi,
+    /// A host's own GI scene (`set_gi_scene`) under its key.
+    gi_host_scene: Option<(u64, Vec<crate::fast_gi::GiInstance>)>,
     clustered_enabled: bool,
     clustered_frames: u64,
     /// Scratch for the transient merge / world selection; reused per frame.
@@ -647,6 +661,8 @@ pub struct Renderer {
     /// to that plane so shadow texels stay roughly one screen pixel under
     /// zoom; `None` keeps the village-scale ladder (walk / game).
     csm_focus: Option<f32>,
+    /// Stable projection for hosts averaging jittered scene recordings.
+    csm_fit_projection: Option<Mat4f>,
     /// Optional host-owned scene bound for CSM fitting. Imported editor
     /// models may deliberately submit as per-frame casters and therefore
     /// own no lightmap layout from which the baker could infer this bound.
@@ -682,9 +698,10 @@ mod water;
 pub use water::{eye_under_water, pack_wave_uniforms};
 pub use items::{splash_material_name, GeometryData, TransformTint, LAYOUT_TRANSFORM_TINT};
 // The names `IblSource::Procedural` indexes, for hosts that name an
-// environment as the engine does (Scene3D's `@hdri_golden_hour`).
-pub use ibl::{HDRI_PREFIX, PROCEDURAL_ENVIRONMENTS, PROCEDURAL_HDRI_WIDTH};
+// environment as the engine does.
+pub use ibl::PROCEDURAL_ENVIRONMENTS;
 pub use stock_ibl::STOCK_IBL_MATERIAL;
+pub use settings::star_map_path;
 
 pub use draw_items::*;
 pub use prepared::*;
@@ -761,6 +778,8 @@ impl Default for Renderer {
             orm_fallback: None,
             pbr_draw: None,
             element_lookup: None,
+            clip_plane: None,
+            element_reach: None,
             custom_draws: Default::default(),
             ibl: Default::default(),
             stock_ibl: Default::default(),
@@ -797,13 +816,14 @@ impl Default for Renderer {
             shadow_debug: false,
             texture_cache: Default::default(),
             hdr_output: false,
+            output_dither: true,
             hdr_exposure: 1.0,
             fxaa: true,
             post: Default::default(),
             bloom: DEFAULT_BLOOM,
             auto_exposure: true,
             grade: Default::default(),
-            star_map: None,
+            star_map_loaded: false,
             star_texture: None,
             gpu_baker: {
                 // MAKEPAD_GPU_LM_MODE=realtime starts the baker in Realtime
@@ -833,6 +853,7 @@ impl Default for Renderer {
             light_grid: LightGrid::default(),
             clustered: crate::clustered::ClusteredLights::default(),
             gi: crate::fast_gi::FastGi::default(),
+            gi_host_scene: None,
             clustered_enabled: !matches!(std::env::var("MAKEPAD_CLUSTERED").as_deref(), Ok("0" | "off")),
             clustered_frames: 0,
             light_rank: Vec::new(),
@@ -859,6 +880,7 @@ impl Default for Renderer {
             models_rev: 0,
             bake: LightBake::default(),
             csm_focus: None,
+            csm_fit_projection: None,
             csm_scene_bounds: None,
         }
     }

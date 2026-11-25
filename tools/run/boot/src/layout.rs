@@ -61,8 +61,8 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 pub(crate) fn choice_text(choice: &str, main: bool, keeps_state: bool) -> (&'static str, &'static str) {
     match choice {
         "retry" => ("Retry", "runs the call that panicked again; what it did before the panic may happen twice"),
-        "restart" if keeps_state => ("Restart app (keep state)", "relaunches the app in this window with the state it saves for restarts"),
-        "restart" => ("Restart app", "relaunches the app in this window; what it holds only in memory is lost"),
+        "restart" if keeps_state => ("Restart app (keep state)", "starts the app again (a fresh process) with the state it saves for restarts"),
+        "restart" => ("Restart app", "starts the app again (a fresh process); what it holds only in memory is lost"),
         "panic" if main => ("Let it panic", "the panic goes on as without the JIT: the event handler unwinds and the app redraws"),
         "panic" => ("Unwind the thread", "the panic goes on to this thread's catch boundary, so the app's own failure path runs (a job ends as failed)"),
         "return" => ("Return a value", "the stopped function returns a value you type"),
@@ -203,6 +203,8 @@ impl Renderer {
             format!("Paused: {what}")
         } else if errors > 0 {
             plural(errors, "error", "errors")
+        } else if state.mode == Mode::Update {
+            state.domain.clone()
         } else {
             state.app.clone()
         };
@@ -252,13 +254,14 @@ impl Renderer {
 
         // ---- footer (fixed): key hints on desktop, buttons on touch
         let mut buttons = Vec::new();
-        if env.touch {
+        if env.touch || state.mode == Mode::Update {
             if self.input.is_some() {
                 buttons.push((Action::Submit, labels[4].clone()));
                 buttons.push((Action::Cancel, labels[5].clone()));
             } else {
                 if state.can_retry || state.can_restart {
-                    buttons.push((Action::Restart, labels[0].clone()));
+                    let label = if state.mode == Mode::Update { "Restart to update".into() } else { labels[0].clone() };
+                    buttons.push((Action::Restart, label));
                 }
                 if errors > 0 || state.parked.is_some() {
                     buttons.push((Action::Copy, labels[1].clone()));

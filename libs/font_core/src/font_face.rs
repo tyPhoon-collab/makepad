@@ -1,10 +1,10 @@
-use makepad_shared_bytes::SharedBytes;
+use makepad_shared_bytes::HostBuf;
 use std::{cell::RefCell, fmt, rc::Rc};
 use {rustybuzz, rustybuzz::ttf_parser};
 
 /// The bytes of a font file: file-mapped where it came from a file, so that its pages are the
 /// OS page cache's and every holder of the file shares them.
-pub type FontData = SharedBytes;
+pub type FontData = HostBuf;
 
 pub struct FontFace {
     parsed: Rc<ParsedFontFace>,
@@ -50,23 +50,6 @@ mod coretext_gate_tests {
             matches!(*face.cached_coretext_face.borrow(), Some(None)),
             "the gate must settle the cache without building a CoreTextFace"
         );
-    }
-
-    /// PingFangUI.ttc on macOS 26+ is the face the fallback exists for.
-    #[test]
-    fn an_hvgl_only_system_face_passes_the_gate() {
-        const PINGFANG: &str = "/System/Library/PrivateFrameworks/FontServices.framework/Resources/Reserved/PingFangUI.ttc";
-        let Ok(data) = FontData::from_file_mmap_or_read(PINGFANG) else {
-            eprintln!("PingFangUI.ttc not present, skipping");
-            return;
-        };
-        let face = FontFace::from_data_and_index(data, 0).unwrap();
-        let has_glyf = face.with_ttf_parser_face(|f| f.tables().glyf.is_some());
-        if has_glyf {
-            eprintln!("this macOS still ships a glyf PingFang, skipping");
-            return;
-        }
-        assert!(face.outlines_live_only_in_hvgl());
     }
 }
 
@@ -213,10 +196,11 @@ impl FontFace {
             data,
             index,
             // SAFETY: `ttf_parser::Face` only borrows the bytes inside `data`.
-            // `ParsedFontFace` owns `data`, which is backed by heap/mmap storage
-            // (via `Rc` inside `SharedBytes`) whose address remains stable even if
+            // `ParsedFontFace` owns `data`, which is backed by heap/mmap/leased storage
+            // (via `Arc` inside `HostBuf`) whose address remains stable even if
             // `ParsedFontFace` itself moves. The transmuted face never outlives the
             // owned bytes because both are stored in the same `Rc<ParsedFontFace>`.
+            // This owner never mutates data; other HostBuf clones copy before writing.
             face: unsafe {
                 std::mem::transmute::<ttf_parser::Face<'_>, ttf_parser::Face<'static>>(face)
             },

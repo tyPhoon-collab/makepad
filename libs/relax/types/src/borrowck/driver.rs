@@ -129,7 +129,7 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
         return v;
     };
     owners.push(item);
-    let g = Group { cx, prog, tcx, typeck, env, eval: &eval, root: &root, name: &name, fv_cache };
+    let g = Group { cx, prog, tcx, typeck, env, root: &root, name: &name, fv_cache };
     check_group(&g, &owners, false, &mut v);
     for child in body::const_children(prog, tcx, typeck) {
         check_group(&g, &[child], true, &mut v);
@@ -211,7 +211,7 @@ fn check_potentially_region_dependent_goals(prog: &Program, tcx: &Tcx, env: Typi
 fn report_fulfillment_errors(prog: &Program, tcx: &Tcx, infcx: &crate::infer::InferCtxt<'_>, typeck: &typeck::Body, errors: Vec<crate::next_solver::fulfill::NextSolverError>, v: &mut Verdict) {
     use crate::next_solver::fulfill::NextSolverError;
     for error in errors {
-        let (code, o) = match error {
+        let (mut code, o) = match error {
             NextSolverError::TrueError(o) => ("E0277", o),
             NextSolverError::Ambiguity(o) => ("E0283", o),
             NextSolverError::Overflow(o) => ("E0275", o),
@@ -225,7 +225,16 @@ fn report_fulfillment_errors(prog: &Program, tcx: &Tcx, infcx: &crate::infer::In
                     "future cannot be sent between threads safely".to_string()
                 } else { message }
             }
-            predicate => crate::wfcheck::obligations::fulfillment_message(infcx, prog, code, &o.goal).unwrap_or_else(|| format!("unsatisfied obligation {predicate:?}")),
+            _ => match crate::wfcheck::obligations::fulfillment_message(infcx, prog, code, &o.goal) {
+                Some(message) => message,
+                None => {
+                    // rustc's wording, as the type check words it: "CODE: message", or "error: message"
+                    let full = typeck::obligation_message(prog, tcx, code, &o.goal.predicate, &mut |t| typeck::ty_to_string(false, prog, tcx, t));
+                    let (c, message) = full.split_once(": ").unwrap_or(("error", full.as_str()));
+                    code = ["E0271", "E0275", "E0277", "E0283", "E0284", "E0308"].into_iter().find(|k| *k == c).unwrap_or("");
+                    message.to_string()
+                }
+            },
         };
         if code == "E0277" { message.push_str(&crate::next_solver::diagnostics::auto_trait_failure_notes(infcx, prog, &o.goal, Some(typeck))); }
         let span = Span { file: typeck.file, lo: o.cause.span, hi: o.cause.span };
@@ -324,7 +333,6 @@ struct Group<'a, 'b> {
     tcx: &'a Tcx,
     typeck: &'a typeck::Body,
     env: TypingEnv,
-    eval: &'b EvalCx<'b>,
     root: &'b BuildRoot<'b>,
     name: &'a str,
     fv_cache: Option<&'a Rc<SummaryCx>>,
@@ -333,7 +341,7 @@ struct Group<'a, 'b> {
 /// Borrow-check a group of bodies together (one inference context each, nested bodies first):
 /// the item with its closures, or one anonymous constant.
 fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &mut Verdict) {
-    let Group { cx, prog, tcx, typeck, env, eval, root, name, fv_cache } = *g;
+    let Group { cx, prog, tcx, typeck, env, root, name, fv_cache } = *g;
     let env = env;
     let provider = BuildProvider { prog, tcx, memo: Default::default() };
 
@@ -392,6 +400,10 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
     // MoveData, signature regions, inference contexts, MIR type check.
     let mut prepared: Vec<Prepared<'_>> = Vec::new();
     let item_sig = if anon_const { Some(SignatureRegions::anon_const(tcx, prog, typeck.def)) } else { SignatureRegions::function(tcx, prog, typeck.def) };
+    // an instance (MAKEPAD_RUN_BORROWCK_INSTANCES): its signature is substituted as its body and
+    // environment are, or the generic signature meets a concrete environment
+    let instance = !typeck.args.is_empty() && typeck.args[..] != tcx.generic_indices_of(prog, typeck.def).identity_types_consts(&tcx.tys)[..];
+    let item_sig = item_sig.map(|s| if instance && !anon_const { s.instantiated(tcx, prog, typeck.def, &typeck.args) } else { s });
     let Some(item_sig) = item_sig else {
         v.unchecked.push(format!("{name}: no universal regions for the signature"));
         return;
@@ -446,6 +458,7 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
         };
         let moves = MoveData::gather_moves(&mir, prog, tcx, env, &|_| true);
         let mut infcx = BorrowckInferCtxt::new(tcx, prog, typeck.def, typeck.def, &typeck.args);
+        infcx.root_typeck = Some(typeck);
         let input = MirNllInput { sig: &sig, nested, def_span: mir.span, moves: &moves, has_loans: true };
         let tc = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| type_check_body(tcx, prog, &mut infcx, &mut *mir, &input))) {
             Ok(tc) => tc,
@@ -493,14 +506,6 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
     let fv_cache: &SummaryCx = match fv_cache { Some(c) => c, None => { own_cache = SummaryCx::new(); &own_cache } };
     let bodies_of = MirBodies { prog, tcx };
     let relaxed = field_views::relaxed(prog, typeck.def);
-    let closure_fv: crate::fxhash::HashMap<u32, Vec<field_views::Summary>> = {
-        let fenv = field_views::FvEnv { prog, tcx, cx: eval, cache: fv_cache, bodies: &bodies_of };
-        prepared.iter().filter_map(|p| match p.owner.kind {
-            OwnerKind::Closure(e) => Some((e.0, field_views::closure_captures(&fenv, &p.mir))),
-            _ => None,
-        }).collect()
-    };
-    let views = FieldViews::new(prog, env, cx.state, fv_cache, &bodies_of, relaxed, closure_fv);
 
     // do_mir_borrowck: nested bodies first.
     let results = {
@@ -508,6 +513,12 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
             key: p.key, body: &p.mir, moves: &p.moves, infcx: &mut p.infcx as &mut dyn RootBodyOps,
             typeck: p.typeck.take().unwrap(), nested: p.nested,
         }).collect();
+        // the closures' capture summaries are made at the first conflict that asks (FieldViews::closure_summaries)
+        let closure_bodies: Vec<(u32, &Body)> = root_bodies.iter().filter_map(|r| match r.key {
+            ClauseOwner::Closure(id) | ClauseOwner::Coroutine(id) => Some((id.expr, r.body)),
+            ClauseOwner::Def(_) => None,
+        }).collect();
+        let views = FieldViews::new(prog, env, cx.state, fv_cache, &bodies_of, relaxed, closure_bodies);
         let ctxt = BorrowCheckRootCtxt { tcx, prog };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctxt.do_mir_borrowck_fv(root_bodies, Some(&views)))) {
             Ok(r) => r,
@@ -577,6 +588,32 @@ fn describe_build_error(reason: &crate::mir::build::UnsupportedReason) -> String
     }
 }
 
+/// Where lifetime parameter `name` of the item of `scope` (or of its impl / trait) is declared
+/// (rustc's "lifetime `'a` defined here" points at it).
+fn lifetime_param_span(prog: &Program, scope: crate::types::RegionScope, name: &str) -> Option<Span> {
+    use crate::ast::{GenericParamKind, ItemKind};
+    let crate::types::RegionScope::Item(mut d) = scope else { return None };
+    for _ in 0..2 {
+        if d == crate::program::NO_DEF { return None; }
+        let def = prog.def(d);
+        let pf = &prog.files[def.file as usize];
+        let ast = &pf.ast;
+        let generics = match ast.item(def.item).kind {
+            ItemKind::Fn(sig, _, _) => Some(ast.fn_sig(sig).generics),
+            ItemKind::Impl(r) => Some(ast.row(r).generics),
+            ItemKind::Trait(r) => Some(ast.row(r).generics),
+            _ => None,
+        };
+        if let Some(g) = generics {
+            for p in ast.list(g.params) {
+                if matches!(p.kind, GenericParamKind::Lifetime(_)) && pf.text(p.name) == name { return Some(Span { file: def.file, lo: p.name.lo, hi: p.name.hi }); }
+            }
+        }
+        d = def.parent;
+    }
+    None
+}
+
 /// The universal-region names of a body (DESIGN-C-NLL5 contract 3), from its signature.
 fn universal_names(tcx: &Tcx, prog: &Program, p: &Prepared<'_>) -> UniversalNames {
     let mut names = UniversalNames::default();
@@ -589,9 +626,11 @@ fn universal_names(tcx: &Tcx, prog: &Program, p: &Prepared<'_>) -> UniversalName
             Identity::Region(scope, r) => match tcx.tys.region_kind(r) {
                 crate::types::RegionKind::ReLateParam(_, crate::types::LateParamKind::ClosureEnv) =>
                     ExternalName::ClosureEnv { span: Span::default(), closure_trait: "Fn" },
-                crate::types::RegionKind::ReEarlyParam(_) | crate::types::RegionKind::ReLateParam(_, crate::types::LateParamKind::Named(_)) if u.name != "'_" =>
-                    ExternalName::Named { name: u.name.clone(), span: Span::default(), early: matches!(tcx.tys.region_kind(r), crate::types::RegionKind::ReEarlyParam(_)) },
-                _ => { let _ = scope; ExternalName::Anon }
+                // (a late-bound lifetime is liberated by its bound variable, `Anon(var)`, written
+                // name or not: the signature's name tells them apart)
+                crate::types::RegionKind::ReEarlyParam(_) | crate::types::RegionKind::ReLateParam(_, crate::types::LateParamKind::Named(_) | crate::types::LateParamKind::Anon(_)) if u.name != "'_" =>
+                    ExternalName::Named { name: u.name.clone(), span: lifetime_param_span(prog, scope, &u.name).unwrap_or_default(), early: matches!(tcx.tys.region_kind(r), crate::types::RegionKind::ReEarlyParam(_)) },
+                _ => ExternalName::Anon,
             },
             Identity::FnBody(_) => continue,
         };
@@ -682,7 +721,9 @@ fn lint_unused_mut(prog: &Program, owner: DefId, mir: &Body, used: &crate::mir::
         let LocalInfo::User(BindingForm::Var(VarBindingForm { binding_mode: crate::mir::BindingMode(ByRef::No, Mutability::Mut), pat_span, .. })) = &decl.local_info else { continue };
         let Some(name) = mir.var_debug_info.iter().find(|v| v.place.local.0 as usize == i && v.place.projection.is_empty()).map(|v| v.name.as_str()) else { continue };
         if name.starts_with('_') || crate::lint::external(prog, pat_span.file, pat_span.lo) { continue; }
-        crate::lint::emit(prog, owner, &crate::lint::UNUSED_MUT, pat_span.file, pat_span.lo,
+        // (under the attributes of the binding's statement, arm or parameter: its name is in the span)
+        let around = crate::lint::attrs_at(prog, owner, pat_span.file, pat_span.lo, pat_span.hi);
+        crate::lint::emit_in(prog, owner, &around, &crate::lint::UNUSED_MUT, pat_span.file, pat_span.lo,
             &format!("variable does not need to be mutable -- help: remove this `mut` (`{}`)", name));
     }
 }

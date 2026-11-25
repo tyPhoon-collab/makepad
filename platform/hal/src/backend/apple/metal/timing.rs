@@ -19,7 +19,10 @@ pub struct PassClock {
     device: RcObjcId,
     descriptor: RcObjcId,
     pub stage: bool,
-    pool: Mutex<Vec<RcObjcId>>,
+    /// the free sample buffers and when each came back (HAL clock ns); `trim` lets go of those
+    /// no batch took for a while
+    pool: Mutex<Vec<(SampleBuffer, u64)>>,
+    pools: Arc<crate::ledger::Pools>,
     /// (host seconds, GPU timestamp) sampled together at creation: with a second pair at resolve
     /// time, the GPU clock's rate and offset.
     anchor: (f64, u64),
@@ -28,11 +31,26 @@ pub struct PassClock {
 /// hardware: timestamps in one command buffer's sample buffer; a batch with more timed passes
 /// starts another command buffer.
 pub const PASS_CLOCK_SAMPLES: usize = 1024;
+/// A free sample buffer no batch took for this long is released (`PassClock::trim`).
+const SAMPLE_BUFFER_IDLE_NS: u64 = 2_000_000_000;
+
+/// A counter sample buffer, on the ledger's timestamps row while it lives (Metal reports no size
+/// for it).
+pub struct SampleBuffer {
+    obj: RcObjcId,
+    _charge: crate::ledger::Charge,
+}
+
+impl SampleBuffer {
+    pub fn as_id(&self) -> ObjcId {
+        self.obj.as_id()
+    }
+}
 /// Timestamps per pass: vertex start and end, fragment start and end.
 pub const PASS_CLOCK_STRIDE: usize = 4;
 
 impl PassClock {
-    pub fn new(device: ObjcId) -> Option<Arc<Self>> {
+    pub fn new(device: ObjcId, pools: Arc<crate::ledger::Pools>) -> Option<Arc<Self>> {
         unsafe {
             let available: bool = msg_send![device, respondsToSelector: sel!(supportsCounterSampling:)];
             if !available {
@@ -81,6 +99,7 @@ impl PassClock {
                 descriptor,
                 stage,
                 pool: Mutex::new(Vec::new()),
+                pools,
                 anchor: Self::now(device),
             }))
         }
@@ -94,13 +113,21 @@ impl PassClock {
         }
     }
 
-    pub fn take(&self) -> Option<RcObjcId> {
-        if let Some(buffer) = self.pool.lock().ok().and_then(|mut pool| pool.pop()) {
+    pub fn take(&self) -> Option<SampleBuffer> {
+        if let Some((buffer, _)) = self.pool.lock().ok().and_then(|mut pool| pool.pop()) {
             return Some(buffer);
         }
         let mut error: ObjcId = nil;
         let buffer: ObjcId = unsafe { msg_send![self.device.as_id(), newCounterSampleBufferWithDescriptor: self.descriptor.as_id() error: &mut error] };
-        NonNull::new(buffer).map(RcObjcId::from_owned)
+        NonNull::new(buffer).map(|b| SampleBuffer { obj: RcObjcId::from_owned(b), _charge: self.pools.charge_unsized(crate::ledger::Pool::Timestamps) })
+    }
+
+    /// Releases the free sample buffers no batch took for `SAMPLE_BUFFER_IDLE_NS`: the pool
+    /// grew to the most batches ever in flight at once, and kept them all.
+    pub fn trim(&self, now: u64) {
+        if let Ok(mut pool) = self.pool.lock() {
+            pool.retain(|(_, at)| now.saturating_sub(*at) < SAMPLE_BUFFER_IDLE_NS);
+        }
     }
 }
 
@@ -108,9 +135,11 @@ impl PassClock {
 /// the first); the sample buffer goes back to the pool when the last handler lets go.
 pub struct PassSamples {
     pub clock: Arc<PassClock>,
-    pub buffer: Option<RcObjcId>,
+    pub buffer: Option<SampleBuffer>,
     /// Samples reserved (backend thread only; atomic to share with handlers).
     used: AtomicUsize,
+    /// Compute encoders use two timestamps, including on stage-boundary devices.
+    simple: [AtomicBool; PASS_CLOCK_SAMPLES / PASS_CLOCK_STRIDE],
     /// per sample group: its four times in host seconds (`None`: not sampled)
     raw: OnceLock<Vec<[Option<f64>; 4]>>,
 }
@@ -118,8 +147,10 @@ pub struct PassSamples {
 impl PassSamples {
     pub fn new(clock: Arc<PassClock>) -> Option<Arc<PassSamples>> {
         let buffer = clock.take()?;
-        Some(Arc::new(PassSamples { clock, buffer: Some(buffer), used: AtomicUsize::new(0), raw: OnceLock::new() }))
+        Some(Arc::new(PassSamples { clock, buffer: Some(buffer), used: AtomicUsize::new(0), simple: std::array::from_fn(|_| AtomicBool::new(false)), raw: OnceLock::new() }))
     }
+
+    pub fn simple_encoder(&self, index: usize) { self.simple[index / PASS_CLOCK_STRIDE].store(true, Ordering::Release); }
 
     pub fn reserve(&self) -> Option<usize> {
         let at = self.used.load(Ordering::Relaxed);
@@ -149,6 +180,9 @@ impl PassSamples {
     /// `GPUStartTime`; `None` for a pass whose fragment stage left no time inside the buffer's span.
     pub fn span(&self, command_buffer: ObjcId, index: usize) -> Option<(f64, f64)> {
         let [v0, v1, f0, f1] = self.raw(command_buffer, index);
+        if self.simple[index / PASS_CLOCK_STRIDE].load(Ordering::Acquire) {
+            return v0.zip(v1).filter(|(a, b)| b >= a);
+        }
         if !self.clock.stage {
             // encoder samples: first and last
             return v0.zip(f1).filter(|(a, b)| b >= a);
@@ -200,7 +234,7 @@ impl PassSamples {
 impl Drop for PassSamples {
     fn drop(&mut self) {
         if let (Some(buffer), Ok(mut pool)) = (self.buffer.take(), self.clock.pool.lock()) {
-            pool.push(buffer);
+            pool.push((buffer, crate::clock_ns()));
         }
     }
 }
@@ -326,6 +360,11 @@ const MTL_COMMAND_BUFFER_STATUS_ERROR: u64 = 5;
 
 /// Command buffers that ended in error since launch. Bounds the log below.
 static CB_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// (`backend::end_run`) The log's bound counts per run.
+pub(crate) fn end_run() {
+    CB_ERRORS.store(0, Ordering::Relaxed);
+}
 
 /// A command buffer that ends in `MTLCommandBufferStatusError` produced no pixels: whatever it
 /// was going to draw is missing from the frame, and nothing else in the backend notices, because

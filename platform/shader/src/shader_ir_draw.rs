@@ -18,7 +18,10 @@ use crate::shader_output::*;
 
 use makepad_live_id::{id, LiveId};
 
-/// What the platform binds a draw shader's resources by.
+/// What the platform binds a draw shader's resources by. Plain data that crosses the
+/// provided-crate boundary in `DrawSpirvView` (`IrDrawSpirvResult::view`): no Vec or String
+/// here, or JIT code cannot read it. The storage buffers are the output's
+/// (`ShaderOutput::storage_buffers`), which the platform binds by.
 #[relax_api(plain)]
 #[derive(Clone, Debug, Default)]
 pub struct IrDrawInfo {
@@ -518,7 +521,7 @@ pub fn build_draw_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
                 }
                 next += 1;
             }
-            ShaderIoKind::StorageBuffer(_) => next += 1,
+            ShaderIoKind::StorageBuffer(_) => {},
             _ => {}
         }
     }
@@ -722,6 +725,7 @@ pub fn build_draw_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
     }
     copy_uniforms(&mut b, dyn_block, &dyn_ios, scope_block, &scope_ios, &io_globals);
     init_frag_depth(&mut b, depth_out, &io_globals);
+    init_frag_position(&mut b, output, &io_globals, FragPositionFix::AsIs);
     if let Some(ff) = fragment_fn {
         let call = b.e(ExprKind::Call(ff, Vec::new()), TY_VOID);
         b.f.body.push(Stmt::Expr(call));
@@ -768,6 +772,58 @@ fn init_frag_depth(b: &mut Bld, depth_out: Option<(u32, usize)>, io_globals: &[O
     let z = b.lane(pos, 2);
     let place = b.glob(g);
     b.assign(place, z);
+}
+
+/// How a backend's position builtin differs from `fragment_position()`'s convention (pixels
+/// from the target's top-left, window depth, 1 / clip w).
+#[derive(Clone, Copy)]
+enum FragPositionFix {
+    /// Metal's `[[position]]`, Vulkan's FragCoord and WebGPU's `position` are it.
+    AsIs,
+    /// D3D's `SV_Position.w` is the clip w itself.
+    ReciprocalW,
+    /// GL counts rows from the bottom of the framebuffer: y becomes o.x + o.y * y with the
+    /// host's `mp_frag_y` = o, (0, 1) where the clip Y flip stores rows top-down (texture
+    /// passes, every HAL pass) and (height, -1) for a canvas drawn bottom-up.
+    GlYOrigin(GlobalId),
+}
+
+/// Before the fragment function: a shader that declares `fragment_position()` reads the
+/// fragment's position builtin in its convention.
+fn init_frag_position(b: &mut Bld, output: &ShaderOutput, io_globals: &[Option<GlobalId>], fix: FragPositionFix) {
+    let Some(io) = output.io.iter().position(|io| matches!(io.kind, ShaderIoKind::FragmentPosition)) else { return };
+    let Some(g) = io_globals[io] else { return };
+    let entry = b.f.entry.as_ref().unwrap();
+    let Some(k) = entry.inputs.iter().position(|i| i.binding == IrIoBinding::Builtin(IrBuiltinIo::Position)) else { return };
+    let vec4 = entry.inputs[k].ty;
+    let pos = b.e(ExprKind::EntryIn(k as u32), vec4);
+    let place = b.glob(g);
+    b.assign(place, pos);
+    match fix {
+        FragPositionFix::AsIs => {}
+        FragPositionFix::ReciprocalW => {
+            let one = b.f32(1.0);
+            let v = b.glob(g);
+            let w = b.lane(v, 3);
+            let inv = b.bin(BinOp::Div, one, w, TY_F32);
+            let v = b.glob(g);
+            let dst = b.lane(v, 3);
+            b.assign(dst, inv);
+        }
+        FragPositionFix::GlYOrigin(origin) => {
+            let o = b.glob(origin);
+            let ox = b.lane(o, 0);
+            let o = b.glob(origin);
+            let oy = b.lane(o, 1);
+            let v = b.glob(g);
+            let y = b.lane(v, 1);
+            let scaled = b.bin(BinOp::Mul, oy, y, TY_F32);
+            let flipped = b.bin(BinOp::Add, ox, scaled, TY_F32);
+            let v = b.glob(g);
+            let dst = b.lane(v, 1);
+            b.assign(dst, flipped);
+        }
+    }
 }
 
 /// The entry's last act: the depth the fragment function wrote goes out.
@@ -1354,9 +1410,14 @@ pub fn build_gl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl c
         }
     }
     let depth_out = push_frag_depth(output, &mut outputs, "gl_FragDepth");
-    if depth_out.is_some() {
+    let reads_position = output.io.iter().any(|io| matches!(io.kind, ShaderIoKind::FragmentPosition));
+    if depth_out.is_some() || reads_position {
         inputs.push(IrEntryIo { name: "gl_FragCoord".to_string(), ty: vec4, binding: IrIoBinding::Builtin(IrBuiltinIo::Position) });
     }
+    let frag_y = reads_position.then(|| {
+        let vec2 = ir.vec_ty(2, IrScalar::F32);
+        ir.global(IrGlobalKind::FragYOrigin, id!(mp_frag_y), vec2)
+    });
     let fragment_fn = ir.function_by_name("io_fragment");
     let mut b = Bld { f: IrFunction::new("fragment_main".to_string(), TY_VOID), m: ir };
     b.f.entry = Some(IrEntry { stage: IrStage::Fragment, inputs, outputs });
@@ -1372,6 +1433,9 @@ pub fn build_gl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl c
         gl_assign_reconstructed(&mut b, types, g, &inline, Source::Numeric, &var_lanes, &mut at);
     }
     init_frag_depth(&mut b, depth_out, &io_globals);
+    if let Some(origin) = frag_y {
+        init_frag_position(&mut b, output, &io_globals, FragPositionFix::GlYOrigin(origin));
+    }
     if let Some(ff) = fragment_fn {
         let call = b.e(ExprKind::Call(ff, Vec::new()), TY_VOID);
         b.f.body.push(Stmt::Expr(call));
@@ -1411,6 +1475,7 @@ fn gl_assign_reconstructed(b: &mut Bld, types: &impl crate::shader_types::Shader
 /// What the HLSL printer needs beyond the IR.
 #[derive(Clone, Debug, Default)]
 pub struct HlslDrawInfo {
+    pub storage_buffers: Vec<crate::shader_ir_compute::ComputeBufferBinding>,
     pub instance_slots: usize,
     /// The semantic of each `vertex_main` input (D3D11's input layout names
     /// geometry `GEOM<letter><chunk>`, one letter per geometry input).
@@ -1460,6 +1525,7 @@ pub fn index_to_semantic(index: usize) -> String {
 /// colour).
 pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl crate::shader_types::ShaderTypes) -> HlslDrawInfo {
     let mut info = HlslDrawInfo::default();
+    info.storage_buffers = output.storage_buffers.clone();
     let mut instance = Vec::new();
     let mut offset = 0;
     for rust in [false, true] {
@@ -1730,6 +1796,7 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
         gl_assign_reconstructed(&mut b, types, g, &inline, Source::Numeric, &var_lanes, &mut at);
     }
     init_frag_depth(&mut b, depth_out, &io_globals);
+    init_frag_position(&mut b, output, &io_globals, FragPositionFix::ReciprocalW);
     if let Some(ff) = fragment_fn {
         let call = b.e(ExprKind::Call(ff, Vec::new()), TY_VOID);
         b.f.body.push(Stmt::Expr(call));
@@ -1820,6 +1887,7 @@ impl IrDrawInfo {
 #[relax_api(plain)]
 #[derive(Clone, Debug, Default)]
 pub struct MetalDrawInfo {
+    pub storage_buffers: Vec<crate::shader_ir_compute::ComputeBufferBinding>,
     /// Words of one instance record (`buffer(1)`).
     pub instance_words: usize,
     /// Words of one vertex (`buffer(0)`, the geometry's packed layout).
@@ -1834,6 +1902,7 @@ pub struct MetalDrawInfo {
 /// backend. No XR variant and no depth clip.
 pub fn build_metal_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl crate::shader_types::ShaderTypes) -> MetalDrawInfo {
     let mut info = MetalDrawInfo::default();
+    info.storage_buffers = output.storage_buffers.clone();
     let mut geometry = Vec::new();
     let mut offset = 0;
     for (i, io) in output.io.iter().enumerate() {
@@ -2076,6 +2145,7 @@ pub fn build_metal_entries(output: &ShaderOutput, ir: &mut IrModule, types: &imp
         }
     }
     init_frag_depth(&mut b, depth_out, &io_globals);
+    init_frag_position(&mut b, output, &io_globals, FragPositionFix::AsIs);
     if let Some(ff) = fragment_fn {
         let call = b.e(ExprKind::Call(ff, Vec::new()), TY_VOID);
         b.f.body.push(Stmt::Expr(call));

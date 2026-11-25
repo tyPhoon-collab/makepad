@@ -6,14 +6,18 @@
 #    checkout; no WM to build or restart);
 # 2. writes node-start.cmd next to them: `cargo run --release -p makepad-app-devhub` in the node's one tree
 #    (-Tree; default %USERPROFILE%\devhub\tree when it exists, the tree the leases run in, else the checkout),
-#    in a loop: every exit (a clean one too: a restart for new code) starts the tree's current code again;
-#    its log is node.log;
+#    in a loop: every exit (a clean one too: a restart for new code) starts the tree's current code again.
+#    The hub writes its own log, node.log (--makepad-devhub-log): the loop redirects nothing a process
+#    the hub starts could hold open (cmd's `>>` shares no writing: a run that outlived its hub held
+#    it, and the loop started no hub, 11-04). The loop's own lines (each start, each exit with its
+#    code) go to node-start.log, the last build's output to node-build.log;
 # 3. registers the per-user task "Makepad devhub node" (at logon, restarted when it fails) that runs
 #    node-start.cmd under a headless console: no console window, and nothing the hub starts (git,
 #    cargo, lease runs) opens one either;
 # 4. allows inbound TCP 8797 to the hub's exe from the local subnet (the fleet identity decides who
 #    gets in; the rule keeps Windows from asking on the desktop when it first listens).
-# -Start starts the task now; -Enable turns a node the tray's Quit switched off back on.
+# -Start starts the task now; -Enable turns a node the tray's Quit switched off back on;
+# -ScriptOnly stops after the start script (a lease can run this: the hub it runs under keeps running).
 # The node proves itself with the machine's fleet identity (%USERPROFILE%\.makepad\fleet,
 # tools/fleet-identity.md); without one it serves this machine's JITs locally only.
 # Role and budgets are the master's: `makepad devhub node <name> role pool` (kept in lease.conf here).
@@ -26,7 +30,8 @@ param(
     [string]$HostAddr = "",
     [int]$Port = 8797,
     [switch]$Start,
-    [switch]$Enable
+    [switch]$Enable,
+    [switch]$ScriptOnly
 )
 $ErrorActionPreference = "Stop"
 $task = "Makepad devhub node"
@@ -36,6 +41,8 @@ $conf = Join-Path $dir "node.conf"
 $sync = Join-Path $dir "sync.conf"
 $startCmd = Join-Path $dir "node-start.cmd"
 $log = Join-Path $dir "node.log"
+$startLog = Join-Path $dir "node-start.log"
+$buildLog = Join-Path $dir "node-build.log"
 $target = Join-Path $env:USERPROFILE "devhub\target\hub"
 $exe = Join-Path $target "release\makepad-app-devhub.exe"
 if (-not (Test-Path (Join-Path $Checkout "apps\devhub\Cargo.toml"))) { throw "no makepad checkout at $Checkout" }
@@ -75,12 +82,34 @@ Set-Content -Path $startCmd -Encoding ascii -Value @(
     "set CARGO_INCREMENTAL=0",
     "set CARGO_NET_OFFLINE=true",
     ":again",
-    "echo ---- %DATE% %TIME% devhub node start in $Tree >> `"$log`"",
-    "cargo run --release -p makepad-app-devhub >> `"$log`" 2>&1",
+    "echo %DATE% %TIME% devhub node start in $Tree >> `"$startLog`"",
+    "rem a tree a lease left at a commit the hub does not build at (from before its package) would loop for",
+    "rem good: it goes to the shared commits, and the hub, once up, puts a lease still holding it back",
+    "cargo build --release -p makepad-app-devhub > `"$buildLog`" 2>&1",
+    "if errorlevel 1 (",
+    "  echo %DATE% %TIME% the hub does not build here: node-build.log >> `"$startLog`"",
+    "  call :to_synced",
+    "  if exist apps\commercial\.git (",
+    "    pushd apps\commercial",
+    "    call :to_synced",
+    "    popd",
+    "  )",
+    ")",
+    "cargo run --release -p makepad-app-devhub -- --makepad-devhub-log `"$log`"",
+    "echo %DATE% %TIME% the hub exited with %ERRORLEVEL% >> `"$startLog`"",
     "rem 5 s between restarts (timeout needs a console input; the task's console is headless)",
     "ping -n 6 127.0.0.1 > nul",
-    "goto again"
+    "goto again",
+    ":to_synced",
+    "for /f %%s in ('git rev-parse -q --verify refs/devhub/synced') do (",
+    "  echo the hub does not build here: back at the shared %%s >> `"$startLog`"",
+    "  git read-tree --reset -u %%s >> `"$buildLog`" 2>&1",
+    "  git update-ref --no-deref HEAD %%s",
+    "  git update-ref refs/devhub/checkout %%s",
+    ")",
+    "exit /b 0"
 )
+if ($ScriptOnly) { Write-Host "wrote $startCmd"; exit 0 }
 
 # 3. the at-logon task in this user's session (the tray lives there)
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -100,6 +129,20 @@ try {
     Write-Host "allowed TCP $Port to $exe from the local subnet"
 } catch {
     Write-Host "firewall rule not set (run elevated): $_"
+}
+
+# 5. build output and the JIT cache: no Defender scan or indexing of every file a build writes (needs an
+#    elevated shell, as the firewall rule)
+foreach ($d in @((Join-Path $Checkout "target"), (Join-Path $Tree "target"), (Split-Path $target -Parent), (Join-Path $h "run")) | Select-Object -Unique) {
+    New-Item -ItemType Directory -Force -Path $d | Out-Null
+    try {
+        Add-MpPreference -ExclusionPath $d
+        $item = Get-Item $d
+        $item.Attributes = $item.Attributes -bor [IO.FileAttributes]::NotContentIndexed
+        Write-Host "no scan, no indexing: $d"
+    } catch {
+        Write-Host "not excluded from scans (run elevated): ${d}: $_"
+    }
 }
 
 if ($Start) {

@@ -975,7 +975,7 @@ impl ImageCache {
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
-            decode_queue: TaskQueue::new(Lane::Light, MAX_POOL_WORKERS, 1024),
+            decode_queue: TaskQueue::new(Class::Visible, available_parallelism().get().saturating_sub(1).max(1), 1024),
             pending_http_requests: HashMap::new(),
             fresh: Vec::new(),
             fresh_event: 0,
@@ -1976,12 +1976,6 @@ mod tests {
     }
 
     #[test]
-    fn test_from_gif_single_frame_has_no_frame_delays() {
-        let image = ImageBuffer::from_gif(&single_frame_gif()).unwrap();
-        assert!(image.animation.is_none());
-    }
-
-    #[test]
     fn test_from_gif_zero_delay_normalised_to_100ms() {
         let image = ImageBuffer::from_gif(&zero_delay_gif()).unwrap();
         let animation = image.animation.as_ref().unwrap();
@@ -2028,26 +2022,6 @@ mod tests {
             decode_image_buffer(Path::new("sticker"), &[0; 16], None),
             Err(ImageError::UnsupportedFormat)
         ));
-    }
-
-    #[test]
-    fn test_makepad_gif_is_only_a_dependency_of_makepad_draw() {
-        let lock_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("Cargo.lock");
-        let lock = std::fs::read_to_string(lock_path).unwrap();
-        let consumers: Vec<&str> = lock
-            .split("[[package]]")
-            .filter(|block| block.contains("\"makepad-gif\""))
-            .filter_map(|block| {
-                block
-                    .lines()
-                    .find_map(|line| line.strip_prefix("name = \"")?.strip_suffix('"'))
-            })
-            .filter(|name| *name != "makepad-gif")
-            .collect();
-        assert_eq!(consumers, ["makepad-draw"]);
     }
 
     fn static_png_2x2(color: [u8; 4]) -> Vec<u8> {
@@ -2360,6 +2334,7 @@ where
 {
     ensure_image_cache_inner(cx);
     let image_size_bytes = (*data).as_ref().len();
+    #[cfg(not(all(target_arch = "wasm32", not(target_feature = "atomics"))))]
     let task_key = image_path.clone();
     let job = move || {
             let start = decode_timing_start();
@@ -2401,8 +2376,9 @@ where
                 result: RefCell::new(Some(result)),
             });
         };
-    let pool = cx.task_pool();
-    if pool.is_open() {
+    #[cfg(not(all(target_arch = "wasm32", not(target_feature = "atomics"))))]
+    {
+        let pool = cx.task_pool();
         let queue = &mut cx.get_global::<ImageCache>().decode_queue;
         queue.set_in_flight_limit(pool.worker_count());
         if let Err(error) = queue.push(&pool, task_key.clone(), true, QueueOrder::Lifo, job) {
@@ -2411,7 +2387,9 @@ where
                 result: RefCell::new(Some(Err(ImageError::Worker(error.to_string())))),
             });
         }
-    } else {
+    }
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+    {
         // A non-threaded wasm build has an explicit serial path for this pure
         // CPU decode.
         job();

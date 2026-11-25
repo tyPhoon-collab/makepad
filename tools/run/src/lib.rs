@@ -4,7 +4,7 @@
 //! compilation and the app domains as its guests (hal_host.rs). The Android host library
 //! (tools/run/android_host) is the same host as a shared object.
 // Diagnostics never panic: std's print macros panic when a write fails (ENOSPC on the session
-// log in a full tmpfs /tmp aborted a fleet Sandbox inside a lazy compile, 2026-10-23), so in this
+// log in a full tmpfs /tmp aborted an app inside a lazy compile, 2026-10-23), so in this
 // crate every print is a write whose error is dropped. Test builds keep std's captured macros.
 #[cfg(not(test))]
 #[allow(unused_macros)]
@@ -30,12 +30,15 @@ macro_rules! print {
 }
 
 mod hal_host;
+#[cfg(target_os = "ios")]
+pub mod ios;
 mod hal_run;
 mod quit_signal;
 mod boot_progress;
 mod boot_editor;
 mod boot_input;
 mod boot_probe;
+mod build_flags;
 
 pub use relax_boot::Environment as BootEnvironment;
 
@@ -49,6 +52,12 @@ fn init() {
         relax_compiler::inspect::register_host_inspect("cap", makepad_hal::inspect::dispatch);
         relax_compiler::inspect::register_host_commands(makepad_hal::framecap::COMMANDS);
         relax_compiler::inspect::register_host_commands(makepad_hal::a11y::COMMANDS);
+        // a font or automation script the run names under a virtual folder (an overlay's
+        // sources) has no disk file; a relative path is the virtual workspace's, as in JIT code
+        makepad_hal::set_virtual_reader(|path| {
+            let path = if std::path::Path::new(path).is_relative() { format!("{}/{path}", relax_compiler::run::workspace_dir()) } else { path.to_string() };
+            relax_compiler::vfs::is_virtual(&path).then(|| relax_compiler::vfs::read(&path))
+        });
     }
 }
 
@@ -56,6 +65,7 @@ pub static HOST: relax_runner::Host = relax_runner::Host {
     provenance: env!("MAKEPAD_RUN_PROVENANCE"),
     init: init,
     provide: provided,
+    run_host: run_host,
     // interactive visual iteration: a bounded compile-ahead of what the UI is about to need
     ahead: relax_compiler::options::AheadLevel::Balanced,
     // apps for users: third-party compile-time code stays sandboxed
@@ -66,8 +76,8 @@ pub static HOST: relax_runner::Host = relax_runner::Host {
 };
 
 /// `makepad` with no arguments and no `runner` launch record (an installation's entry script
-/// writes one): the runner app of the checkout this binary was built from, when it has one
-/// (apps/commercial/runner), run from that checkout like `makepad run makepad-runner` there.
+/// writes one): the default app of the checkout this binary was built from, when it has one,
+/// run from that checkout.
 fn checkout_runner() -> Option<relax_runner::launch::Launch> {
     let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().ok()?;
     if !checkout.join("apps/commercial/runner/Cargo.toml").is_file() {
@@ -108,6 +118,7 @@ fn source_manifest(name: &str) -> &'static [u8] {
         "makepad_script_census" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-script-census.src.bin")),
         "makepad_script_compute" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-script-compute.src.bin")),
         "makepad_shader" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-shader.src.bin")),
+        "makepad_cpu_budget" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-cpu-budget.src.bin")),
         "makepad_tween_script" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-tween-script.src.bin")),
         "makepad_script_audio_aot" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-script-audio-aot.src.bin")),
         "makepad_hal" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-hal.src.bin")),
@@ -125,6 +136,7 @@ fn src(name: &str) -> u64 {
         "makepad_script_census" => env!("MAKEPAD_RUN_SRC_makepad_script_census"),
         "makepad_script_compute" => env!("MAKEPAD_RUN_SRC_makepad_script_compute"),
         "makepad_shader" => env!("MAKEPAD_RUN_SRC_makepad_shader"),
+        "makepad_cpu_budget" => env!("MAKEPAD_RUN_SRC_makepad_cpu_budget"),
         "makepad_tween_script" => env!("MAKEPAD_RUN_SRC_makepad_tween_script"),
         "makepad_script_audio_aot" => env!("MAKEPAD_RUN_SRC_makepad_script_audio_aot"),
         "makepad_hal" => env!("MAKEPAD_RUN_SRC_makepad_hal"),
@@ -148,16 +160,16 @@ extern crate makepad_script_compute;
 extern crate makepad_script_std;
 extern crate makepad_shader;
 extern crate makepad_tween_script;
+extern crate makepad_cpu_budget;
 extern crate relax_provided_fixture;
 
 fn provided() {
     use std::collections::HashMap;
-    // the HAL starts and stops apps as domains through this host; the boot app's privilege is the host's grant
-    hal_host::register();
+    run_host();
     // the registry, its keys and the lazily built `type_name` strings of the entries (statics of
     // the provided crates) live for the process: the program's heap, not the compiler's
     let _kept = relax_compiler::zone_alloc::kept();
-    const CRATES: [&str; 10] = [
+    const CRATES: [&str; 11] = [
         "relax_provided_fixture",
         "makepad_live_id",
         "makepad_script",
@@ -166,6 +178,7 @@ fn provided() {
         "makepad_script_compute",
         "makepad_shader",
         "makepad_tween_script",
+        "makepad_cpu_budget",
         "makepad_script_audio_aot",
         "makepad_hal",
     ];
@@ -211,15 +224,40 @@ fn provided() {
         relax_compiler::inspect::register_host_inspect(name, script_query);
     }
     relax_compiler::inspect::register_host_commands(makepad_script::inspect_query::COMMANDS);
-    // a restart into a rebuilt makepad keeps the WM connection: the app keeps its window
-    #[cfg(target_os = "linux")]
-    relax_compiler::reload::set_before_exec(makepad_hal::wm_prepare_exec, makepad_hal::wm_undo_exec);
-    relax_compiler::run::set_main_host(relax_compiler::run::MainHost {
-        domain_zero: cfg!(target_os = "android"),
-        run: hal_run::run,
-        open: hal_run::open,
-        start: hal_run::start,
-        relaunch: hal_run::relaunch,
+    // an exec restart (an edit's, or into a rebuilt makepad) opens the window where it was and
+    // keeps the WM connection: the app keeps its window
+    #[cfg(any(unix, windows))]
+    relax_compiler::reload::set_before_exec(hal_run::prepare_exec, hal_run::undo_exec);
+    relax_compiler::reload::set_restart_begins(hal_run::restart_begins);
+}
+
+/// The HAL's host, the main-thread run host (the window, the boot screen) and the run's native
+/// end, once: with the provided crates, or before them for an app's start, whose window opens
+/// before its source is had (`relax_runner::Host::run_host`).
+fn run_host() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // the HAL starts and stops apps as domains through this host; the boot app's privilege is the host's grant
+        hal_host::register();
+        relax_compiler::run::set_main_host(relax_compiler::run::MainHost {
+            domain_zero: cfg!(target_os = "android"),
+            run: hal_run::run,
+            open: hal_run::open,
+            start: hal_run::start,
+            batch: hal_run::batch,
+            status: hal_run::status,
+            end_app: hal_run::end_app,
+            next_run: hal_run::next_run,
+        });
+        relax_compiler::run_end::set_native_end(
+            || {
+                makepad_hal::end_run();
+                makepad_script::end_run();
+                makepad_script_census::end_run();
+                makepad_script_compute::end_run();
+            },
+            makepad_script::end_domain,
+        );
     });
 }
 

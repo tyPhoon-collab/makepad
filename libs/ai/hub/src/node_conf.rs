@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 pub const CONF_ENV: &str = "MAKEPAD_WM_AI_HUB_CONF";
 /// The variable the WM sets for the AI Hub app it starts: this file's path. The app then
 /// serves as this node's hub (`NodeConf`) instead of from its own settings.
-pub const NODE_CONF_ENV: &str = "MAKEPAD_AI_HUB_NODE_CONF";
+pub use makepad_network::netconfig::NODE_CONF_ENV;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeConf {

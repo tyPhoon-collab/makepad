@@ -12,6 +12,8 @@ pub mod http_server;
 // May this process touch the local network (macOS Local Network privacy): the one rule.
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 pub mod lan;
+#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+pub mod netconfig;
 // MAKEPAD_NET_AUDIT=1: every socket this process holds, logged (lan.rs).
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 pub mod socket_audit;
@@ -77,7 +79,7 @@ pub use crate::ui_signal::{
     ReceiverAlreadyTaken, SignalFromUI, SignalToUI, ToUIOneshotReceiver, ToUIOneshotSender,
     ToUIReceiver, ToUISender, UiWaker,
 };
-pub use crate::utils::HttpServerHeaders;
+pub use crate::utils::{clone_tcp, HttpServerHeaders};
 pub use crate::web_socket_parser::{
     ServerWebSocketError, ServerWebSocketMessage, ServerWebSocketMessageFormat,
     ServerWebSocketMessageHeader, WebSocketError, WebSocketMessage as ParsedWebSocketMessage,

@@ -5,7 +5,8 @@
 //!   opens its menu: the fleet at a glance (nodes up, leases, the land queue, the newest verify,
 //!   lanes, the last events) and Open devhub (the panel: the inbox and the explorer, machines → JITs
 //!   → inspect views), Pause landing, Run verify now. It listens on nothing but its control socket
-//!   and dials the nodes with the Mac's fleet identity. On the Mac it runs from the Dock wrapper
+//!   and dials the nodes with the Mac's fleet identity. The profiler (`libs/prof_view`: a running makepad app's timeline, answers,
+//!   recordings and inspect console) opens from the menu's Open profiler and from a JIT row's Profile. On the Mac it runs from the Dock wrapper
 //!   (`makepad run makepad-app-devhub`, the current code under the JIT); "Open at login" makes the
 //!   per-user LaunchAgent that starts that wrapper at login and again after a crash.
 //! - Node (a Linux WM): a tray icon in the WM's bar with a status menu; it serves this machine's
@@ -22,7 +23,11 @@
 
 pub use makepad_widgets;
 
-use makepad_devhub::tray_glyph as glyph;
+/// counted, so `devhub heap <node>` can say what holds the hub's memory
+#[global_allocator]
+static HEAP: makepad_devhub::heap::Counted = makepad_devhub::heap::Counted;
+
+use makepad_devhub_conf::tray_glyph as glyph;
 mod graph;
 mod installed;
 mod live;
@@ -32,7 +37,8 @@ mod view;
 use makepad_devhub::explorer::{self, Snapshot};
 use makepad_devhub::glance::Glance;
 use makepad_devhub::master::Master;
-use makepad_devhub::node::{Node, NodeConf, NODE_CONF_ENV};
+use makepad_devhub::node::Node;
+use makepad_devhub_conf::{NodeConf, NODE_CONF_ENV};
 use makepad_devhub::trust::{FleetTrust, Trust};
 use makepad_devhub::lease::sched::{ordinal, Lease, State};
 use makepad_devhub::proto;
@@ -60,6 +66,15 @@ script_mod! {
                     hub_view := mod.widgets.DevhubView{}
                 }
             }
+            // the profile view of a running makepad app: timeline, answers, recordings
+            profile_window := Window{
+                create_on_start: false
+                window.title: "devhub profile"
+                window.inner_size: vec2(1280, 800)
+                body +: {
+                    prof := mod.widgets.ProfView{}
+                }
+            }
             // a node's tray dropdown: the task-manager view of this machine's JITs
             node_window := Window{
                 create_on_start: false
@@ -81,6 +96,7 @@ const QUIT: LiveId = live_id!(quit_devhub);
 const SEEN: LiveId = live_id!(seen_all);
 const DEVSW: LiveId = live_id!(dev_switch);
 const OPEN: LiveId = live_id!(open_window);
+const PROFILE: LiveId = live_id!(open_profile);
 const LOGIN: LiveId = live_id!(open_at_login);
 const PAUSE: LiveId = live_id!(pause_landing);
 const VERIFY: LiveId = live_id!(verify_now);
@@ -290,8 +306,8 @@ fn size_jit_cache(m: &MasterCore, machine: String, app: Option<String>) {
 }
 
 fn start_master() -> Result<MasterCore, String> {
-    let name = std::env::var("MAKEPAD_DEVHUB_NAME").ok().filter(|n| makepad_devhub::trust::valid_name(n)).unwrap_or_else(|| "mac".into());
-    let master = Master::start(&name, proto::HITCH_MS, trust(&name), Arc::new(|_r| {}))?;
+    let name = std::env::var("MAKEPAD_DEVHUB_NAME").ok().filter(|n| makepad_devhub_conf::valid_name(n)).unwrap_or_else(|| "mac".into());
+    let master = Master::start(&name, makepad_devhub_conf::HITCH_MS, trust(&name), Arc::new(|_r| {}))?;
     log_line(&format!("devhub: master {name} up; control {}", proto::control_socket().display()));
     let looking = Arc::new(AtomicBool::new(false));
     let snapshot = Arc::new(Mutex::new(Snapshot::default()));
@@ -349,8 +365,12 @@ fn start_node(conf_path: PathBuf) -> Result<Option<NodeCore>, String> {
 }
 
 fn start_core() -> Result<Option<Core>, String> {
-    match std::env::var_os(NODE_CONF_ENV).filter(|p| !p.is_empty()) {
-        Some(p) => Ok(start_node(PathBuf::from(p))?.map(Core::Node)),
+    // before it starts anything: a run gets the handles it is given, never one of the hub's
+    makepad_devhub::os::keep_handles_to_self();
+    let conf = std::env::var_os(NODE_CONF_ENV).filter(|p| !p.is_empty()).map(|p| std::path::absolute(PathBuf::from(p)).map_err(|e| format!("{NODE_CONF_ENV}: {e}"))).transpose()?;
+    proto::settle_cwd()?;
+    match conf {
+        Some(p) => Ok(start_node(p)?.map(Core::Node)),
         // the master is the Mac's: on Windows devhub is always a node (its logon task's tray)
         None if cfg!(windows) => Ok(start_node(proto::home().join("node.conf"))?.map(Core::Node)),
         None => Ok(Some(Core::Master(start_master()?))),
@@ -391,9 +411,26 @@ pub struct App {
     /// whether the fleet identity is here, and when that was looked at
     #[rust]
     fleet: Option<(std::time::Instant, bool)>,
+    /// a JIT row's Profile: the pid to attach the profile window to, taken after the action
+    #[rust]
+    profile_req: Option<u32>,
 }
 
 impl App {
+    /// Opens the profile window (recordings are kept in devhub's folder), attached to the app
+    /// with `pid` when given.
+    fn open_profile(&mut self, cx: &mut Cx, pid: Option<u32>) {
+        cx.show_in_dock(true);
+        self.ui.window(cx, ids!(profile_window)).show(cx);
+        let dir = proto::home().join("recordings");
+        if let Some(mut p) = self.ui.widget(cx, ids!(prof)).borrow_mut::<makepad_prof_view::panel::ProfView>() {
+            p.set_recordings_dir(cx, dir);
+            if let Some(pid) = pid {
+                p.attach_pid(cx, pid);
+            }
+        }
+    }
+
     /// The master at a glance (the fleet identity looked for at most every `FLEET_EVERY`).
     fn glance(&mut self) -> Option<Glance> {
         let Some(Core::Master(m)) = &self.core else { return None };
@@ -443,6 +480,7 @@ impl App {
                     menu.push(TrayMenuItem::Line);
                 }
                 menu.push(TrayMenuItem::item(OPEN, "Open devhub"));
+                menu.push(TrayMenuItem::item(PROFILE, "Open profiler"));
                 menu.push(TrayMenuItem::check(PAUSE, "Pause landing", gl.land_paused.is_some()));
                 if gl.verify != makepad_devhub::glance::Verify::None {
                     menu.push(TrayMenuItem::item(VERIFY, "Run verify now"));
@@ -454,7 +492,8 @@ impl App {
                     menu.push(TrayMenuItem::Line);
                     self.dev_nodes = nodes.iter().map(|(n, _, _)| n.clone()).collect();
                     for (i, (name, dev, user)) in nodes.iter().enumerate() {
-                        let label = if *dev && *user { format!("Dev on {name} \u{b7} user") } else { format!("Dev on {name}") };
+                        // the switch's own label; a person at the box is said apart from it
+                        let label = if *user { format!("Dev on {name} \u{b7} in use: no new leases until 3 min idle") } else { format!("Dev on {name}") };
                         menu.push(TrayMenuItem::check(LiveId(DEV_BASE + i as u64), label, *dev));
                     }
                     menu.push(TrayMenuItem::Line);
@@ -673,6 +712,13 @@ impl App {
                         self.state.view = "log";
                         let _ = m.drill.send((machine, pid, "!log".into()));
                     }
+                    JitDo::Profile => {
+                        if machine == m.master.name {
+                            self.profile_req = Some(pid);
+                        } else {
+                            *m.note.lock().unwrap() = format!("profile: {machine}'s JITs are profiled on {machine}; this window attaches to this Mac's apps");
+                        }
+                    }
                     JitDo::ClearCache => {
                         let app = self.state.machines.iter().find(|x| x.name == machine).and_then(|x| x.jits.iter().find(|j| j.pid == pid)).map(|j| j.app.clone());
                         size_jit_cache(m, machine, app);
@@ -819,6 +865,9 @@ impl MatchEvent for App {
                 continue;
             }
             self.act(a);
+            if let Some(pid) = self.profile_req.take() {
+                self.open_profile(cx, Some(pid));
+            }
             self.refresh(cx);
             self.sync_live(cx);
         }
@@ -855,6 +904,7 @@ impl AppMain for App {
         crate::makepad_widgets::script_mod(vm);
         makepad_shell_kit::eval_default_theme(vm);
         makepad_shell_kit::script_mod(vm);
+        makepad_prof_view::script_mod(vm);
         crate::view::script_mod(vm);
         crate::taskview::script_mod(vm);
         self::script_mod(vm)
@@ -892,7 +942,9 @@ impl AppMain for App {
                 id if id == PAUSE => {
                     if let Some(Core::Master(m)) = &self.core {
                         let resume = m.master.land.paused().is_some();
-                        m.master.land.set_paused(if resume { None } else { Some("from the menu bar") });
+                        if let Err(e) = m.master.land.set_paused(if resume { None } else { Some("from the menu bar") }) {
+                            log_line(&format!("devhub: land pause: {e}"));
+                        }
                     }
                     self.refresh(cx);
                 }
@@ -909,6 +961,7 @@ impl AppMain for App {
                     self.act(DevhubAction::SeenAll);
                     self.refresh(cx);
                 }
+                id if id == PROFILE => self.open_profile(cx, None),
                 id if id == OPEN => {
                     self.window_shown = true;
                     self.set_looking();
@@ -918,6 +971,14 @@ impl AppMain for App {
                 }
                 _ => {}
             },
+            Event::WindowCloseRequested(e) if cx.has_tray() && self.ui.window(cx, ids!(profile_window)).window_id() == Some(e.window_id) => {
+                // the profile window only hides; its sessions end with it
+                e.accept_close.set(false);
+                self.ui.window(cx, ids!(profile_window)).set_visible(cx, false);
+                if let Some(mut p) = self.ui.widget(cx, ids!(prof)).borrow_mut::<makepad_prof_view::panel::ProfView>() {
+                    p.detach(cx);
+                }
+            }
             Event::WindowCloseRequested(e) if cx.has_tray() => {
                 e.accept_close.set(false);
                 self.ui.window(cx, ids!(main_window)).set_visible(cx, false);

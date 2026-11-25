@@ -151,6 +151,11 @@ fn manifest_features(toml: &str) -> Vec<String> {
     on
 }
 
+/// Whether any site was accepted only in relaxed mode so far (`finish_check` reports them).
+pub fn pending() -> bool {
+    !NOTES.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
 pub fn note(n: Note) {
     let mut v = NOTES.lock().unwrap_or_else(|e| e.into_inner());
     if !v.iter().any(|x| x.at == n.at && x.code == n.code && x.msg == n.msg) {
@@ -208,4 +213,11 @@ pub fn apply_fixes(notes: &[Note]) -> std::io::Result<(usize, usize)> {
         files += 1;
     }
     Ok((files, edits))
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&NOTES, Mutex::new(Vec::new()));
+    reset(&FEATURES_NS, std::sync::atomic::AtomicU64::new(0));
 }

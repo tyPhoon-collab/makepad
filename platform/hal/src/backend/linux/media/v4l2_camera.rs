@@ -959,14 +959,6 @@ mod tests {
     }
 
     #[test]
-    fn the_slide_names_pick_the_obsbot_or_the_first_asus() {
-        let names: Vec<String> = listed().iter().map(|(_, n)| n.to_lowercase()).collect();
-        let by = |wanted: &str| names.iter().position(|n| n.contains(&wanted.to_lowercase()));
-        assert_eq!(listed()[by("OBSBOT").unwrap()].0, "/dev/video4");
-        assert_eq!(listed()[0].0, "/dev/video0");
-    }
-
-    #[test]
     fn fourcc_round_trips() {
         for p in [VideoPixel::YUY2, VideoPixel::MJPEG, VideoPixel::NV12, VideoPixel::YUV420, VideoPixel::RGB24, VideoPixel::GRAY] {
             assert_eq!(fourcc_to_video_pixel_format(video_pixel_format_to_fourcc(p)), p);

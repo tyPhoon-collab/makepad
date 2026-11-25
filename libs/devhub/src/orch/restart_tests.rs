@@ -1,6 +1,9 @@
-//! A master restart ends nothing, end to end: a real master process (leases, jobs, verify, CI) over
-//! real node executors in another process, killed under a job, a verify leg and a CI shard and
-//! started again on its state. All three finish with their real exit codes, each command run once.
+//! A master restart ends nothing, end to end: a real master process (leases, jobs, verify, CI,
+//! allapps) over real node executors in another process, killed under a job, a verify leg, a CI
+//! shard and its own allapps run, and started again on its state after the nodes went longer than
+//! their no-beat limit without it. All four finish with their real exit codes, each command run
+//! once. The tools wait for a release file, created once the restarted master has taken its state
+//! back.
 
 use super::*;
 use crate::lease::exec::{Exec, Opts, WORDS};
@@ -11,7 +14,12 @@ use makepad_remote::{lines, Endpoint};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const NODES: [&str; 6] = ["n1", "n2", "n3", "n4", "n5", "n6"];
+/// The first two are the CI boxes (their lease.conf opts in).
+const NODES: [&str; 6] = ["c1", "c2", "n3", "n4", "n5", "n6"];
+/// The nodes' no-beat limit here (60 s on a box), five of the master's beats ([`PACE`]); it is
+/// gone until each box holding its leases has said it is away.
+const NO_BEAT: Duration = Duration::from_secs(1);
+const PACE: crate::lease::master::Pace = crate::lease::master::Pace { beat: Duration::from_millis(200), caps: Duration::from_millis(500) };
 
 fn role_env(name: &str) -> PathBuf {
     PathBuf::from(std::env::var_os(name).unwrap_or_default())
@@ -24,20 +32,31 @@ fn restart_role_nodes() {
         return;
     }
     let base = role_env("DEVHUB_RESTART_BASE");
+    // The boots need a gui box, independent of the host's WM (a node's may speak another wire).
+    let wm = std::os::unix::net::UnixListener::bind(role_env("XDG_RUNTIME_DIR").join("makepad-wm-0")).unwrap();
+    let _ = std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+        for mut s in wm.incoming().flatten() {
+            let _ = std::io::BufReader::new(&s).read_line(&mut String::new());
+            let _ = s.write_all(b"makepad-wm ok 1\n");
+        }
+    });
     let mut keep = Vec::new();
     for name in NODES {
         let dir = base.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         // (beside the test binary: a build lease asks for more disk than /tmp may hold)
         let work = work_dir(&base, name);
-        let conf = crate::lease::caps::LeaseConf::parse(&format!("work = {}\nrole = pool\ndisk_floor_gb = 0\ndisk_warn_gb = 0\n", work.display()), &dir);
-        let x = Exec::new(name, conf, dir.join("leases"), Opts { scopes: Some(false), ..Opts::default() }, Arc::new(|_| {}));
+        let ci = if NODES[..2].contains(&name) { "slots.ci = 1\n" } else { "" };
+        let conf = crate::lease::caps::LeaseConf::parse(&format!("work = {}\nrole = pool\ndisk_floor_gb = 0\ndisk_warn_gb = 0\n{ci}", work.display()), &dir);
+        let x = Exec::new(name, conf, dir.join("leases"), Opts { watch_memory: false, scopes: Some(false), no_beat: NO_BEAT, tick: Duration::from_millis(100), ..Opts::default() }, Arc::new(|_| {}));
         let ep = Endpoint::new(name);
         for &word in WORDS {
             let e = x.clone();
             ep.register(word, 1, lines::service(word, Arc::new(move |line, out| {
-                // no checkout here: a lease at a revision runs in its lane's dir
-                let line = if word == "lease-start" { unpinned(line) } else { line.to_string() };
+                // no checkout here: a lease at a revision, an overlay too, runs in its lane's dir
+                if word == "ship-done" { out.push("{\"overlay\":0}".into()); return; }
+                let line = if word == "lease-start" { unpinned(line).replace("\"src\":\"overlay\"", "\"src\":\"tree\"") } else { line.to_string() };
                 out.extend(e.handle(word, &line));
             })));
         }
@@ -84,23 +103,47 @@ fn restart_role_master() {
         })?;
         Ok(out)
     });
-    let rev: crate::lease::master::EnsureRev = Arc::new(|_: &str, _: &str, _: &std::path::Path, pin: &crate::lease::RevPin| Ok(pin.sha.clone()));
+    let rev: crate::lease::master::EnsureRev = Arc::new(|_: &str, _: &str, _: &std::path::Path, pin: &crate::lease::RevPin, _: bool| Ok(pin.sha.clone()));
     let leases = Arc::new(LeaseMaster::new("mac", crate::proto::home(), ask, Arc::new(|_| {}), Arc::new(crate::proto::wall_ms), Some(rev), false));
     for svc in LEASE_SERVICES {
         let l = leases.clone();
         ep.register(svc, 1, lines::service(svc, Arc::new(move |line, out| l.serve(svc, line, out))));
     }
-    start(&ep, "mac", leases.clone(), Arc::new(|_| {}));
+    start(&ep, "mac", leases.clone(), Arc::new(|_| 0));
+    ep.register("land", 1, lines::service("land", Arc::new(|line, out| {
+        assert!(line.starts_with("land add ci-proof-") && line.ends_with(" proof"));
+        out.push("{\"ok\":1,\"id\":1}".into());
+    })));
     crate::node::listen_control(&ep).unwrap();
     let names: Vec<(String, String)> = hosts.hosts.iter().map(|h| (h.name.clone(), match &h.via { Via::Fleet { addr } => addr.clone(), _ => String::new() })).collect();
-    leases.start(Arc::new(move || names.clone()));
+    leases.start(Arc::new(move || names.clone()), PACE);
     let ctx = ctx().unwrap().clone();
     if let Some(submit) = std::env::var_os("DEVHUB_RESTART_SUBMIT") {
         job::serve(&ctx, &submit.to_string_lossy()).unwrap();
+        // the JIT's legs run in the background job (jitlegs), asked here
+        jitlegs::serve(&ctx, "jitlegs run").unwrap();
+        // and the master's own run, as `allapps kick` asks it
+        allapps::serve(&ctx, "allapps kick").unwrap();
     }
     job::start(ctx.clone());
     ci::start(&ctx);
-    verify::start(ctx);
+    if std::env::var_os("DEVHUB_RESTART_SUBMIT").is_some() {
+        let run = ci::ci(ctx.repo.clone());
+        let pair = snapshot(&ctx.repo).unwrap();
+        let log = base.join("ci.log");
+        let _ = std::thread::spawn(move || run(None, &pair, &log));
+    }
+    jitlegs::start(ctx.clone());
+    allapps::start(ctx.clone());
+    verify::start(ctx.clone());
+    // as `go` does: the master's own leases no record names end
+    let named = ctx.store.read(|d| {
+        let mut ids = std::collections::HashSet::new();
+        strings_of(&d.to_value(), &mut ids);
+        ids
+    });
+    ctx.leases.end_unfollowed(&|id| named.contains(id));
+    eprintln!("restart master ready");
     std::thread::sleep(Duration::from_secs(600));
 }
 
@@ -134,54 +177,67 @@ fn a_master_restart_ends_nothing() {
     let _ = std::fs::remove_dir_all(&base);
     let (bin, tmp, home, ran) = (base.join("bin"), base.join("tmp"), base.join("home"), base.join("ran"));
     let repo = base.join("repo");
-    for d in [&bin, &tmp, &home.join("devhub"), &ran, &repo.join("platform/b/src"), &repo.join("platform/src"), &repo.join("apps/commercial")] {
+    for d in [&bin, &tmp, &home.join("devhub"), &ran, &base.join("rt"), &repo.join("apps/a/src"), &repo.join("apps/b/src"), &repo.join("tools/ci_leg/src"), &repo.join("tools/run"), &repo.join("apps/commercial")] {
         std::fs::create_dir_all(d).unwrap();
     }
-    // the tree: two crates the shards are planned from, and a commercial side
-    std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = [\"platform\", \"platform/b\"]\n").unwrap();
-    std::fs::write(repo.join("platform/Cargo.toml"), "[package]\nname = \"p-a\"\n").unwrap();
-    std::fs::write(repo.join("platform/src/lib.rs"), "").unwrap();
-    std::fs::write(repo.join("platform/b/Cargo.toml"), "[package]\nname = \"p-b\"\n").unwrap();
-    std::fs::write(repo.join("platform/b/src/lib.rs"), "").unwrap();
+    // the tree: two apps the gate boots (each on Linux only), ci-leg, and a commercial side
+    std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = [\"apps/*\", \"tools/ci_leg\"]\n").unwrap();
+    for app in ["a", "b"] {
+        std::fs::write(repo.join(format!("apps/{app}/Cargo.toml")), format!("[package]\nname = \"makepad-app-{app}\"\n")).unwrap();
+        std::fs::write(repo.join(format!("apps/{app}/src/main.rs")), "fn main() {}\n").unwrap();
+        std::fs::write(repo.join(format!("apps/{app}/ci.splash")), "// ci os: linux\nnil\n").unwrap();
+    }
+    std::fs::write(repo.join("tools/ci_leg/Cargo.toml"), "[package]\nname = \"makepad-ci-leg\"\n").unwrap();
+    std::fs::write(repo.join("tools/ci_leg/src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(repo.join("tools/run/Cargo.toml"), "[package]\nname = \"makepad-run\"\n").unwrap();
+    let lock: String = ["makepad-app-a", "makepad-app-b", "makepad-ci-leg", "makepad-run"].iter().map(|name| format!("[[package]]\nname = {name:?}\nversion = \"0.1.0\"\n")).collect();
+    std::fs::write(repo.join("Cargo.lock"), lock).unwrap();
     let com = repo.join("apps/commercial");
     git(&com, &["init", "-q", "-b", "main"]);
     git(&com, &["commit", "-q", "--allow-empty", "-m", "c"]);
-    std::fs::write(repo.join(".gitignore"), "/apps/commercial/\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/apps/commercial/\n/Cargo.lock\n").unwrap();
     git(&repo, &["init", "-q", "-b", "work"]);
+    git(&repo, &["config", "user.name", "CI Test"]);
+    git(&repo, &["config", "user.email", "ci@example.invalid"]);
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "-m", "w"]);
     let (work, main) = (git(&repo, &["rev-parse", "HEAD"]), git(&com, &["rev-parse", "HEAD"]));
-    // the tools on the nodes: each run leaves a line behind, so a run started twice shows
-    let once = |name: &str, body: &str| format!("#!/bin/sh\necho \"$*\" >> {}/{name}\n{body}\n", ran.display());
-    script(&bin.join("cargo"), &once("cargo", "echo before\nsleep 5\necho 0 errors\nexit 0"));
+    // the tools on the nodes: each run leaves a line behind, so a run started twice shows (an empty
+    // CARGO_HOME keeps the box's rustup toolchain from going ahead of them in the runs' PATH)
+    let release = base.join("release");
+    let once = |name: &str, body: &str| format!("#!/bin/sh\necho \"$*\" >> {}/{name}\necho before\nwhile [ ! -e \"{}\" ]; do sleep 0.02; done\n{body}\n", ran.display(), release.display());
+    // (the JIT stage before a box's shards, `makepad --version`: the box keeps that binary)
+    let version = "#!/bin/sh\ncase \"$*\" in *' -- --version') echo makepad; exit 0;; esac\n";
+    script(&bin.join("cargo"), &once("cargo", "echo 0 errors\necho \"test result: ok. 1 passed; 0 failed\"\nexit 0").replacen("#!/bin/sh\n", version, 1));
     script(&bin.join("git"), &format!("#!/bin/sh\nif [ \"$1\" = -C ]; then echo {main}; else echo {work}; fi\n"));
-    script(&bin.join("leg"), &once("leg", "echo before\nsleep 12\necho TESTLEG-OK\nexit 0"));
-    script(&bin.join("job"), &once("job", "echo before\nsleep 12\necho after\nexit 7"));
+    script(&bin.join("leg"), &once("leg", "echo TESTLEG-OK\nexit 0"));
+    script(&bin.join("job"), &once("job", "echo after\nexit 7"));
+    script(&bin.join("allapps"), &once("allapps", "echo allapps done\nexit 0"));
 
-    let exe = std::env::current_exe().unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
     let role = |name: &str, test: &str| {
-        let mut c = Command::new(&exe);
-        c.args(["--exact", test, "--nocapture", "--test-threads=1"]).env("DEVHUB_RESTART_ROLE", name).env("DEVHUB_RESTART_BASE", &base).env("TMPDIR", &tmp).env("MAKEPAD_HOME", &home).env("DEVHUB_TEST_REPO", &repo).env("DEVHUB_TEST_LEG", bin.join("leg")).stdin(Stdio::null());
+        let mut c = crate::testenv::role(test, &base);
+        c.args(["--nocapture", "--test-threads=1"]).env("DEVHUB_RESTART_ROLE", name).env("DEVHUB_RESTART_BASE", &base).env("TMPDIR", &tmp).env("MAKEPAD_HOME", &home).env("CARGO_HOME", base.join("no-cargo-home")).env("DEVHUB_TEST_REPO", &repo).env("DEVHUB_TEST_LEG", bin.join("leg")).env("DEVHUB_TEST_ALLAPPS", bin.join("allapps")).stdin(Stdio::null());
         c
     };
     let mut roles = Roles(Vec::new());
-    roles.0.push(role("nodes", "orch::restart_tests::restart_role_nodes").env("PATH", &path).spawn().unwrap());
+    roles.0.push(role("nodes", "orch::restart_tests::restart_role_nodes").env("PATH", &path).env("XDG_RUNTIME_DIR", base.join("rt")).stderr(std::fs::File::create(base.join("nodes.log")).unwrap()).spawn().unwrap());
     let sock = base.join("n6.sock");
     let t = Instant::now();
     while !sock.exists() {
         assert!(t.elapsed() < Duration::from_secs(30), "the nodes did not come up");
         std::thread::sleep(Duration::from_millis(50));
     }
-    let submit = format!("job submit {{\"tree\":{},\"rev\":{},\"jobs\":[{{\"kind\":\"test\",\"lane\":\"proof\",\"cmd\":[{}]}}]}}", json(&repo), makepad_remote::json_str(&format!("work@{work}")), json(&bin.join("job")));
+    let submit = format!("job submit {{\"tree\":{},\"rev\":{},\"jobs\":[{{\"kind\":\"test\",\"lane\":\"proof\",\"cmd\":[{}]}},{{\"kind\":\"test\",\"lane\":\"refused\",\"cmd\":[\"env\"]}}]}}", json(&repo), makepad_remote::json_str(&format!("work@{work}")), json(&bin.join("job")));
     let mut first = role("master", "orch::restart_tests::restart_role_master");
     first.env("DEVHUB_RESTART_SUBMIT", submit);
     let mut master = first.spawn().unwrap();
 
     // everything is on its box, running
     let state = || {
-        let text = std::fs::read(home.join("devhub/state.json")).unwrap_or_default();
-        makepad_strict_json::parse_depth(&text, 32).ok()
+        // Decode the durable document, including its file-backed completed records.
+        // The assertions below still check the same run/lease identities and exact output.
+        crate::state::Store::open_quiet(&home.join("devhub"), "").ok().map(|store| store.read(crate::state::Doc::to_value))
     };
     let num = |v: &makepad_strict_json::Value, k: &str| v.get(k).and_then(crate::lease::num).unwrap_or(0.0) as u64;
     let text = |v: &makepad_strict_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -191,25 +247,70 @@ fn a_master_restart_ends_nothing() {
             if state().is_some_and(|s| f(&s)) {
                 return;
             }
-            let now = String::from_utf8_lossy(&std::fs::read(home.join("devhub/state.json")).unwrap_or_default()).into_owned();
+            let now = crate::state::committed(&home.join("devhub")).map(|v| v.map(|v| v.to_json()).unwrap_or_default()).unwrap_or_else(|e| e);
             assert!(t.elapsed() < Duration::from_secs(180), "{what}: {now}");
             std::thread::sleep(Duration::from_millis(50));
         }
     };
     let job0 = |s: &makepad_strict_json::Value| s.get("jobs").and_then(|j| j.as_arr()).and_then(|j| j.first()).cloned();
-    let leg0 = |s: &makepad_strict_json::Value| s.get("verify").and_then(|v| v.get("run")).and_then(|r| r.get("legs")).and_then(|l| l.as_arr()).and_then(|l| l.first()).cloned();
-    let shard_running = |s: &makepad_strict_json::Value| s.get("ci").and_then(|c| c.get("run")).and_then(|r| r.get("shards")).and_then(|x| x.as_arr()).and_then(|x| x.iter().find(|x| num(x, "run_n") > 0).cloned());
-    until("a job, a leg and a shard running", &|s| job0(s).is_some_and(|j| num(&j, "run_n") > 0) && leg0(s).is_some_and(|l| num(&l, "run_n") > 0) && shard_running(s).is_some());
+    let leg0 = |s: &makepad_strict_json::Value| s.get("jitlegs").and_then(|v| v.get("runs")).and_then(|r| r.as_arr()).and_then(|r| r.last()).and_then(|r| r.get("legs")).and_then(|l| l.as_arr()).and_then(|l| l.first()).cloned();
+    let shards_of = |s: &makepad_strict_json::Value| s.get("ci").and_then(|c| c.get("run")).and_then(|r| r.get("shards")).and_then(|x| x.as_arr()).map(|a| a.to_vec()).unwrap_or_default();
+    let shard_running = |s: &makepad_strict_json::Value| shards_of(s).into_iter().find(|x| num(x, "run_n") > 0);
+    let allapps_running = |s: &makepad_strict_json::Value| s.get("allapps").and_then(|a| a.get("running")).filter(|r| !r.is_null()).cloned();
+    // The kill must land on a settled fleet. A shard whose lease is granted but whose run the master
+    // has not recorded yet is mid-start: killed then, the new master starts its command a second
+    // time (the "each command once" count below fails), and how long that window is depends on the
+    // load of the box. So every granted shard of the run is waited for, not just the first one.
+    until("a job, a leg, every shard and allapps running", &|s| {
+        let shards = shards_of(s);
+        // (CI runs on two nodes only, so shards past those wait for a lease: the settled ones are the granted)
+        job0(s).is_some_and(|j| num(&j, "run_n") > 0) && leg0(s).is_some_and(|l| num(&l, "run_n") > 0) && shards.iter().any(|x| num(x, "run_n") > 0) && shards.iter().all(|x| text(x, "lease").is_empty() || num(x, "run_n") > 0)
+            && allapps_running(s).is_some_and(|r| num(&r, "run_n") > 0)
+    });
     let s = state().unwrap();
     let (job_lease, leg_lease, shard) = (text(&job0(&s).unwrap(), "lease"), text(&leg0(&s).unwrap(), "lease"), shard_running(&s).unwrap());
+    let allapps_lease = text(&allapps_running(&s).unwrap(), "lease");
     let (shard_id, shard_lease) = (text(&shard, "id"), text(&shard, "lease"));
+    // the boxes those leases are on
+    let mut held: Vec<String> = [job0(&s).unwrap(), leg0(&s).unwrap(), allapps_running(&s).unwrap()].iter().chain(shards_of(&s).iter().filter(|x| !text(x, "lease").is_empty())).map(|x| text(x, "node")).collect();
+    held.sort();
+    held.dedup();
+    assert!(!held.is_empty() && held.iter().all(|n| NODES.contains(&n.as_str())), "{held:?}: {}", s.to_json());
+
+    // a client waits for the job: the kill cuts its call, and it asks again until it has the result
+    let socket = home.join("devhub/devhub.sock");
+    let waiter = std::thread::spawn(move || {
+        let client = makepad_remote::link::Client::new(makepad_remote::link::Target::Unix(socket.clone()), "observe");
+        let (mut cut, mut lines) = (0, Vec::new());
+        while !lines.iter().any(|l: &String| l.contains("\"state\":\"failed\"")) {
+            lines = crate::cli::retry_master_wait(|| {
+                let answer = crate::cli::ask(&client, None, "job", "job wait J1");
+                cut += answer.is_err() as u32;
+                answer
+            }, || {
+                std::thread::sleep(Duration::from_millis(50));
+                makepad_remote::link::Client::new(makepad_remote::link::Target::Unix(socket.clone()), "observe").conn().is_ok()
+            }).unwrap();
+        }
+        cut
+    });
 
     // the master dies under all three, and comes back on its state
     let _ = master.kill();
     let _ = master.wait();
-    let down = Duration::from_secs(2);
-    std::thread::sleep(down);
-    roles.0.push(role("master", "orch::restart_tests::restart_role_master").spawn().unwrap());
+    // gone past the nodes' no-beat limit: each box holding its leases says it keeps them for it.
+    // Their word, not a time: when a box's watchdog sees it gone depends on the box's load.
+    // Readiness below, not elapsed time either, releases the tools
+    let away = |n: &String| format!(": no call from it on {n};");
+    until("every box holding its leases saw the master away", &|_| {
+        let log = std::fs::read_to_string(base.join("nodes.log")).unwrap_or_default();
+        held.iter().all(|n| log.contains(&away(n)))
+    });
+    let ready = base.join("master.log");
+    roles.0.push(role("master", "orch::restart_tests::restart_role_master").stderr(std::fs::File::create(&ready).unwrap()).spawn().unwrap());
+    // only the new master writes this log, after restoring leases and starting every workflow
+    until("the restarted master ready", &|_| std::fs::read_to_string(&ready).unwrap_or_default().lines().any(|l| l == "restart master ready"));
+    std::fs::write(&release, "").unwrap();
 
     until("the job's result", &|s| job0(s).is_some_and(|j| !matches!(text(&j, "state").as_str(), "queued" | "leasing" | "running")));
     let s = state().unwrap();
@@ -217,9 +318,19 @@ fn a_master_restart_ends_nothing() {
     assert_eq!((text(&j, "state").as_str(), num(&j, "exit"), text(&j, "lease"), num(&j, "attempts")), ("failed", 7, job_lease, 1), "{}", j.to_json());
     let log = std::fs::read_to_string(home.join("devhub/jobs/J1.log")).unwrap();
     assert_eq!(log, "before\nafter\n", "the job's whole output, once");
+    assert!(waiter.join().unwrap() >= 1, "the kill cut the waiting client's call");
+    // a run its node refuses is the job's result on its first box, not a lost box placed again
+    let refused = |s: &makepad_strict_json::Value| s.get("jobs").and_then(|j| j.as_arr()).and_then(|j| j.iter().find(|j| text(j, "lane") == "refused").cloned());
+    until("the refused job's result", &|s| refused(s).is_some_and(|j| !matches!(text(&j, "state").as_str(), "queued" | "leasing" | "running")));
+    let refused = refused(&state().unwrap()).unwrap();
+    assert_eq!((text(&refused, "state").as_str(), num(&refused, "attempts")), ("failed", 1), "{}", refused.to_json());
+    assert!(text(&refused, "note").contains("env needs a command"), "{}", refused.to_json());
 
     let verified = |s: &makepad_strict_json::Value| s.get("verify").and_then(|v| v.get("verified")).and_then(|v| v.as_arr()).is_some_and(|v| !v.is_empty());
-    until("the verdict", &|s| verified(s) || s.get("verify").and_then(|v| v.get("failing")).is_some_and(|f| !f.is_null()));
+    until("the verdict", &|s| (verified(s) || s.get("verify").and_then(|v| v.get("failing")).is_some_and(|f| !f.is_null()))
+        && s.get("ci").and_then(|c| c.get("runs")).and_then(|r| r.as_arr()).is_some_and(|r| !r.is_empty()));
+    // and the legs' run, which nothing waits for
+    until("the legs' end", &|s| s.get("jitlegs").and_then(|v| v.get("runs")).and_then(|r| r.as_arr()).and_then(|r| r.last()).is_some_and(|r| num(r, "ended_ms") > 0));
     let s = state().unwrap();
     assert!(verified(&s), "{}", s.get("verify").unwrap().to_json());
     let runs = s.get("ci").and_then(|c| c.get("runs")).and_then(|r| r.as_arr()).unwrap();
@@ -231,8 +342,13 @@ fn a_master_restart_ends_nothing() {
     let count = |name: &str| std::fs::read_to_string(ran.join(name)).unwrap_or_default().lines().count();
     assert_eq!(count("job"), 1, "the job ran once");
     assert_eq!(count("leg"), 1, "the leg ran once");
-    let planned: usize = shards.len() + 1; // jit:01 has both crates' checks
+    let planned: usize = shards.len(); // one boot each
     assert_eq!(count("cargo"), planned, "each shard's steps ran once: {}", run.to_json());
+    // the master's own run went on on its lease, once
+    until("allapps' verdict", &|s| allapps_running(s).is_none() && s.get("allapps").and_then(|a| a.get("last")).is_some_and(|l| !l.is_null()));
+    let last = state().unwrap().get("allapps").and_then(|a| a.get("last")).cloned().unwrap();
+    assert_eq!((text(&last, "verdict").as_str(), text(&last, "lease")), ("ok", allapps_lease.clone()), "{}", last.to_json());
+    assert_eq!(count("allapps"), 1, "allapps ran once");
     let ended = std::fs::read_to_string(home.join("devhub/leases.jsonl")).unwrap_or_default();
     assert!(ended.lines().any(|l| l.contains(&format!("\"id\":\"{leg_lease}\""))), "the leg kept its lease {leg_lease}: {ended}");
     drop(roles);

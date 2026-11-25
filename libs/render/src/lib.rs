@@ -53,13 +53,13 @@ pub mod shadow;
 pub mod shadow_mesh;
 pub mod shadow_csm;
 pub mod shadow_sdf;
-// Procedural HDRI environments (outdoor sky, studio lights) as the engine's
-// linear equirect `EnvMap`s.
-pub mod hdri;
+// Environment maps: their IBL preparation, a generated map's key, a photographed sky's sun.
+pub mod env_map;
 pub mod sky;
 pub mod smoke;
 pub mod vfx;
 pub mod ssao;
+pub mod still_aa;
 pub mod stream;
 pub mod sun;
 pub mod thermometer;
@@ -69,10 +69,10 @@ pub use bake::*;
 pub use custom_material::{DrawSceneCustom, DrawMaterialShadow};
 pub use makepad_render_material;
 pub use clustered::{ClusterConfig, ClusterStats};
-pub use fast_gi::{GiMode, GiConfig, GiStats, GiDebug};
+pub use fast_gi::{GiMode, GiConfig, GiStats, GiDebug, GiInstance, GiMesh, GiField};
 pub use local_shadows::{LocalShadowConfig, LocalShadowStats};
 pub use gpu_lightmap::{
-    dynamic_shadow_tiers, CsmConfig, DynamicShadowTiers, GpuLightmapMode, GpuLmMover,
+    dynamic_shadow_tiers, CascadeCasters, CascadeTile, CsmConfig, DynamicShadowTiers, GpuLightmapMode, GpuLmMover,
     GpuLmSkin, DEFAULT_CSM_CONFIG,
 };
 pub use geometry::*;
@@ -87,6 +87,7 @@ pub use preview::*;
 pub use shadow::*;
 pub use shadow_mesh::*;
 pub use ssao::*;
+pub use still_aa::{jittered_projection, still_aa_offset, DrawStillAaBlend, StillAa, STILL_AA_SAMPLES};
 pub use smoke::SmokeVolume;
 pub use sun::*;
 // `sun::solar_dir` (axis-mapped game-space wrapper) and
@@ -111,6 +112,7 @@ pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
     clustered::script_mod(vm);
     fast_gi::script_mod(vm);
     ssao::script_mod(vm);
+    still_aa::script_mod(vm);
     makepad_render_graph::script_mod(vm);
     smoke::script_mod(vm);
     vfx::shader::script_mod(vm);

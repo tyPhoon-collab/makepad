@@ -2,9 +2,11 @@
 //! - [`lane`]: the lane worktree lifecycle (new, adopt, cleanup after landing, drop);
 //! - [`job`]: async jobs: one command run each at a worktree snapshot, placed on a free box, the
 //!   box released when it ends;
-//! - [`verify`]: the rolling full verifier of the newest landed work + main pair;
+//! - [`verify`]: the rolling CI verifier of the newest landed work + main pair;
+//! - [`jitlegs`]: long JIT correctness legs after input changes, outside every gate;
+//! - [`warm`]: warm dev JITs and test code caches on active lane boxes and one spare per lane;
 //! - [`allapps`]: `makepad check` of every app, example and WM package, hourly when idle;
-//! - [`push`]: the collapsed push of the newest verified tip to origin/work, only when asked;
+//! - [`push`]: a requested commit or the newest landed tip to origin/work, one commit per area ([`group`]);
 //! - [`live`]: a long-running app on a box that the worktree's edits hot-patch into;
 //! - [`roll`]: the self-update of the hubs, the WM-supervised services and the master itself;
 //! - [`show`]: the latest landed build of an app on one of the user's display devices, tracked;
@@ -16,18 +18,25 @@
 
 pub mod after;
 pub mod allapps;
+pub mod arm;
 pub mod ci;
 pub mod ci_status;
 pub mod cli;
+pub mod group;
+pub mod jitlegs;
+pub mod warm;
 pub mod job;
 pub mod lane;
 pub mod live;
+pub mod live_shadow;
+pub mod promote;
 pub mod push;
 pub mod roll;
 pub mod show;
 pub mod leg;
 pub mod verify;
-#[cfg(all(test, unix))]
+// The fake pool advertises this host; the gate requires Linux app boots.
+#[cfg(all(test, target_os = "linux"))]
 mod restart_tests;
 
 use crate::lease::master::LeaseMaster;
@@ -38,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The control services of the jobs (`cli` talks to them).
-pub const SERVICES: [&str; 10] = ["lane", "job", "live", "show", "verify", "after", "allapps", "push", "state", "ci"];
+pub const SERVICES: [&str; 14] = ["overlay-shadow", "lane", "job", "live", "show", "verify", "jitlegs", "warm", "after", "allapps", "push", "state", "ci", "master"];
 
 /// What every job has: the state, the leases, the checkout the master serves.
 pub struct Ctx {
@@ -76,12 +85,25 @@ pub fn repo() -> PathBuf {
 
 /// Registers the services and starts the jobs (the master only).
 pub fn start(ep: &makepad_remote::Endpoint, machine: &str, leases: Arc<LeaseMaster>, publish: crate::state::Publish) {
-    let store = crate::state::Store::open(&crate::proto::home(), machine, publish);
+    let store = crate::state::Store::open(&crate::proto::home(), machine, publish).expect("workflow state must open before services start");
     let repo = repo();
+    for dir in [repo.clone(), repo.join("apps/commercial")] {
+        if dir.join(".git").exists() {
+            if let Err(e) = crate::ci_merge::install_merge_driver(&dir, &repo) {
+                store.event("ci", crate::proto::Sev::Err, format!("ci merge driver: {e}"), None);
+            }
+        }
+    }
     let monitor = crate::monitor::Monitor::start(&[crate::lease::wt::root_of(&repo)]);
     if let Some(e) = &monitor.error {
         store.event("lane", crate::proto::Sev::Warn, format!("lane: the file monitor did not start ({e}); dirty sets come from git status"), None);
     }
+    if let Err(e) = roll::keep_started_binary(&repo) {
+        store.event("update", crate::proto::Sev::Warn, format!("{e}: a rollback goes back to the file a restart finds"), None);
+    }
+    // a lane's lease comes from the worktree the lane registry holds for it
+    let lanes = store.clone();
+    leases.set_lane_trees(Arc::new(move |lane: &str| lanes.read(|d| d.lanes.iter().rev().find(|l| l.name == lane && l.state == "live").map(|l| l.path.clone()))));
     let ctx = Arc::new(Ctx { store, leases, machine: machine.to_string(), repo, home: crate::proto::home(), monitor });
     for svc in SERVICES {
         let c = ctx.clone();
@@ -91,7 +113,7 @@ pub fn start(ep: &makepad_remote::Endpoint, machine: &str, leases: Arc<LeaseMast
 }
 
 /// Starts the workflow threads, once the control socket listens: they ask for leases on it, and a
-/// job that asked before it was there failed for good (J389-J393, 2026-10-31).
+/// job that asked before it was there failed for good (five jobs, 2026-10-31).
 pub fn go() {
     let Some(ctx) = ctx().cloned() else { return };
     let c = ctx.clone();
@@ -111,9 +133,30 @@ pub fn go() {
     live::start(ctx.clone());
     ci::start(&ctx);
     verify::start(ctx.clone());
+    jitlegs::start(ctx.clone());
+    warm::start(ctx.clone());
     ci_status::start(ctx.clone());
     after::start(ctx.clone());
-    allapps::start(ctx);
+    allapps::start(ctx.clone());
+    // the workflows read their records back above: a lease of the master's own work that no
+    // record names has nothing that follows it, and frees its box now
+    let named = ctx.store.read(|d| {
+        let mut ids = std::collections::HashSet::new();
+        strings_of(&d.to_value(), &mut ids);
+        ids
+    });
+    ctx.leases.end_unfollowed(&|id| named.contains(id));
+}
+
+/// Every string in `v` (a record names a lease by its id, wherever it sits).
+fn strings_of(v: &makepad_strict_json::Value, out: &mut std::collections::HashSet<String>) {
+    use makepad_strict_json::Value;
+    match v {
+        Value::Str(s) => { out.insert(s.clone()); }
+        Value::Arr(a) => a.iter().for_each(|x| strings_of(x, out)),
+        Value::Obj(o) => o.iter().for_each(|(_, x)| strings_of(x, out)),
+        _ => {}
+    }
 }
 
 static CTX: std::sync::OnceLock<Arc<Ctx>> = std::sync::OnceLock::new();
@@ -126,6 +169,35 @@ pub fn ctx() -> Option<&'static Arc<Ctx>> {
 /// The master's lease scheduler (None outside a master).
 pub fn leases() -> Option<Arc<LeaseMaster>> {
     CTX.get().map(|c| c.leases.clone())
+}
+
+/// The rustc the boxes of `os` run, when most of them agree (verify and CI take only those: a box
+/// on another toolchain makes the agree fixtures disagree); None: no majority (a tie), nothing is
+/// held back. Every box off the fleet's own version is said once, as an error.
+pub fn fleet_rustc(ctx: &Ctx, os: &str) -> Option<String> {
+    let nodes = ctx.leases.nodes();
+    let versions: Vec<(String, String, String)> = nodes.iter().filter(|n| n.up).filter_map(|n| n.caps.as_ref().map(|c| (n.name.clone(), c.os.to_ascii_lowercase(), c.rustc.clone()))).filter(|(_, _, v)| !v.is_empty()).collect();
+    let majority = |of: &mut dyn Iterator<Item = &String>| -> Option<String> {
+        let mut count: std::collections::BTreeMap<&String, usize> = std::collections::BTreeMap::new();
+        for v in of {
+            *count.entry(v).or_default() += 1;
+        }
+        let best = count.values().copied().max()?;
+        let top: Vec<&&String> = count.iter().filter(|(_, n)| **n == best).map(|(v, _)| v).collect();
+        (top.len() == 1).then(|| (*top[0]).clone())
+    };
+    if let Some(fleet) = majority(&mut versions.iter().map(|(_, _, v)| v)) {
+        static SAID: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+        let mut said = SAID.lock().unwrap();
+        for (node, _, v) in versions.iter().filter(|(_, _, v)| *v != fleet) {
+            if !said.iter().any(|(n, x)| n == node && x == v) {
+                said.push((node.clone(), v.clone()));
+                ctx.store.event("toolchain", crate::proto::Sev::Err, format!("toolchain: {node} runs rustc {v}, most of the fleet {fleet} (verify and CI hold back a box that is off its own OS's majority; the box's owner updates it)"), None);
+            }
+        }
+    }
+    let os = os.to_ascii_lowercase();
+    majority(&mut versions.iter().filter(|(_, o, _)| *o == os).map(|(_, _, v)| v))
 }
 
 /// Lane work that waited this long takes a box from background work.
@@ -149,27 +221,33 @@ pub(crate) fn fits(needs: &[(String, String)], caps: Option<&crate::lease::Caps>
 }
 
 /// Preempts background work for lane work that waited [`PREEMPT_AFTER_MS`]: the youngest running
-/// background lease on a box the waiting lease fits ends cleanly; its leg asks again.
+/// background lease on a box the waiting lease then starts on ends cleanly; its leg asks again.
+/// Ending one for anything less loses its work and gains nothing: a timed lease waiting for
+/// another box, and screen leases behind another lane's, ended CI leases every 30 s, so one 47 s
+/// shard took 171 attempts and three hours (11-04).
 pub fn preempt(ctx: &Ctx, last: &mut u64) {
     use crate::lease::sched::State;
     let now = crate::proto::wall_ms();
-    let view = ctx.leases.view();
-    // a show someone waits for does not wait out the 30 s
-    let show = |l: &crate::lease::sched::Lease| l.req.agent.as_deref() == Some("devhub-show");
-    let starved = view.iter().filter(|l| l.state == State::Queued && show(l)).min_by_key(|l| l.asked_ms);
-    let starved = match starved {
-        Some(s) => Some(s),
-        None if now.saturating_sub(*last) < PREEMPT_AFTER_MS => return,
-        None => view.iter().filter(|l| l.state == State::Queued && !leg::is_background(l) && now.saturating_sub(l.asked_ms) > PREEMPT_AFTER_MS).min_by_key(|l| l.asked_ms),
+    let view: Vec<_> = ctx.leases.view().into_iter().filter(|l| l.priority != crate::lease::Priority::Interactive).collect();
+    if now.saturating_sub(*last) < PREEMPT_AFTER_MS { return; }
+    // Interactive work drains successors in the scheduler; only background work uses this path.
+    let mut cands: Vec<_> = view.iter().filter(|l| l.state == State::Queued && crate::lease::sched::owed_leg(l)).collect();
+    cands.extend(view.iter().filter(|l| l.state == State::Queued && !leg::is_background(l) && now.saturating_sub(l.asked_ms) > PREEMPT_AFTER_MS));
+    cands.sort_by_key(|l| (!crate::lease::sched::owed_leg(l), l.asked_ms));
+    // what may end, by box (owed background work asked at OWED_PRIO: it keeps its box)
+    let mut boxes: std::collections::BTreeMap<&str, Vec<&crate::lease::sched::Lease>> = Default::default();
+    for l in view.iter().filter(|l| matches!(l.state, State::Granted | State::Starting) && l.req.prio >= leg::BACKGROUND_PRIO) {
+        if let (false, Some(node)) = (matches!(l.req.kind, crate::lease::Kind::Long | crate::lease::Kind::Test | crate::lease::Kind::Screen | crate::lease::Kind::Timed), l.node.as_deref()) {
+            boxes.entry(node).or_default().push(l);
+        }
+    }
+    let victim_for = |starved: &crate::lease::sched::Lease| {
+        boxes.iter()
+            .filter(|(node, here)| ctx.leases.starts_without(&starved.id, node, &here.iter().map(|l| l.id.clone()).collect::<Vec<_>>()))
+            .flat_map(|(_, here)| here.iter().copied())
+            .max_by_key(|l| l.granted_ms.unwrap_or(0))
     };
-    let Some(starved) = starved else { return };
-    let nodes = ctx.leases.nodes();
-    let victim = view
-        .iter()
-        .filter(|l| matches!(l.state, State::Granted | State::Starting) && l.req.prio >= leg::BACKGROUND_PRIO)
-        // owed background work (it asked at OWED_PRIO) keeps its box
-        .filter(|l| l.node.as_ref().is_some_and(|n| nodes.iter().any(|x| &x.name == n && fits(&starved.req.needs, x.caps.as_ref()))))
-        .max_by_key(|l| l.granted_ms.unwrap_or(0));
+    let Some((starved, victim)) = cands.into_iter().find_map(|c| victim_for(c).map(|v| (c, Some(v)))) else { return };
     let Some(v) = victim else { return };
     *last = now;
     leg::mark_preempted(&v.id);
@@ -185,6 +263,8 @@ pub fn preempt(ctx: &Ctx, last: &mut u64) {
 
 /// Every record on the master's stream (a parked panic pauses its job).
 pub fn on_record(r: &crate::proto::Record) {
+    // JIT ownership is independent of the app/lane that happened to expose it.
+    if matches!(r.kind.as_str(), "patch_failed" | "jit_error" | "jit_hot") { return; }
     if let Some(ctx) = CTX.get() {
         job::on_record(ctx, r);
         show::on_record(ctx, r);
@@ -194,18 +274,29 @@ pub fn on_record(r: &crate::proto::Record) {
 
 fn serve(ctx: &Arc<Ctx>, svc: &str, line: &str, out: &mut Vec<String>) {
     let r = match svc {
+        "overlay-shadow" => crate::lease::shadow::serve(ctx, line),
         "lane" => lane::serve(ctx, line),
         "job" => job::serve(ctx, line),
         "show" => show::serve(ctx, line),
         "live" => live::serve(ctx, line),
         "verify" => verify::serve(ctx, line),
+        "jitlegs" => jitlegs::serve(ctx, line),
+        "warm" => warm::serve(line),
         "after" => after::serve(ctx, line),
         "allapps" => allapps::serve(ctx, line),
         "push" => push::serve(ctx, line),
         "ci" => ci::serve(ctx, line),
+        // builds work's tip and answers how that went: the exec follows the answer, a failed
+        // build keeps this master running (and is in the inbox too). On the tip already (its
+        // self-update came first) it says so: an exec onto the same build only drops what runs
+        // through it (a job's JIT build twice in 2 min, 11-02).
+        "master" if line.trim() == "master restart" => git(&ctx.repo, &["rev-parse", "refs/heads/work"])
+            .and_then(|work| if work == crate::lease::caps::hub_rev() { Ok(format!("the master already runs work's tip {}: nothing to restart", short(&work))) } else { roll::restart_master(ctx, &work, "`devhub master restart`") })
+            .map(|done| format!("{{\"restart\":{}}}", json_str(&done))),
+        "master" if line.trim() == "master rollback" => roll::rollback_master(ctx, "`devhub master rollback`").map(|done| format!("{{\"restart\":{}}}", json_str(&done))),
         "state" => {
             let name = line.split_whitespace().nth(1);
-            ctx.store.read(|d| d.section(name)).ok_or_else(|| format!("no state section `{}` (verify allapps after pushes lanes jobs)", name.unwrap_or("")))
+            ctx.store.read(|d| d.section(name)).ok_or_else(|| format!("no state section `{}` (verify jitlegs allapps after pushes lanes jobs)", name.unwrap_or("")))
         }
         _ => Err(format!("no service {svc}")),
     };
@@ -217,8 +308,9 @@ pub fn err(e: &str) -> String {
 }
 
 /// `git -C <dir> <args>`: its stdout (trimmed), or why it failed.
+#[track_caller]
 pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let o = makepad_remote::group::command("git")
+    let o = crate::git_exec::command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -232,29 +324,23 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
-/// `git merge-base --is-ancestor a b`.
+/// `git merge-base --is-ancestor a b`, in-process ([`crate::gitread`]).
 pub fn is_ancestor(dir: &Path, a: &str, b: &str) -> bool {
-    makepad_remote::group::command("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["merge-base", "--is-ancestor", a, b])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    crate::gitread::is_ancestor(dir, a, b)
 }
 
 /// The newest landed pair: work and commercial main, read twice, never while a landing moves them
-/// (`land-ff.lock` in the makepad repo's common dir). No ref is written.
+/// (`land-ff.lock` in the makepad repo's common dir). No ref is written and no git process starts:
+/// the refs are read as files (a few stats and small reads), so pollers may call it every second.
 pub fn snapshot(repo: &Path) -> Option<Pair> {
-    let common = PathBuf::from(git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).ok()?);
-    let lock = common.join("land-ff.lock");
+    let mk = makepad_git::repository_paths(repo).ok()??;
+    let com = makepad_git::repository_paths(&repo.join("apps/commercial")).ok()??;
+    let lock = mk.common_dir.join("land-ff.lock");
     if lock.exists() {
         return None;
     }
-    let com = repo.join("apps/commercial");
-    let read = || Some(Pair { work: git(repo, &["rev-parse", "refs/heads/work"]).ok()?, main: git(&com, &["rev-parse", "refs/heads/main"]).ok()? });
+    let sha = |p: &makepad_git::RepositoryPaths, name: &str| makepad_git::refs::resolve_ref_in(&p.git_dir, &p.common_dir, name).ok().map(|o| o.to_hex());
+    let read = || Some(Pair { work: sha(&mk, "refs/heads/work")?, main: sha(&com, "refs/heads/main")? });
     let (a, b) = (read()?, read()?);
     (a == b && a.valid() && !lock.exists()).then_some(a)
 }

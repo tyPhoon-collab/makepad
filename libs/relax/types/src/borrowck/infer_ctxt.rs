@@ -34,6 +34,10 @@ pub struct BorrowckInferCtxt<'tcx> {
     /// The views of the bodies being checked around the current one (a promoted's parent).
     mir_views_outer: Vec<Option<MirView>>,
     pub reg_var_to_origin: RefCell<HashMap<RegionVid, RegionCtxt>>,
+    /// The typeck root's body being checked (driver.rs check_group sets it): its closures'
+    /// written signatures are read from it, not from the typeck query, which holds no body for a
+    /// dependency check's root (check.rs typeck_unstored) and would type-check it again.
+    pub root_typeck: Option<&'tcx crate::typeck::Body>,
 }
 
 impl<'tcx> BorrowckInferCtxt<'tcx> {
@@ -55,7 +59,7 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         for p in &*result.clauses { clauses.push(tcx.instantiate_predicate(prog, def_id, &full, p)); }
         let param_env = ParamEnv { clauses: clauses.into() };
         let param_env_id = std::cell::OnceCell::new();
-        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), type_op_failed: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_view: None, mir_views_outer: Vec::new(), reg_var_to_origin: RefCell::new(HashMap::default()) }
+        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), type_op_failed: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_view: None, mir_views_outer: Vec::new(), reg_var_to_origin: RefCell::new(HashMap::default()), root_typeck: None }
     }
 
     pub(crate) fn param_env_id(&self) -> crate::tcx::ParamEnvId {
@@ -275,6 +279,10 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         self.fully_perform_op(out, locations, ConstraintCategory::Boring, ParamEnvAnd { param_env: self.param_env_id(), value: Normalize { value: ty } }).unwrap_or(ty)
     }
     fn deeply_normalize_sig(&mut self, out: &mut MirTypeckRegionConstraints, sig: &FnSig, at: Location) -> Result<FnSig, ()> {
+        // normalize.rs:15 try_fast_path: a signature without aliases is its own normalization, and no
+        // fn pointer type is made for it (normalize_type_op's own fast path, taken before interning).
+        let tys = &self.tcx.tys;
+        if sig.inputs.iter().chain([&sig.output]).all(|&t| !tys.may_project(t) && !tys.has_opaque(t)) { return Ok(sig.clone()); }
         let value = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&sig.inputs), sig.output, sig.header, 0));
         let ty = self.fully_perform_op(out, Locations::Single(at), ConstraintCategory::Boring, ParamEnvAnd { param_env: self.param_env_id(), value: Normalize { value } }).map_err(|_| ())?;
         let TyKind::FnPtr(inputs, output, header, _) = self.tcx.tys.kind(ty) else { unreachable!() };
@@ -323,7 +331,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
     /// `FnPtr` binder instantiated with fresh variables.
     fn closure_user_provided_sig(&mut self, body: &Body) -> Option<FnSig> {
         let mir::BodyKind::Closure(expr) = body.source.kind else { return None };
-        let typeck = self.tcx.typeck(self.prog, self.root_def_id);
+        let typeck = self.root_typeck.expect("a closure body is borrow-checked with its typeck root's body (driver.rs check_group)");
         let canonical = typeck.user_provided_sigs.get(&expr)?.clone();
         let sig = crate::next_solver::canonical::user_type::instantiate_user_signature(&self.infcx, &canonical);
         let TyKind::FnPtr(inputs, output, header, bound) = *self.tcx.tys.kind(sig) else { unreachable!("closure signature is a FnPtr") };
@@ -339,10 +347,8 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
     fn fn_def_sig(&self, def: DefId, args: &[TyId], regions: crate::types::RegionArgsId) -> PolyFnSig {
         let args = self.tcx.complete_args(self.prog, def, args, regions);
         let sig = self.tcx.fn_item_sig(self.prog, def).expect("FnDef signature");
-        let ty = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&sig.params), sig.ret, sig.header, sig.bound_regions));
-        let ty = self.tcx.instantiate_ty(self.prog, def, &args, ty);
-        let TyKind::FnPtr(inputs, output, header, bound_regions) = self.tcx.tys.kind(ty) else { unreachable!() };
-        PolyFnSig { sig: FnSig { inputs: self.tcx.tys.list(*inputs).to_vec(), output: *output, header: *header }, bound_regions: *bound_regions }
+        let (inputs, output) = self.tcx.instantiate_sig_tys(self.prog, def, &args, &sig.params, sig.ret);
+        PolyFnSig { sig: FnSig { inputs, output, header: sig.header }, bound_regions: sig.bound_regions }
     }
     fn field_ty(&self, base: PlaceTy, field: FieldIdx) -> Option<TyId> {
         match self.tcx.tys.kind(base.ty) {

@@ -63,7 +63,9 @@ impl Program {
             };
             let mut next = None;
             let mut hidden = None;
-            let mut visible = false;
+            // A use imports every accessible namespace. An exported macro
+            // remains public when a private module has the same spelling.
+            let mut visible = last && in_use && last_ns.is_none() && self.lookup_macro_in_container(cur, name);
             for &ns in nss {
                 let mut q = GlobQuery { precise: true, ..Default::default() };
                 let Some((fd, v)) = self.lookup_in_module_vis(m, name, ns, &mut q) else { continue };
@@ -82,6 +84,11 @@ impl Program {
                     }
                 }
             }
+            // rustc_resolve imports.rs finalize_import: an inaccessible binding is an error only when
+            // no namespace resolves, and the macro namespace is one of them
+            if !visible && last && last_ns.is_none() && self.macro_binding_visible(m, name, from) {
+                return None;
+            }
             if !visible {
                 if let Some((fd, ns)) = hidden {
                     let flags = self.mods[m as usize].import_pub.get(&(name, ns)).copied();
@@ -91,6 +98,12 @@ impl Program {
             cur = next?;
         }
         None
+    }
+
+    /// The replay's macro namespace (rsim.rs) binds `name` in module `m` where `from` can see it.
+    fn macro_binding_visible(&self, m: u32, name: Sym, from: u32) -> bool {
+        let Some(b) = self.sim_macros.as_ref().and_then(|t| t.get(&(m, name))) else { return false };
+        (b.non_glob.is_some() && self.vis_visible(b.non_glob_vis, from)) || (b.glob.is_some() && self.vis_visible(b.glob_vis, from))
     }
 
     /// Whether `name` is found in module `m` only through glob imports that bring different
@@ -227,10 +240,12 @@ impl Program {
         }
     }
 
-    /// E0603 for the `use` declarations of the own crates (`own[krate]`).
-    pub fn import_privacy_errors(&self, own: &[bool]) -> Vec<String> {
+    /// E0603 for the `use` declarations of the own crates (`own[krate]`). With an error, the index
+    /// of an import that never binds in rustc (a path through something private): rustc_resolve
+    /// plants a dummy binding for it and counts it used.
+    pub fn import_privacy_errors(&self, own: &[bool]) -> Vec<(Option<usize>, String)> {
         let mut out = Vec::new();
-        for im in &self.imports {
+        for (i, im) in self.imports.iter().enumerate() {
             let krate = self.mods[im.module as usize].krate;
             if !own.get(krate as usize).copied().unwrap_or(false) || im.bound & BOUND_INJECTED != 0 {
                 continue;
@@ -250,12 +265,14 @@ impl Program {
                 None
             };
             if let Some(e) = single.or_else(|| self.path_privacy(im.module, im.global, segs, ns, edition < 2018, true)).filter(|e| !e.lint) {
-                out.push(self.record_error(im.file, im.pos, "resolve", self.privacy_message(&e)));
+                // (an ambiguous name still binds: rustc reports the import unused as well)
+                out.push(((!e.ambiguous).then_some(i), self.record_error(im.file, im.pos, "resolve", self.privacy_message(&e))));
             } else if im.glob && im.bound & BOUND_PREFIX_ONLY == 0 && self.glob_of_own_module(im, segs, edition) {
-                out.push(self.record_error(im.file, im.pos, "resolve", "E0432: unresolved import -- cannot glob-import a module into itself".to_string()));
+                // (it binds nothing: rustc reports it unused as well)
+                out.push((None, self.record_error(im.file, im.pos, "resolve", "E0432: unresolved import -- cannot glob-import a module into itself".to_string())));
             } else if !im.glob && im.is_pub && !im.ext {
                 if let Some(msg) = self.cannot_reexport(im, segs, edition) {
-                    out.push(self.record_error(im.file, im.pos, "resolve", msg));
+                    out.push((None, self.record_error(im.file, im.pos, "resolve", msg)));
                 }
             }
         }
@@ -314,7 +331,7 @@ impl Program {
         let item = f.ast.items.iter().find(|it| it.lo == im.pos && matches!(it.kind, ItemKind::Use(_)))?;
         let import_vis = self.vis_module(im.file, im.module, &item.vis);
         let pd = self.def(parent);
-        let mut any_ok = false;
+        let mut any_ok = self.lookup_macro_in_container(parent, name);
         let mut failed: Option<(bool, BindVis)> = None;
         for ns in [true, false] {
             let found = match pd.kind {

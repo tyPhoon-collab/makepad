@@ -5,7 +5,8 @@ use super::super::log_enabled;
 use makepad_vulkan::{vk, Entry};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -53,6 +54,7 @@ pub struct Device {
     pub present_wait: bool,
     /// Multiview render passes (Vulkan 1.1 `multiview`, enabled when the device has it).
     pub multiview: bool,
+    pub compute: bool,
     /// Fragment density maps (VK_EXT_fragment_density_map: a target's coarser shading where
     /// its map says, an XR runtime's foveation), enabled when the device has them.
     pub fdm: bool,
@@ -60,6 +62,14 @@ pub struct Device {
     /// 1: none but single sampling): the framebuffer colour and depth counts, up to 8, when the
     /// device resolves depth (VK_KHR_create_renderpass2 + VK_KHR_depth_stencil_resolve).
     pub msaa: u32,
+    /// The device's pipeline cache, primed from its file of the last run (the driver checks the
+    /// header: another device's or driver's data is ignored), so a relaunch does not compile
+    /// every pipeline variant from SPIR-V again (`save_pipeline_cache` writes it back).
+    pub pipeline_cache: vk::PipelineCache,
+    pipeline_cache_file: Option<PathBuf>,
+    /// Pipelines made since the cache was last saved, and when the last one was (clock_ns).
+    pub pipelines_made: AtomicU32,
+    pub pipeline_made_ns: AtomicU64,
     /// The queue of the GPU's hardware video encoder (VK_KHR_video_encode_queue + H.264), when
     /// it has one: `video_encode::Stream` submits there. Its own lock: video submits never wait
     /// for the graphics queue's.
@@ -67,7 +77,9 @@ pub struct Device {
     /// The instance, destroyed after the last device made on it (display peers and a device
     /// that replaced a lost one share it).
     life: Arc<InstanceLife>,
-    pub allocated: AtomicU64,
+    /// What the backend made for itself (arenas, staging, leases, multisample and window
+    /// copies): the ledger's backend rows.
+    pub pools: Arc<crate::ledger::Pools>,
     /// The driver reported VK_ERROR_DEVICE_LOST (or a simulated loss): the backend replaces
     /// the device. Nothing else marks a device lost; running out of memory never does.
     pub lost: AtomicBool,
@@ -78,6 +90,9 @@ pub struct Device {
     /// An out-of-memory answer at the open-file limit was reported (`refused`); cleared by the
     /// next refusal below the limit, so each episode logs once.
     files_reported: AtomicBool,
+    /// Whether `Buffer::new` has already logged falling back from `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`
+    /// to host memory on this device, so a non-ReBAR or exhausted BAR heap logs once per device.
+    pub rebar_fallback_logged: AtomicBool,
     /// The last device budget read (`memory_budget`) and when.
     budget: Mutex<Option<(std::time::Instant, MemoryBudget)>>,
     /// Sampler Y'CbCr conversion (core 1.1 `samplerYcbcrConversion`, enabled when the device has
@@ -105,6 +120,8 @@ pub struct MemoryBudget {
     pub budget: u64,
     pub usage: u64,
     pub size: u64,
+    /// what the driver says this process holds in every heap (device-local and host memory)
+    pub process: u64,
 }
 
 impl MemoryBudget {
@@ -331,13 +348,14 @@ impl Device {
             plane444.p_next = std::ptr::null_mut();
             if plane444.ycbcr2plane444_formats != 0 { wanted.push(vk::EXT_YCBCR_2PLANE_444_FORMATS_NAME); }
         }
-        // QP delta maps for the encoder (a QP per region of the picture)
+        // QP delta maps for the encoder (a QP per region of the picture); below Vulkan 1.3 (the
+        // device runs 1.1) the extension requires VK_KHR_format_feature_flags2 enabled with it
         let mut qp_map = vk::PhysicalDeviceVideoEncodeQuantizationMapFeaturesKHR::default();
-        if video_family.is_some() && supported(vk::KHR_VIDEO_ENCODE_QUANTIZATION_MAP_NAME) {
+        if video_family.is_some() && supported(vk::KHR_VIDEO_ENCODE_QUANTIZATION_MAP_NAME) && supported(vk::KHR_FORMAT_FEATURE_FLAGS_2_NAME) {
             let mut query = vk::PhysicalDeviceFeatures2::default().next_physical_device_video_encode_quantization_map_features_khr(&mut qp_map);
             unsafe { instance.get_physical_device_features2(physical, &mut query); }
             qp_map.p_next = std::ptr::null_mut();
-            if qp_map.video_encode_quantization_map != 0 { wanted.push(vk::KHR_VIDEO_ENCODE_QUANTIZATION_MAP_NAME); }
+            if qp_map.video_encode_quantization_map != 0 { wanted.extend([vk::KHR_VIDEO_ENCODE_QUANTIZATION_MAP_NAME, vk::KHR_FORMAT_FEATURE_FLAGS_2_NAME]); }
         }
         let has_qp_map = qp_map.video_encode_quantization_map != 0;
         // fragment density maps (an XR runtime's foveation of its swapchains)
@@ -358,6 +376,18 @@ impl Device {
             (l.framebuffer_color_sample_counts & l.framebuffer_depth_sample_counts).0 & 0b1111 | 1
         } else { 1 };
         let mut fdm = vk::PhysicalDeviceFragmentDensityMapFeaturesEXT::default().fragment_density_map(has_fdm);
+        // KHR buffer-device-address works with the existing Vulkan 1.1 instance.
+        // A graphics-only 1.1 device remains usable, with compute unadvertised.
+        let supported_features = unsafe { instance.get_physical_device_features(physical) };
+        let mut address = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
+        let mut compute = supported(vk::KHR_BUFFER_DEVICE_ADDRESS_NAME) && queue.queue_flags.contains(vk::QueueFlags::COMPUTE);
+        if compute {
+            let mut query = vk::PhysicalDeviceFeatures2::default().next_physical_device_buffer_device_address_features(&mut address);
+            unsafe { instance.get_physical_device_features2(physical, &mut query); }
+            compute = address.buffer_device_address != 0 && supported_features.shader_int64 == vk::TRUE;
+        }
+        address = vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(compute);
+        if compute { wanted.push(vk::KHR_BUFFER_DEVICE_ADDRESS_NAME); }
         wanted.sort_by(|a, b| a.to_bytes().cmp(b.to_bytes()));
         wanted.dedup();
         if log_enabled() { eprintln!("[hal-vulkan] vkCreateDevice device={name:?} queue_family={family} extensions={wanted:?}"); }
@@ -381,9 +411,11 @@ impl Device {
         ycbcr.p_next = std::ptr::null_mut();
         let has_ycbcr = ycbcr.sampler_ycbcr_conversion != 0 && instance.table.get_physical_device_features2.is_some();
         let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default().sampler_ycbcr_conversion(has_ycbcr);
-        let supported_features = unsafe { instance.get_physical_device_features(physical) };
+
         let features = vk::PhysicalDeviceFeatures::default()
             .independent_blend(supported_features.independent_blend == vk::TRUE)
+            .shader_storage_image_extended_formats(supported_features.shader_storage_image_extended_formats == vk::TRUE)
+            .shader_int64(compute && supported_features.shader_int64 == vk::TRUE)
             .texture_compression_bc(supported_features.texture_compression_bc == vk::TRUE)
             .texture_compression_astc_ldr(supported_features.texture_compression_astc_ldr == vk::TRUE)
             // line fill: frame capture's wireframe view (`Draw::WIREFRAME`)
@@ -405,6 +437,7 @@ impl Device {
         if pacing { create = create.next_physical_device_present_id_features_khr(&mut present_id)
             .next_physical_device_present_wait_features_khr(&mut present_wait); }
         if plane444.ycbcr2plane444_formats != 0 { create = create.next_physical_device_ycbcr2_plane444_formats_features_ext(&mut plane444); }
+        if compute { create = create.next_physical_device_buffer_device_address_features(&mut address); }
         if has_multiview { create = create.next_physical_device_multiview_features(&mut multiview); }
         if has_ycbcr { create = create.next_physical_device_sampler_ycbcr_conversion_features(&mut ycbcr); }
         if has_fdm { create = create.next_physical_device_fragment_density_map_features_ext(&mut fdm); }
@@ -449,13 +482,15 @@ impl Device {
         let video_encode = video_family.map(|f| VideoQueue { family: f as u32, queue: unsafe { raw.get_device_queue(f as u32, 0) }, timestamp_bits: video_timestamp_bits,
             more: (1..video_count).map(|i| (unsafe { raw.get_device_queue(f as u32, i) }, Mutex::new(()))).collect(), lock: Mutex::new(()), h265, qp_map: has_qp_map });
         if let Some(v) = &video_encode { if log_enabled() { eprintln!("[hal-vulkan] hardware video encode queue family={}", v.family); } }
+        let (pipeline_cache, pipeline_cache_file) = open_pipeline_cache(&raw, &properties);
         Ok(Some(Arc::new(Self {
             queue: unsafe { raw.get_device_queue(family as u32, 0) }, queue_lock: Mutex::new(()), raw, instance: instance.clone(),
             physical, family: family as u32, properties, memory, features, formats,
-            timestamp_bits: queue.timestamp_valid_bits, calibrated, extensions, present_wait: pacing, multiview: has_multiview, fdm: has_fdm, msaa, life: life.clone(),
+            timestamp_bits: queue.timestamp_valid_bits, calibrated, extensions, present_wait: pacing, multiview: has_multiview, compute, fdm: has_fdm, msaa, life: life.clone(),
             video_encode,
-            allocated: AtomicU64::new(0), lost: AtomicBool::new(false), starved: AtomicBool::new(false), files_reported: AtomicBool::new(false), budget: Mutex::new(None),
+            pools: Default::default(), lost: AtomicBool::new(false), starved: AtomicBool::new(false), files_reported: AtomicBool::new(false), rebar_fallback_logged: AtomicBool::new(false), budget: Mutex::new(None),
             ycbcr: has_ycbcr, video_samplers: Mutex::new(Default::default()),
+            pipeline_cache, pipeline_cache_file, pipelines_made: AtomicU32::new(0), pipeline_made_ns: AtomicU64::new(0),
         })))
     }
 
@@ -532,6 +567,7 @@ impl Device {
         let m = props.memory_properties;
         let mut b = MemoryBudget::default();
         for i in 0..(m.memory_heap_count as usize).min(m.memory_heaps.len()) {
+            b.process += heaps.heap_usage[i];
             // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
             if m.memory_heaps[i].flags.as_raw() & 1 == 0 { continue; }
             b.budget += heaps.heap_budget[i];
@@ -563,8 +599,6 @@ impl Device {
         if !self.out_of_files(what) { self.starved.store(true, Ordering::Release); }
     }
 
-    pub fn charge(&self, bytes: u64) { self.allocated.fetch_add(bytes, Ordering::Relaxed); }
-    pub fn uncharge(&self, bytes: u64) { self.allocated.fetch_sub(bytes, Ordering::Relaxed); }
 
     /// A display-only peer on another GPU. Rendering remains on the process's compositor
     /// device; this queue only reads imported images and drives that GPU's KMS outputs.
@@ -607,12 +641,14 @@ impl Device {
         let raw = unsafe { instance.create_device(physical, &create, None) }.map_err(error)?;
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let formats = std::array::from_fn(|f| unsafe { instance.get_physical_device_format_properties(physical, super::resources::vk_format(f as u32).unwrap()) });
+        let (pipeline_cache, pipeline_cache_file) = open_pipeline_cache(&raw, &properties);
         Ok(Arc::new(Self { instance: instance.clone(), queue: unsafe { raw.get_device_queue(family as u32, 0) },
             raw, physical, queue_lock: Mutex::new(()), family: family as u32, properties, memory, features, formats,
             // a display peer only scans out: the GPU profiler times the rendering device
-            timestamp_bits: queue.timestamp_valid_bits, calibrated: false, extensions, present_wait: pacing, multiview: false, fdm: false, msaa: 1, life: owner.life.clone(), video_encode: None,
-            allocated: AtomicU64::new(0), lost: AtomicBool::new(false), starved: AtomicBool::new(false), files_reported: AtomicBool::new(false), budget: Mutex::new(None),
-            ycbcr: false, video_samplers: Mutex::new(Default::default()) }))
+            timestamp_bits: queue.timestamp_valid_bits, calibrated: false, extensions, present_wait: pacing, multiview: false, compute: false, fdm: false, msaa: 1, life: owner.life.clone(), video_encode: None,
+            pools: Default::default(), lost: AtomicBool::new(false), starved: AtomicBool::new(false), files_reported: AtomicBool::new(false), rebar_fallback_logged: AtomicBool::new(false), budget: Mutex::new(None),
+            ycbcr: false, video_samplers: Mutex::new(Default::default()),
+            pipeline_cache, pipeline_cache_file, pipelines_made: AtomicU32::new(0), pipeline_made_ns: AtomicU64::new(0) }))
     }
 }
 
@@ -625,7 +661,66 @@ impl Drop for Device {
                 self.raw.destroy_sampler(v.sampler, None);
                 if v.conversion != vk::SamplerYcbcrConversion::null() { self.raw.destroy_sampler_ycbcr_conversion(v.conversion, None); }
             }
+            if self.pipeline_cache != vk::PipelineCache::null() { self.raw.destroy_pipeline_cache(self.pipeline_cache, None); }
             self.raw.destroy_device(None);
+        }
+    }
+}
+
+/// The pipeline cache file of this device and driver, under the app's cache directory
+/// (MAKEPAD_HAL_CACHE_DIR; Android: TMPDIR, the app's cache dir; Apple: Library/Caches; else
+/// XDG_CACHE_HOME, LOCALAPPDATA or ~/.cache). None: pipelines are not kept across runs.
+fn pipeline_cache_file(properties: &vk::PhysicalDeviceProperties) -> Option<PathBuf> {
+    let dir = if let Some(d) = std::env::var_os("MAKEPAD_HAL_CACHE_DIR") { PathBuf::from(d) }
+        else if cfg!(target_os = "android") { PathBuf::from(std::env::var_os("TMPDIR")?) }
+        else if cfg!(target_vendor = "apple") { PathBuf::from(apple_cache_dir()?) }
+        else if let Some(d) = std::env::var_os("XDG_CACHE_HOME") { PathBuf::from(d) }
+        else if let Some(d) = std::env::var_os("LOCALAPPDATA") { PathBuf::from(d) }
+        else { PathBuf::from(std::env::var_os("HOME")?).join(".cache") };
+    Some(dir.join("makepad-hal").join(format!("pipelines-{:x}-{:x}-{:x}.bin", properties.vendor_id, properties.device_id, properties.driver_version)))
+}
+#[cfg(target_vendor = "apple")]
+fn apple_cache_dir() -> Option<String> { crate::app_cache_dir() }
+#[cfg(not(target_vendor = "apple"))]
+fn apple_cache_dir() -> Option<String> { None }
+
+/// The device's pipeline cache, primed from its file when there is one. On a phone's GPU
+/// an app's warm start spent seconds of its HAL thread in vkCreateGraphicsPipelines
+/// (every variant compiled from SPIR-V, every launch) before this.
+fn open_pipeline_cache(raw: &makepad_vulkan::Device, properties: &vk::PhysicalDeviceProperties) -> (vk::PipelineCache, Option<PathBuf>) {
+    let file = pipeline_cache_file(properties);
+    let data = file.as_ref().and_then(|f| std::fs::read(f).ok()).unwrap_or_default();
+    let mut info = vk::PipelineCacheCreateInfo::default();
+    if !data.is_empty() { info.initial_data_size = data.len(); info.p_initial_data = data.as_ptr() as *const std::ffi::c_void; }
+    let made = unsafe { raw.create_pipeline_cache(&info, None) }
+        .or_else(|_| unsafe { raw.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) });
+    match made {
+        Ok(cache) => {
+            if log_enabled() { eprintln!("[hal-vulkan] pipeline cache: {} bytes from {}", data.len(), file.as_ref().map_or("nowhere".into(), |f| f.display().to_string())); }
+            (cache, file)
+        }
+        Err(e) => { eprintln!("[hal-vulkan] pipeline cache: {e:?}; pipelines are compiled every run"); (vk::PipelineCache::null(), None) }
+    }
+}
+
+impl Device {
+    /// Writes the pipeline cache when pipelines were made since it was last saved (the file is
+    /// replaced whole, through a rename). Called from the compile worker and at exit.
+    pub fn save_pipeline_cache(&self) {
+        if self.pipeline_cache == vk::PipelineCache::null() { return; }
+        let Some(file) = &self.pipeline_cache_file else { return };
+        if self.pipelines_made.swap(0, Ordering::AcqRel) == 0 { return; }
+        let data = match unsafe { self.raw.get_pipeline_cache_data(self.pipeline_cache) } {
+            Ok(d) => d,
+            Err(e) => { eprintln!("[hal-vulkan] pipeline cache data: {e:?}"); return; }
+        };
+        let tmp = file.with_extension("tmp");
+        let written = file.parent().map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(&tmp, &data))
+            .and_then(|_| std::fs::rename(&tmp, file));
+        match written {
+            Ok(()) => if log_enabled() { eprintln!("[hal-vulkan] pipeline cache saved: {} bytes", data.len()); },
+            Err(e) => eprintln!("[hal-vulkan] pipeline cache {}: {e}", file.display()),
         }
     }
 }
@@ -730,6 +825,148 @@ impl Drop for Worker {
     }
 }
 
+/// A pipeline compile's place in the queue (`Compilers`): lower goes first.
+pub(crate) mod compile_rank {
+    /// a submitted frame or compute pass waits for it
+    pub const WAITED: u8 = 0;
+    /// a draw program: the first frame is held until every one is ready
+    pub const DRAW: u8 = 1;
+    /// a compute kernel: the platform makes it for the first pass that dispatches it and holds
+    /// that pass until it is ready, so the pass never reaches `compute_ready` to lower this
+    pub const KERNEL: u8 = 2;
+    /// the pipeline cache written to its file (`Device::save_pipeline_cache`): nothing waits for
+    /// it, so it runs after every compile
+    pub const SAVE: u8 = 3;
+}
+
+/// The pipeline compiles, on up to `Compilers::threads()` threads sharing one queue: Vulkan
+/// creates pipelines on any thread at once, and the driver compiles on the calling thread
+/// (NVIDIA with a cold shader cache: a large app's cold first frame waited 19.8 s for 183 pipelines on
+/// one thread, 7.7 s on eight). Each job carries its rank (`compile_rank`), which a waiting frame lowers
+/// (`Compilers::waited`); a free thread takes the lowest-ranked job, the oldest first. A job runs
+/// inside the process CPU budget, so compiles and the JIT do not oversubscribe the cores, and in
+/// its interactive class: something waits for every compile (a frame for its draw programs, a
+/// held pass for its kernel), and none is made ahead of need.
+pub(crate) struct Compilers {
+    shared: Arc<CompileShared>,
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+struct CompileShared {
+    queue: Mutex<CompileQueue>,
+    /// a job was queued, or the pool closed
+    work: std::sync::Condvar,
+    /// a job ended (`settle`)
+    ended: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct CompileQueue {
+    jobs: VecDeque<(Arc<std::sync::atomic::AtomicU8>, Job)>,
+    /// threads started, and those waiting for a job
+    started: usize,
+    idle: usize,
+    running: usize,
+    /// `stop` or `Drop`: the queued jobs run, then the threads end; later pushes are dropped
+    closed: bool,
+}
+
+impl Compilers {
+    pub fn new() -> Self {
+        Self { shared: Arc::new(CompileShared { queue: Mutex::new(CompileQueue::default()), work: std::sync::Condvar::new(), ended: std::sync::Condvar::new() }),
+            threads: Mutex::new(Vec::new()) }
+    }
+
+    /// Half the cores, 2 to 8.
+    fn threads() -> usize {
+        std::thread::available_parallelism().map_or(2, |n| n.get() / 2).clamp(2, 8)
+    }
+
+    /// A rank a job is queued with and its waiters lower (`waited`).
+    pub fn rank(rank: u8) -> Arc<std::sync::atomic::AtomicU8> {
+        Arc::new(std::sync::atomic::AtomicU8::new(rank))
+    }
+
+    /// A frame or pass waits for the job queued with `rank`: it goes before every job not waited for.
+    pub fn waited(rank: &std::sync::atomic::AtomicU8) {
+        rank.fetch_min(compile_rank::WAITED, Ordering::Relaxed);
+    }
+
+    /// Queues `job` at `rank`; a thread is started for it when none is free (up to `threads()`).
+    pub fn push(&self, rank: Arc<std::sync::atomic::AtomicU8>, job: impl FnOnce() + Send + 'static) {
+        let mut q = lock(&self.shared.queue);
+        if q.closed { return; }
+        q.jobs.push_back((rank, Box::new(job)));
+        // an idle thread takes one queued job: woken, it counts as idle until it takes it, so
+        // the jobs queued past the idle threads are the ones without a thread
+        if q.jobs.len() > q.idle && q.started < Self::threads() {
+            q.started += 1;
+            let n = q.started;
+            let shared = self.shared.clone();
+            match std::thread::Builder::new().name(format!("makepad-vulkan-compile-{n}")).spawn(move || Self::run(&shared)) {
+                Ok(t) => lock(&self.threads).push(t),
+                Err(e) => { q.started -= 1; eprintln!("[hal-vulkan] compile thread: {e}"); }
+            }
+        } else {
+            self.shared.work.notify_one();
+        }
+    }
+
+    fn run(shared: &CompileShared) {
+        let mut q = lock(&shared.queue);
+        loop {
+            let at = q.jobs.iter().enumerate().min_by_key(|(_, (r, _))| r.load(Ordering::Relaxed)).map(|(i, _)| i);
+            let Some((_, job)) = at.and_then(|i| q.jobs.remove(i)) else {
+                if q.closed { return; }
+                q.idle += 1;
+                q = shared.work.wait(q).unwrap_or_else(|e| e.into_inner());
+                q.idle -= 1;
+                continue;
+            };
+            q.running += 1;
+            drop(q);
+            let permit = makepad_cpu_budget::admit(makepad_cpu_budget::INTERACTIVE, makepad_cpu_budget::HAL, "pipeline compile");
+            job();
+            makepad_cpu_budget::release(permit);
+            q = lock(&shared.queue);
+            q.running -= 1;
+            shared.ended.notify_all();
+        }
+    }
+
+    /// Waits (up to `limit`) until every job pushed before this call ran.
+    pub fn settle(&self, limit: std::time::Duration) -> bool {
+        let end = std::time::Instant::now() + limit;
+        let mut q = lock(&self.shared.queue);
+        while !q.jobs.is_empty() || q.running > 0 {
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() { return false; }
+            q = self.shared.ended.wait_timeout(q, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        true
+    }
+
+    /// The end of the process (`Vulkan::before_exit`): the queued jobs run, the threads end, and
+    /// this returns once they have. Jobs pushed afterwards are dropped. Never on a compile thread.
+    pub fn stop(&self) {
+        lock(&self.shared.queue).closed = true;
+        self.shared.work.notify_all();
+        for t in std::mem::take(&mut *lock(&self.threads)) {
+            debug_assert!(t.thread().id() != std::thread::current().id(), "a Vulkan compile thread cannot stop the pool");
+            if t.join().is_err() { eprintln!("[hal-vulkan] a compile thread panicked"); }
+        }
+    }
+}
+
+impl Drop for Compilers {
+    fn drop(&mut self) {
+        // the threads run the queued jobs and end on their own (only the end of the process
+        // joins them: `stop`)
+        lock(&self.shared.queue).closed = true;
+        self.shared.work.notify_all();
+    }
+}
+
 /// The Vulkan loader. makepad-vulkan opens it once per process and never closes it (ICDs register
 /// process-exit and thread-exit handlers that must not outlive their library).
 fn loader() -> Result<Entry, String> { unsafe { Entry::load() } }
@@ -774,5 +1011,67 @@ mod tests {
         assert_eq!(Arc::strong_count(&ran), 1, "the abandoned job was dropped");
         // stopping again (a second before_exit) is a no-op
         worker.stop();
+    }
+
+    /// The compile threads run at once (a pipeline each), and a free thread takes the job a
+    /// frame waits for first, then the draw programs, then the kernels made ahead.
+    #[test]
+    fn compiles_run_at_once_waited_first() {
+        use super::{compile_rank, Compilers};
+        use std::sync::mpsc::{channel, sync_channel};
+        let pool = Compilers::new();
+        let n = Compilers::threads();
+        let (started_tx, started) = channel();
+        let gates: Vec<_> = (0..n).map(|_| {
+            let (gate, wait) = sync_channel::<()>(0);
+            let started = started_tx.clone();
+            pool.push(Compilers::rank(compile_rank::DRAW), move || { started.send(()).unwrap(); let _ = wait.recv(); });
+            gate
+        }).collect();
+        for _ in 0..n {
+            started.recv_timeout(std::time::Duration::from_secs(10)).expect("every compile thread runs at once");
+        }
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let push = |name: &'static str, rank: u8| {
+            let (order, rank) = (order.clone(), Compilers::rank(rank));
+            pool.push(rank.clone(), move || order.lock().unwrap().push(name));
+            rank
+        };
+        push("kernel", compile_rank::KERNEL);
+        push("draw", compile_rank::DRAW);
+        Compilers::waited(&push("waited", compile_rank::KERNEL));
+        // one thread free: it takes the three in rank order (the others are held until it did)
+        gates[0].send(()).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while order.lock().unwrap().len() < 3 && std::time::Instant::now() < end { std::thread::yield_now(); }
+        for gate in &gates[1..] { gate.send(()).unwrap(); }
+        assert!(pool.settle(std::time::Duration::from_secs(10)), "the queue ran out");
+        assert_eq!(*order.lock().unwrap(), ["waited", "draw", "kernel"]);
+        pool.stop();
+        assert!(super::lock(&pool.threads).is_empty(), "the threads were joined");
+    }
+
+    /// Compiles pushed together while a thread idles run side by side: the woken thread takes
+    /// one, and the others each get a thread of their own instead of queueing behind it.
+    #[test]
+    fn pushes_past_an_idle_thread_start_threads() {
+        use super::{compile_rank, Compilers};
+        use std::sync::mpsc::{channel, sync_channel};
+        let pool = Compilers::new();
+        pool.push(Compilers::rank(compile_rank::KERNEL), || {});
+        assert!(pool.settle(std::time::Duration::from_secs(10)), "the first job ran");
+        assert_eq!(super::lock(&pool.shared.queue).idle, 1, "its thread idles");
+        let (started_tx, started) = channel();
+        let gates: Vec<_> = (0..2).map(|_| {
+            let (gate, wait) = sync_channel::<()>(0);
+            let started = started_tx.clone();
+            pool.push(Compilers::rank(compile_rank::KERNEL), move || { started.send(()).unwrap(); let _ = wait.recv(); });
+            gate
+        }).collect();
+        for _ in 0..2 {
+            started.recv_timeout(std::time::Duration::from_secs(10)).expect("both compiles run at once");
+        }
+        drop(gates);
+        pool.stop();
     }
 }

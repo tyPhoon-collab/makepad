@@ -96,6 +96,19 @@ impl SyncConf {
         Self::parse(&std::fs::read_to_string(path()).unwrap_or_default())
     }
 
+    /// The apply's prebuild builds the AI Hub the WM runs (`build = wm` with `hub`): after it, the
+    /// checkout's binary is the deployment's.
+    pub fn builds_hub(&self) -> bool {
+        self.build == Build::Wm && self.prebuild.iter().any(|p| p == "hub")
+    }
+
+    /// The JIT app the prebuild builds the JIT for (`--jit` of the WM's flags in the prebuild
+    /// list): its build is the box's JIT of the deployed commits.
+    pub fn jit_app(&self) -> Option<String> {
+        let jit = super::build::jit_apps(&self.wm_flags);
+        (self.build != Build::Off).then(|| self.prebuild.iter().find(|p| jit.contains(p)).cloned()).flatten()
+    }
+
     /// The nested commercial checkout.
     pub fn commercial(&self) -> PathBuf {
         self.checkout.join("apps").join("commercial")
@@ -117,14 +130,17 @@ mod tests {
 
     #[test]
     fn conf_parses() {
-        let c = SyncConf::parse("checkout = /x/makepad\nbuild = apps\nprebuild = sandbox\nwm_flags = --jit sandbox,code\njobs = 4\nwm_service = none\n");
+        let c = SyncConf::parse("checkout = /x/makepad\nbuild = apps\nprebuild = foo\nwm_flags = --jit foo,code\njobs = 4\nwm_service = none\n");
         assert_eq!(c.checkout, PathBuf::from("/x/makepad"));
         assert_eq!(c.build, Build::Apps);
-        assert_eq!(c.prebuild, vec!["sandbox"]);
-        assert_eq!(c.wm_flags, vec!["--jit", "sandbox,code"]);
+        assert_eq!(c.prebuild, vec!["foo"]);
+        assert_eq!(c.wm_flags, vec!["--jit", "foo,code"]);
         assert_eq!(c.jobs, 4);
         assert_eq!(c.wm_service, None);
         assert_eq!(c.repo_dir("commercial"), Some(PathBuf::from("/x/makepad/apps/commercial")));
+        assert_eq!(c.jit_app().as_deref(), Some("foo"), "the prebuild builds the JIT for its first JIT app");
+        assert_eq!(SyncConf::parse("build = off\nprebuild = foo\nwm_flags = --jit foo\n").jit_app(), None);
+        assert_eq!(SyncConf::parse("prebuild = hub terminal\nwm_flags = --jit foo\n").jit_app(), None, "no JIT app in the prebuild");
     }
 
     #[test]
@@ -132,8 +148,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("devhub-sync-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("session.sh");
-        std::fs::write(&f, "#!/bin/bash\n# The WM's own flags\nwm_flags=(--jit sandbox)\nexec cargo run -- \"${wm_flags[@]}\"\n").unwrap();
-        assert_eq!(session_wm_flags(&f), Some(vec!["--jit".to_string(), "sandbox".to_string()]));
+        std::fs::write(&f, "#!/bin/bash\n# The WM's own flags\nwm_flags=(--jit foo)\nexec cargo run -- \"${wm_flags[@]}\"\n").unwrap();
+        assert_eq!(session_wm_flags(&f), Some(vec!["--jit".to_string(), "foo".to_string()]));
         let _ = std::fs::remove_file(&f);
         let _ = std::fs::remove_dir(&dir);
     }

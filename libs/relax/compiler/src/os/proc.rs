@@ -15,6 +15,13 @@
 
 pub use imp::*;
 
+/// `name` (a C symbol) wherever this platform's loader finds one for the process: the default
+/// search of every loaded image (`find`), then the system libraries (`find_system`). Null: none.
+pub unsafe fn find_any(name: *const u8) -> *mut u8 {
+    let p = find(name);
+    if p.is_null() { find_system(name) } else { p }
+}
+
 /// The status an embedded run (the Android host) ended with when it failed; 0: it has not.
 pub static EMBEDDED_FAILURE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 /// Whether a host owns this process (it named its library): a failed run then must not exit().
@@ -63,23 +70,37 @@ pub fn symbol_at(pc: u64) -> Option<(String, u64, String)> {
     symbol_at_imp(pc)
 }
 
+/// dladdr's answer (`Dl_info`). The process's one declaration of dladdr: the profiler and the
+/// executable-region scan use it too (two declarations with their own structs clash where
+/// `c_char` is unsigned, arm64 Linux and Android).
+#[cfg(unix)]
+#[repr(C)]
+pub(crate) struct DlInfo {
+    pub fname: *const std::ffi::c_char,
+    pub fbase: *mut u8,
+    pub sname: *const std::ffi::c_char,
+    pub saddr: *mut u8,
+}
+
+#[cfg(unix)]
+impl Default for DlInfo {
+    fn default() -> Self {
+        Self { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() }
+    }
+}
+
+#[cfg(unix)]
+extern "C" {
+    pub(crate) fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
+}
+
 /// From a fault handler (no allocation): the image holding `a` (its file name's last part and
 /// load base) and the nearest symbol dladdr knows (empty when none, with its address). Unix:
 /// dladdr, which the handler calls only on the way to the end of the process. Windows: None.
 pub fn image_at_raw(a: u64) -> Option<(&'static [u8], u64, &'static [u8], u64)> {
     #[cfg(unix)]
     {
-        #[repr(C)]
-        struct DlInfo {
-            fname: *const std::ffi::c_char,
-            fbase: *mut u8,
-            sname: *const std::ffi::c_char,
-            saddr: *mut u8,
-        }
-        extern "C" {
-            fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
-        }
-        let mut info = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
+        let mut info = DlInfo::default();
         if unsafe { dladdr(a as *const u8, &mut info) } == 0 || info.fname.is_null() {
             return None;
         }
@@ -98,17 +119,7 @@ pub fn image_at_raw(a: u64) -> Option<(&'static [u8], u64, &'static [u8], u64)> 
 
 #[cfg(unix)]
 fn symbol_at_imp(pc: u64) -> Option<(String, u64, String)> {
-    #[repr(C)]
-    struct DlInfo {
-        fname: *const std::ffi::c_char,
-        fbase: *mut u8,
-        sname: *const std::ffi::c_char,
-        saddr: *mut u8,
-    }
-    extern "C" {
-        fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
-    }
-    let mut info = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
+    let mut info = DlInfo::default();
     if unsafe { dladdr(pc as *const u8, &mut info) } == 0 || info.sname.is_null() {
         return None;
     }
@@ -170,6 +181,29 @@ fn symbol_at_imp(pc: u64) -> Option<(String, u64, String)> {
     }
 }
 
+/// The program's atexit handlers, in the order it registered them.
+static PROGRAM_ATEXIT: std::sync::Mutex<Vec<(u64, extern "C" fn())>> = std::sync::Mutex::new(Vec::new());
+
+/// The program's `atexit`: [`exit`] runs the handler, while JIT code can still compile.
+pub extern "C" fn program_atexit(f: extern "C" fn()) -> i32 {
+    PROGRAM_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()).push((crate::domain::current(), f));
+    0
+}
+
+/// A run ended: its handlers go with it, not run (its end does not depend on its cleanup).
+pub fn forget_program_atexit(bases: &[u64]) {
+    PROGRAM_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| !bases.contains(&h.0));
+}
+
+/// Runs (and empties) the program's atexit handlers, last registered first; one a handler
+/// registers runs too. exit() runs them, and so does the exit of the run's app domain, which
+/// ends the process from the host (domain.rs exit_current).
+pub fn run_program_atexit() {
+    while let Some((_, f)) = { let mut g = PROGRAM_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()); g.pop() } {
+        f();
+    }
+}
+
 #[cfg(unix)]
 mod unix {
     use std::path::Path;
@@ -179,26 +213,42 @@ mod unix {
         pub fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8;
     }
 
-    pub unsafe fn lookup(handle: *mut u8, name: *const u8) -> *mut u8 {
-        dlsym(handle, name)
+    /// The library's handle, or the loader's diagnostic.
+    pub fn load_path(path: &str, flags: i32) -> Result<usize, String> {
+        let path = std::ffi::CString::new(path).map_err(|e| e.to_string())?;
+        unsafe {
+            let h = dlopen(path.as_ptr().cast(), flags);
+            if !h.is_null() {
+                return Ok(h as usize);
+            }
+            extern "C" {
+                fn dlerror() -> *const std::ffi::c_char;
+            }
+            let error = dlerror();
+            Err(if error.is_null() {
+                "dlopen failed without a loader diagnostic".into()
+            } else {
+                std::ffi::CStr::from_ptr(error).to_string_lossy().into_owned()
+            })
+        }
     }
 
-    /// The program's atexit handlers, in the order it registered them.
-    static PROGRAM_ATEXIT: std::sync::Mutex<Vec<extern "C" fn()>> = std::sync::Mutex::new(Vec::new());
+    /// The address of `name` (a C symbol) in the library `handle` (load_path) and what it loaded.
+    pub fn symbol_in(handle: usize, name: &str) -> usize {
+        let Ok(name) = std::ffi::CString::new(name) else { return 0 };
+        unsafe { dlsym(handle as *mut u8, name.as_ptr().cast()) as usize }
+    }
 
-    /// The program's `atexit`: [`exit`] runs the handler, while JIT code can still compile.
-    pub extern "C" fn program_atexit(f: extern "C" fn()) -> i32 {
-        PROGRAM_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()).push(f);
-        0
+    // (Android's own `lookup` also asks the host library and the program's libraries)
+    #[cfg(not(target_os = "android"))]
+    pub unsafe fn lookup(handle: *mut u8, name: *const u8) -> *mut u8 {
+        dlsym(handle, name)
     }
 
     /// exit(): the main thread's pthread key destructors do not run (the program's thread locals
     /// are left as they are, as in a rustc build).
     pub fn exit(code: i32) -> ! {
-        // last registered first; one a handler registers runs too
-        while let Some(f) = { let mut g = PROGRAM_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()); g.pop() } {
-            f();
-        }
+        super::run_program_atexit();
         // An embedded run (the Android host: its library handle is named) failed: exit() would run the
         // process's atexit/static destructors on this thread while the host's UI thread still locks
         // the mutexes they destroy (FORTIFY abort, no message). The host owns the process: the failure
@@ -224,7 +274,7 @@ mod unix {
             #[cfg(target_os = "android")]
             #[link_name = "__errno"]
             fn __errno_location() -> *mut i32;
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             #[link_name = "__error"]
             fn __errno_location() -> *mut i32;
         }
@@ -267,7 +317,7 @@ mod unix {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    pub use super::unix::{program_atexit, os_args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
+    pub use super::unix::{os_args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
     use super::unix::{dlopen, dlsym};
 
     #[cfg(target_env = "gnu")]
@@ -309,11 +359,11 @@ mod imp {
         std::ptr::null_mut()
     }
 
-    /// A shared library by absolute path (--allow-c's native library), its symbols global.
-    pub fn load_path(path: &str) -> bool {
-        // RTLD_NOW | RTLD_GLOBAL
-        unsafe { !dlopen(format!("{}\0", path).as_ptr(), 2 | 0x100).is_null() }
+    /// A native bundle must resolve every import before any program code starts. Its handle.
+    pub fn load_path(path: &str) -> Result<usize, String> {
+        super::unix::load_path(path, 2 | 0x100)
     }
+    pub use super::unix::symbol_in;
 
     pub fn load_library(name: &str, framework: bool) -> bool {
         let path = if framework { format!("/System/Library/Frameworks/{}.framework/{}\0", name, name) } else { format!("lib{}.so\0", name) };
@@ -370,7 +420,7 @@ mod imp {
 
 #[cfg(target_os = "android")]
 mod imp {
-    pub use super::unix::{program_atexit, os_args_bytes, create_private, ensure_private_dir, exit, last_error, set_last_error};
+    pub use super::unix::{os_args_bytes, create_private, ensure_private_dir, exit, last_error, set_last_error};
     use super::unix::{dlopen, dlsym};
 
     /// The library Relax itself is (libmakepad.so): System.loadLibrary loads it into a scope of its
@@ -473,11 +523,11 @@ mod imp {
         std::ptr::null_mut()
     }
 
-    /// A shared library by absolute path (--allow-c's native library), its symbols global.
-    pub fn load_path(path: &str) -> bool {
-        // RTLD_NOW | RTLD_GLOBAL
-        unsafe { !dlopen(format!("{}\0", path).as_ptr(), 2 | 0x100).is_null() }
+    /// A shared library by absolute path (--allow-c's native library), its symbols global. Its handle.
+    pub fn load_path(path: &str) -> Result<usize, String> {
+        super::unix::load_path(path, 2 | 0x100)
     }
+    pub use super::unix::symbol_in;
 
     pub fn load_library(name: &str, framework: bool) -> bool {
         let path = if framework { format!("/System/Library/Frameworks/{}.framework/{}\0", name, name) } else { format!("lib{}.so\0", name) };
@@ -525,9 +575,9 @@ mod imp {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod imp {
-    pub use super::unix::{program_atexit, os_args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
+    pub use super::unix::{os_args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
     use super::unix::{dlopen, dlsym};
 
     /// Symbol in any loaded image (RTLD_DEFAULT). libm lives in libSystem, always loaded.
@@ -535,15 +585,18 @@ mod imp {
         dlsym(-2isize as *mut u8, name)
     }
 
-    pub unsafe fn find_system(_name: *const u8) -> *mut u8 {
-        std::ptr::null_mut()
+    /// libSystem's (libc, libm): always loaded, so `find` sees them too.
+    pub unsafe fn find_system(name: *const u8) -> *mut u8 {
+        // RTLD_NOW; from the dyld shared cache, not a file on disk
+        let h = dlopen("/usr/lib/libSystem.B.dylib\0".as_ptr(), 2);
+        if h.is_null() { std::ptr::null_mut() } else { dlsym(h, name) }
     }
 
-    /// A shared library by absolute path (--allow-c's native library), its symbols global.
-    pub fn load_path(path: &str) -> bool {
-        // RTLD_NOW | RTLD_GLOBAL
-        unsafe { !dlopen(format!("{}\0", path).as_ptr(), 2 | 8).is_null() }
+    /// A shared library by absolute path (--allow-c's native library), its symbols global. Its handle.
+    pub fn load_path(path: &str) -> Result<usize, String> {
+        super::unix::load_path(path, 2 | 8)
     }
+    pub use super::unix::symbol_in;
 
     pub fn load_library(name: &str, framework: bool) -> bool {
         let path = if framework { format!("/System/Library/Frameworks/{}.framework/{}\0", name, name) } else { format!("lib{}.dylib\0", name) };
@@ -555,6 +608,13 @@ mod imp {
         false
     }
 
+    /// iOS and tvOS: a phone or tablet runs on its battery (IOKit's power sources are macOS's)
+    #[cfg(not(target_os = "macos"))]
+    pub fn on_battery() -> bool {
+        true
+    }
+
+    #[cfg(target_os = "macos")]
     pub fn on_battery() -> bool {
         #[link(name = "IOKit", kind = "framework")]
         extern "C" {
@@ -618,8 +678,12 @@ mod imp {
     }
 
     /// --allow-c's native library is not supported on Windows.
-    pub fn load_path(_path: &str) -> bool {
-        false
+    pub fn load_path(_path: &str) -> Result<usize, String> {
+        Err("--allow-c native libraries are not supported on Windows".into())
+    }
+
+    pub fn symbol_in(_handle: usize, _name: &str) -> usize {
+        0
     }
 
     /// `#[link(name = "user32")]` / raw-dylib `name = "DINPUT8"`: the DLL of that name.
@@ -636,12 +700,26 @@ mod imp {
         GetProcAddress(handle as HANDLE, name)
     }
 
-    /// ExitProcess would run the fiber-local destructors of the exiting thread, and the program's
-    /// thread locals (FlsAlloc callbacks in JIT code) would run after Relax dropped the unit:
-    /// flush our output and end the process without them, as unix's exit() does not run the main
-    /// thread's key destructors either.
+    /// What unix's exit() does: the program's atexit handlers, then the process's (`_cexit`: the
+    /// run's exit work, the control endpoint's cleanup). A run that returned from main or quit
+    /// through its app domain did neither: no final cache, and a discovery file left behind, which
+    /// the hub reads as a crash (11-04). Then the process ends without ExitProcess, which would run
+    /// the fiber-local destructors of the exiting thread: the program's thread locals (FlsAlloc
+    /// callbacks in JIT code) would run after Relax dropped the unit, and unix's exit() does not
+    /// run the main thread's key destructors either.
     pub fn exit(code: i32) -> ! {
+        super::run_program_atexit();
+        end_process(code)
+    }
+
+    /// The process's own exit work and its end, without the program's handlers (a restart, which
+    /// stands in for an exec: restart_parent.rs).
+    pub fn end_process(code: i32) -> ! {
         use std::io::Write;
+        extern "C" {
+            fn _cexit();
+        }
+        unsafe { _cexit() };
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
         unsafe {
@@ -907,4 +985,11 @@ mod imp {
             Ok(())
         }
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&EMBEDDED_FAILURE, std::sync::atomic::AtomicI32::new(0));
+    reset(&PROGRAM_ATEXIT, std::sync::Mutex::new(Vec::new()));
 }

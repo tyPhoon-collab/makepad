@@ -19,7 +19,7 @@ use makepad_network::fleet::id::{Peer, Role};
 fn job_route(method: &str, path: &str) -> bool {
     matches!(
         (method, path),
-        ("GET", "/health") | ("GET", "/models") | ("GET", "/voices") | ("POST", "/generate") | ("POST", "/realtime") | ("POST", "/bye")
+        ("GET", "/health") | ("GET", "/fleet") | ("GET", "/models") | ("GET", "/voices") | ("POST", "/generate") | ("POST", "/realtime") | ("POST", "/bye")
     ) || (method == "GET" && (path.starts_with("/job/") || path.starts_with("/artifact/") || path.starts_with("/realtime/")))
         || (method == "POST" && path.starts_with("/job/") && (path.ends_with("/cancel") || path.ends_with("/keepalive")))
 }
@@ -77,6 +77,12 @@ mod tests {
         let mac_elsewhere = peer(Role::Device, "192.0.2.50", Some("192.0.2.91"));
         let node = peer(Role::Node, "192.0.2.89", None);
         let phone = peer(Role::Paired, "192.0.2.60", None);
+        for who in [&admin, &mac_elsewhere, &node, &phone] {
+            for edge in [false, true] {
+                assert_eq!(route_allowed(who, edge, "GET", "/fleet"), route_allowed(who, edge, "GET", "/health"));
+                assert!(route_allowed(who, edge, "GET", "/fleet"));
+            }
+        }
         // Admin: control, panel, everything.
         for (m, p) in [("GET", "/control"), ("POST", "/control/model"), ("GET", "/control/watch?since=3"), ("POST", "/llm/context"), ("GET", "/index.html"), ("POST", "/control/yield")] {
             assert!(route_allowed(&admin, false, m, p), "{m} {p}");
@@ -88,7 +94,7 @@ mod tests {
         for who in [&node, &mac_elsewhere] {
             assert!(route_allowed(who, false, "POST", "/generate"));
             assert!(route_allowed(who, false, "GET", "/job/abc"));
-            assert!(route_allowed(who, false, "POST", "/kernel/jobs"));
+            assert!(route_allowed(who, false, "GET", "/kernel/stream"));
             assert!(route_allowed(who, false, "GET", "/v1/model_blob/00"));
             assert!(route_allowed(who, false, "GET", "/v1/model_inventory"));
             assert!(!route_allowed(who, false, "POST", "/v1/model_blob/00"));
@@ -111,7 +117,7 @@ mod tests {
         assert!(route_allowed(&phone, false, "POST", "/generate"));
         assert!(route_allowed(&phone, false, "GET", "/v1/model_blob/00"));
         assert!(!route_allowed(&phone, false, "GET", "/v1/model_inventory"));
-        assert!(!route_allowed(&phone, false, "POST", "/kernel/jobs"));
+        assert!(!route_allowed(&phone, false, "GET", "/kernel/stream"));
         assert!(!route_allowed(&phone, false, "GET", "/jobs"));
         // The edge narrows even the admin to the job API.
         assert!(!route_allowed(&admin, true, "GET", "/control"));

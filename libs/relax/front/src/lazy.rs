@@ -73,6 +73,8 @@ pub struct PendingPlan {
     /// the stored plan of an earlier load, taken over without planning (`carried`): its inputs
     /// and probes are that load's, not this one's
     carried: bool,
+    /// planned again for its outline (outline_macros), when `plan` is a restored one
+    outlined: std::sync::OnceLock<Plan>,
 }
 impl PendingPlan {
     /// The plan an earlier load of these crates recorded (`image`), taken as it is: an edited start
@@ -80,7 +82,7 @@ impl PendingPlan {
     /// the edit (a full selection is always a sound one), so nothing is planned. Its parts stay
     /// the stored ones (the next plan validates them by their own inputs).
     pub fn carried(crates: &[PreCrate], contexts: Vec<Arc<crate::source_context::Context>>, image: Arc<DemandImage>) -> Self {
-        let pending = Self { pending_crates: crates.to_vec(), pending_contexts: contexts, plan: std::sync::OnceLock::new(), early: EarlyCrates::default(), parts: None, carried: true };
+        let pending = Self { pending_crates: crates.to_vec(), pending_contexts: contexts, plan: std::sync::OnceLock::new(), early: EarlyCrates::default(), parts: None, carried: true, outlined: std::sync::OnceLock::new() };
         let plan = Plan::build(&pending.pending_crates, pending.pending_contexts.clone(), Some(image), &pending.early, None);
         let _ = pending.plan.set(plan);
         pending
@@ -93,7 +95,7 @@ impl PendingPlan {
             && !crates.iter().any(|c| c.cfg.session.runtime.lazy_verify) {
             images.and_then(|i| i.demand_parts(crates, recipe_identity(crates)))
         } else { None };
-        let pending = Self { pending_crates: crates.to_vec(), pending_contexts: contexts, plan: std::sync::OnceLock::new(), early: EarlyCrates::default(), parts, carried: false };
+        let pending = Self { pending_crates: crates.to_vec(), pending_contexts: contexts, plan: std::sync::OnceLock::new(), early: EarlyCrates::default(), parts, carried: false, outlined: std::sync::OnceLock::new() };
         // The crates selected in full (Plan::build) are known before planning.
         pending.early.publish(selected_prefix(crates, pending.parts.as_ref()));
         if image.is_some() || !parallel {
@@ -108,6 +110,17 @@ impl PendingPlan {
         self.early.wake_all();
     }
     pub fn ready(&self) -> Option<&Plan> { self.plan.get() }
+    /// The macro definitions the outline of crate `ci` found, its expansions' included (what
+    /// the raw scan a crate's files parse against lacks). Waits for the plan. A restored plan
+    /// (an earlier load's, whose inputs the sources still match) holds no outline: the crates
+    /// are planned again for it, once, from their sources as they are now.
+    pub(crate) fn outline_macros(&self, ci: usize) -> Option<Vec<crate::macros::MacroRef>> {
+        if let Some(defs) = std::ops::Deref::deref(self).image.outline_macros(ci) {
+            return Some(defs);
+        }
+        self.outlined.get_or_init(|| Plan::build(&self.pending_crates, self.pending_contexts.clone(), None, &EarlyCrates::default(), None))
+            .image.outline_macros(ci)
+    }
     /// The crates' source contexts (the plan's own, without waiting for it).
     pub fn contexts(&self) -> &[Arc<crate::source_context::Context>] { &self.pending_contexts }
     /// The crates the plan is for (without waiting for it).
@@ -129,17 +142,17 @@ impl PendingPlan {
     pub fn on_early_publish(&self, notify: impl Fn() + Send + Sync + 'static) {
         let _ = self.early.notify.set(Box::new(notify));
     }
-    pub fn skips(&self, root: &str, path: &str) -> bool {
+    pub fn skips(&self, root: &str, test: bool, path: &str) -> bool {
         // MAKEPAD_RUN_LAZY_DEFER=<path suffix>,..: these files are skipped whatever the
         // closure says; the post-boot loader brings them in when code needs them (its test)
         if self.pending_crates.first().is_some_and(|c| c.cfg.session.options.rs_lazy) && forced_deferral(path) {
             return true;
         }
-        if self.pending_crates.iter().position(|c| c.root == root).is_some_and(|ci| self.eagerly_selected(ci)) {
+        if self.pending_crates.iter().position(|c| c.root == root && c.cfg.holds("test") == test).is_some_and(|ci| self.eagerly_selected(ci)) {
             return false;
         }
         self.pending_crates.first().is_some_and(|c| c.cfg.session.options.rs_lazy)
-            && std::ops::Deref::deref(self).skips(root, path)
+            && std::ops::Deref::deref(self).skips(root, test, path)
     }
 }
 impl std::ops::Deref for PendingPlan {
@@ -217,34 +230,9 @@ impl Plan {
         // Crate scans share only immutable source snapshots. Publish the
         // results in crate/DFS order, preserving lexical macro precedence.
         let next_crate = std::sync::atomic::AtomicUsize::new(0);
-        let workers_profile = crate::load_profile::span(profile, "rust-demand-discovery-workers", "load");
-        let mut discovered = crate::pool::scope(|scope| {
-            let handles = (0..jobs().min(crates.len())).map(|_| {
-                let contexts = &contexts;
-                let template = &names;
-                let next_crate = &next_crate;
-                scope.spawn(move || {
-                    let _mem = crate::memstat::tag(crate::memstat::Tag::Planner);
-                    let mut output = Vec::new();
-                    loop {
-                        let ci = next_crate.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(c) = crates.get(ci) else { break };
-                        let _profile = crate::load_profile::span(profile, "rust-demand-crate", &c.name);
-                        if let Some(part) = saved.get(ci).and_then(Option::as_ref) {
-                            output.push((ci, part.scans.clone(), part.aliases.clone(), template.fork()));
-                            continue;
-                        }
-                        let (scans, aliases, local_names) = discover_crate(c, ci, &contexts[ci], template, rust_lazy, profile);
-                        output.push((ci, scans, aliases, local_names));
-                    }
-                    output
-                })
-            }).collect::<Vec<_>>();
-            handles.into_iter().flat_map(|h| h.join().expect("context discovery worker")).collect::<Vec<_>>()
-        });
-        drop(workers_profile);
-        let merge_profile = crate::load_profile::span(profile, "rust-demand-discovery-merge", "load");
-        discovered.sort_by_key(|entry| entry.0);
+        let template = names.fork();
+        let discovery = Discovery::new(crates.len());
+        let mut discovered = (0..crates.len()).map(|_| None).collect::<Vec<_>>();
         let relevant = (0..crates.len()).collect::<BTreeSet<_>>();
         let mut expanded_indexes = BTreeMap::new();
         let mut expansion_failures = BTreeMap::new();
@@ -258,19 +246,37 @@ impl Plan {
         early.publish(eager_prefix);
         let mut prepared_files = Vec::new();
         let mut unindexed_files = Vec::new();
+        let queue = OutlineQueue::default();
+        // Workers claim crates in order; publication takes crate k as soon as its discovery is in.
+        crate::pool::scope(|workers| {
+        let handles = (0..jobs().min(crates.len())).map(|_| {
+            let (contexts, template, next_crate, discovery) = (&contexts, &template, &next_crate, &discovery);
+            workers.spawn(move || {
+                let _discovery = DiscoveryWorker(discovery);
+                let _mem = crate::memstat::tag(crate::memstat::Tag::Planner);
+                loop {
+                    let ci = next_crate.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(c) = crates.get(ci) else { break };
+                    let _profile = crate::load_profile::span(profile, "rust-demand-crate", &c.name);
+                    if let Some(part) = saved.get(ci).and_then(Option::as_ref) {
+                        discovery.put((ci, part.scans.clone(), part.aliases.clone(), template.fork()));
+                        continue;
+                    }
+                    let (scans, aliases, local_names) = discover_crate(c, ci, &contexts[ci], template, rust_lazy, profile);
+                    discovery.put((ci, scans, aliases, local_names));
+                }
+            })
+        }).collect::<Vec<_>>();
         if rust_lazy {
             let _profile = crate::load_profile::span(profile, "rs-outline-expand", "load");
             // Shared like Program::macros: snapshots are Arc clones; a write copies
             // the table only while a snapshot still shares it.
             let mut table = Arc::new(crate::macros::MacroTable::default());
-            // Crates expand on shared workers: a crate whose dependencies are all published
-            // starts expanding (against a copy of the table as its publication will see it)
-            // while earlier crates still publish. Publication stays in crate order and
-            // replays every surface against the real table.
-            let queue = OutlineQueue::default();
-            let newest_dep = (0..crates.len()).map(|ci| dependency_crates[ci].iter().copied().max()).collect::<Vec<_>>();
+            // Crates expand on shared workers once their dependencies are started or published.
+            // The speculative base has their scanned names, but lacks macros and uses added by
+            // their expansions. Publication stays in crate order and replays every surface
+            // against the real table, catching those differences.
             let mut started: Vec<Option<(Arc<OutlineJob>, Vec<Vec<crate::macros::MacroRef>>, Arc<crate::macros::CrateMods>)>> = (0..crates.len()).map(|_| None).collect();
-            crate::pool::scope(|workers| {
             // (the workers end with the queue, also when publication panics)
             let finish = OutlineFinish(&queue);
             for _ in 0..jobs() {
@@ -299,16 +305,31 @@ impl Plan {
                 });
             }
             for k in 0..discovered.len() {
+                if discovered[k].is_none() {
+                    discovered[k] = Some(discovery.wait(k, profile, &crates[k].name));
+                }
                 for j in k + 1..(k + 1 + OUTLINE_AHEAD).min(discovered.len()) {
-                    let ready = newest_dep[j].is_none_or(|d| d < k);
+                    let ready = dependency_crates[j].iter().all(|&d| d < k || started[d].is_some());
                     if started[j].is_some() || !ready || saved.get(j).and_then(Option::as_ref).is_some() { continue; }
+                    if discovered[j].is_none() { discovered[j] = discovery.take(j); }
+                    let (before, after) = discovered.split_at_mut(j);
+                    let Some((_, scans, _, _)) = &mut after[0] else { continue; };
                     let c = &crates[j];
-                    let scans = &mut discovered[j].1;
                     let modules = Arc::new(crate_modules(c, scans));
                     let mut base = table.clone();
                     let mut defs = Vec::with_capacity(scans.len());
                     {
                         let t = Arc::make_mut(&mut base);
+                        for i in k..j {
+                            let Some((_, defs, modules)) = &started[i] else { continue; };
+                            let (_, scans, _, _) = before[i].as_ref().expect("started crate discovery");
+                            let c = &crates[i];
+                            for ((_, _, _, scan, _, _), own) in scans.iter().zip(defs) {
+                                let Some(scan) = scan else { continue; };
+                                publish_scan_names(t, &c.name, scan, own);
+                            }
+                            t.add_crate(c.name.clone(), modules.clone());
+                        }
                         for (_, _, _, scan, _, _) in scans.iter_mut() {
                             let Some(scan) = scan else { defs.push(Vec::new()); continue; };
                             let scan = Arc::make_mut(scan);
@@ -323,7 +344,7 @@ impl Plan {
                     queue.push(job.clone());
                     started[j] = Some((job, defs, modules));
                 }
-                let (ci, scans, aliases, _) = &mut discovered[k];
+                let (ci, scans, aliases, _) = discovered[k].as_mut().expect("context discovery worker");
                 let c = &crates[*ci];
                 let _crate_profile = crate::load_profile::span(profile, "rust-demand-outline-crate", &c.name);
                 let dependencies = dependency_identities(&dependency_crates[*ci], &identities);
@@ -401,7 +422,7 @@ impl Plan {
                         let mut map = job.ready.0.lock().unwrap();
                         loop {
                             if let Some(surface) = map.remove(&key) { return surface; }
-                            map = job.ready.1.wait(map).unwrap();
+                            map = crate::pool::wait(&job.ready.1, &job.ready.0, map).unwrap();
                         }
                     };
                     let mut directories = BTreeMap::new();
@@ -457,7 +478,7 @@ impl Plan {
                             let dir = directories.get(path).cloned().unwrap_or_else(|| crate::program::dir_of(path).into());
                             let _profile = crate::load_profile::span(profile, "rust-demand-outline-scan", path);
                             if let Some(expanded) = scan_tokens(path, &dir, module, &c.name, c.edition, &c.cfg, scan.src_len,
-                                expanded_src, surface.toks, &contexts[*ci], false) { *scan = expanded; }
+                                expanded_src, surface.toks, &contexts[*ci], ScanSurface::Modules) { *scan = expanded; }
                         }
                         let mut chain = chains.get(&(path.clone(), module.clone())).cloned().unwrap_or_default();
                         chain.push(path.clone());
@@ -560,8 +581,14 @@ impl Plan {
                 if profile { eprintln!("rust-demand-part: {} rebuilt outline", c.name); }
             }
             drop(finish);
-            });
         }
+        for handle in handles { handle.join().expect("context discovery worker"); }
+        if !rust_lazy {
+            for (ci, entry) in discovered.iter_mut().enumerate() { *entry = discovery.take(ci); }
+        }
+        });
+        let merge_profile = crate::load_profile::span(profile, "rust-demand-discovery-merge", "load");
+        let discovered = discovered.into_iter().map(|entry| entry.expect("context discovery worker")).collect::<Vec<_>>();
         for (ci, scans, _aliases, local_names) in discovered {
             use std::fmt::Write as _;
             let c = &crates[ci];
@@ -862,8 +889,8 @@ impl Plan {
             .filter(|k| !self.reached.contains(*k)).map(|k| k.1.clone()).collect()
     }
 
-    pub fn skips(&self, root: &str, path: &str) -> bool {
-        self.crates.iter().position(|c| c.root == root).is_some_and(|ci| {
+    pub fn skips(&self, root: &str, test: bool, path: &str) -> bool {
+        self.crates.iter().position(|c| c.root == root && c.cfg.holds("test") == test).is_some_and(|ci| {
             let key = (ci, path.to_owned());
             ci >= self.image.eager_prefix && self.indexed.contains(&key) && !self.reached.contains(&key)
         })
@@ -978,6 +1005,48 @@ fn selected_prefix(crates: &[PreCrate], stored: Option<&crate::crate_image::Dema
     prefix + usize::from(prefix + 1 == crates.len() && stored.is_some_and(|p| p.last_selected))
 }
 
+type DiscoveredCrate = (usize, Vec<part::Scan>, Vec<(String, String)>, Names);
+
+/// Discovery hands each crate to ordered publication as soon as its scan is ready.
+struct Discovery {
+    entries: relax_session::sync::Mutex<(Vec<Option<DiscoveredCrate>>, bool)>,
+    wake: relax_session::sync::Condvar,
+}
+impl Discovery {
+    fn new(len: usize) -> Self {
+        Self { entries: relax_session::sync::Mutex::new(((0..len).map(|_| None).collect(), false)),
+            wake: relax_session::sync::Condvar::new() }
+    }
+    fn put(&self, entry: DiscoveredCrate) {
+        let ci = entry.0;
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).0[ci] = Some(entry);
+        self.wake.notify_all();
+    }
+    fn take(&self, ci: usize) -> Option<DiscoveredCrate> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).0[ci].take()
+    }
+    fn wait(&self, ci: usize, profile: bool, name: &str) -> DiscoveredCrate {
+        let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = g.0[ci].take() { return entry; }
+        let _profile = crate::load_profile::span(profile, "rust-demand-discovery-wait", name);
+        loop {
+            if g.1 { panic!("context discovery worker"); }
+            g = crate::pool::wait(&self.wake, &self.entries, g).unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = g.0[ci].take() { return entry; }
+        }
+    }
+}
+/// Wake publication if a discovery worker unwinds before filling its slots.
+struct DiscoveryWorker<'a>(&'a Discovery);
+impl Drop for DiscoveryWorker<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.entries.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+            self.0.wake.notify_all();
+        }
+    }
+}
+
 /// Crates a dependency-ready crate may start expanding ahead of publication (`Plan::build`).
 const OUTLINE_AHEAD: usize = 32;
 
@@ -1024,7 +1093,7 @@ impl OutlineQueue {
                 g.0.remove(&ci);
             }
             if g.1 { return None; }
-            g = self.wake.wait(g).unwrap();
+            g = crate::pool::wait(&self.wake, &self.jobs, g).unwrap();
         }
     }
 }
@@ -1041,27 +1110,14 @@ impl Drop for OutlineFinish<'_> {
 fn crate_modules(c: &PreCrate, scans: &[part::Scan]) -> crate::macros::CrateMods {
     let mut modules = crate::macros::CrateMods { root: c.name.clone(), src: c.root.clone(), ..Default::default() };
     modules.externs.extend(c.deps.iter().cloned());
-    for (_, path, _, scan, _, _) in scans {
+    for (path, _, _, scan, _, _) in scans {
         let Some(scan) = scan else { continue; };
         if path == &c.root && scan.recursion_limit.is_some() {
             modules.recursion_limit = scan.recursion_limit;
         }
         modules.mods.extend(scan.mods.iter().cloned());
         modules.items.extend(scan.mod_items.iter().cloned());
-        for u in &scan.uses {
-            if let Some(bind) = &u.bind {
-                if u.path.last() != Some(bind) { modules.renames.insert(bind.clone()); }
-                if u.module == c.name {
-                    if u.path == ["crate"] {
-                        modules.externs.insert(bind.clone(), c.name.clone());
-                    } else if u.path.len() == 2 && u.path[0].is_empty() {
-                        let target = modules.externs.get(&u.path[1]).cloned().unwrap_or_else(|| u.path[1].clone());
-                        modules.externs.insert(bind.clone(), target);
-                    }
-                }
-            }
-            modules.uses.entry(u.module.clone()).or_default().push(u.clone());
-        }
+        for u in &scan.uses { modules.add_use(u.clone()); }
     }
     modules
 }

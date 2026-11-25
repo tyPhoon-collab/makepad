@@ -241,6 +241,20 @@ pub fn armed() -> bool {
     ARMED.load(Ordering::Relaxed)
 }
 
+/// (`hal::end_run`) No capture of the ended run is waited for or answered; the numbers go on, a
+/// waiter of an old one times out on its own.
+pub(crate) fn end_run() {
+    let done = {
+        let mut st = state();
+        st.arm = None;
+        st.open = None;
+        ARMED.store(false, Ordering::Relaxed);
+        std::mem::take(&mut st.done)
+    };
+    drop(done);
+    answer::end_run();
+}
+
 /// Arms the recorder for the next frame of `session` (`None`: any): its texture packets and the
 /// window packet that ends it. Returns the request's number for [`wait`].
 pub fn arm(session: Option<u32>, window: Option<u32>) -> u64 {
@@ -523,7 +537,9 @@ fn record_packet(gpu: &mut dyn Gpu, s: &mut Session, sid: u32, p: &FramePacket, 
         };
         let attr = s.ledger.get(Kind::Buffer, id.index).filter(|l| l.gen == id.gen).map(|l| l.attr).unwrap_or_default();
         strs.extend([attr.owner, attr.site, attr.label]);
-        let contents = gpu.capture_buffer(sid, id);
+        // A storage buffer can be written by the GPU. The synchronous capture hook
+        // cannot safely read mapped bytes; its contents require BufferReadback.
+        let contents = if e.val.kind & buffer_kind::KIND_MASK == buffer_kind::STORAGE { None } else { gpu.capture_buffer(sid, id) };
         if contents.is_none() {
             c.notes.push(format!("buffer {}:{}: this backend did not give its bytes", id.index, id.gen));
         }

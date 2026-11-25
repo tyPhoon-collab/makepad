@@ -223,30 +223,3 @@ fn cpu_per_voice() {
     }
     assert!(full < 5.0, "{full}% of a core per voice");
 }
-
-/// Renders for the ear: `ANALOG_RENDERS=<dir>` writes the example files.
-#[test]
-fn renders_for_the_ear() {
-    let Ok(dir) = std::env::var("ANALOG_RENDERS") else { return };
-    std::fs::create_dir_all(&dir).unwrap();
-    let phrase: &[(&str, &[u8], f32, f32)] = &[
-        ("analog_bass", &[33], 0.45, 1.0),
-        ("analog_brass", &[48, 55, 60, 64], 1.6, 2.6),
-        ("analog_strings", &[48, 60, 64, 67], 3.0, 5.0),
-        ("analog_sync_lead", &[60], 1.2, 2.0),
-        ("analog_reversal", &[48], 2.0, 2.6),
-        ("analog_pluck", &[60, 67, 72], 0.2, 1.4),
-        ("analog_whistle", &[72], 1.4, 2.2),
-        ("analog_phase_keys", &[48, 60, 64, 67], 3.0, 4.0),
-        ("analog_fm_bell", &[72], 0.5, 3.0),
-        ("analog_state_bass", &[36], 0.5, 1.2),
-    ];
-    for (name, notes, hold, secs) in phrase {
-        let text = PRESETS.iter().find(|p| p.0 == *name).unwrap().2;
-        let mut m = engine(text);
-        let (l, r) = render(&mut m, notes, *hold, *secs);
-        let path = format!("{dir}/{name}.wav");
-        std::fs::write(&path, makepad_audio_synth::wav::stereo_wav_16(&l, &r, RATE as u32)).unwrap();
-        eprintln!("wrote {path}");
-    }
-}

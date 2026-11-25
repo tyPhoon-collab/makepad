@@ -24,6 +24,14 @@ static ABNORMAL: AtomicBool = AtomicBool::new(false);
 pub(crate) fn exit_code(code: i32) { EXIT_CODE.store(code, Ordering::Release); }
 pub(crate) fn abnormal() { ABNORMAL.store(true, Ordering::Release); }
 
+/// The session met an internal compiler error (a makepad run bug): its log is kept where the
+/// run's temporary directory going away does not take it (the captures directory).
+static KEEP_LOG: AtomicBool = AtomicBool::new(false);
+pub(crate) fn keep_log() {
+    KEEP_LOG.store(true, Ordering::Release);
+    abnormal();
+}
+
 // ---- what each compiling thread is on: one slot per thread, written without locks.
 // A slot is a sequence number (odd while written), the start (ms since process start, +1) and
 // the first 96 bytes of the name; the ticker reads it and drops a torn read.
@@ -228,11 +236,13 @@ pub fn start(_progress: bool) {}
 pub fn finish(_summary: bool) {}
 #[cfg(not(unix))]
 pub(crate) fn flush() {}
+#[cfg(not(unix))]
+pub(crate) fn log_only(_line: &str) {}
 
 #[cfg(unix)]
 pub use unix::{finish, start};
 #[cfg(unix)]
-pub(crate) use unix::{flush, fault_fd};
+pub(crate) use unix::{flush, fault_fd, log_only};
 
 #[cfg(unix)]
 mod unix {
@@ -245,8 +255,8 @@ mod unix {
         fn dup(fd: i32) -> i32;
         fn dup2(a: i32, b: i32) -> i32;
         fn close(fd: i32) -> i32;
-        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
-        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        fn read(fd: i32, buf: *mut core::ffi::c_void, n: usize) -> isize;
+        fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
         fn atexit(f: extern "C" fn()) -> i32;
         fn pipe(fds: *mut i32) -> i32;
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
@@ -312,7 +322,7 @@ mod unix {
         use std::io::Write;
         let mut buf = [0u8; 16384];
         loop {
-            let n = unsafe { read(r.fd, buf.as_mut_ptr(), buf.len()) };
+            let n = unsafe { read(r.fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
                 let chunk = &buf[..n as usize];
                 if let Some(f) = r.file.as_mut() {
@@ -331,6 +341,25 @@ mod unix {
                 _ => return true,
             }
         }
+    }
+
+    /// A line for the session log alone (the terminal does not show it), after what the program
+    /// wrote before it. Nothing without a session log.
+    pub(crate) fn log_only(line: &str) {
+        use std::io::Write;
+        let mut g = READER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(r) = g.as_mut() else { return };
+        let ended = drain(r);
+        if let Some(f) = r.file.as_mut() {
+            // a failed transcript write drops this line from the file only
+            let _ = writeln!(f, "{line}");
+        }
+        if ended {
+            unsafe { close(r.fd) };
+            *g = None;
+        }
+        drop(g);
+        kick_forward();
     }
 
     /// Drain under READER; closes the read end at end of stream.
@@ -372,7 +401,7 @@ mod unix {
 
     fn out_all(fd: i32, mut b: &[u8]) {
         while !b.is_empty() {
-            let n = unsafe { write(fd, b.as_ptr(), b.len()) };
+            let n = unsafe { write(fd, b.as_ptr().cast(), b.len()) };
             if n <= 0 {
                 return;
             }
@@ -658,6 +687,11 @@ mod unix {
             if let Err(e) = std::fs::remove_file(&st.path) {
                 out_all(st.out, format!("makepad-run: session log kept at {}: {e}\n", st.path.display()).as_bytes());
             }
+        } else if KEEP_LOG.load(Ordering::Acquire) {
+            match crate::inspect::snapshot::keep_file(&st.path, "session") {
+                Ok(kept) => out_all(st.out, format!("makepad-run: session log kept at {} (an internal compiler error)\n", kept.display()).as_bytes()),
+                Err(e) => out_all(st.out, format!("makepad-run: session log kept at {} (an internal compiler error; not copied to the captures: {e})\n", st.path.display()).as_bytes()),
+            }
         } else {
             out_all(st.out, format!("makepad-run: session log kept at {}\n", st.path.display()).as_bytes());
         }
@@ -676,4 +710,29 @@ mod unix {
         let line = format!("{} {} ready in {}{}\n", style("1;32", "\u{2713}"), style("1;36", &pkg), secs(ms), style("2", &cache));
         out_all(st.out, line.as_bytes());
     }
+
+    /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+    pub(crate) unsafe fn reset_statics() {
+        use relax_session::reset_static as reset;
+        reset(&READY_LINE, AtomicBool::new(false));
+        // (the clock starts over with the next run)
+        if let Some(st) = STATE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            st.last_draw_ms = 0.0;
+        }
+    }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    #[cfg(unix)]
+    unix::reset_statics();
+    reset(&LOAD_DONE, AtomicU32::new(0));
+    reset(&LOAD_TOTAL, AtomicU32::new(0));
+    // (the bar is the process's, `start` ran once: the next run's load fills it again)
+    let shown = ACTIVE.load(Ordering::Relaxed);
+    reset(&PHASE, AtomicU8::new(shown as u8));
+    reset(&ACTIVE, AtomicBool::new(shown));
+    reset(&SLOW, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&LOADING, relax_session::sync::Mutex::new((String::new(), 0.0)));
 }

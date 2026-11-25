@@ -176,7 +176,7 @@ pub(crate) fn patched_row(u: &Unit, id: u32, before: &(String, Option<CodeKind>)
     use crate::jit::tier;
     let now = installed_json(u, id);
     let mut s = format!("\"replaced\":{},\"now\":{}", before.0, now);
-    let o3 = |t: u8| t == tier::O3 || t == tier::GUARDED || t == tier::INSTRUMENTED_O3;
+    let o3 = |t: u8| t == tier::O3 || t == tier::INSTRUMENTED_O3;
     if let (Ok(true), Some(k)) = (r, before.1) {
         let new = kind_at(u, u.fns[id as usize].code);
         if (o3(k.tier) && !o3(new.tier)) || (k.tier == tier::O2 && !o3(new.tier) && new.tier != tier::O2) {
@@ -994,7 +994,7 @@ pub fn cmd_tier(req: &Req, out: &mut Out) {
                             return false;
                         }
                         let k = kind_at(u, f.code);
-                        fresh || !(k.tier == crate::jit::tier::O3 || k.tier == crate::jit::tier::GUARDED)
+                        fresh || !(k.tier == crate::jit::tier::O3)
                     })
                     .collect();
                 for &id in &ids {
@@ -1019,7 +1019,7 @@ pub fn cmd_tier(req: &Req, out: &mut Out) {
         let upv = up as usize;
         let spawned = {
             let _k = crate::zone_alloc::kept();
-            std::thread::Builder::new().name("run-inspect-tier".into()).spawn(move || {
+            crate::run_threads::spawn("run-inspect-tier", move || {
                 super::heap::exclude_this_thread();
                 let up = upv as *mut Unit;
                 let mut rows = Vec::new();
@@ -1149,4 +1149,10 @@ pub fn cmd_cache(_req: &Req, out: &mut Out) {
         }
         None => out.err(&format!("the owner did not answer in 10 s ({})", crate::owner::serving_note())),
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&PINS, relax_session::sync::Mutex::new(Vec::new()));
 }

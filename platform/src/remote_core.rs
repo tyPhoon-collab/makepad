@@ -89,6 +89,8 @@ pub fn note_injected_input() {
 
 /// The fields the endpoint adds to the end line of every answer: the user sequence as the answer
 /// leaves and as the request started, so a driver can tell that the person used the app during it.
+/// The app's own endpoint only: under the JIT its host owns the endpoint and its end fields.
+#[cfg(not(relax))]
 pub fn end_fields(out: &mut String) {
     use std::fmt::Write as _;
     let _ = write!(out, ",\"user_seq\":{},\"user_seq_start\":{}", super::activity::user_seq_now(), REQUEST_START_USER_SEQ.get());
@@ -152,11 +154,15 @@ pub struct WinInfo {
     pub w: f64,
     pub h: f64,
     pub dpi: f64,
+    /// the scale the window's main pass last rasterised at (0 before its first frame): a pass
+    /// at another scale than `dpi` draws stretched and takes input offset
+    pub pass_dpi: f64,
     pub x: f64,
     pub y: f64,
 }
 
 pub struct GrabSink {
+    pub id: u64,
     pub window: Option<usize>,
     pub requested_at: Instant,
     pub scale: f64,
@@ -166,8 +172,36 @@ pub struct GrabSink {
     pub tx: SyncSender<Result<Grabbed, String>>,
 }
 
+/// A grab's frame: its number (`Cx::repaint_id`, counting drawn frames) and how many live patches
+/// (`std::relax::patched`) the app had applied when it drew it. A grab after a patch shows the
+/// patch's frame or a later one: the grab's command is served after the app took in every patch
+/// installed before it (`Cx::poll_live_patch`), and its snapshot is a frame drawn after that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Drawn {
+    pub frame: u64,
+    pub patch: u64,
+}
+
+/// The armed grabs whose snapshot a frame build took, until they are delivered.
+static GRAB_DRAWN: Mutex<Vec<(u64, Drawn)>> = Mutex::new(Vec::new());
+
+/// The frame build put a snapshot of `ids` in frame `frame` (the UI thread).
+pub fn grabs_drawn(ids: &[u64], drawn: Drawn) {
+    let mut d = GRAB_DRAWN.lock().unwrap_or_else(|e| e.into_inner());
+    d.extend(ids.iter().filter(|id| is_grab_id(**id)).map(|id| (*id, drawn)));
+}
+
+/// The frame grab `id`'s snapshot was taken in (taken out: the grab is being delivered).
+pub fn take_grab_drawn(id: u64) -> Option<Drawn> {
+    let mut d = GRAB_DRAWN.lock().unwrap_or_else(|e| e.into_inner());
+    let i = d.iter().position(|x| x.0 == id)?;
+    Some(d.swap_remove(i).1)
+}
+
 impl Drop for GrabSink {
     fn drop(&mut self) {
+        // a grab that failed or was cancelled after its frame was drawn
+        take_grab_drawn(self.id);
         PENDING_GRABS.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -224,6 +258,7 @@ pub fn start_encoder() -> Result<(), String> {
                     capture_ms: job.capture_ms,
                     encode_ms: started.elapsed().as_secs_f64() * 1000.0,
                     backend_png: job.backend_png,
+                    drawn: take_grab_drawn(job.sink.id),
                     _bytes: job.bytes.take(),
                 });
                 let _ = job.sink.tx.try_send(result);
@@ -280,10 +315,8 @@ pub fn submit_encode(mut job: EncodeJob, raw: bool) {
     // loses nothing, since the encoder would have scaled down anyway.
     let len = loop {
         let len = job.pixels.len();
-        // Keep fetch_update for older stable toolchains without try_update.
-        #[allow(deprecated)]
         let fits = GRAB_BYTES
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(len)
                     .filter(|total| *total <= MAX_GRAB_BYTES)
             })
@@ -318,7 +351,44 @@ pub fn submit_encode(mut job: EncodeJob, raw: bool) {
 pub struct QueuedCmd {
     pub cmd: Cmd,
     pub user_seq: Option<u64>,
-    pub deadline: Instant,
+    pub deadline: CommandDeadline,
+}
+
+/// Native commands expire at their deadline. A JIT command stays live while its requester
+/// waits through compilation, then expires when that wait ends (including on unwind).
+#[derive(Clone)]
+pub struct CommandDeadline {
+    at: Instant,
+    #[cfg(relax)]
+    pending: Option<Arc<AtomicBool>>,
+}
+
+impl CommandDeadline {
+    fn at(at: Instant) -> Self {
+        Self {
+            at,
+            #[cfg(relax)]
+            pending: None,
+        }
+    }
+
+    pub fn expired(&self) -> bool {
+        #[cfg(relax)]
+        if let Some(pending) = &self.pending {
+            return !pending.load(Ordering::Relaxed);
+        }
+        Instant::now() >= self.at
+    }
+}
+
+#[cfg(relax)]
+struct PendingReply(Arc<AtomicBool>);
+
+#[cfg(relax)]
+impl Drop for PendingReply {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
 }
 
 pub enum Cmd {
@@ -339,8 +409,6 @@ pub enum Cmd {
         tx: Sender<Reply>,
     },
     CancelGrabs(Vec<u64>),
-    /// The task pool's one-line summary (workers, jobs, queue waits).
-    PoolSummary(Sender<Reply>),
     /// Run `frames` frames of the virtual clock at `fps`; answered after
     /// the last is presented (and captured, while a capture runs).
     Step {
@@ -398,6 +466,9 @@ pub enum Cmd {
         tx: Sender<Reply>,
     },
     Quit(Sender<Reply>),
+    /// The run ends either way (a hub stopping its lease's run): the app's exit, whatever the person
+    /// is doing to it. Refused, the hub ended it on the spot, without its exit write.
+    QuitForced(Sender<Reply>),
     /// The hot-patchable constant tables of the compiled shaders (one
     /// shader, or all that have entries).
     ShaderConsts {
@@ -410,6 +481,12 @@ pub enum Cmd {
         shader: usize,
         index: usize,
         value: Option<f32>,
+        tx: Sender<Reply>,
+    },
+    /// `Cx::gpu_inventory()`: GPU + CPU-retained graphics memory across
+    /// textures (including free pool slots), draw-list instances, and geometries.
+    GpuInventory {
+        n: usize,
         tx: Sender<Reply>,
     },
 }
@@ -712,24 +789,27 @@ pub fn err(msg: &str) -> Answer {
 /// (`cap pause`, `tweak apply`); `design <op>` takes the designer op as its second word.
 /// `grab`, `gseq`, `gq` and `tweak grab` are client side: they open the `frames` service.
 pub const COMMANDS: &[Command] = &[
-    Command { words: "status", args: "[w=ID]", answers: "{\"app\",\"pid\",\"w\":[{\"i\":id,\"t\":title,\"sz\":[w,h],\"px\":[w,h],\"dpi\",\"pos\":[x,y]}],\"activity\"}", service: "ui", risk: CmdRisk::Read, params: "\"w\":{\"type\":\"integer\",\"description\":\"window id (status lists them)\"}", required: &[], positional: &[] },
+    Command { words: "status", args: "[w=ID]", answers: "{\"app\",\"pid\",\"w\":[{\"i\":id,\"t\":title,\"sz\":[w,h],\"px\":[w,h],\"dpi\",\"pass_dpi\",\"pos\":[x,y]}],\"activity\"}", service: "ui", risk: CmdRisk::Read, params: "\"w\":{\"type\":\"integer\",\"description\":\"window id (status lists them)\"}", required: &[], positional: &[] },
     Command { words: "gamepads", args: "", answers: "connected controllers and their current input states", service: "ui", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
     Command { words: "activity", args: "", answers: "native user activity: user_active, user_seq, idle_ms, quiet_ms, held, last_input, window (also in status)", service: "ui", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
-    Command { words: "grab", args: "[w=ID] [scale=1] [out=FILE]", answers: "client side (frames service): the window as a PNG file; prints {\"png\":path,\"w\",\"sz\",\"capture_ms\",\"encode_ms\",\"capture_kind\"}", service: "ui", risk: CmdRisk::Read, params: "\"w\":{\"type\":\"integer\"},\"scale\":{\"type\":\"number\"},\"out\":{\"type\":\"string\"}", required: &[], positional: &[] },
-    Command { words: "gseq", args: "[n=8] [every_ms=50] [scale=1] [w=ID] [out=DIR]", answers: "client side (frames service): n frames, a separate present per deadline; n=1..64, every_ms>=8, span<=60s", service: "ui", risk: CmdRisk::Read, params: "\"n\":{\"type\":\"integer\"},\"every_ms\":{\"type\":\"integer\"},\"scale\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"},\"out\":{\"type\":\"string\"}", required: &[], positional: &[] },
-    Command { words: "rec", args: "[out=DIR] [seconds=5] [fps=30] [codec=png|raw] [w=ID]", answers: "client side (frames cap=1): capture by streaming -- every presented frame is read back on the device and written here as frame_<slot>.png; prints {\"dir\",\"frames\",\"missing\",\"slots\",\"sz\"}; no video encoder on the device", service: "ui", risk: CmdRisk::Read, params: "\"seconds\":{\"type\":\"number\"},\"fps\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"},\"out\":{\"type\":\"string\"}", required: &[], positional: &[] },
-    Command { words: "gq", args: "[scale=1] [w=ID]", answers: "client side: FINISH HERE: grab every window, then quit. {\"png\":[paths],\"quit\":1}", service: "ui", risk: CmdRisk::Destructive, params: "\"scale\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"}", required: &[], positional: &[] },
-    Command { words: "mouse", args: "k=move|down|up|click|scroll|pinch|touch x= y= [b=0] [dx= dy=] [scale= phase=begin|update|end] [scroll phase=touched|began|changed|ended|momentum|momentum_ended: a touchpad scroll] [touch phase=start|move|stop|cancel id=N: one finger] [time=] [hw=1] [native=1: AppKit primary click] [shift=1 ctrl=1 alt=1 cmd=1] [w=ID] [wait=1]", answers: "inject a mouse event through the real event path", service: "ui", risk: CmdRisk::Act, params: "\"k\":{\"type\":\"string\",\"enum\":[\"move\",\"down\",\"up\",\"click\",\"scroll\",\"pinch\",\"touch\"]},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"b\":{\"type\":\"integer\"},\"dx\":{\"type\":\"number\"},\"dy\":{\"type\":\"number\"},\"scale\":{\"type\":\"number\"},\"phase\":{\"type\":\"string\",\"enum\":[\"begin\",\"update\",\"end\",\"touched\",\"began\",\"changed\",\"ended\",\"momentum\",\"momentum_ended\",\"start\",\"move\",\"stop\",\"cancel\"]},\"id\":{\"type\":\"integer\"},\"time\":{\"type\":\"number\"},\"hw\":{\"type\":\"boolean\"},\"native\":{\"type\":\"boolean\"},\"shift\":{\"type\":\"boolean\"},\"ctrl\":{\"type\":\"boolean\"},\"alt\":{\"type\":\"boolean\"},\"logo\":{\"type\":\"boolean\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"}", required: &["k"], positional: &[] },
-    Command { words: "click", args: "x= y= [b=0] [w=ID] [wait=1]", answers: "mouse k=click", service: "ui", risk: CmdRisk::Act, params: "\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"b\":{\"type\":\"integer\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"}", required: &["x", "y"], positional: &[] },
-    Command { words: "key", args: "t=TEXT | c=KeyA [k=down|up|press] [shift=1 ...] [w=ID] [wait=1]", answers: "type text or press a key (Escape ReturnKey Tab Backspace ArrowLeft F1 Key1 ..)", service: "ui", risk: CmdRisk::Act, params: "\"t\":{\"type\":\"string\",\"description\":\"text to type\"},\"c\":{\"type\":\"string\",\"description\":\"a key code: Escape ReturnKey Tab Backspace ArrowLeft F1 KeyA Key1 ..\"},\"k\":{\"type\":\"string\",\"enum\":[\"down\",\"up\",\"press\"]},\"shift\":{\"type\":\"boolean\"},\"ctrl\":{\"type\":\"boolean\"},\"alt\":{\"type\":\"boolean\"},\"logo\":{\"type\":\"boolean\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"}", required: &[], positional: &[] },
-    Command { words: "text", args: "t=TEXT [w=ID] [wait=1]", answers: "type text", service: "ui", risk: CmdRisk::Act, params: "\"t\":{\"type\":\"string\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"}", required: &["t"], positional: &[] },
-    Command { words: "drop", args: "path=ABS x= y= [w=ID] [wait=1]", answers: "drop one absolute file path through Drag/Drop/DragEnd", service: "ui", risk: CmdRisk::Act, params: "\"path\":{\"type\":\"string\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"}", required: &["path"], positional: &[] },
-    Command { words: "window", args: "k=maximize | k=resize width= height= | k=dragquery x= y= [w=ID] [wait=1]", answers: "window operations (the maximise/occlusion proof, the caption hit test)", service: "ui", risk: CmdRisk::Act, params: "\"k\":{\"type\":\"string\",\"enum\":[\"maximize\",\"resize\",\"dragquery\"]},\"width\":{\"type\":\"number\"},\"height\":{\"type\":\"number\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"}", required: &["k"], positional: &[] },
-    Command { words: "log", args: "[n=50] [since=N]", answers: "{\"n\":lastseq,\"pool\",\"l\":[lines]}", service: "logs", risk: CmdRisk::Read, params: "\"n\":{\"type\":\"integer\"},\"since\":{\"type\":\"integer\"}", required: &[], positional: &[] },
+    Command { words: "grab", args: "[w=ID] [scale=1] [out=FILE]", answers: "client side (frames service): the window as a PNG file; prints {\"png\":path,\"w\",\"sz\",\"capture_ms\",\"encode_ms\",\"capture_kind\"}", service: "ui", risk: CmdRisk::Read, params: makepad_remote::params::GRAB, required: &[], positional: &[] },
+    Command { words: "gseq", args: "[n=8] [every_ms=50] [scale=1] [w=ID] [out=DIR]", answers: "client side (frames service): n frames, a separate present per deadline; n=1..64, every_ms>=8, span<=60s", service: "ui", risk: CmdRisk::Read, params: makepad_remote::params::GSEQ, required: &[], positional: &[] },
+    Command { words: "rec", args: "[out=DIR] [seconds=5] [fps=30] [codec=png|raw] [w=ID]", answers: "client side (frames cap=1): capture by streaming -- every presented frame is read back on the device and written here as frame_<slot>.png; prints {\"dir\",\"frames\",\"missing\",\"slots\",\"sz\"}; no video encoder on the device", service: "ui", risk: CmdRisk::Read, params: makepad_remote::params::REC, required: &[], positional: &[] },
+    Command { words: "gq", args: "[scale=1] [w=ID]", answers: "client side: FINISH HERE: grab every window, then quit. {\"png\":[paths],\"quit\":1}", service: "ui", risk: CmdRisk::Destructive, params: makepad_remote::params::GQ, required: &[], positional: &[] },
+    Command { words: "mouse", args: "k=move|down|up|click|scroll|pinch|touch x= y= [b=0] [dx= dy=] [scale= phase=begin|update|end] [scroll phase=touched|began|changed|ended|momentum|momentum_ended: a touchpad scroll] [touch phase=start|move|stop|cancel id=N: one finger] [time=] [hw=1] [native=1: AppKit primary click] [shift=1 ctrl=1 alt=1 logo=1] [w=ID] [wait=1]", answers: "inject a mouse event through the real event path", service: "ui", risk: CmdRisk::Act, params: "\"k\":{\"type\":\"string\",\"enum\":[\"move\",\"down\",\"up\",\"click\",\"scroll\",\"pinch\",\"touch\"]},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"b\":{\"type\":\"integer\"},\"dx\":{\"type\":\"number\"},\"dy\":{\"type\":\"number\"},\"scale\":{\"type\":\"number\"},\"phase\":{\"type\":\"string\",\"enum\":[\"begin\",\"update\",\"end\",\"touched\",\"began\",\"changed\",\"ended\",\"momentum\",\"momentum_ended\",\"start\",\"move\",\"stop\",\"cancel\"]},\"id\":{\"type\":\"integer\"},\"time\":{\"type\":\"number\"},\"hw\":{\"type\":\"boolean\"},\"native\":{\"type\":\"boolean\"},\"shift\":{\"type\":\"boolean\"},\"ctrl\":{\"type\":\"boolean\"},\"alt\":{\"type\":\"boolean\"},\"logo\":{\"type\":\"boolean\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"x1\":{\"type\":\"number\"},\"y1\":{\"type\":\"number\"},\"steps\":{\"type\":\"integer\"},\"back\":{\"type\":\"boolean\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["k"], positional: &[] },
+    Command { words: "click", args: "x= y= [b=0] [w=ID] [wait=1]", answers: "mouse k=click", service: "ui", risk: CmdRisk::Act, params: "\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"b\":{\"type\":\"integer\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"shift\":{\"type\":\"boolean\"},\"ctrl\":{\"type\":\"boolean\"},\"alt\":{\"type\":\"boolean\"},\"logo\":{\"type\":\"boolean\"},\"hw\":{\"type\":\"boolean\"},\"native\":{\"type\":\"boolean\"},\"time\":{\"type\":\"number\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["x", "y"], positional: &[] },
+    Command { words: "move", args: "x= y= [hw=1] [w=ID] [wait=1]", answers: "mouse k=move", service: "ui", risk: CmdRisk::Act, params: "\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"shift\":{\"type\":\"boolean\"},\"ctrl\":{\"type\":\"boolean\"},\"alt\":{\"type\":\"boolean\"},\"logo\":{\"type\":\"boolean\"},\"hw\":{\"type\":\"boolean\"},\"time\":{\"type\":\"number\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["x", "y"], positional: &[] },
+    Command { words: "key", args: "t=TEXT | c=KeyA [k=down|up|press] [shift=1 ...] [w=ID] [wait=1]", answers: "type text or press a key (Escape ReturnKey Tab Backspace ArrowLeft F1 Key1 ..)", service: "ui", risk: CmdRisk::Act, params: "\"t\":{\"type\":\"string\",\"description\":\"text to type\"},\"c\":{\"type\":\"string\",\"description\":\"a key code: Escape ReturnKey Tab Backspace ArrowLeft F1 KeyA Key1 ..\"},\"k\":{\"type\":\"string\",\"enum\":[\"down\",\"up\",\"press\"]},\"shift\":{\"type\":\"boolean\"},\"ctrl\":{\"type\":\"boolean\"},\"alt\":{\"type\":\"boolean\"},\"logo\":{\"type\":\"boolean\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &[], positional: &[] },
+    Command { words: "text", args: "t=TEXT [w=ID] [wait=1]", answers: "type text", service: "ui", risk: CmdRisk::Act, params: "\"t\":{\"type\":\"string\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["t"], positional: &[] },
+    Command { words: "drop", args: "path=ABS x= y= [w=ID] [wait=1]", answers: "drop one absolute file path through Drag/Drop/DragEnd", service: "ui", risk: CmdRisk::Act, params: "\"path\":{\"type\":\"string\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["path"], positional: &[] },
+    Command { words: "window", args: "k=maximize | k=resize width= height= | k=dragquery x= y= [w=ID] [wait=1]", answers: "window operations (the maximise/occlusion proof, the caption hit test)", service: "ui", risk: CmdRisk::Act, params: "\"k\":{\"type\":\"string\",\"enum\":[\"maximize\",\"resize\",\"dragquery\"]},\"width\":{\"type\":\"number\"},\"height\":{\"type\":\"number\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["k"], positional: &[] },
+    Command { words: "cpu", args: "", answers: "shared CPU budget and app pool summary", service: "platform", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
+    Command { words: "log", args: "[n=50] [since=N]", answers: "{\"n\":lastseq,\"l\":[lines]}", service: "logs", risk: CmdRisk::Read, params: "\"n\":{\"type\":\"integer\"},\"since\":{\"type\":\"integer\"}", required: &[], positional: &[] },
     Command { words: "net", args: "", answers: "the app's HTTP requests and network event queue, answered off the UI thread: a verdict per runtime first (STUCK: an answer waits unread in the app's queue, with when the app last read it / WAITING: in flight with nothing from the backend / OK), then per request: id, method and URL, the backend's answer and when, whether the app read it", service: "logs", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
-    Command { words: "midi", args: "a= b= c= [p=PORT] | k=ports n=NAME[,NAME] | k=out | k=reset", answers: "inject a MIDI message as if a device sent it; declare ports; read back what the app sent", service: "ui", risk: CmdRisk::Act, params: "\"a\":{\"type\":\"integer\"},\"b\":{\"type\":\"integer\"},\"c\":{\"type\":\"integer\"},\"p\":{\"type\":\"string\"},\"k\":{\"type\":\"string\",\"enum\":[\"ports\",\"out\",\"reset\"]},\"n\":{\"type\":\"string\"}", required: &[], positional: &[] },
+    Command { words: "loop", args: "", answers: "what the UI thread's event loop waits for, answered off the UI thread: one verdict line (STUCK: a frame asked for and never granted, or a raised signal the loop slept through / WAITING: the GPU / OK) with the pump, frame-request, GPU and signal ages", service: "logs", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
+    Command { words: "midi", args: "a= b= c= [p=PORT] | k=ports n=NAME[,NAME] | k=out | k=reset", answers: "inject a MIDI message as if a device sent it; declare ports; read back what the app sent", service: "ui", risk: CmdRisk::Act, params: "\"a\":{\"type\":\"integer\"},\"b\":{\"type\":\"integer\"},\"c\":{\"type\":\"integer\"},\"p\":{\"type\":\"string\"},\"k\":{\"type\":\"string\",\"enum\":[\"ports\",\"out\",\"reset\"]},\"n\":{\"type\":\"string\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &[], positional: &[] },
     Command { words: "trace", args: "[topics=a,b] [off=1]", answers: "get / set the trace topics", service: "logs", risk: CmdRisk::Act, params: "\"topics\":{\"type\":\"string\"},\"off\":{\"type\":\"boolean\"}", required: &[], positional: &[] },
-    Command { words: "step", args: "[frames=1] [fps=60] [wait_loads=1] [w=ID]", answers: "--virtual-clock only: run frames of 1/fps; answers {\"frame\",\"time\"} after the last", service: "ui", risk: CmdRisk::Act, params: "\"frames\":{\"type\":\"integer\"},\"fps\":{\"type\":\"number\"},\"wait_loads\":{\"type\":\"boolean\"},\"w\":{\"type\":\"integer\"}", required: &[], positional: &[] },
+    Command { words: "step", args: "[frames=1] [fps=60] [wait_loads=1] [w=ID]", answers: "--virtual-clock only: run frames of 1/fps; answers {\"frame\",\"time\"} after the last", service: "ui", risk: CmdRisk::Act, params: "\"frames\":{\"type\":\"integer\"},\"fps\":{\"type\":\"number\"},\"wait_loads\":{\"type\":\"boolean\"},\"w\":{\"type\":\"integer\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &[], positional: &[] },
     Command { words: "settled", args: "", answers: "{\"settled\":bool,\"reasons\":[next_frame|redraw|repaint|timer|step|shaders|loads],\"loads\":{kind:n}}", service: "ui", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
     Command { words: "uicounts", args: "", answers: "{\"ins\":n,\"cyc\":n,\"cpu_ns\":n} of the UI thread so far (ins/cyc: thread_counters, user mode: macOS thread_selfcounts, Linux perf_event; else 0)", service: "ui", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
     Command { words: "cap start", args: "path=ABS.mp4 [fps=60] [audio=1] [overwrite=1] [w=ID]", answers: "record the window in process (native pixels, H.264)", service: "ui", risk: CmdRisk::Act, params: "\"path\":{\"type\":\"string\"},\"fps\":{\"type\":\"number\"},\"audio\":{\"type\":\"boolean\"},\"overwrite\":{\"type\":\"boolean\"},\"w\":{\"type\":\"integer\"}", required: &["path"], positional: &[] },
@@ -741,23 +821,24 @@ pub const COMMANDS: &[Command] = &[
     Command { words: "cap pause", args: "", answers: "stop writing without stopping the clock", service: "ui", risk: CmdRisk::Act, params: "", required: &[], positional: &[] },
     Command { words: "cap resume", args: "", answers: "restart writing", service: "ui", risk: CmdRisk::Act, params: "", required: &[], positional: &[] },
     Command { words: "cursor", args: "[show=1|0] [style=arrow|hand|text|crosshair|app] [x= y=] [w=ID]", answers: "a pointer drawn into the frame, moved by injected mouse input", service: "ui", risk: CmdRisk::Act, params: "\"show\":{\"type\":\"boolean\"},\"style\":{\"type\":\"string\",\"enum\":[\"arrow\",\"hand\",\"text\",\"crosshair\",\"app\"]},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"}", required: &[], positional: &[] },
-    Command { words: "close", args: "[w=ID] [ask=1]", answers: "close one window the normal way; ask=1 asks the app first like the window's close button (it may keep or hide the window)", service: "ui", risk: CmdRisk::Destructive, params: "\"w\":{\"type\":\"integer\"},\"ask\":{\"type\":\"integer\"}", required: &[], positional: &[] },
-    Command { words: "resize", args: "w= h= [window=ID]", answers: "give the window a new inner size in layout points; answers after the frame that shows it", service: "ui", risk: CmdRisk::Act, params: "\"w\":{\"type\":\"number\"},\"h\":{\"type\":\"number\"},\"window\":{\"type\":\"integer\"}", required: &["w", "h"], positional: &[] },
+    Command { words: "close", args: "[w=ID] [ask=1]", answers: "close one window the normal way; ask=1 asks the app first like the window's close button (it may keep or hide the window)", service: "ui", risk: CmdRisk::Destructive, params: "\"w\":{\"type\":\"integer\"},\"ask\":{\"type\":\"integer\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &[], positional: &[] },
+    Command { words: "resize", args: "w= h= [window=ID]", answers: "give the window a new inner size in layout points; answers after the frame that shows it", service: "ui", risk: CmdRisk::Act, params: "\"w\":{\"type\":\"number\"},\"h\":{\"type\":\"number\"},\"window\":{\"type\":\"integer\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["w", "h"], positional: &[] },
     Command { words: "handsoff", args: "[on=1|0]", answers: "the red hands-off frame round the window", service: "ui", risk: CmdRisk::Act, params: "\"on\":{\"type\":\"boolean\"}", required: &[], positional: &[] },
-    Command { words: "ai", args: "[on=1|0] | say=TEXT", answers: "the AI chat overlay: toggle or type a line", service: "ui", risk: CmdRisk::Act, params: "\"on\":{\"type\":\"boolean\"},\"say\":{\"type\":\"string\"}", required: &[], positional: &[] },
+    Command { words: "ai", args: "[on=1|0] | say=TEXT", answers: "the AI chat overlay: toggle or type a line", service: "ui", risk: CmdRisk::Act, params: "\"on\":{\"type\":\"boolean\"},\"say\":{\"type\":\"string\"},\"confirm\":{\"type\":\"string\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &[], positional: &[] },
     Command { words: "ai transcript", args: "", answers: "the conversation", service: "ui", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
-    Command { words: "tweak", args: "[on=1|0]", answers: "the TWEAKER design-feedback overlay", service: "edit", risk: CmdRisk::Act, params: "\"on\":{\"type\":\"boolean\"}", required: &[], positional: &[] },
-    Command { words: "tweak state", args: "", answers: "selection, editable properties, diff log, annotations, asks waiting on the source", service: "edit", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
-    Command { words: "tweak apply", args: "path=a.b.c splash={padding: 20} | prop= value=", answers: "live-apply and relayout", service: "edit", risk: CmdRisk::Act, params: "\"path\":{\"type\":\"string\"},\"splash\":{\"type\":\"string\"},\"prop\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}", required: &[], positional: &[] },
-    Command { words: "tweak diff", args: "", answers: "the raw edit log", service: "edit", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
-    Command { words: "tweak clear", args: "", answers: "reset the edit log", service: "edit", risk: CmdRisk::Act, params: "", required: &[], positional: &[] },
-    Command { words: "tweak final", args: "", answers: "coalesced end state per widget; with \"drew\":1 the client adds \"png\" (the composited window)", service: "edit", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
+    Command { words: "tweak", args: "[on=1|0]", answers: "the TWEAKER design-feedback overlay", service: "edit", risk: CmdRisk::Act, params: makepad_remote::params::TWEAK_TOGGLE, required: &[], positional: &[] },
+    Command { words: "tweak state", args: "", answers: "selection, editable properties, diff log, annotations, asks waiting on the source", service: "edit", risk: CmdRisk::Read, params: makepad_remote::params::TWEAK_STATE, required: &[], positional: &[] },
+    Command { words: "tweak apply", args: "path=a.b.c splash={padding: 20} | prop= value=", answers: "live-apply and relayout", service: "edit", risk: CmdRisk::Act, params: makepad_remote::params::TWEAK_APPLY, required: &[], positional: &[] },
+    Command { words: "tweak diff", args: "", answers: "the raw edit log", service: "edit", risk: CmdRisk::Read, params: makepad_remote::params::TWEAK_DIFF, required: &[], positional: &[] },
+    Command { words: "tweak clear", args: "", answers: "reset the edit log", service: "edit", risk: CmdRisk::Act, params: makepad_remote::params::TWEAK_CLEAR, required: &[], positional: &[] },
+    Command { words: "tweak final", args: "", answers: "coalesced end state per widget; with \"drew\":1 the client adds \"png\" (the composited window)", service: "edit", risk: CmdRisk::Read, params: makepad_remote::params::TWEAK_FINAL, required: &[], positional: &[] },
     Command { words: "tweak op", args: "op=NAME ...", answers: "a tweaker op that has no named command", service: "edit", risk: CmdRisk::Act, params: "\"op\":{\"type\":\"string\"}", required: &["op"], positional: &[] },
-    Command { words: "tweak grab", args: "[w=ID] [scale=1] [out=FILE]", answers: "client side: grab with the overlay composited", service: "edit", risk: CmdRisk::Read, params: "\"w\":{\"type\":\"integer\"},\"scale\":{\"type\":\"number\"},\"out\":{\"type\":\"string\"}", required: &[], positional: &[] },
+    Command { words: "tweak grab", args: "[w=ID] [scale=1] [out=FILE]", answers: "client side: grab with the overlay composited", service: "edit", risk: CmdRisk::Read, params: makepad_remote::params::GRAB, required: &[], positional: &[] },
     Command { words: "design", args: "<op> ...", answers: "structural edits to the Splash source under design (open state palette insert move delete duplicate wrap up down out rename set bake undo redo reset patch commit verify close)", service: "edit", risk: CmdRisk::Act, params: "\"op\":{\"type\":\"string\",\"enum\":[\"open\",\"state\",\"palette\",\"insert\",\"move\",\"delete\",\"duplicate\",\"wrap\",\"up\",\"down\",\"out\",\"rename\",\"set\",\"bake\",\"undo\",\"redo\",\"reset\",\"patch\",\"commit\",\"verify\",\"close\"]},\"path\":{\"type\":\"string\"}", required: &["op"], positional: &["op"] },
     Command { words: "shader consts", args: "[shader=ID]", answers: "the compiled shaders' hot-patchable constants", service: "edit", risk: CmdRisk::Read, params: "\"shader\":{\"type\":\"integer\"}", required: &[], positional: &[] },
-    Command { words: "shader const", args: "shader=ID i=N v=VALUE | reset=1", answers: "patch one constant on the GPU (no recompile)", service: "edit", risk: CmdRisk::Act, params: "\"shader\":{\"type\":\"integer\"},\"i\":{\"type\":\"integer\"},\"v\":{\"type\":\"number\"},\"reset\":{\"type\":\"boolean\"}", required: &[], positional: &[] },
-    Command { words: "quit", args: "", answers: "shut the app down gracefully (no final grab)", service: "ui", risk: CmdRisk::Destructive, params: "", required: &[], positional: &[] },
+    Command { words: "shader const", args: "shader=ID i=N v=VALUE | reset=1", answers: "patch one constant on the GPU (no recompile)", service: "edit", risk: CmdRisk::Act, params: "\"shader\":{\"type\":\"integer\"},\"i\":{\"type\":\"integer\"},\"v\":{\"type\":\"number\"},\"reset\":{\"type\":\"boolean\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &[], positional: &[] },
+    Command { words: "gpu_inventory", args: "[n=15]", answers: "Cx GPU and CPU-retained graphics memory (textures, free pool slots, draw-list instances, geometries)", service: "inspect", risk: CmdRisk::Read, params: "\"n\":{\"type\":\"integer\"}", required: &[], positional: &[] },
+    Command { words: "quit", args: "[force=1]", answers: "shut the app down gracefully (no final grab); force=1: even while the person is using it", service: "ui", risk: CmdRisk::Destructive, params: "\"force\":{\"type\":\"integer\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &[], positional: &[] },
 ];
 
 /// The commands the client side answers by opening the `frames` service.
@@ -794,7 +875,17 @@ pub fn resolve(words: &[String]) -> Result<Resolved, String> {
     }
     match COMMANDS.iter().find(|c| c.words == first) {
         Some(c) => Ok(Resolved { key: c.words, sub: None, used: 1 }),
-        None => Err(format!("unknown command `{first}` (try `help`)")),
+        None => {
+            let mut names = Vec::new();
+            for command in COMMANDS {
+                if let Some(name) = command.words.split_whitespace().next() {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+            Err(format!("unknown command `{first}`: the commands are {} (`help` describes each)", names.join(", ")))
+        }
     }
 }
 
@@ -890,7 +981,7 @@ pub fn route_status(p: &Params) -> Answer {
         }
         index += 1;
         out.push_str(&format!(
-            "{{\"i\":{},\"t\":{},\"sz\":[{},{}],\"px\":[{},{}],\"dpi\":{},\"pos\":[{},{}]}}",
+            "{{\"i\":{},\"t\":{},\"sz\":[{},{}],\"px\":[{},{}],\"dpi\":{},\"pass_dpi\":{},\"pos\":[{},{}]}}",
             window.id,
             json_str(&window.title),
             num(window.w),
@@ -898,6 +989,7 @@ pub fn route_status(p: &Params) -> Answer {
             num((window.w * window.dpi).round()),
             num((window.h * window.dpi).round()),
             num(window.dpi),
+            num(window.pass_dpi),
             num(window.x),
             num(window.y),
         ));
@@ -1258,6 +1350,7 @@ pub struct Grabbed {
     pub capture_ms: f64,
     pub encode_ms: f64,
     pub backend_png: bool,
+    pub drawn: Option<Drawn>,
     pub _bytes: Option<GrabBytes>,
 }
 
@@ -1282,7 +1375,7 @@ impl Drop for PendingGrabs {
             .push(QueuedCmd {
                 cmd: Cmd::CancelGrabs(self.ids.clone()),
                 user_seq: None,
-                deadline: Instant::now(),
+                deadline: CommandDeadline::at(Instant::now()),
             });
         wake();
     }
@@ -1307,10 +1400,8 @@ pub fn arm_grabs(
             .or_else(|| status_cell().lock().unwrap().windows.first().map(|w| w.id))
             .ok_or("no windows")?,
     );
-    // Keep fetch_update for older stable toolchains without try_update.
-    #[allow(deprecated)]
     PENDING_GRABS
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
             used.checked_add(n)
                 .filter(|total| *total <= MAX_PENDING_GRABS)
         })
@@ -1330,6 +1421,7 @@ pub fn arm_grabs(
             sinks.insert(
                 id,
                 GrabSink {
+                    id,
                     window,
                     requested_at: started + every * index as u32,
                     scale,
@@ -1360,9 +1452,12 @@ pub fn arm_grabs(
 }
 
 pub fn receive_grab(pending: &PendingGrabs, index: usize) -> Result<Grabbed, String> {
-    pending.replies[index]
-        .recv_timeout(pending.deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| "grab timeout (is this backend rendering?)".to_string())?
+    receive_reply(
+        &pending.replies[index],
+        pending.deadline.saturating_duration_since(Instant::now()),
+        Duration::from_secs(10),
+        "grab timeout (is this backend rendering?)",
+    )?
 }
 
 pub fn encode_grab(job: &EncodeJob) -> Result<(u32, u32, Vec<u8>), String> {
@@ -1512,8 +1607,9 @@ pub fn parse_frames_args(args: &str) -> Result<FramesArgs, String> {
 
 /// The header of one `frames` record (see `makepad_remote::frames`).
 pub fn frame_header(seq: u64, g: &Grabbed, raw: bool) -> String {
+    let drawn = g.drawn.map_or(String::new(), |d| format!(",\"frame\":{},\"patch\":{}", d.frame, d.patch));
     format!(
-        "{{\"seq\":{seq},\"w\":{},\"h\":{},\"window\":{},\"t_ns\":{},\"codec\":\"{}\",\"capture_ms\":{:.3},\"encode_ms\":{:.3},\"capture_kind\":{}}}",
+        "{{\"seq\":{seq},\"w\":{},\"h\":{},\"window\":{},\"t_ns\":{},\"codec\":\"{}\",\"capture_ms\":{:.3},\"encode_ms\":{:.3},\"capture_kind\":{}{drawn}}}",
         g.width,
         g.height,
         g.window_id,
@@ -1675,6 +1771,8 @@ fn box_down(w: u32, h: u32, rgba: &[u8], k: usize) -> (u32, u32, Vec<u8>) {
 }
 
 /// The `frames` service of the endpoint: each OPEN becomes a producer thread ([`run_frames`]).
+/// The app's own endpoint only: under the JIT the host serves it (remote.rs `host_frames_open`).
+#[cfg(not(relax))]
 pub fn frames_service() -> makepad_remote::endpoint::Factory {
     use makepad_remote::conn::{Event, SendError, CLOSE_REFUSED};
     Arc::new(|_conn, open| {
@@ -1711,20 +1809,61 @@ pub fn frames_service() -> makepad_remote::endpoint::Factory {
 /// wedged app from pinning the command thread forever.
 pub const ACTIVITY_WAIT_SECS: u64 = 600;
 
+/// Wait again on the same reply when compilation consumed its timeout. Only command/service
+/// threads do this; the UI thread merely checks the command's pending bit before applying it.
+fn receive_reply<T>(rx: &Receiver<T>, timeout: Duration, idle_timeout: Duration, message: &str) -> Result<T, String> {
+    #[cfg(not(relax))]
+    {
+        let _ = idle_timeout;
+        rx.recv_timeout(timeout).map_err(|_| message.to_string())
+    }
+    #[cfg(relax)]
+    {
+        use std::sync::mpsc::RecvTimeoutError;
+        let mut timeout = timeout;
+        let mut inspect = None;
+        let mut wait = makepad_remote::jit::Wait::default();
+        loop {
+            match rx.recv_timeout(timeout) {
+                Ok(reply) => return Ok(reply),
+                Err(RecvTimeoutError::Disconnected) => return Err(message.to_string()),
+                Err(RecvTimeoutError::Timeout) => {
+                    if inspect.is_none() {
+                        inspect = Some(makepad_remote::Client::connect(&std::process::id().to_string())
+                            .map_err(|err| format!("JIT state: {err}"))?);
+                    }
+                    if !wait.keep_waiting(inspect.as_ref().unwrap()).map_err(|err| format!("JIT state: {err}"))? {
+                        // A reply may have arrived while inspect sampled the JIT.
+                        return rx.try_recv().map_err(|_| message.to_string());
+                    }
+                    timeout = idle_timeout;
+                }
+            }
+        }
+    }
+}
+
 pub fn ask<F>(make: F, timeout_secs: u64) -> Reply
 where
     F: FnOnce(Sender<Reply>) -> Cmd,
 {
     let (tx, rx) = channel();
+    let timeout = Duration::from_secs(timeout_secs);
+    #[cfg(relax)]
+    let pending = PendingReply(Arc::new(AtomicBool::new(true)));
     queue().lock().unwrap().push(QueuedCmd {
         cmd: make(tx),
         user_seq: REQUEST_USER_SEQ.get(),
-        deadline: Instant::now() + Duration::from_secs(timeout_secs),
+        deadline: CommandDeadline {
+            at: Instant::now() + timeout,
+            #[cfg(relax)]
+            pending: Some(pending.0.clone()),
+        },
     });
     wake();
-    match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+    match receive_reply(&rx, timeout, timeout, "timeout (app busy or not running its event loop)") {
         Ok(reply) => reply,
-        Err(_) => Reply::Err("timeout (app busy or not running its event loop)".to_string()),
+        Err(message) => Reply::Err(message),
     }
 }
 
@@ -1900,6 +2039,7 @@ mod tests {
             ("activity", 1),
             ("mouse", 1),
             ("click", 1),
+            ("move", 1),
             ("key", 1),
             ("text", 1),
             ("drop", 1),
@@ -1930,9 +2070,12 @@ mod tests {
             ("tweak op", 2),
             ("shader consts", 2),
             ("shader const", 2),
+            ("gpu_inventory", 1),
             ("quit", 1),
             ("log", 1),
+            ("cpu", 1),
             ("net", 1),
+            ("loop", 1),
             ("midi", 1),
             ("cursor", 1),
         ];
@@ -1947,6 +2090,11 @@ mod tests {
             assert!(resolve(&words(removed)).unwrap_err().contains("unknown command"));
         }
         assert!(resolve(&words("nope")).unwrap_err().contains("unknown command"));
+        let unknown = resolve(&words("m")).unwrap_err();
+        assert!(unknown.starts_with("unknown command `m`: the commands are "), "{unknown}");
+        assert!(unknown.contains("mouse, click, move"), "{unknown}");
+        assert_eq!(unknown.matches("cap").count(), 1, "{unknown}");
+        assert!(unknown.ends_with("(`help` describes each)"), "{unknown}");
         // the table has no command the test above does not know of
         // design, and the four client-side ones
         assert_eq!(COMMANDS.len(), routes.len() + 1 + CLIENT_SIDE.len(), "COMMANDS and the route list disagree");

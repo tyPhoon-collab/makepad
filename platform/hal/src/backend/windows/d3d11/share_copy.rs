@@ -41,6 +41,12 @@ fn slots() -> &'static Mutex<HashMap<u64, Arc<Slot>>> {
     SLOTS.get_or_init(Default::default)
 }
 
+/// (`windows::end_run`) The shared slots the ended run opened.
+pub(crate) fn end_run() {
+    let slots = std::mem::take(&mut *lock(slots()));
+    drop(slots);
+}
+
 fn device1(dev: &Device) -> Result<ID3D11Device1, String> {
     unsafe { ID3D11Device1::query(dev.device.as_raw()) }.map_err(|e| hr("ID3D11Device1", e))
 }
@@ -106,9 +112,9 @@ fn read_lock() -> std::sync::MutexGuard<'static, ()> {
 /// A staging texture of `w` x `h`, kept for the next read of that size (a recorder reads every
 /// frame of one size; a new one per frame cost a stall at the start of a capture).
 fn staging(dev: &Device, w: u32, h: u32) -> Result<ID3D11Texture2D, String> {
-    static CACHE: OnceLock<Mutex<Vec<([u32; 2], ID3D11Texture2D)>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<Vec<([u32; 2], ID3D11Texture2D, crate::ledger::Charge)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    if let Some((_, t)) = lock(cache).iter().find(|(size, _)| *size == [w, h]) {
+    if let Some((_, t, _)) = lock(cache).iter().find(|(size, ..)| *size == [w, h]) {
         return Ok(t.clone());
     }
     let t = make_staging(dev, w, h)?;
@@ -116,7 +122,7 @@ fn staging(dev: &Device, w: u32, h: u32) -> Result<ID3D11Texture2D, String> {
     if c.len() >= 4 {
         c.remove(0);
     }
-    c.push(([w, h], t.clone()));
+    c.push(([w, h], t.clone(), dev.pools.charge(crate::ledger::Pool::Capture, w as u64 * h as u64 * 4)));
     Ok(t)
 }
 

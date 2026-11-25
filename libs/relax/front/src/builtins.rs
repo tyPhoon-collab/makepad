@@ -83,7 +83,7 @@ fn crate_meta_uncached(path: &str) -> (String, String, String, String) {
     let mut d = Some(mdir.clone());
     while let Some(x) = d {
         if let Ok(t) = crate::vfs::read_to_string(x.join("Cargo.toml")) {
-            if t.lines().any(|l| l.trim() == "[workspace]") {
+            if is_workspace_manifest(&t) {
                 ws = x.to_string_lossy().into_owned();
                 if ver_ws {
                     version = workspace_version(&t);
@@ -151,15 +151,27 @@ pub fn lex_stream(s: &str) -> Option<TokenStream> {
     to_stream(s.as_bytes(), &toks, 0, toks.len().saturating_sub(1), &|_lo, _hi| cs)
 }
 
-/// The path `file!()` names for source file `path` (as cargo passes it to rustc: relative to
-/// the workspace root for a workspace member, else as given); `Location::caller().file()` and
-/// panic locations name the same path.
+static ROOT: std::sync::OnceLock<Option<crate::resolve::FileRoot>> = std::sync::OnceLock::new();
+
+/// The path `file!()` names for source file `path`, as cargo passes it to rustc: a path
+/// package's file under the run's workspace root relative to that root, any other as given
+/// (resolve.rs FileRoot); `Location::caller().file()` and panic locations name the same path.
 pub fn file_macro_path(path: &str) -> String {
-    let ws = crate_meta(path).3;
-    if !ws.is_empty() {
-        if let Some(rel) = crate::vfs::relative_path(path, &ws) { return rel; }
-    }
-    path.to_string()
+    let root = ROOT.get_or_init(|| crate::zone_alloc::kept_with(|| crate::resolve::FileRoot::of(&crate::dirs::workspace_dir())));
+    root.as_ref().and_then(|r| r.relative(path)).unwrap_or_else(|| path.to_string())
+}
+
+/// A workspace root's manifest: a `[workspace]` table, as a header, a `[workspace.<x>]`
+/// sub-table or top-level dotted `workspace.<x> = ..` keys (the makepad root's spelling).
+fn is_workspace_manifest(toml: &str) -> bool {
+    let mut top = true;
+    toml.lines().map(str::trim).any(|l| {
+        if l.starts_with('[') {
+            top = false;
+            return l == "[workspace]" || l.starts_with("[workspace.");
+        }
+        top && l.strip_prefix("workspace").is_some_and(|r| r.trim_start().starts_with(['.', '=']))
+    })
 }
 
 impl FileCtx {
@@ -363,13 +375,21 @@ pub fn lookup(name: &str) -> Builtin {
 }
 
 /// A `macro_rules!` definition Relax replaces with a native expansion: the bitflags crate's
-/// `bitflags!` (MAKEPAD_RUN_NATIVE_BITFLAGS=0 keeps the crate's macro_rules, for A/B measurement).
+/// 2.x `bitflags!` (MAKEPAD_RUN_NATIVE_BITFLAGS=0 keeps the crate's macro_rules, for A/B measurement).
 pub fn override_rules(options: &crate::options::Options, d: crate::macros::MacroRef) -> crate::macros::MacroRef {
-    if d.name == "bitflags" && crate::crates::base_crate_name(&d.krate) == "bitflags" && options.native_bitflags {
+    // Match the implementation the native expander replaces. Version 1 declares a named
+    // `bits` field and supplies implicit derives; substituting the 2.x tuple breaks its API.
+    // Parsed transcribers also survive images, unlike cold-parse input tokens or source paths.
+    let bitflags_v2 = || d.arms.iter().any(|(_, body)| body.windows(4).any(|nodes| {
+        use crate::macros::TNode;
+        matches!(nodes, [TNode::Crate, TNode::Tok(path), TNode::Tok(helper), TNode::Tok(bang)]
+            if path.text == "::" && helper.text == "__declare_public_bitflags" && bang.text == "!")
+    }));
+    if d.name == "bitflags" && crate::crates::base_crate_name(&d.krate) == "bitflags" && options.native_bitflags && bitflags_v2() {
         crate::memo_local! {
             static BF: std::cell::OnceCell<crate::macros::MacroRef>;
         }
-        return BF.with(|b| b.get_or_init(|| std::sync::Arc::new(crate::macros::MacroDef { name: "bitflags".to_string(), krate: "bitflags".to_string(), exported: true, arms: Vec::new(), builtin: Builtin::Bitflags as u16, def_file: String::new(), def_pos: 0, def_mod: String::new(), input: None })).clone());
+        return BF.with(|b| b.get_or_init(|| std::sync::Arc::new(crate::macros::MacroDef { name: "bitflags".to_string(), krate: "bitflags".to_string(), exported: true, arms: Vec::new(), builtin: Builtin::Bitflags as u16, def_file: String::new(), def_pos: 0, scope_pos: None, def_mod: String::new(), edition: 0, input: None })).clone());
     }
     d
 }
@@ -415,7 +435,7 @@ fn def_for_id(name: &str, id: u16) -> crate::macros::MacroRef {
             d.resize(i + 1, None);
         }
         if d[i].is_none() {
-            d[i] = Some(std::sync::Arc::new(crate::macros::MacroDef { name: name.to_string(), krate: String::new(), exported: true, arms: Vec::new(), builtin: id, def_file: String::new(), def_pos: 0, def_mod: String::new(), input: None }));
+            d[i] = Some(std::sync::Arc::new(crate::macros::MacroDef { name: name.to_string(), krate: String::new(), exported: true, arms: Vec::new(), builtin: id, def_file: String::new(), def_pos: 0, scope_pos: None, def_mod: String::new(), edition: 0, input: None }));
         }
         d[i].clone().unwrap()
     })
@@ -618,7 +638,13 @@ fn stringify_o(buf: Buf, toks: &(impl TokSeq + ?Sized), lo: usize, hi: usize, or
     let mut i = lo;
     while i < hi {
         let t = toks.at(i);
-        out.push_str(std::str::from_utf8(buf.get(t.lo, t.hi)).unwrap_or("?"));
+        let text = std::str::from_utf8(buf.get(t.lo, t.hi)).unwrap_or("?");
+        // rustc_span `normalize_newlines`: the source rustc reads has no CRLF
+        if text.contains('\r') {
+            out.push_str(&text.replace("\r\n", "\n"));
+        } else {
+            out.push_str(text);
+        }
         if i + 1 < hi {
             let n = toks.at(i + 1);
             // tokens that stand for source tokens: the source's spacing
@@ -744,9 +770,14 @@ pub fn expand(p: &crate::parser::Parser, id: u16, lo: usize, hi: usize, call_lo:
     if let Some(x) = crate::parse_work::get(&key) { return Ok(x); }
     if id >= HOSTED {
         let i = (id - HOSTED) as usize;
-        let ts = expand_pm_ts(p, true, lo, hi, call_lo, call_hi, |input, call| crate::macro_reg::run_bang_in(p.session, &p.krate, i, input, call))?;
-        let mut out = Expansion { text: String::new(), toks: Vec::new(), origins: Vec::new() };
+        let mut call_span = None;
+        let ts = expand_pm_ts(p, true, lo, hi, call_lo, call_hi, |input, call| {
+            call_span = Some(call);
+            crate::macro_reg::run_bang_in(p.session, &p.krate, i, input, call)
+        })?;
+        let mut out = Expansion { text: String::new(), toks: Vec::new(), origins: Vec::new(), editions: Vec::new() };
         emit_tokens(&ts.trees, p.edition, &mut out, &mut Vec::new())?;
+        if let Some(call) = call_span { mark_made(&mut out, 0, call, crate::macro_reg::bang_edition(i)); }
         crate::parse_work::put(key, &out);
         return Ok(out);
     }
@@ -764,12 +795,7 @@ pub fn expand(p: &crate::parser::Parser, id: u16, lo: usize, hi: usize, call_lo:
         for t in &toks {
             // Proc macros split joint punctuation into smaller source ranges. Lifetimes
             // deliberately keep one full span for both the apostrophe and name, like rustc.
-            if t.kind == T::AtId {
-                origin(t.lo, t.lo + 1);
-                origin(t.lo + 1, t.hi);
-            } else if (T::Semi as u8..=T::LArrow as u8).contains(&(t.kind as u8))
-                || matches!(t.kind, T::ColonEq | T::PlusColon | T::OtherPunct)
-            {
+            if (T::Semi as u8..=T::LArrow as u8).contains(&(t.kind as u8)) {
                 for (i, ch) in text[t.lo as usize..t.hi as usize].char_indices() {
                     origin(t.lo + i as u32, t.lo + (i + ch.len_utf8()) as u32);
                 }
@@ -777,7 +803,7 @@ pub fn expand(p: &crate::parser::Parser, id: u16, lo: usize, hi: usize, call_lo:
                 origin(t.lo, t.hi);
             }
         }
-        return Ok(Expansion { text, toks, origins });
+        return Ok(Expansion { text, toks, origins, editions: Vec::new() });
     }
     let g = expand_buf(p, id, lo, hi, call_lo, call_hi)?;
     if g.origins.is_empty() { return Ok(Expansion::from_buf(g)); }
@@ -803,7 +829,7 @@ pub fn expand(p: &crate::parser::Parser, id: u16, lo: usize, hi: usize, call_lo:
 impl Expansion {
     /// Flatten a whole file or macro output with one spelling buffer and full token origins.
     pub fn from_stream(stream: &TokenStream, edition: u16) -> Result<Self, String> {
-        let mut out = Self { text: String::new(), toks: Vec::new(), origins: Vec::new() };
+        let mut out = Self { text: String::new(), toks: Vec::new(), origins: Vec::new(), editions: Vec::new() };
         emit_tokens(&stream.trees, edition, &mut out, &mut Vec::new())?;
         Ok(out)
     }
@@ -813,8 +839,53 @@ impl Expansion {
         if crate::parser::verify_tokens() {
             g.verify("built-in macro");
         }
-        Self { text: g.s, toks: g.toks, origins: Vec::new() }
+        Self { text: g.s, toks: g.toks, origins: Vec::new(), editions: Vec::new() }
     }
+}
+
+/// The file an include macro of source file `current` names by `rel`.
+pub fn include_path(current: Option<&str>, rel: &str) -> String {
+    let path = if std::path::Path::new(rel).is_absolute() {
+        rel.to_string()
+    } else if let Some(path) = current {
+        format!("{}/{}", crate::program::dir_of(path), rel)
+    } else { rel.to_string() };
+    crate::vfs::normalize_path(&path)
+}
+
+/// The paths (as written) of the `include!("..")` / `include_str!("..")` / `include_bytes!("..")`
+/// calls among token texts: a plain or raw string literal argument, or `concat!` of such literals
+/// (another computed one, `env!(..)`, is not seen).
+pub fn include_literals<'a>(texts: &[&'a [u8]]) -> Vec<String> {
+    let lit = |lit: &[u8]| -> Option<String> {
+        let body = if let Some(raw) = lit.strip_prefix(b"r") {
+            let hashes = raw.iter().take_while(|&&c| c == b'#').count();
+            raw.get(hashes + 1..raw.len().saturating_sub(hashes + 1))
+        } else if lit.first() == Some(&b'"') && !lit.contains(&b'\\') {
+            lit.get(1..lit.len().saturating_sub(1))
+        } else { None };
+        body.and_then(|b| std::str::from_utf8(b).ok()).map(str::to_string)
+    };
+    let mut out = Vec::new();
+    for (i, w) in texts.windows(3).enumerate() {
+        if !matches!(w[0], b"include" | b"include_str" | b"include_bytes") || w[1] != b"!" || w[2] != b"(" { continue; }
+        let at = |k: usize| texts.get(i + k).copied().unwrap_or(b"");
+        if at(4) == b")" {
+            if let Some(s) = lit(at(3)) { out.push(s); }
+            continue;
+        }
+        // `concat!` of literals (a macro's `include_str!(concat!($dir, $name))`, expanded)
+        if at(3) != b"concat" || at(4) != b"!" || at(5) != b"(" { continue; }
+        let (mut s, mut k, mut ok) = (String::new(), 6, false);
+        while let Some(part) = lit(at(k)) {
+            s.push_str(&part);
+            k += 1;
+            if at(k) == b"," { k += 1; }
+            if at(k) == b")" && at(k + 1) == b")" { ok = true; break; }
+        }
+        if ok { out.push(s); }
+    }
+    out
 }
 
 /// Resolve nested includes relative to the file that authored the invocation.
@@ -826,12 +897,7 @@ fn include_input(p: &crate::parser::Parser, lo: usize, hi: usize, call_lo: u32) 
         Some(p.sources.as_ref().ok_or("include! requires a source registry")?.get(source.file)?)
     } else { None };
     let current = authored.as_ref().map(|s| s.path.as_str()).or_else(|| p.bctx.as_ref().map(|c| c.path.as_str()));
-    let path = if std::path::Path::new(rel).is_absolute() {
-        rel.clone()
-    } else if let Some(path) = current {
-        format!("{}/{}", crate::program::dir_of(path), rel)
-    } else { rel.clone() };
-    let path = crate::vfs::normalize_path(&path);
+    let path = include_path(current, rel);
     let data = crate::vfs::read(&path).map_err(|e| format!("couldn't read `{}`: {}", path, e))?;
     crate::sip::note_late_input(p.bctx.as_ref().map_or("", |c| c.krate.as_str()), crate::sip::LATE_FILE, &path, Some(&data));
     Ok((path, data))
@@ -885,6 +951,27 @@ fn expand_buf(p: &crate::parser::Parser, id: u16, lo: usize, hi: usize, call_lo:
             return Ok(one_str(&m));
         }
         Builtin::Stringify => {
+            // rustc's token printer omits invisible delimiters around forwarded
+            // expressions. Keep authored parentheses, including those inside an
+            // invisible group; only the transcriber's matching pair disappears.
+            if !p.synth_parens.is_empty() {
+                let mut visible = Vec::new();
+                let mut groups = Vec::new();
+                for i in lo..hi {
+                    let t = toks.at(i);
+                    let invisible = match t.kind {
+                        T::OpenParen | T::OpenBracket | T::OpenBrace => {
+                            let invisible = p.synth_parens.contains(&{ t.lo });
+                            groups.push(invisible);
+                            invisible
+                        }
+                        T::CloseParen | T::CloseBracket | T::CloseBrace => groups.pop().unwrap_or(false),
+                        _ => false,
+                    };
+                    if !invisible { visible.push(t); }
+                }
+                return Ok(one_str(&stringify_o(buf, &visible, 0, visible.len(), p.tok_origin.view(), p.src.len() as u32)));
+            }
             return Ok(one_str(&stringify_o(buf, toks, lo, hi, p.tok_origin.view(), p.src.len() as u32)));
         }
         Builtin::Env | Builtin::OptionEnv => {
@@ -1223,7 +1310,8 @@ fn env_value(ctx: Option<&FileCtx>, name: &str) -> Option<String> {
 
 fn env_value_inner(ctx: Option<&FileCtx>, name: &str) -> Option<String> {
     // cargo's per-crate environment as `makepad run` registered it (unitgraph.rs), then what Relax
-    // knows from the crate's Cargo.toml, then the process environment
+    // knows from the crate's Cargo.toml, then cargo's `[env]` configuration, then the process
+    // environment
     if let Some(c) = ctx {
         if let Some(v) = crate::crates::crate_env_registered(&c.krate, name) {
             return Some(v);
@@ -1236,7 +1324,7 @@ fn env_value_inner(ctx: Option<&FileCtx>, name: &str) -> Option<String> {
             _ => {}
         }
     }
-    std::env::var(name).ok()
+    crate::crates::config_env_value(name).or_else(|| std::env::var(name).ok())
 }
 
 /// The value of tokens [a, z) when they are a literal or a literal-producing built-in call
@@ -1370,11 +1458,15 @@ pub struct Expansion {
     pub toks: Vec<Tok>,
     /// Every output token's source span, sorted by its spelling-buffer offset.
     pub origins: Vec<TokenOrigin>,
+    /// Text ranges of tokens a proc macro made, with its crate's edition (`mark_made`).
+    pub editions: Vec<(u32, u32, u16)>,
 }
 
 enum ItemOut {
     /// no derive to run (none named, or the item is cfg-disabled)
     Nothing,
+    /// Resolution depends on the parser's lexical scope, unavailable to prescan.
+    Deferred,
     Done(Expansion),
 }
 
@@ -1447,7 +1539,7 @@ fn item_tokens(p: &crate::parser::Parser, buf: &Buf, lo: usize, hi: usize, item_
 
 /// Derives of one item, from its source bytes (`item_lo`: its position, for diagnostics).
 /// Linked derives run natively, the rest through the JIT host (pmhost.rs; any thread).
-fn expand_item(sess: &std::sync::Arc<crate::Session>, krate: &str, path: &str, item: &[u8], fresh: Vec<Tok>, item_lo: u32, location: (usize, usize), cfg: Option<&CfgSet>, edition: u16, authored: Option<&dyn Fn(u32, u32) -> Option<Span>>) -> Result<ItemOut, (u32, String)> {
+fn expand_item(sess: &std::sync::Arc<crate::Session>, krate: &str, path: &str, item: &[u8], fresh: Vec<Tok>, item_lo: u32, location: (usize, usize), cfg: Option<&CfgSet>, edition: u16, authored: Option<&dyn Fn(u32, u32) -> Option<Span>>, resolve: Option<&dyn Fn(&str) -> Option<crate::macro_reg::Entry>>) -> Result<ItemOut, (u32, String)> {
     let span_of = |a: u32, z: u32| authored.and_then(|f| f(item_lo + a, item_lo + z)).unwrap_or(Span { file: 0, lo: item_lo + a, hi: item_lo + z, start: LineColumn { line: 1, column: 1 }, end: LineColumn { line: 1, column: 1 } });
     // the item's own tokens (parsing rewrites tokens in place, `>>` closing two generic lists
     // becomes `>`: callers hand over the tokens as the source spelled them)
@@ -1461,26 +1553,39 @@ fn expand_item(sess: &std::sync::Arc<crate::Session>, krate: &str, path: &str, i
         Some(s) => s,
         None => return Err((item_lo, "unbalanced delimiters in derive input".to_string())),
     };
-    let (names, item_ts) = prepare_derive_input(input, cfg);
+    let (mut names, item_ts) = prepare_derive_input(input, cfg);
+    // A spelling absent from the registry may be an imported alias. The
+    // parallel prescan has no lexical scope, so leave that item to the parser.
+    if resolve.is_none() && names.iter().any(|name| !is_derive(name)
+        && crate::parser::derive::trait_path(name.rsplit("::").next().unwrap_or(name)).is_none()) {
+        return Ok(ItemOut::Deferred);
+    }
+    names.retain(|name| is_derive(name) || resolve.is_some_and(|resolve| resolve(name).is_some()));
     // a `#[cfg]`-disabled item is gone before derives run (rustc strips it first)
     if names.is_empty() || !item_cfg_on(&item_ts.trees, cfg) {
         return Ok(ItemOut::Nothing);
     }
+    if resolve.is_none() && names.iter().any(|name| scoped_derive(name)) { return Ok(ItemOut::Deferred); }
     if trace_on("pmhost") {
         eprintln!("pmhost: derive({}) on `{}`", names.join(", "), item_ts);
     }
     let call = span_of(0, item.len() as u32);
     // leading space: expansion ranges map to call sites by an inclusive range check, so two
     // expansions must not share an endpoint
-    let mut out = Expansion { text: String::from(" "), toks: Vec::new(), origins: Vec::new() };
+    let mut out = Expansion { text: String::from(" "), toks: Vec::new(), origins: Vec::new(), editions: Vec::new() };
     let mut scratch = Vec::new();
+    let mut expanded = false;
     for name in names {
         // The host selects a source-matched linked library or the sandboxed JIT.
-        let r = match crate::macro_reg::run_derive_in(sess, krate, &name, &item_ts, call) {
+        let entry = if scoped_derive(&name) { resolve.and_then(|resolve| resolve(&name)) } else { crate::macro_reg::derive_entry(krate, &name) };
+        let result = entry.as_ref().map(|entry| crate::macro_reg::run_derive_entry(sess, krate, &name, entry, &item_ts, call));
+        let r = match result {
             Some(r) => r,
-            // no host for this derive: leave the item as it is
-            None => return Ok(ItemOut::Nothing),
+            // A builtin or an unrelated crate's same-named derive has no host
+            // here. It must not prevent later derives of this item from running.
+            None => continue,
         };
+        expanded = true;
         let ts = match r {
             Ok(ts) => ts,
             // the error stays at the item (`compile_error!` item); the file still loads
@@ -1496,13 +1601,15 @@ fn expand_item(sess: &std::sync::Arc<crate::Session>, krate: &str, path: &str, i
             }
         };
         let t0 = out.text.len();
+        let o0 = out.origins.len();
         emit_tokens(&ts.trees, edition, &mut out, &mut scratch).map_err(|m| (item_lo, m))?;
+        if let Some(entry) = &entry { mark_made(&mut out, o0, call, crate::macro_reg::entry_edition(entry)); }
         if trace_on("expand:derive") {
             eprintln!("expand derive({}) @{} => {}", name, path, &out.text[t0..]);
         }
         out.text.push('\n');
     }
-    Ok(ItemOut::Done(out))
+    Ok(if expanded { ItemOut::Done(out) } else { ItemOut::Nothing })
 }
 
 /// Appends lexed `text` (its tokens `toks`, Eof dropped) to an expansion.
@@ -1516,6 +1623,29 @@ fn emit_lexed(text: &str, toks: &[Tok], source: SourceSpan, out: &mut Expansion)
         }
     }
     out.text.push(' ');
+}
+
+/// Records which output tokens of `out` from `origins[from..]` on the proc macro made itself: the
+/// ones spanned at its call site (`Span::call_site()`, `def_site()` and `mixed_site()` are that
+/// span here, as are a parsed string's tokens and a new group's delimiters). rustc gives them
+/// the expansion's edition, the macro crate's (rustc_expand proc_macro_server.rs: the call-site
+/// context's outer expansion; ExpnData::edition), while a token taken from the input keeps its
+/// own. Consecutive made tokens share one range.
+fn mark_made(out: &mut Expansion, from: usize, call: Span, edition: u16) {
+    if edition == 0 { return; }
+    let call = SourceSpan::from(call);
+    let mut open = false;
+    for o in &out.origins[from..] {
+        if o.source != call {
+            open = false;
+            continue;
+        }
+        match out.editions.last_mut() {
+            Some(r) if open => r.1 = o.hi,
+            _ => out.editions.push((o.lo, o.hi, edition)),
+        }
+        open = true;
+    }
 }
 
 /// Proc-macro output trees straight to Relax tokens (and the text they point into): idents,
@@ -1638,7 +1768,7 @@ fn emit_tokens(trees: &[TokenTree], edition: u16, out: &mut Expansion, scratch: 
 
 /// Proc-macro style trees as tokens over their own text (no origins).
 pub fn trees_to_buf(trees: &[TokenTree], edition: u16) -> Result<TokBuf, String> {
-    let mut out = Expansion { text: String::new(), toks: Vec::new(), origins: Vec::new() };
+    let mut out = Expansion { text: String::new(), toks: Vec::new(), origins: Vec::new(), editions: Vec::new() };
     emit_tokens(trees, edition, &mut out, &mut Vec::new())?;
     Ok(TokBuf::from_parts(edition, out.text, out.toks))
 }
@@ -1679,8 +1809,8 @@ fn single_punct(c: char) -> Option<T> {
 }
 
 crate::memo_local! {
-    /// derive expansions computed ahead in parallel (pre_expand_derives): (file, item byte range)
-    static PRE: std::cell::RefCell<crate::fxhash::HashMap<(String, u32, u32), Result<Option<Expansion>, (u32, String)>>>;
+    /// Derive expansions by file, test cfg and item byte range.
+    static PRE: std::cell::RefCell<crate::fxhash::HashMap<(String, bool, u32, u32), Result<Option<Expansion>, (u32, String)>>>;
 }
 
 
@@ -1702,7 +1832,7 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
     let item_hi = toks.at(hi.saturating_sub(1)).hi;
     // computed ahead on the worker threads?
     if let Some(c) = p.bctx.as_ref().filter(|_| !crate::macro_reg::declaring()) {
-        if let Some(r) = PRE.with(|m| m.borrow_mut().remove(&(c.path.clone(), item_lo, item_hi))) {
+        if let Some(r) = PRE.with(|m| m.borrow_mut().remove(&(c.path.clone(), c.cfg.holds("test"), item_lo, item_hi))) {
             crate::macro_reg::add_pre(true);
             return r;
         }
@@ -1722,7 +1852,7 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
         for i in alo..ahi {
             if toks.at(i).kind == T::Ident {
                 let w = buf.get(toks.at(i).lo, toks.at(i).hi);
-                if std::str::from_utf8(w).map_or(false, is_derive) {
+                if std::str::from_utf8(w).is_ok_and(|name| is_derive(name) || derive_entry(p, lo, name).is_some()) {
                     any = true;
                     reusable &= crate::macro_reg::reusable_derive(std::str::from_utf8(w).unwrap());
                 }
@@ -1751,7 +1881,7 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
         v
     };
     let cfg = p.bctx.as_ref().map(|c| &c.cfg);
-    let r = expand_item(sess, &p.krate, p.bctx.as_ref().map_or("", |c| c.path.as_str()), buf.get(item_lo, item_hi), fresh, item_lo, item_location(p,item_lo), cfg, p.edition, Some(&|lo, hi| p.input_span(lo, hi)));
+    let r = expand_item(sess, &p.krate, p.bctx.as_ref().map_or("", |c| c.path.as_str()), buf.get(item_lo, item_hi), fresh, item_lo, item_location(p,item_lo), cfg, p.edition, Some(&|lo, hi| p.input_span(lo, hi)), Some(&|name| derive_entry(p, lo, name)));
     match r? {
         ItemOut::Done(x) => {
             if let Some(reused) = reused {
@@ -1796,10 +1926,14 @@ pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> O
         // the path: idents joined by `::`
         let mut i = lo;
         let mut last = String::new();
+        let mut path = Vec::new();
         while i < hi {
             match toks.at(i).kind {
-                T::Ident | T::RawIdent | T::KwCrate | T::KwSelfValue | T::KwSuper => last = text(i),
-                T::PathSep => {}
+                T::Ident | T::RawIdent | T::KwCrate | T::KwSelfValue | T::KwSuper => {
+                    last = text(i);
+                    path.push(last.clone());
+                }
+                T::PathSep => { if i == lo { path.push(String::new()); } }
                 _ => break,
             }
             i += 1;
@@ -1810,10 +1944,18 @@ pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> O
         if last == "relax" && (relax_level_toks(&text, toks, i, hi).is_some() || relax_keep_toks(&text, toks, i, hi)) {
             continue;
         }
-        let entry = if i == lo + 1 && matches!(last.as_str(), "test" | "bench" | "test_case") {
-            test_attr_entry(p, lo, &last)
+        let entry = if i != lo + 1 {
+            // Qualified attributes resolve in their actual module. In particular, the
+            // builtin emitted by a test proc macro must not call that macro again.
+            p.macros.as_ref().and_then(|scope| scope.attr_path(&p.krate, &p.cur_module(), &path, &mut Default::default()))
+        } else if crate::builtin_attrs::is_builtin_attr(&last) {
+            // Builtin attributes are not imports from a dependency that happens to
+            // export the same name (a crate's `path` attribute on a module). Only
+            // lexical resolution may select a same-name proc macro here.
+            scoped_proc_macro_entry(p, lo, &last, crate::macro_reg::Kind::Attr)
         } else {
-            crate::macro_reg::attr_entry_for(&p.krate, &last)
+            scoped_proc_macro_entry(p, lo, &last, crate::macro_reg::Kind::Attr)
+                .or_else(|| crate::macro_reg::attr_entry_for(&p.krate, &last))
         };
         if let Some(entry) = entry {
             cand = Some((k, last, entry));
@@ -1829,9 +1971,20 @@ pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> O
 /// compiler/rustc_resolve/src/ident.rs `visit_scopes` / `hygienic_lexical_parent`:
 /// module/block imports, then macro_use, then the std prelude. library/core/src/macros/mod.rs
 /// defines test, bench and test_case as builtins; library/core/src/prelude/v1.rs exports them.
-fn test_attr_entry(p: &crate::parser::Parser, mut at: usize, name: &str) -> Option<crate::macro_reg::Entry> {
+fn scoped_proc_macro_entry(p: &crate::parser::Parser, at: usize, name: &str, kind: crate::macro_reg::Kind) -> Option<crate::macro_reg::Entry> {
     if crate::macro_reg::in_world() { return None; }
     let scope = p.macros.as_ref()?;
+    let module = p.cur_module();
+    if p.may_import(name, &module, kind) {
+        for uses in scoped_imports(p, at)? {
+            if let Some(entry) = scope.proc_macro_import(&p.krate, &module, &uses, name, kind) { return entry; }
+        }
+    }
+    scope.proc_macro_use(&p.krate, name, kind)
+}
+
+/// Imports visible at a token, ordered from the innermost item scope outward.
+pub(crate) fn scoped_imports(p: &crate::parser::Parser, mut at: usize) -> Option<Vec<Vec<crate::macros::UseItem>>> {
     let module = p.cur_module();
     // The prescan's CrateMods flattens block imports into modules. Scan the enclosing
     // ranges instead, including later uses (Reference names/scopes.md: item scopes),
@@ -1868,6 +2021,7 @@ fn test_attr_entry(p: &crate::parser::Parser, mut at: usize, name: &str) -> Opti
         at = call_at;
     }
     let view = crate::parser::lazy_bodies::TokView::new(p.src, &p.toks, &p.ext);
+    let mut imports = Vec::new();
     for (start, end) in ranges {
         let mut uses = Vec::new();
         let mut i = start;
@@ -1890,9 +2044,9 @@ fn test_attr_entry(p: &crate::parser::Parser, mut at: usize, name: &str) -> Opti
                 _ => i += 1,
             }
         }
-        if let Some(entry) = scope.attr_import(&p.krate, &module, &uses, name) { return entry; }
+        imports.push(uses);
     }
-    scope.attr_macro_use(&p.krate, name)
+    Some(imports)
 }
 
 /// Optimisation level of a `relax(..)` attribute's arguments at tokens [i, hi) (i at the `(`):
@@ -1966,7 +2120,7 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], 
     // Doc comments are attributes too, but are absent from the parser's Attr list.
     let prefix = buf.get(item_lo, body_lo);
     let mut leading = Vec::new();
-    let opts = crate::lexer::LexOptions { edition: p.edition, mode: crate::lexer::Mode::Rust, trivia: true };
+    let opts = crate::lexer::LexOptions { edition: p.edition, trivia: true };
     crate::lexer::lex_with(prefix, &opts, &mut leading).map_err(|_| (item_lo, format!("#[{}] input does not lex", name)))?;
     let mut docs = Vec::new();
     let mut depth = 0;
@@ -1990,6 +2144,12 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], 
             trees.extend(docs.next().unwrap().1.trees);
         }
         if j == k { continue; }
+        // A `#[cfg]` of the item, before or after this attribute, held (the item is expanded) and
+        // is gone from what the macro sees: rustc_expand expand.rs take_first_attr takes cfg
+        // attributes before any macro attribute, and expand_cfg_true leaves a `cfg_trace` in its
+        // place whose tokens are empty ("unobservable to token-based proc macros"). An item whose
+        // tokens were configured first (demand.rs active_tokens) has no such attribute either.
+        if toks.at(a.toks.lo as usize).kind == T::Ident && buf.get(start, toks.at(a.toks.lo as usize).hi) == b"cfg" { continue; }
         let end = toks.at(a.toks.hi as usize - 1).hi;
         let span = span_of(start, end);
         let mut hash = Punct::new('#', Spacing::Alone);
@@ -2003,10 +2163,11 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], 
     trees.extend(stream(buf.get(body_lo, item_hi), body_lo)?.trees);
     let item_ts = TokenStream { trees };
     let call = span_of(item_lo, item_hi);
-    let mut out = Expansion { text: String::from(" "), toks: Vec::new(), origins: Vec::new() };
+    let mut out = Expansion { text: String::from(" "), toks: Vec::new(), origins: Vec::new(), editions: Vec::new() };
     match crate::macro_reg::run_attr(p.session, &p.krate, entry, &attr_ts, &item_ts, call) {
         Ok(ts) => {
             emit_tokens(&ts.trees, p.edition, &mut out, &mut Vec::new()).map_err(|m| (item_lo, m))?;
+            mark_made(&mut out, 0, call, crate::macro_reg::entry_edition(entry));
             if trace_on("expand:attr") {
                 eprintln!("expand #[{}] @{} => {}", name, path, out.text);
             }
@@ -2067,7 +2228,7 @@ pub fn pre_expand_derives(krate: &str, files: &[(&str, &[u8], &[Tok])], cfg: &Cf
                     }
                     let (fi, lo, hi) = sites[k];
                     let src = files[fi].1;
-                    out.push((k, expand_item(sess, krate, files[fi].0, &src[lo as usize..hi as usize], site_tokens(files[fi].2, lo, hi), lo, crate::lexer::line_col_at(&lines[fi], src.len(), lo), Some(cfg), edition, None)));
+                    out.push((k, expand_item(sess, krate, files[fi].0, &src[lo as usize..hi as usize], site_tokens(files[fi].2, lo, hi), lo, crate::lexer::line_col_at(&lines[fi], src.len(), lo), Some(cfg), edition, None, None)));
                 }
                 out
             }));
@@ -2088,9 +2249,10 @@ pub fn pre_expand_derives(krate: &str, files: &[(&str, &[u8], &[Tok])], cfg: &Cf
                 let r = match r {
                     Ok(ItemOut::Done(x)) => Ok(Some(x)),
                     Ok(ItemOut::Nothing) => Ok(None),
+                    Ok(ItemOut::Deferred) => continue,
                     Err(e) => Err(e),
                 };
-                m.insert((files[fi].0.to_string(), lo, hi), r);
+                m.insert((files[fi].0.to_string(), cfg.holds("test"), lo, hi), r);
             }
         }
     });
@@ -2208,7 +2370,21 @@ fn match_close(toks: &[Tok], open: usize) -> Option<usize> {
 
 /// A derive Relax can run (through the JIT host).
 fn is_derive(name: &str) -> bool {
-    crate::macro_reg::has_derive(name)
+    crate::macro_reg::has_derive(name.rsplit("::").next().unwrap_or(name))
+}
+
+fn scoped_derive(name: &str) -> bool {
+    name.contains("::") || crate::parser::derive::EXPANDED.contains(&name) || crate::macro_reg::has_derive_collision(name) || !is_derive(name)
+}
+
+/// rustc_resolve resolves compiler and hosted derives in the same macro namespace.
+/// A dependency exporting `Debug` does not put that macro in the caller's scope.
+pub(crate) fn derive_entry(p: &crate::parser::Parser, at: usize, name: &str) -> Option<crate::macro_reg::Entry> {
+    if crate::macro_reg::in_world() { return None; }
+    let path: Vec<String> = name.split("::").map(str::to_owned).collect();
+    if path.len() > 1 {
+        p.macros.as_ref()?.proc_macro_path(&p.krate, &p.cur_module(), &path, crate::macro_reg::Kind::Derive, &mut Default::default())
+    } else { scoped_proc_macro_entry(p, at, name, crate::macro_reg::Kind::Derive) }
 }
 
 /// Do the item's own leading `#[cfg(..)]` attributes hold?
@@ -2232,7 +2408,7 @@ fn item_cfg_on(trees: &[TokenTree], cfg: Option<&CfgSet>) -> bool {
 }
 
 /// rustc's derive input: `cfg_attr` expanded, `#[cfg]`-false fields/variants removed (cfg_eval),
-/// the `#[derive]` attributes taken off. Returns the native derive names in order and the item.
+/// the `#[derive]` attributes taken off. Returns all derive paths in order and the item.
 fn prepare_derive_input(input: TokenStream, cfg: Option<&CfgSet>) -> (Vec<String>, TokenStream) {
     let mut names = Vec::new();
     let trees = expand_cfg_attrs(input.trees, cfg);
@@ -2246,23 +2422,20 @@ fn prepare_derive_input(input: TokenStream, cfg: Option<&CfgSet>) -> (Vec<String
                 if let Some(TokenTree::Ident(id)) = inner.first() {
                     if id.to_string() == "derive" {
                         if let Some(TokenTree::Group(args)) = inner.get(1) {
-                            // last path segment of each derive
-                            let mut last = String::new();
+                            // Keep qualification until macro-namespace resolution.
+                            let mut path = String::new();
                             for t in &args.stream().trees {
                                 match t {
-                                    TokenTree::Ident(x) => last = x.to_string(),
+                                    TokenTree::Ident(x) => path.push_str(&x.to_string()),
+                                    TokenTree::Punct(p) if p.as_char() == ':' => path.push(':'),
                                     TokenTree::Punct(p) if p.as_char() == ',' => {
-                                        if is_derive(&last) {
-                                            names.push(std::mem::take(&mut last));
-                                        }
-                                        last.clear();
+                                        if !path.is_empty() { names.push(std::mem::take(&mut path)); }
+                                        path.clear();
                                     }
                                     _ => {}
                                 }
                             }
-                            if is_derive(&last) {
-                                names.push(last);
-                            }
+                            if !path.is_empty() { names.push(path); }
                         }
                         i += 2;
                         continue;
@@ -2548,6 +2721,8 @@ fn prescan_rules(tb: &[u8], krate: &str, cfg: &CfgSet) -> Vec<crate::macros::Mac
             let mt: Vec<crate::macros::MTok> =
                 t2[open + 1..close.min(t2.len())].iter().map(|t| crate::macros::MTok { kind: t.kind, text: String::from_utf8_lossy(&tb[t.lo as usize..t.hi as usize]).into_owned(), pos: u32::MAX }).collect();
             if let Ok(mut def) = crate::macros::parse_def(&mname, krate, 2021, &mt) {
+                // (a proc macro's output: its spans are the call site's, so is the edition)
+                def.edition = 0;
                 def.exported = exported.is_some();
                 if exported.is_some_and(|a| (a.toks.lo..a.toks.hi).any(|k| tx(k as usize) == b"local_inner_macros")) {
                     crate::macros::local_inner_macros(&mut def);
@@ -2571,6 +2746,17 @@ mod pm_input_tests {
         p.expand_toks(text, &toks, call_lo)
     }
     use super::*;
+
+    #[test]
+    fn workspace_manifests_in_every_spelling() {
+        assert!(is_workspace_manifest("[workspace]\nmembers = []\n"));
+        assert!(is_workspace_manifest("workspace.members = [\n    \"a\",\n]\n[workspace.dependencies]\n"));
+        assert!(is_workspace_manifest("[package]\nname = \"a\"\n[workspace.dependencies]\n"));
+        assert!(is_workspace_manifest("workspace = { members = [] }\n"));
+        assert!(!is_workspace_manifest("[package]\nname = \"a\"\nworkspace = \"..\"\n"));
+        assert!(!is_workspace_manifest("[package]\nname = \"a\"\n[dependencies]\nb = { workspace = true }\n"));
+        assert!(!is_workspace_manifest("workspaces = 1\n"));
+    }
 
     #[test]
     fn prescan_cfg_definitions() {
@@ -2782,4 +2968,12 @@ mod payload_tests {
         assert!(payload_of(b"\0relax-include:").is_none());
         assert!(payload_of(b"\0relax-include:no key and path").is_none());
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&BY_DIR, relax_session::sync::Mutex::new(None));
+    reset(&ROOT, std::sync::OnceLock::new());
+    reset(&PAYLOADS, relax_session::sync::Mutex::new(None));
 }

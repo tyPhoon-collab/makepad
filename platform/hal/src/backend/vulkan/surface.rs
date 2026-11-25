@@ -79,7 +79,8 @@ pub trait VkCreator: Send + Sync {
 /// fence signals. It owns presentation pacing and reports actual presentation separately
 /// from GPU completion. The image lease must survive all display reads, including peers.
 pub trait FramePresenter: Send + Sync {
-    fn submit(&self, session: u32, window: Id, image: Arc<super::Image>, presented: Box<dyn FnOnce(u64) + Send>);
+    /// `session` owns `window`; `from` is the session whose frame this is (the borrower's when lent).
+    fn submit(&self, session: u32, window: Id, from: u32, image: Arc<super::Image>, presented: Box<dyn FnOnce(u64) + Send>);
     /// A frame of this window was encoded for this presenter: its [`Self::submit`] (GPU done)
     /// or [`Self::dropped`] (its batch failed) follows exactly once. A shell that grants its
     /// windows frames itself bounds the frames in flight with this.
@@ -207,7 +208,7 @@ impl Swapchain {
     /// The acquire waits at most ACQUIRE_WAIT_NS (1 ms), not 0: the NVIDIA Wayland WSI learns
     /// that the compositor released a buffer only while it may wait in vkAcquireNextImageKHR
     /// (it reads its event queue there). With 0, after the third present every acquire was
-    /// NOT_READY/TIMEOUT and every later frame was dropped (149, weston, video at ~0 fps shown).
+    /// NOT_READY/TIMEOUT and every later frame was dropped (a node, weston, video at ~0 fps shown).
     pub fn show(&self, image: &super::Image) -> Result<Shown, String> {
         if self.retired.load(Ordering::Acquire) || self.dirty.load(Ordering::Acquire) { return Ok(Shown::Dropped); }
         let _host = lock(&self.host);

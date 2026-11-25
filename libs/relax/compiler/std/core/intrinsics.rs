@@ -4,6 +4,7 @@
 
 /// Float operations that become single instructions.
 pub mod intrinsics {
+    pub use super::intrinsics_mem::{copy, copy_nonoverlapping};
     extern "relax-intrinsic" {
         pub fn sqrt_f64(x: f64) -> f64;
         pub fn sqrt_f32(x: f32) -> f32;
@@ -126,17 +127,26 @@ pub mod intrinsics_simd {
 }
 
 /// Memory, pointers and type information.
+// The const-stability attribute on an intrinsic is the one rustc puts on its counterpart (Relax's
+// names: ptr_read = read_via_copy, ptr_write = write_via_move, ptr_add/ptr_sub = offset,
+// slice_ptr/slice_len/str_as_bytes = ptr_metadata, slice_from_raw/str_from_raw = aggregate_raw_ptr):
+// it marks the intrinsics a const fn may call (const_check const_intrinsic).
 pub mod intrinsics_mem {
     extern "relax-intrinsic" {
         /// A linear-memory offset as a program pointer (the trace host may map
         /// wasm64 memory at a nonzero native base; the exported module uses zero).
         #[cfg(relax_web)]
         pub fn web_memory_ptr(offset: usize) -> *mut u8;
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn size_of<T>() -> usize;
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn align_of<T>() -> usize;
         /// Size/alignment from a (possibly fat) raw pointer, as in rustc's intrinsics.
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn size_of_val<T: ?Sized>(v: *const T) -> usize;
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn align_of_val<T: ?Sized>(v: *const T) -> usize;
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn needs_drop<T>() -> bool;
         /// `T: Copy` for this instantiation (a constant per instance): std's Copy fast paths
         /// (real std specializes Clone-for-Copy into memcpy)
@@ -150,49 +160,77 @@ pub mod intrinsics_mem {
         /// one loop per iterator type, as real alloc's SpecExtend specialization picks one
         pub fn is_trusted_len<T>() -> bool;
         pub fn drop_in_place<T: crate::marker::PointeeSized>(p: *mut T);
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn ptr_read<T>(p: *const T) -> T;
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn ptr_write<T>(p: *mut T, v: T);
         /// volatile access (never removed, merged, forwarded or reordered with other volatile ops)
         pub fn volatile_load<T>(p: *const T) -> T;
         pub fn volatile_store<T>(p: *mut T, v: T);
         /// `p + n * size_of::<T>()`
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn ptr_add<T>(p: *const T, n: usize) -> *const T;
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn ptr_add_mut<T>(p: *mut T, n: usize) -> *mut T;
         /// `p` moved back by `n` elements, in bounds (core's `sub`: `offset` by `-n`)
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn ptr_sub<T>(p: *const T, n: usize) -> *const T;
         /// `p` moved by `n` elements with wrapping arithmetic, keeping its provenance (core::intrinsics::arith_offset)
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn arith_offset<T>(p: *const T, n: isize) -> *const T;
         /// `(p - origin) / size_of::<T>()` of two pointers into one allocation (core::intrinsics::ptr_offset_from)
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn ptr_offset_from<T>(p: *const T, origin: *const T) -> isize;
         /// `p` is null: its address at run time; in const evaluation `ptr_guaranteed_cmp(p, null)`, which may
         /// not know (core::ptr is_null's const_eval_select)
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn ptr_is_null(p: *const u8) -> bool;
+        // (rustc builds slices in const fns: from_raw_parts, the aggregate_raw_ptr intrinsic)
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn slice_from_raw<'a, T>(p: *const T, len: usize) -> &'a [T];
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn slice_from_raw_mut<'a, T>(p: *mut T, len: usize) -> &'a mut [T];
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn slice_ptr<T>(s: &[T]) -> *const T;
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn str_from_raw<'a>(p: *const u8, len: usize) -> &'a str;
         /// memcpy of `n` elements
+        #[rustc_const_stable(feature = "const_intrinsic_copy", since = "1.83.0")]
         pub fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, n: usize);
         /// memmove of `n` elements
+        #[rustc_const_stable(feature = "const_intrinsic_copy", since = "1.83.0")]
         pub fn copy<T>(src: *const T, dst: *mut T, n: usize);
         /// memset of `n` elements to byte `b`
+        #[rustc_const_stable(feature = "const_intrinsic_copy", since = "1.83.0")]
         pub fn write_bytes<T>(dst: *mut T, b: u8, n: usize);
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn forget<T>(v: T);
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn null_mut<T>() -> *mut T;
         /// all-zero value of T
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn zeroed<T>() -> T;
         /// reinterpret the bits; Relax checks size equality and R14 (repr(C)/scalars only)
+        #[rustc_const_stable(feature = "const_transmute", since = "1.56.0")]
         pub fn transmute<T, U>(v: T) -> U;
         /// enum discriminant as i64 (0 for non-enums)
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn discriminant_value<T>(v: &T) -> i64;
         /// stable 128-bit hash of the type (after monomorphisation): low and high halves
+        // (rustc's type_id intrinsic is a const fn, const-unstable)
+        #[rustc_const_unstable(feature = "core_intrinsics", issue = "none")]
         pub fn type_id<T: ?Sized>() -> u64;
+        #[rustc_const_unstable(feature = "core_intrinsics", issue = "none")]
         pub fn type_id_hi<T: ?Sized>() -> u64;
+        #[rustc_const_unstable(feature = "core_intrinsics", issue = "none")]
         pub fn type_name<T: ?Sized>() -> &'static str;
         /// opaque to the optimiser
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn black_box<T>(v: T) -> T;
         /// fat pointer parts of a `*const [T]` / `&[T]`
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn slice_len<T>(s: &[T]) -> usize;
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn str_as_bytes(s: &str) -> &[u8];
     }
 }
@@ -231,6 +269,7 @@ pub mod intrinsics_rt {
         /// AOT aborts. `msg` is the formatted message.
         pub fn panic_impl(msg: *const u8, msg_len: usize, file: *const u8, file_len: usize, line: u32, col: u32) -> !;
         /// The location of the caller of the enclosing #[track_caller] fn (or this call).
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn caller_location() -> &'static crate::panic::Location<'static>;
         /// This thread's thread-local block: word 0 the domain base, word 1 the runtime's per-thread
         /// record (thread-local keys: `std::thread::local`). An inline TLS access, not a call.
@@ -243,6 +282,7 @@ pub mod intrinsics_rt {
         /// (argc, argv) as the process received them (Rt::args; `makepad run` passes the program's
         /// own arguments).
         pub fn args() -> (usize, *const *const crate::ffi::c_char);
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn unreachable() -> !;
         /// Whether this thread is unwinding a panic (from the panic to the recovery point that
         /// catches it): std::thread::panicking.
@@ -272,12 +312,17 @@ pub mod intrinsics_rt {
 /// unsigned integer type; counts are in bits of T.
 pub mod intrinsics_int {
     extern "relax-intrinsic" {
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn ctpop<T>(x: T) -> u32;
         /// leading zeros; ctlz(0) = bits of T
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn ctlz<T>(x: T) -> u32;
         /// trailing zeros; cttz(0) = bits of T
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn cttz<T>(x: T) -> u32;
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn bswap<T>(x: T) -> T;
+        #[rustc_intrinsic_const_stable_indirect]
         pub fn bitreverse<T>(x: T) -> T;
         /// high 64 bits of the 128-bit product (signed for signed T); T is 64 bits wide
         pub fn mul_hi<T>(a: T, b: T) -> T;
@@ -300,14 +345,20 @@ pub mod intrinsics_vx {
     // (width 32: f32 lanes, 64: f64 lanes; Intel NaN results).
     // 52/53 f32 NEON min/max (NaN propagation and signed-zero ordering).
     // 60..63 NEON f32 add/sub/mul/div.
+    // 90..93 carry-less multiply of one 64-bit lane of a and one of b (width 64; x86 pclmulqdq,
+    // Arm pmull .1q): bit 0 of op - 90 picks a's high lane, bit 1 b's.
     // SHA binary (width 32): 70 x86 sha1nexte, 71 sha1msg1, 72 sha1msg2,
     // 73 sha256msg1, 74 sha256msg2; 80 Arm sha1su1, 81 sha256su0.
     // Ternary: 0 x86 sha256rnds2; 1/2/3 Arm sha1c/p/m (b is u32),
     // 4 Arm sha1su0, 5 sha256h, 6 sha256h2, 7 sha256su1 (b is a vector).
     // 8 / 9 NEON f32 fused a + b * c / a - b * c (FMLA / FMLS .4s); 10 bitwise select
-    // (a & b) | (!a & c) (BSL; a, the mask, is passed as T).
+    // (a & b) | (!a & c) (BSL; a, the mask, is passed as T); 11..14 x86 f32, 15..18 x86 f64 fused
+    // a * b + c, a * b - c, -(a * b) + c, -(a * b) - c (vfmadd / vfmsub / vfnmadd / vfnmsub .ps /
+    // .pd: a NaN operand keeps its sign, where FMLS flips it).
     // vx_sha1rnds4: x86, immediate FUNC in 0..=3, checked at lowering.
     // vx_sha1h: Arm, scalar u32 -> u32 through lane 0 of a V128.
+    // vx_crc32: Arm crc32{b,h,w,x} of data's low `bytes` (1/2/4/8, constant) bytes into crc;
+    // aarch64 targets only, checked at lowering.
     // Unary: 0 abs, 1 shl, 2 unsigned shr, 3 signed shr, 4 shuffle i32,
     // 5/6 byte shift right/left, 7 SSE sqrt, 8 float abs, 9 NEON sqrt f32, 10 float neg
     // 11 SSE4.1 round to integral, imm & 3 = nearest-even / down / up / toward zero
@@ -319,6 +370,7 @@ pub mod intrinsics_vx {
         pub fn vx_ternary<T, S>(a: T, b: S, c: T, op: u32) -> T;
         pub fn vx_sha1rnds4<T>(a: T, b: T, func: i32) -> T;
         pub fn vx_sha1h(a: u32) -> u32;
+        pub fn vx_crc32(crc: u32, data: u64, bytes: u32) -> u32;
         pub fn vx_unary<T>(a: T, op: u32, width: u32, imm: i32) -> T;
         pub fn vx_splat<T>(a: u64, width: u32) -> T;
         pub fn vx_load<T>(p: *const u8) -> T;

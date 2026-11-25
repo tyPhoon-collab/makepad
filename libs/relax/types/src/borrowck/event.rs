@@ -16,7 +16,7 @@ pub struct BorrowError {
     pub labels: Vec<Label>, pub notes: Vec<String>, pub helps: Vec<String>, pub fv_only: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Origin { Background, Gate, Check, Serve, Run }
+pub enum Origin { Background, Gate, Check, Serve, Run, DeferredCheck }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GandalfEvent {
     pub seq: u64, pub origin: Origin, pub src: usize, pub epoch: u64,
@@ -146,3 +146,11 @@ pub fn all_crates() -> bool {
 
 /// Whether a crate's borrow errors are reported (and refuse live edits).
 pub fn admit(prog: &Program, krate: u32) -> bool { all_crates() || app_crate(prog, krate) }
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&APP_SCOPE, Mutex::new(Vec::new()));
+    reset(&USER_TYPES, Mutex::new(Vec::new()));
+    reset(&USER_TYPES_STALE, std::sync::atomic::AtomicBool::new(false));
+}

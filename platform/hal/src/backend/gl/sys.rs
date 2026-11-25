@@ -93,6 +93,7 @@ gl_functions! {
     glGetActiveUniformBlockiv(GLuint, GLuint, GLenum, *mut GLint);
     glUniform1i(GLint, GLint);
     glUniform1f(GLint, GLfloat);
+    glUniform2f(GLint, GLfloat, GLfloat);
     glUniform2ui(GLint, GLuint, GLuint);
     glGenSamplers(GLsizei, *mut GLuint);
     glDeleteSamplers(GLsizei, *const GLuint);
@@ -172,6 +173,7 @@ pub const DEPTH_TEST: GLenum = 0x0B71;
 pub const BLEND: GLenum = 0x0BE2;
 pub const SCISSOR_TEST: GLenum = 0x0C11;
 pub const LEQUAL: GLenum = 0x0203;
+pub const GREATER: GLenum = 0x0204;
 pub const ONE: GLenum = 1;
 pub const ONE_MINUS_SRC_ALPHA: GLenum = 0x0303;
 pub const FUNC_ADD: GLenum = 0x8006;

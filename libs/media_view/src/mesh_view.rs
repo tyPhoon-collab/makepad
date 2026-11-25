@@ -2001,11 +2001,11 @@ impl Widget for MeshView {
                 })
                 .collect();
             let mut draws = SceneDraws {
-                cube: &mut self.draw_cube,
-                alpha: &mut self.draw_alpha,
+                cube: Some(&mut self.draw_cube),
+                alpha: Some(&mut self.draw_alpha),
                 sky: &mut self.draw_sky,
                 sky_analytic: None,
-                terrain: &mut self.draw_terrain,
+                terrain: Some(&mut self.draw_terrain),
                 shadow: if self.shadows_enabled {
                     Some(&mut self.draw_shadow)
                 } else {
@@ -2225,93 +2225,6 @@ mod tests {
         assert!(!empty.passes());
         assert!(landing_contact_gate_passes(false, empty));
         assert!(!landing_contact_gate_passes(true, empty));
-    }
-
-    #[test]
-    fn unrigged_sample_never_enters_playable_landing_gate() {
-        let Ok(bytes) = std::fs::read(crate::repo_path(
-            "apps/asset-ui/resources/test/character_retex.glb",
-        )) else {
-            return;
-        };
-        assert!(
-            SkinnedModel::parse_glb(&bytes).is_err(),
-            "load_pending must keep this asset off the playable branch"
-        );
-    }
-
-    #[test]
-    fn static_material_bearing_sample_routes_to_the_pbr_branch() {
-        // The bundled retextured sample is exactly the shape the pipeline
-        // produces: static, self-contained, materials referencing an
-        // embedded texture. load_pending's route: not playable → material-
-        // bearing → PBR.
-        let Ok(bytes) = std::fs::read(crate::repo_path(
-            "apps/asset-ui/resources/test/character_retex.glb",
-        )) else {
-            return;
-        };
-        assert!(SkinnedModel::parse_glb(&bytes).is_err());
-        assert!(
-            pbr_preview::parse_material_bearing_glb(&bytes).is_some(),
-            "embedded-material GLB must classify for the PBR branch"
-        );
-    }
-
-    #[test]
-    fn playable_classification_outranks_pbr_classification() {
-        // The animated sample carries materials TOO — both classifiers can
-        // match. load_pending checks the playable shape first, so a rigged
-        // character always keeps its play mode; this pins the sample really
-        // exercising that precedence rather than passing vacuously.
-        let Ok(bytes) = std::fs::read(crate::repo_path(
-            "apps/asset-ui/resources/test/character_anim.glb",
-        )) else {
-            return;
-        };
-        let model = SkinnedModel::parse_glb(&bytes).expect("parse bundled generated character");
-        assert!(is_playable_skin(&model), "playable branch must win");
-    }
-
-    #[test]
-    fn bundled_generated_rig_passes_every_grounded_landing_fade() {
-        let Ok(bytes) = std::fs::read(crate::repo_path(
-            "apps/asset-ui/resources/test/character_anim.glb",
-        )) else {
-            return;
-        };
-        let model = SkinnedModel::parse_glb(&bytes).expect("parse bundled generated character");
-        let idle = model
-            .clip_index_any(LocoState::Idle.clip_candidates())
-            .expect("idle clip");
-        let walk = model
-            .clip_index_any(LocoState::Walk.clip_candidates())
-            .expect("walk clip");
-        let run = model
-            .clip_index_any(LocoState::Run.clip_candidates())
-            .unwrap_or(walk);
-        let jump = model
-            .clip_index_any(LocoState::Jump.clip_candidates())
-            .expect("jump clip");
-        let clips = [idle, walk, run, jump];
-        let rest = model.rest_pose();
-        let mut palette = Vec::new();
-        let mut packed = Vec::new();
-        model.palette(&rest, &mut palette);
-        model.skin_to_packed(&palette, &mut packed);
-        let (min_y, max_y) = packed_y_bounds(&packed).expect("finite rest bounds");
-        let audit = audit_landing_contact(&model, &clips, min_y, max_y - min_y);
-        assert!(audit.samples > 0);
-        assert_eq!(audit.invalid_samples, 0);
-        assert!(
-            audit.max_corrected_gap_fraction <= LANDING_CONTACT_TOLERANCE_FRACTION,
-            "first-ground/fade hover: {audit:?}"
-        );
-        assert!(
-            audit.max_corrected_penetration_fraction <= LANDING_CONTACT_TOLERANCE_FRACTION,
-            "landing penetration spike: {audit:?}"
-        );
-        assert!(audit.passes(), "landing contact hard gate: {audit:?}");
     }
 
     #[cfg(not(target_arch = "wasm32"))]

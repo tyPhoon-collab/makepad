@@ -155,9 +155,12 @@ pub(super) struct Program {
     pub desc: PipelineDesc,
     pub code: SpirvPipeline,
     pub bindings: Vec<u32>,
+    pub storage: Vec<StorageBinding>,
     pub vertex_stride: u32,
     pub layout: vk::PipelineLayout,
     pub descriptors: vk::DescriptorSetLayout,
+    /// Held while the layout is: what is kept for it (a batch slot's descriptor pool) goes after it.
+    pub alive: Arc<()>,
     pub descriptor_types: Vec<(u32, vk::DescriptorType)>,
     /// The bindings fed from the batch's upload arena (the uniform blocks, the pick block and
     /// the instance storage), by binding number: dynamic, so one written set serves every draw
@@ -177,7 +180,7 @@ pub(super) struct Program {
 
 impl Program {
     /// `video`: the samplers of its video slots (`None`: an ordinary image's for each).
-    pub fn new(dev: Arc<Device>, desc: PipelineDesc, code: SpirvPipeline, bindings: Vec<u32>, vertex_stride: u32, video: Option<&[VideoSampler]>) -> Result<Arc<Self>, String> {
+    pub fn new(dev: Arc<Device>, desc: PipelineDesc, code: SpirvPipeline, bindings: Vec<u32>, vertex_stride: u32, storage: Vec<StorageBinding>, video: Option<&[VideoSampler]>) -> Result<Arc<Self>, String> {
         if bindings.len() < pipeline_binding::BUFFERS || bindings.len() > pipeline_binding::BUFFERS + 4
             || bindings[pipeline_binding::TEXTURES] as usize != code.textures.len() || vertex_stride % 4 != 0 {
             return Err("SPIR-V pipeline binding/layout mismatch".into());
@@ -189,8 +192,8 @@ impl Program {
             None if slots == 0 => Vec::new(),
             None => vec![dev.video_sampler(0, None)?; slots],
         };
-        let mut out = Self { dev, desc, code, bindings, vertex_stride, layout: vk::PipelineLayout::null(),
-            descriptors: vk::DescriptorSetLayout::null(), descriptor_types: Vec::new(), dynamic: Vec::new(), samplers: Vec::new(), video,
+        let mut out = Self { dev, desc, code, bindings, storage, vertex_stride, layout: vk::PipelineLayout::null(),
+            descriptors: vk::DescriptorSetLayout::null(), alive: Arc::new(()), descriptor_types: Vec::new(), dynamic: Vec::new(), samplers: Vec::new(), video,
             vertex: vk::ShaderModule::null(), fragment: vk::ShaderModule::null(),
             xr_vertex: vk::ShaderModule::null(), xr_fragment: vk::ShaderModule::null() };
         for (i, slot) in out.bindings.iter().enumerate() {
@@ -247,7 +250,11 @@ impl Program {
         unsafe {
             out.descriptors = out.dev.raw.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(error)?;
             let layouts = [out.descriptors];
-            out.layout = out.dev.raw.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None).map_err(error)?;
+            let push_size = out.desc.storage_push_size;
+            if out.storage.iter().any(|b| b.offset % 8 != 0 || b.offset.checked_add(8).is_none_or(|n| n > push_size)) { return Err("invalid draw storage push layout".into()); }
+            if push_size > 128 || (!out.storage.is_empty() && !out.dev.compute) { return Err("draw storage unsupported".into()); }
+            let push: Vec<_> = (push_size > 0).then(|| vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).size(push_size)).into_iter().collect();
+            out.layout = out.dev.raw.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&push), None).map_err(error)?;
             out.vertex = out.dev.raw.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&out.code.vertex), None).map_err(error)?;
             out.fragment = out.dev.raw.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&out.code.fragment), None).map_err(error)?;
             if out.dev.multiview && !out.code.xr_vertex.is_empty() {
@@ -255,20 +262,25 @@ impl Program {
                 out.xr_fragment = out.dev.raw.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&out.code.xr_fragment), None).map_err(error)?;
             }
             for s in &out.code.samplers {
-                let filter = if s.filter == 0 { vk::Filter::NEAREST } else { vk::Filter::LINEAR };
-                let address = match s.address { 0 => vk::SamplerAddressMode::REPEAT, 1 => vk::SamplerAddressMode::CLAMP_TO_EDGE,
-                    2 => vk::SamplerAddressMode::CLAMP_TO_BORDER, _ => vk::SamplerAddressMode::MIRRORED_REPEAT };
-                if s.pixel && (s.compare || !matches!(s.address, 1 | 2)) { return Err("invalid unnormalized sampler".into()); }
-                out.samplers.push(out.dev.raw.create_sampler(&vk::SamplerCreateInfo::default().mag_filter(filter).min_filter(filter)
-                    .mipmap_mode(if s.pixel { vk::SamplerMipmapMode::NEAREST } else { vk::SamplerMipmapMode::LINEAR })
-                    .address_mode_u(address).address_mode_v(address).address_mode_w(address)
-                    .border_color(vk::BorderColor::FLOAT_TRANSPARENT_BLACK).unnormalized_coordinates(s.pixel)
-                    .compare_enable(s.compare).compare_op(vk::CompareOp::LESS_OR_EQUAL).min_lod(0.0)
-                    .max_lod(if s.pixel { 0.0 } else { vk::LOD_CLAMP_NONE }), None).map_err(error)?);
+                out.samplers.push(sampler(&out.dev, s)?);
             }
         }
         Ok(Arc::new(out))
     }
+}
+
+/// The sampler a draw's or a kernel's sampler `s` describes.
+pub(super) fn sampler(dev: &Device, s: &crate::spirv::SpirvSampler) -> Result<vk::Sampler, String> {
+    let filter = if s.filter == 0 { vk::Filter::NEAREST } else { vk::Filter::LINEAR };
+    let address = match s.address { 0 => vk::SamplerAddressMode::REPEAT, 1 => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+        2 => vk::SamplerAddressMode::CLAMP_TO_BORDER, _ => vk::SamplerAddressMode::MIRRORED_REPEAT };
+    if s.pixel && (s.compare || !matches!(s.address, 1 | 2)) { return Err("invalid unnormalized sampler".into()); }
+    unsafe { dev.raw.create_sampler(&vk::SamplerCreateInfo::default().mag_filter(filter).min_filter(filter)
+        .mipmap_mode(if s.pixel { vk::SamplerMipmapMode::NEAREST } else { vk::SamplerMipmapMode::LINEAR })
+        .address_mode_u(address).address_mode_v(address).address_mode_w(address)
+        .border_color(vk::BorderColor::FLOAT_TRANSPARENT_BLACK).unnormalized_coordinates(s.pixel)
+        .compare_enable(s.compare).compare_op(vk::CompareOp::LESS_OR_EQUAL).min_lod(0.0)
+        .max_lod(if s.pixel { 0.0 } else { vk::LOD_CLAMP_NONE }), None) }.map_err(error)
 }
 
 impl Drop for Program {
@@ -294,8 +306,8 @@ struct VariantKey { colors: [u32; 4], depth: u32, flags: u32, views: u8, samples
 
 impl VariantKey {
     fn new(pass: PassKey, flags: u32) -> Self {
-        let mut flags = flags & (Draw::BLEND | Draw::CULL | Draw::DEPTH_WRITE | Draw::WIREFRAME);
-        if pass.depth == ABSENT { flags &= !Draw::DEPTH_WRITE; } // no depth attachment: the bit changes nothing
+        let mut flags = flags & (Draw::BLEND | Draw::CULL | Draw::DEPTH_WRITE | Draw::WIREFRAME | Draw::DEPTH_GREATER);
+        if pass.depth == ABSENT { flags &= !(Draw::DEPTH_WRITE | Draw::DEPTH_GREATER); } // no depth attachment: the bit changes nothing
         Self { colors: pass.colors, depth: pass.depth, flags, views: pass.views, samples: pass.samples.max(1) }
     }
 }
@@ -310,6 +322,7 @@ pub(super) struct Source {
     pub desc: PipelineDesc,
     pub code: SpirvPipeline,
     pub bindings: Vec<u32>,
+    pub storage: Vec<StorageBinding>,
     pub stride: u32,
     pub key: Vec<u8>,
 }
@@ -332,12 +345,14 @@ pub(super) struct State {
     /// by shader content, so every session that created a pipeline with it is told); `None` once
     /// the compile has answered
     waiters: Mutex<Option<Vec<u32>>>,
+    /// the compile's place in the queue (`Compilers`): a draw program's, lowered once a frame waits for it
+    pub rank: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl State {
     pub fn new(src: Arc<Source>) -> Arc<Self> {
         Arc::new(Self { src, program: OnceLock::new(), variants: Mutex::new(HashMap::new()), video: Mutex::new(HashMap::new()), video_variants: Mutex::new(HashMap::new()),
-            epoch: AtomicU64::new(0), waiters: Mutex::new(Some(Vec::new())) })
+            epoch: AtomicU64::new(0), waiters: Mutex::new(Some(Vec::new())), rank: super::Compilers::rank(super::compile_rank::DRAW) })
     }
 
     /// Session `sid` has a pipeline on this program: its pump is woken when the compile answers.
@@ -411,7 +426,7 @@ impl State {
         let program = {
             let mut programs = lock(&self.video);
             programs.entry(video.to_vec()).or_insert_with(|| {
-                let made = Program::new(base.dev.clone(), self.src.desc, self.src.code.clone(), self.src.bindings.clone(), self.src.stride, Some(video));
+                let made = Program::new(base.dev.clone(), self.src.desc, self.src.code.clone(), self.src.bindings.clone(), self.src.stride, self.src.storage.clone(), Some(video));
                 if let Err(e) = &made { eprintln!("[hal-vulkan] video pipeline: {e}"); }
                 made
             }).as_ref().ok()?.clone()
@@ -468,14 +483,18 @@ fn create_variant(program: Arc<Program>, pass: &RenderPass, flags: u32) -> Resul
     }
     let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
     let depth = vk::PipelineDepthStencilStateCreateInfo::default().depth_test_enable(pass.key.depth != ABSENT)
-        .depth_write_enable(pass.key.depth != ABSENT && flags & Draw::DEPTH_WRITE != 0).depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+        .depth_write_enable(pass.key.depth != ABSENT && flags & Draw::DEPTH_WRITE != 0).depth_compare_op(if flags & Draw::DEPTH_GREATER != 0 { vk::CompareOp::GREATER } else { vk::CompareOp::LESS_OR_EQUAL });
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let info = vk::GraphicsPipelineCreateInfo::default().stages(&stages).vertex_input_state(&vertex).input_assembly_state(&assembly)
         .viewport_state(&viewport).rasterization_state(&raster).multisample_state(&samples).depth_stencil_state(&depth)
         .color_blend_state(&blend).dynamic_state(&dynamic).layout(program.layout).render_pass(pass.raw).subpass(0);
-    let raw = match unsafe { dev.raw.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) } {
-        Ok(p) => p[0],
+    let raw = match unsafe { dev.raw.create_graphics_pipelines(dev.pipeline_cache, &[info], None) } {
+        Ok(p) => {
+            dev.pipelines_made.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            dev.pipeline_made_ns.store(crate::clock_ns(), std::sync::atomic::Ordering::Relaxed);
+            p[0]
+        }
         Err((partial, e)) => { for p in partial { unsafe { dev.raw.destroy_pipeline(p, None); } } return Err(error(e)); }
     };
     Ok(Arc::new(Pipeline { program, raw }))

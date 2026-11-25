@@ -249,6 +249,7 @@ impl Replayer {
             let mut expected = 0u64;
             for (pi, p) in c.passes.iter().enumerate().take(cut.pass + 1) {
                 let pass = Pass {
+                    kind: pass_kind::DRAW, dispatches: Range::default(),
                     color: if p.is_window() { [self.rt, Id::NONE, Id::NONE, Id::NONE] } else { p.color.map(|i| self.map_tex(i)) },
                     depth: self.map_tex(p.depth),
                     load: p.load,
@@ -261,7 +262,7 @@ impl Replayer {
                     views: 1,
                     // (and single sampled: the replay's target has no multisampled images)
                     samples: 1,
-                    uniforms: Slice::from_bytes(&p.uniforms),
+                    uniforms: w.keep(&p.uniforms),
                     draws: Range::default(),
                     name: 0,
                     owner: 0,
@@ -282,6 +283,7 @@ impl Replayer {
                     let tex_ids: Vec<Id> = d.tex.iter().map(|t| self.map_tex(*t)).collect();
                     let tex = w.put_ids(&tex_ids);
                     let draw = Draw {
+                        storage_buffers: Range::default(),
                         pipeline,
                         vb: self.map_buf(d.vb),
                         ib: self.map_buf(d.ib),
@@ -291,10 +293,10 @@ impl Replayer {
                             id: if d.inst_kind == Inst::BUFFER { self.map_buf(d.inst_id) } else { Id::NONE },
                             off: d.inst_off,
                             count: d.inst_count,
-                            data: if d.inst_kind == Inst::INLINE { Slice::from_bytes(&d.inst_data) } else { Slice::EMPTY },
+                            data: if d.inst_kind == Inst::INLINE { w.keep(&d.inst_data) } else { Slice::EMPTY },
                         },
                         inst_ranges,
-                        uniforms: [Slice::from_bytes(&d.uniforms[0]), Slice::from_bytes(&d.uniforms[1]), Slice::from_bytes(&d.uniforms[2]), Slice::from_bytes(&d.uniforms[3])],
+                        uniforms: [w.keep(&d.uniforms[0]), w.keep(&d.uniforms[1]), w.keep(&d.uniforms[2]), w.keep(&d.uniforms[3])],
                         ubufs: d.ubufs.map(|b| self.map_buf(b)),
                         tex,
                         pick_tex: Range::default(),

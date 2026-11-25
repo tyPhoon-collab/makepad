@@ -3453,10 +3453,27 @@ extern "C" cudaError_t mkllm_softmax_mask(
 
 // ---------------------------------------------------------------------------
 // Flash-attention decode (small n_q): one block per (head, query).
-// q f32 [D, nq, H], k f16 [D, kc, Hkv], v f16 [Dv, kc, Hkv], mask f16
-// [kc, nq_pad], dst f32 [Dv, H, nq]. Online softmax, f32 accumulation.
+// q f32 [D, nq, H], k [D, kc, Hkv], v [Dv, kc, Hkv] (f16, or q8_0 read as the
+// f16 its dequant would store), mask f16 [kc, nq_pad], dst f32 [Dv, H, nq].
+// Online softmax, f32 accumulation.
 // ---------------------------------------------------------------------------
 
+// Element `i` of one K/V row as f32. A q8_0 row yields exactly the f16 value
+// mkllm_dequant_q8_0_f16 would have written for it, so both storage types give
+// bit-identical attention.
+template <bool q8>
+static __device__ __forceinline__ float mkllm_kv_elem(const uint8_t * row, int i) {
+    if constexpr (q8) {
+        const uint8_t * blk = row + (size_t) (i / 32) * 34;
+        const float d = __half2float(*(const __half *) blk);
+        const int q = ((const int8_t *) (blk + 2))[i % 32];
+        return __half2float(__float2half(d * (float) q));
+    } else {
+        return __half2float(((const __half *) row)[i]);
+    }
+}
+
+template <bool kv_q8>
 static __global__ void mkllm_flash_decode_kernel(
         const uint8_t * __restrict__ q, const uint8_t * __restrict__ k,
         const uint8_t * __restrict__ v, const uint8_t * __restrict__ mask,
@@ -3497,10 +3514,10 @@ static __global__ void mkllm_flash_decode_kernel(
         if (mval == -INFINITY || mval < -65500.0f) {
             s = -INFINITY;
         } else {
-            const __half * krow = (const __half *) (kh + (size_t) key * k_nb1);
+            const uint8_t * krow = kh + (size_t) key * k_nb1;
             float partial = 0.0f;
             for (int i = lane; i < D; i += blockDim.x) {
-                partial += qs[i] * __half2float(krow[i]);
+                partial += qs[i] * mkllm_kv_elem<kv_q8>(krow, i);
             }
             red[lane] = partial;
             __syncthreads();
@@ -3518,9 +3535,9 @@ static __global__ void mkllm_flash_decode_kernel(
             const float corr = expf(m_running - m_new);
             const float p = expf(s - m_new);
             __syncthreads();
-            const __half * vrow = (const __half *) (vh + (size_t) key * v_nb1);
+            const uint8_t * vrow = vh + (size_t) key * v_nb1;
             for (int i = lane; i < Dv; i += blockDim.x) {
-                acc[i] = acc[i] * corr + p * __half2float(vrow[i]);
+                acc[i] = acc[i] * corr + p * mkllm_kv_elem<kv_q8>(vrow, i);
             }
             if (lane == 0) {
                 l_running = l_running * corr + p;
@@ -3537,20 +3554,33 @@ static __global__ void mkllm_flash_decode_kernel(
     }
 }
 
+// `kv_q8`: K and V are q8_0 (both or neither; a q8_0 head dim is a multiple
+// of 32).
 extern "C" cudaError_t mkllm_flash_decode(
         const void * q, const void * k, const void * v, const void * mask, void * dst,
         int D, int Dv, int kc, int n_q, int H, int Hkv, float scale,
         size_t q_nb1, size_t q_nb2, size_t k_nb1, size_t k_nb2,
         size_t v_nb1, size_t v_nb2, size_t m_nb1, size_t d_nb1, size_t d_nb2,
-        cudaStream_t stream) {
+        int kv_q8, cudaStream_t stream) {
+    if (kv_q8 && (D % 32 != 0 || Dv % 32 != 0)) {
+        return cudaErrorInvalidValue;
+    }
     dim3 block(128);
     dim3 grid(H, n_q);
     const size_t shared = (size_t) (D + 128 + Dv) * sizeof(float);
-    mkllm_flash_decode_kernel<<<grid, block, shared, stream>>>(
-        (const uint8_t *) q, (const uint8_t *) k, (const uint8_t *) v,
-        (const uint8_t *) mask, (uint8_t *) dst,
-        D, Dv, kc, n_q, H, Hkv, scale,
-        q_nb1, q_nb2, k_nb1, k_nb2, v_nb1, v_nb2, m_nb1, d_nb1, d_nb2);
+    if (kv_q8) {
+        mkllm_flash_decode_kernel<true><<<grid, block, shared, stream>>>(
+            (const uint8_t *) q, (const uint8_t *) k, (const uint8_t *) v,
+            (const uint8_t *) mask, (uint8_t *) dst,
+            D, Dv, kc, n_q, H, Hkv, scale,
+            q_nb1, q_nb2, k_nb1, k_nb2, v_nb1, v_nb2, m_nb1, d_nb1, d_nb2);
+    } else {
+        mkllm_flash_decode_kernel<false><<<grid, block, shared, stream>>>(
+            (const uint8_t *) q, (const uint8_t *) k, (const uint8_t *) v,
+            (const uint8_t *) mask, (uint8_t *) dst,
+            D, Dv, kc, n_q, H, Hkv, scale,
+            q_nb1, q_nb2, k_nb1, k_nb2, v_nb1, v_nb2, m_nb1, d_nb1, d_nb2);
+    }
     return cudaGetLastError();
 }
 
@@ -4401,8 +4431,18 @@ extern "C" cudaError_t mkllm_gated_delta_net(
         size_t k_h_elems, size_t k_t_elems, size_t k_s_elems,
         size_t v_h_elems, size_t v_t_elems, size_t v_s_elems,
         int state_checkpoints,
+        void * state_cache, const void * state_read_rows, const void * state_write_rows,
+        int64_t state_row_stride,
         cudaStream_t stream) {
     if (sv % 32 != 0 || sv > 256) {
+        return cudaErrorInvalidValue;
+    }
+    // `state_cache` non-null: `s` is unused, sequence `i` resumes from cache
+    // row `state_read_rows[i]`, and each state lands in the row
+    // `state_write_rows` names for it (`t * n_seqs + i` with checkpoints, `i`
+    // without), `state_row_stride` floats apart. `dst` keeps only the outputs.
+    if (state_cache != nullptr && (state_read_rows == nullptr || state_write_rows == nullptr
+            || state_row_stride < (int64_t) sv * sv * h)) {
         return cudaErrorInvalidValue;
     }
     // Non-zero => write one state per token, `sv*sv*h*n_seqs` floats apart.
@@ -4427,7 +4467,9 @@ extern "C" cudaError_t mkllm_gated_delta_net(
                 (float *) dst, sv, h, n_tokens, n_seqs,
                 (int64_t) q_h_elems, (int64_t) q_t_elems, (int64_t) q_s_elems,
                 (int64_t) v_h_elems, (int64_t) v_t_elems, (int64_t) v_s_elems,
-                sb1, sb2, sb3, q_heads, rq3, scale, state_ckpt_stride, stream);
+                sb1, sb2, sb3, q_heads, rq3, scale, state_ckpt_stride,
+                (float *) state_cache, (const int *) state_read_rows,
+                (const int *) state_write_rows, state_row_stride, stream);
         } else {
             launch_gated_delta_net<false>(
                 (const float *) q, (const float *) k, (const float *) v,
@@ -4435,13 +4477,15 @@ extern "C" cudaError_t mkllm_gated_delta_net(
                 (float *) dst, sv, h, n_tokens, n_seqs,
                 (int64_t) q_h_elems, (int64_t) q_t_elems, (int64_t) q_s_elems,
                 (int64_t) v_h_elems, (int64_t) v_t_elems, (int64_t) v_s_elems,
-                sb1, sb2, sb3, q_heads, rq3, scale, state_ckpt_stride, stream);
+                sb1, sb2, sb3, q_heads, rq3, scale, state_ckpt_stride,
+                (float *) state_cache, (const int *) state_read_rows,
+                (const int *) state_write_rows, state_row_stride, stream);
         }
         return cudaGetLastError();
     }
-    if (state_checkpoints) {
-        // Only the official kernel emits per-token states; fail closed rather
-        // than silently leaving the checkpoint rows unwritten.
+    if (state_checkpoints || state_cache != nullptr) {
+        // Only the official kernel emits per-token states or works in the
+        // state cache; fail closed rather than leaving cache rows unwritten.
         return cudaErrorInvalidValue;
     }
     const int cols_per_block = 4;
@@ -4597,31 +4641,49 @@ extern "C" cudaError_t mkllm_copy_strided(
 
 #include "fattn/fattn-mma-f16.cuh"
 
+// First few host launches only.
+static int mkllm_fattn_trace_prints = 0;
+
+static bool mkllm_fattn_tracing() {
+    return mkllm_fattn_trace_prints < 8;
+}
+
+// `occ` sizes the split; `occ_own` is the launched kernel's own occupancy
+// (they differ only for q8_0 K/V, whose split follows the f16 kernel).
 static void mkllm_fattn_trace_launch(
         const char * kind, int D, int n_q, int kc, int H, int Hkv,
-        int nsm, int max_blocks_per_sm, int parallel_blocks, int ntiles_dst,
+        int nsm, int max_blocks_per_sm, int own_blocks_per_sm, int parallel_blocks, int ntiles_dst,
         int ntiles_KV, int stream_k, unsigned gx, unsigned gy, unsigned gz) {
-    // First few host launches only. Official launch_fattn (fattn-common.cuh:990)
-    // for VEC is stream_k=false; pb is occupancy-capped then efficiency-swept.
-    static int prints = 0;
-    if (prints >= 8) {
+    // Official launch_fattn (fattn-common.cuh:990) for VEC is stream_k=false;
+    // pb is occupancy-capped then efficiency-swept.
+    if (!mkllm_fattn_tracing()) {
         return;
     }
     fprintf(stderr,
-        "fattn.launch: kind=%s D=%d n_q=%d n_kv=%d H=%d Hkv=%d nsm=%d occ=%d "
+        "fattn.launch: kind=%s D=%d n_q=%d n_kv=%d H=%d Hkv=%d nsm=%d occ=%d occ_own=%d "
         "pb=%d ntiles_dst=%d ntiles_KV=%d stream_k=%d grid=(%u,%u,%u) "
         "pad256=%d\n",
-        kind, D, n_q, kc, H, Hkv, nsm, max_blocks_per_sm, parallel_blocks,
+        kind, D, n_q, kc, H, Hkv, nsm, max_blocks_per_sm, own_blocks_per_sm, parallel_blocks,
         ntiles_dst, ntiles_KV, stream_k, gx, gy, gz,
         (kc + 255) & ~255);
-    ++prints;
+    ++mkllm_fattn_trace_prints;
+}
+
+static int mkllm_fattn_own_occupancy(
+        bool differs, fattn_kernel_t kernel, int threads, size_t shared, int split_occ) {
+    int occ = split_occ;
+    if (differs && mkllm_fattn_tracing()
+            && cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kernel, threads, shared) != cudaSuccess) {
+        occ = -1;
+    }
+    return occ;
 }
 
 // The MMA launcher, templated on the tile shape so the GQA ratio can pick
 // it. `ncols2` is how many query heads of one KV head a tile covers, and
 // `ncols1` how many tokens; their product is the 64-column tile every size
 // below is derived from, so a different split costs nothing in shared memory.
-template <int D, int ncols1, int ncols2>
+template <int D, int ncols1, int ncols2, bool kv_q8>
 static cudaError_t mkllm_fattn_mma_launch(
         const void * q, const void * k, const void * v, const void * mask, void * dst,
         int kc, int n_q, int H, int Hkv, float scale,
@@ -4661,10 +4723,23 @@ static cudaError_t mkllm_fattn_mma_launch(
                 ? nbytes_shared_Q : nbytes_shared_KV + nbytes_shared_mask)
             : nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
 
+    if (kv_q8 && (nstages <= 1 || nbatch_K2 != DKQ / 2 || nbatch_V2 != DV / 2)) {
+        // q8_0 tiles are whole rows on the cp.async pipeline (Ampere and newer).
+        return cudaErrorInvalidValue;
+    }
     fattn_kernel_t fattn_kernel =
-        flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view>;
+        flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, kv_q8>;
+    // The split over SMs is sized from the f16 kernel for q8_0 K/V too: a
+    // q8_0 cache then reduces in the same order as its f16 dequant would,
+    // which is what keeps the two bit-identical.
+    fattn_kernel_t split_kernel =
+        flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false>;
     cudaError_t err = cudaFuncSetAttribute(
         fattn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) nbytes_shared_total);
+    if (err == cudaSuccess && kv_q8) {
+        err = cudaFuncSetAttribute(
+            split_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) nbytes_shared_total);
+    }
     if (err != cudaSuccess) {
         return err;
     }
@@ -4677,7 +4752,7 @@ static cudaError_t mkllm_fattn_mma_launch(
     dim3 block_dim(32, nwarps, 1);
     int max_blocks_per_sm = 1;
     err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y, nbytes_shared_total);
+        &max_blocks_per_sm, split_kernel, block_dim.x * block_dim.y, nbytes_shared_total);
     if (err != cudaSuccess || max_blocks_per_sm <= 0) {
         max_blocks_per_sm = 1;
     }
@@ -4697,9 +4772,11 @@ static cudaError_t mkllm_fattn_mma_launch(
         blocks_num = dim3(ntiles_x, 1, ntiles_z_gqa * Hkv);
     }
     char kind[16];
-    snprintf(kind, sizeof(kind), "mma%dx%d", ncols1, ncols2);
+    snprintf(kind, sizeof(kind), "mma%dx%d%s", ncols1, ncols2, kv_q8 ? "q8" : "");
     mkllm_fattn_trace_launch(
         kind, DKQ, n_q, kc, H, Hkv, nsm, max_blocks_per_sm,
+        mkllm_fattn_own_occupancy(kv_q8, fattn_kernel, block_dim.x * block_dim.y,
+            nbytes_shared_total, max_blocks_per_sm),
         use_stream_k ? nblocks_stream_k : 1, ntiles_dst, ntiles_KV,
         use_stream_k ? 1 : 0, blocks_num.x, blocks_num.y, blocks_num.z);
 
@@ -4732,18 +4809,27 @@ static cudaError_t mkllm_fattn_mma_launch(
     return cudaSuccess;
 }
 
-extern "C" cudaError_t mkllm_fattn_mma_f16(
+// `kv_q8`: K and V are q8_0 views of the cache, read in place (both or
+// neither). Their rows must start on the cp.async granule of their length.
+extern "C" cudaError_t mkllm_fattn_mma(
         const void * q, const void * k, const void * v, const void * mask, void * dst,
         int D, int Dv, int kc, int n_q, int H, int Hkv, float scale,
         size_t q_nb1, size_t q_nb2, size_t k_nb1, size_t k_nb2,
         size_t v_nb1, size_t v_nb2, size_t m_nb1, size_t d_nb1, size_t d_nb2,
-        int nsm, int cc, float * tmp_fixup, cudaStream_t stream) {
+        int nsm, int cc, int kv_q8, float * tmp_fixup, cudaStream_t stream) {
     (void) d_nb1;
     (void) d_nb2;
     if ((D != 128 && D != 256) || Dv != D || n_q <= 0 || kc <= 0 || H <= 0 || Hkv <= 0
             || H % Hkv != 0 || q == nullptr || k == nullptr || v == nullptr
             || mask == nullptr || dst == nullptr) {
         return cudaErrorInvalidValue;
+    }
+    if (kv_q8) {
+        const size_t granule = D == 256 ? 16 : 8;
+        if (k_nb1 % granule || k_nb2 % granule || v_nb1 % granule || v_nb2 % granule
+                || (uintptr_t) k % granule || (uintptr_t) v % granule) {
+            return cudaErrorInvalidValue;
+        }
     }
     // llama.cpp fattn.cu switch_ncols2: the GQA ratio decides how many query
     // heads share a tile. Getting this wrong is not slow, it is wrong — a
@@ -4755,19 +4841,22 @@ extern "C" cudaError_t mkllm_fattn_mma_f16(
 #define MKLLM_FATTN_MMA_ARGS                                                   \
     q, k, v, mask, dst, kc, n_q, H, Hkv, scale,                                \
     q_nb1, q_nb2, k_nb1, k_nb2, v_nb1, v_nb2, m_nb1, nsm, cc, tmp_fixup, stream
+#define MKLLM_FATTN_MMA_TILE(D_, c1, c2)                                         \
+    return kv_q8 ? mkllm_fattn_mma_launch<D_, c1, c2, true>(MKLLM_FATTN_MMA_ARGS) \
+                 : mkllm_fattn_mma_launch<D_, c1, c2, false>(MKLLM_FATTN_MMA_ARGS)
     const int gqa_ratio = H / Hkv;
     if (D == 128) {
         // The same official MMA template, with its D=128 launch geometry.
-        if (gqa_ratio % 8 == 0) return mkllm_fattn_mma_launch<128, 8, 8>(MKLLM_FATTN_MMA_ARGS);
-        if (gqa_ratio % 4 == 0) return mkllm_fattn_mma_launch<128, 16, 4>(MKLLM_FATTN_MMA_ARGS);
-        if (gqa_ratio % 2 == 0) return mkllm_fattn_mma_launch<128, 32, 2>(MKLLM_FATTN_MMA_ARGS);
+        if (gqa_ratio % 8 == 0) MKLLM_FATTN_MMA_TILE(128, 8, 8);
+        if (gqa_ratio % 4 == 0) MKLLM_FATTN_MMA_TILE(128, 16, 4);
+        if (gqa_ratio % 2 == 0) MKLLM_FATTN_MMA_TILE(128, 32, 2);
         return cudaErrorInvalidValue;
     }
     if (gqa_ratio % 8 == 0) {
-        return mkllm_fattn_mma_launch<256, 8, 8>(MKLLM_FATTN_MMA_ARGS);
+        MKLLM_FATTN_MMA_TILE(256, 8, 8);
     }
     if (gqa_ratio % 4 == 0) {
-        return mkllm_fattn_mma_launch<256, 16, 4>(MKLLM_FATTN_MMA_ARGS);
+        MKLLM_FATTN_MMA_TILE(256, 16, 4);
     }
     if (gqa_ratio % 2 == 0) {
         // The rung llama.cpp's switch_ncols2 ladder has and this port was
@@ -4776,9 +4865,10 @@ extern "C" cudaError_t mkllm_fattn_mma_f16(
         // Without it the caller's gate sent that model to the generic
         // FlashDecode kernel: measured 11-20x slower past 8k context, flat
         // 85-91 tok/s restored with the tile.
-        return mkllm_fattn_mma_launch<256, 32, 2>(MKLLM_FATTN_MMA_ARGS);
+        MKLLM_FATTN_MMA_TILE(256, 32, 2);
     }
     return cudaErrorInvalidValue;
+#undef MKLLM_FATTN_MMA_TILE
 #undef MKLLM_FATTN_MMA_ARGS
 }
 
@@ -4795,6 +4885,7 @@ extern "C" size_t mkllm_fattn_mma_fixup_bytes(int nsm) {
 // llama.cpp fattn.cu:402-404 + fattn-vec.cuh:522-532:
 // Ada+ decode, F16 K/V, n_q==1, not (GQA>4 && KV>=8192) ->
 // flash_attn_ext_vec<256, 1, F16, F16, false>, launch_fattn stream_k=false.
+// A q8_0 cache runs the same kernel on Q8_0 views (see fattn_vec_f16_math).
 #include "fattn/fattn-vec.cuh"
 
 extern "C" size_t mkllm_fattn_vec_tmp_bytes(int n_q, int H, int kc) {
@@ -4810,7 +4901,7 @@ extern "C" size_t mkllm_fattn_vec_tmp_bytes(int n_q, int H, int kc) {
     return (bytes128 > bytes256 ? bytes128 : bytes256) * (size_t) n_q * (size_t) H;
 }
 
-template <int DKQ>
+template <int DKQ, ggml_type type_KV>
 static cudaError_t mkllm_fattn_vec_launch(
         const void * q, const void * k, const void * v, const void * mask, void * dst,
         int D, int Dv, int kc, int n_q, int H, int Hkv, float scale,
@@ -4831,11 +4922,15 @@ static cudaError_t mkllm_fattn_vec_launch(
     constexpr int nwarps = nthreads / 32;
     constexpr int nbatch_fa = DKQ;
     fattn_kernel_t fattn_kernel =
+        flash_attn_ext_vec<DKQ, ncols1, type_KV, type_KV, false>;
+    // Split sized from the f16 kernel whatever the storage, as in the MMA
+    // launcher: the same split is the same reduction order.
+    fattn_kernel_t split_kernel =
         flash_attn_ext_vec<DKQ, ncols1, GGML_TYPE_F16, GGML_TYPE_F16, false>;
     dim3 block_dim(32, nwarps, 1);
     int max_blocks_per_sm = 1;
     cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y, 0);
+        &max_blocks_per_sm, split_kernel, block_dim.x * block_dim.y, 0);
     if (err != cudaSuccess || max_blocks_per_sm <= 0) {
         max_blocks_per_sm = 1;
     }
@@ -4864,7 +4959,10 @@ static cudaError_t mkllm_fattn_vec_launch(
     dim3 blocks_num((unsigned) ntiles_x, (unsigned) parallel_blocks,
         (unsigned) (ntiles_z_gqa * Hkv));
     mkllm_fattn_trace_launch(
-        "vec", D, n_q, kc, H, Hkv, nsm, max_blocks_per_sm, parallel_blocks,
+        type_KV == GGML_TYPE_Q8_0 ? "vecq8" : "vec", D, n_q, kc, H, Hkv, nsm, max_blocks_per_sm,
+        mkllm_fattn_own_occupancy(type_KV != GGML_TYPE_F16, fattn_kernel, block_dim.x * block_dim.y,
+            0, max_blocks_per_sm),
+        parallel_blocks,
         ntiles_dst, ntiles_KV, 0, blocks_num.x, blocks_num.y, blocks_num.z);
     float * dst_ptr = (float *) dst;
     float2 * meta_ptr = nullptr;
@@ -4901,17 +4999,292 @@ static cudaError_t mkllm_fattn_vec_launch(
     return cudaSuccess;
 }
 
-extern "C" cudaError_t mkllm_fattn_vec_f16(
+// `kv_q8`: K and V are q8_0 views of the cache, read in place (both or
+// neither), with the F16 kernel's arithmetic on the values their dequant
+// would produce.
+extern "C" cudaError_t mkllm_fattn_vec(
         const void * q, const void * k, const void * v, const void * mask, void * dst,
         int D, int Dv, int kc, int n_q, int H, int Hkv, float scale,
         size_t q_nb1, size_t q_nb2, size_t k_nb1, size_t k_nb2,
         size_t v_nb1, size_t v_nb2, size_t m_nb1, size_t d_nb1, size_t d_nb2,
-        int nsm, float * tmp, cudaStream_t stream) {
+        int nsm, int kv_q8, float * tmp, cudaStream_t stream) {
 #define MKLLM_FATTN_VEC_ARGS \
     q, k, v, mask, dst, D, Dv, kc, n_q, H, Hkv, scale, \
     q_nb1, q_nb2, k_nb1, k_nb2, v_nb1, v_nb2, m_nb1, d_nb1, d_nb2, nsm, tmp, stream
-    if (D == 128) return mkllm_fattn_vec_launch<128>(MKLLM_FATTN_VEC_ARGS);
-    if (D == 256) return mkllm_fattn_vec_launch<256>(MKLLM_FATTN_VEC_ARGS);
+    if (kv_q8) {
+        if (D == 128) return mkllm_fattn_vec_launch<128, GGML_TYPE_Q8_0>(MKLLM_FATTN_VEC_ARGS);
+        if (D == 256) return mkllm_fattn_vec_launch<256, GGML_TYPE_Q8_0>(MKLLM_FATTN_VEC_ARGS);
+        return cudaErrorInvalidValue;
+    }
+    if (D == 128) return mkllm_fattn_vec_launch<128, GGML_TYPE_F16>(MKLLM_FATTN_VEC_ARGS);
+    if (D == 256) return mkllm_fattn_vec_launch<256, GGML_TYPE_F16>(MKLLM_FATTN_VEC_ARGS);
     return cudaErrorInvalidValue;
 #undef MKLLM_FATTN_VEC_ARGS
+}
+
+// ---------------------------------------------------------------------------
+// Sampler weighing: the device half of libs/ai/llm/src/sampler.rs, which
+// defines it. Same operations in the same order, so the same bits: the
+// penalties come off the logits (f32 subtract), m is the penalised maximum,
+// every weight is mks_exp((l - m) / T) with the reference's constants and
+// explicit fma/mul/rint, each 1024-token chunk is summed by halving strides
+// and the chunk sums are added in order. The heaviest `cap` tokens come back
+// as rank keys (weight bits << 32 | ~token), heaviest first.
+//
+// logits f32 [vocab] rows `logits_stride` floats apart, weighed row r reading
+// logits row row_idx[r]; per-row temperature;
+// penalties as CSR (pen_off[rows + 1], pen_tok, pen_val), each token once per
+// row. Scratch: w [rows][w_stride] floats, cmax/csum [rows][nchunks]. out row
+// r at r * out_stride bytes: f32 sum, f32 max, u32 count, u32 0, then `count`
+// u64 keys.
+// ---------------------------------------------------------------------------
+
+#define MKS_CHUNK 1024
+#define MKS_MAX_CAP 1024
+
+static __device__ __forceinline__ float mks_exp(float x) {
+    if (!(x >= -87.0f)) return 0.0f;
+    const float k = rintf(__fmul_rn(x, __int_as_float(0x3FB8AA3B)));
+    float r = __fmaf_rn(-k, __int_as_float(0x3F317200), x);
+    r = __fmaf_rn(-k, __int_as_float(0x35BFBE8E), r);
+    float p = __int_as_float(0x3AB60B61);
+    p = __fmaf_rn(p, r, __int_as_float(0x3C088889));
+    p = __fmaf_rn(p, r, __int_as_float(0x3D2AAAAB));
+    p = __fmaf_rn(p, r, __int_as_float(0x3E2AAAAB));
+    p = __fmaf_rn(p, r, 0.5f);
+    p = __fmaf_rn(p, r, 1.0f);
+    p = __fmaf_rn(p, r, 1.0f);
+    const float scale = __int_as_float(((int) k + 127) << 23);
+    return __fmul_rn(p, scale);
+}
+
+// grid (nchunks, rows), block 256: penalised logits into w, chunk maxima.
+static __global__ void mks_prep_kernel(
+        const float * __restrict__ logits, size_t logits_stride, const int * __restrict__ row_idx, int vocab,
+        const int * __restrict__ pen_off, const unsigned * __restrict__ pen_tok,
+        const float * __restrict__ pen_val,
+        float * __restrict__ w, size_t w_stride, float * __restrict__ cmax, int nchunks) {
+    const int c = blockIdx.x;
+    const int row = blockIdx.y;
+    const int t = threadIdx.x;
+    __shared__ float s[MKS_CHUNK];
+    __shared__ float red[256];
+    const int base = c * MKS_CHUNK;
+    const float * l = logits + (size_t) row_idx[row] * logits_stride;
+    for (int j = t; j < MKS_CHUNK; j += 256) {
+        const int i = base + j;
+        s[j] = i < vocab ? l[i] : -INFINITY;
+    }
+    __syncthreads();
+    for (int e = pen_off[row] + t; e < pen_off[row + 1]; e += 256) {
+        const unsigned tok = pen_tok[e];
+        if (tok >= (unsigned) base && tok < (unsigned) (base + MKS_CHUNK) && tok < (unsigned) vocab) {
+            s[tok - base] = __fsub_rn(s[tok - base], pen_val[e]);
+        }
+    }
+    __syncthreads();
+    float best = -INFINITY;
+    float * wr = w + (size_t) row * w_stride;
+    for (int j = t; j < MKS_CHUNK; j += 256) {
+        const int i = base + j;
+        if (i < vocab) {
+            wr[i] = s[j];
+            best = fmaxf(best, s[j]);
+        }
+    }
+    red[t] = best;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (t < off) red[t] = fmaxf(red[t], red[t + off]);
+        __syncthreads();
+    }
+    if (t == 0) cmax[(size_t) row * nchunks + c] = red[0];
+}
+
+// grid (nchunks, rows), block 256: weights in place in w, chunk tree sums.
+static __global__ void mks_exp_kernel(
+        float * __restrict__ w, size_t w_stride, int vocab,
+        const float * __restrict__ cmax, int nchunks, const float * __restrict__ temps,
+        float * __restrict__ csum) {
+    const int c = blockIdx.x;
+    const int row = blockIdx.y;
+    const int t = threadIdx.x;
+    __shared__ float red[256];
+    float m = -INFINITY;
+    for (int j = t; j < nchunks; j += 256) m = fmaxf(m, cmax[(size_t) row * nchunks + j]);
+    red[t] = m;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (t < off) red[t] = fmaxf(red[t], red[t + off]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+    const float temp = temps[row];
+    float * wr = w + (size_t) row * w_stride;
+    const int base = c * MKS_CHUNK;
+    float v[4];
+    #pragma unroll
+    for (int q = 0; q < 4; q++) {
+        const int i = base + t + q * 256;
+        float x = 0.0f;
+        if (i < vocab) {
+            x = mks_exp(__fdiv_rn(__fsub_rn(wr[i], m), temp));
+            wr[i] = x;
+        }
+        v[q] = x;
+    }
+    // Thread t holds chunk positions t, t+256, t+512, t+768. Stride 512 adds
+    // t+512 into t and t+768 into t+256; stride 256 adds t+256 into t.
+    const float sum = __fadd_rn(__fadd_rn(v[0], v[2]), __fadd_rn(v[1], v[3]));
+    red[t] = sum;
+    __syncthreads();
+    for (int off = 128; off >= 32; off >>= 1) {
+        if (t < off) red[t] = __fadd_rn(red[t], red[t + off]);
+        __syncthreads();
+    }
+    if (t < 32) {
+        float x = red[t];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) x = __fadd_rn(x, __shfl_down_sync(0xffffffffu, x, off));
+        if (t == 0) csum[(size_t) row * nchunks + c] = x;
+    }
+}
+
+static __device__ __forceinline__ unsigned long long mks_key(unsigned bits, int token) {
+    return ((unsigned long long) bits << 32) | (unsigned long long) (0xFFFFFFFFu - (unsigned) token);
+}
+
+// grid (rows), block 1024: the row's sum and maximum, and its heaviest `cap`
+// tokens by a radix select on the weight bits, ties at the threshold taken in
+// token order, then a bitonic sort of the keys.
+static __global__ void mks_select_kernel(
+        const float * __restrict__ w, size_t w_stride, int vocab,
+        const float * __restrict__ cmax, const float * __restrict__ csum, int nchunks, int cap,
+        unsigned char * __restrict__ out, size_t out_stride) {
+    const int row = blockIdx.x;
+    const int t = threadIdx.x;
+    const int lane = t & 31;
+    const int warp = t >> 5;
+    const unsigned * wb = (const unsigned *) (w + (size_t) row * w_stride);
+    __shared__ unsigned hist[256];
+    __shared__ unsigned long long keys[MKS_MAX_CAP];
+    __shared__ unsigned warp_counts[32];
+    __shared__ unsigned prefix_s, need_s, gt_s, taken_s, total_s;
+    unsigned char * o = out + (size_t) row * out_stride;
+    const int take = cap < vocab ? cap : vocab;
+    if (t == 0) {
+        float sum = 0.0f;
+        float m = -INFINITY;
+        for (int j = 0; j < nchunks; j++) {
+            sum = __fadd_rn(sum, csum[(size_t) row * nchunks + j]);
+            m = fmaxf(m, cmax[(size_t) row * nchunks + j]);
+        }
+        ((float *) o)[0] = sum;
+        ((float *) o)[1] = m;
+        ((unsigned *) o)[2] = (unsigned) take;
+        ((unsigned *) o)[3] = 0u;
+    }
+    unsigned prefix = 0u;
+    unsigned need = (unsigned) take;
+    for (int pass = 3; pass >= 0; pass--) {
+        const int shift = pass * 8;
+        const unsigned hi_mask = pass == 3 ? 0u : (0xFFFFFFFFu << (shift + 8));
+        if (t < 256) hist[t] = 0u;
+        __syncthreads();
+        for (int i = t; i < vocab; i += 1024) {
+            const unsigned b = wb[i];
+            if ((b & hi_mask) == (prefix & hi_mask)) atomicAdd(&hist[(b >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        if (t == 0) {
+            unsigned above = 0u;
+            int d = 255;
+            for (; d > 0; d--) {
+                if (above + hist[d] >= need) break;
+                above += hist[d];
+            }
+            prefix_s = prefix | ((unsigned) d << shift);
+            need_s = need - above;
+        }
+        __syncthreads();
+        prefix = prefix_s;
+        need = need_s;
+        __syncthreads();
+    }
+    const unsigned tau = prefix;
+    if (t == 0) {
+        gt_s = 0u;
+        taken_s = 0u;
+    }
+    for (int j = t; j < MKS_MAX_CAP; j += 1024) keys[j] = 0ull;
+    __syncthreads();
+    for (int i = t; i < vocab; i += 1024) {
+        const unsigned b = wb[i];
+        if (b > tau) keys[atomicAdd(&gt_s, 1u)] = mks_key(b, i);
+    }
+    __syncthreads();
+    const unsigned gt = gt_s;
+    // The `need` lowest-id tokens at the threshold, in token order.
+    for (int base = 0; base < vocab; base += 1024) {
+        const unsigned taken = taken_s;
+        if (taken >= need) break;
+        const int i = base + t;
+        const bool flag = i < vocab && wb[i] == tau;
+        const unsigned mask = __ballot_sync(0xffffffffu, flag);
+        if (lane == 0) warp_counts[warp] = __popc(mask);
+        __syncthreads();
+        if (t == 0) {
+            unsigned run = 0u;
+            for (int k = 0; k < 32; k++) {
+                const unsigned count = warp_counts[k];
+                warp_counts[k] = run;
+                run += count;
+            }
+            total_s = run;
+        }
+        __syncthreads();
+        if (flag) {
+            const unsigned pos = taken + warp_counts[warp] + __popc(mask & ((1u << lane) - 1u));
+            if (pos < need) keys[gt + pos] = mks_key(tau, i);
+        }
+        __syncthreads();
+        if (t == 0) taken_s = taken + total_s;
+        __syncthreads();
+    }
+    // Bitonic sort, descending, over the whole key array (zeros sort last).
+    for (unsigned k = 2; k <= MKS_MAX_CAP; k <<= 1) {
+        for (unsigned j = k >> 1; j > 0; j >>= 1) {
+            const unsigned ixj = (unsigned) t ^ j;
+            if (ixj > (unsigned) t) {
+                const unsigned long long a = keys[t];
+                const unsigned long long b = keys[ixj];
+                const bool desc = ((unsigned) t & k) == 0;
+                if (desc ? (a < b) : (a > b)) {
+                    keys[t] = b;
+                    keys[ixj] = a;
+                }
+            }
+            __syncthreads();
+        }
+    }
+    unsigned long long * ok = (unsigned long long *) (o + 16);
+    for (int j = t; j < take; j += 1024) ok[j] = keys[j];
+}
+
+extern "C" cudaError_t mkllm_sample_weigh(
+        const void * logits, size_t logits_stride, const int * row_idx, int vocab, int rows,
+        const int * pen_off, const unsigned * pen_tok, const float * pen_val,
+        const float * temps, float * w, size_t w_stride, float * cmax, float * csum,
+        int cap, void * out, size_t out_stride, cudaStream_t stream) {
+    if (vocab <= 0 || rows <= 0 || cap <= 0 || cap > MKS_MAX_CAP) return cudaErrorInvalidValue;
+    const int nchunks = (vocab + MKS_CHUNK - 1) / MKS_CHUNK;
+    dim3 grid(nchunks, rows);
+    mks_prep_kernel<<<grid, 256, 0, stream>>>(
+        (const float *) logits, logits_stride, row_idx, vocab, pen_off, pen_tok, pen_val,
+        w, w_stride, cmax, nchunks);
+    mks_exp_kernel<<<grid, 256, 0, stream>>>(w, w_stride, vocab, cmax, nchunks, temps, csum);
+    mks_select_kernel<<<rows, 1024, 0, stream>>>(
+        w, w_stride, vocab, cmax, csum, nchunks, cap, (unsigned char *) out, out_stride);
+    return cudaGetLastError();
 }

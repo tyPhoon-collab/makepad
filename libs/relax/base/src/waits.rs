@@ -21,16 +21,20 @@ pub enum Kind {
     Pump,
     /// a query another thread runs (object: the query's dep node)
     Query,
-    /// a slot another thread builds
+    /// a slot another thread builds (object: the slot, label: its fn, holder: the thread running
+    /// the build)
     Build,
     /// a program futex wait (object: the futex address; label: mutex, condvar, read, write, park,
     /// once). Its holder is an address on the holder thread's stack (0: unknown), not a thread id.
     Futex,
     /// a program thread join
     Join,
+    /// a CPU token of the budget (object and label: the class). No one thread holds it up:
+    /// makepad_cpu_budget::tokens names who has them.
+    Token,
 }
 
-pub const KIND_NAMES: [&str; 7] = ["none", "owner", "pump", "query", "build", "futex", "join"];
+pub const KIND_NAMES: [&str; 8] = ["none", "owner", "pump", "query", "build", "futex", "join", "token"];
 
 const ROWS: usize = 1024;
 
@@ -163,12 +167,11 @@ impl Drop for Guard {
     }
 }
 
-/// The holder of this thread's current wait became known (a latch's runner found after the wait
-/// began).
-pub fn set_holder(holder: u64) {
-    if let Some(r) = row() {
-        r.holder.store(holder, Relaxed);
-    }
+/// What a wait for a CPU token runs (makepad_cpu_budget::set_wait_hook).
+pub extern "C" fn token_wait(class: u8) {
+    const CLASSES: [&str; 3] = ["interactive", "visible", "background"];
+    let _w = begin(Kind::Token, class as u64, 0, CLASSES[class as usize]);
+    makepad_cpu_budget::park();
 }
 
 /// Starts a wait with no guard (program futex waits enter and leave through two C calls).
@@ -209,37 +212,44 @@ pub struct Wait {
 
 /// Every thread's current wait (consistent per row; lock-free).
 pub fn snapshot() -> Vec<Wait> {
-    let mut out = Vec::new();
-    for r in TABLE.iter() {
-        let thread = r.thread.load(Acquire);
-        if thread == 0 {
+    TABLE.iter().filter_map(read).collect()
+}
+
+/// `thread`'s current wait (None: it waits for nothing the registry knows, or has no row).
+pub fn of(thread: u64) -> Option<Wait> {
+    TABLE.iter().find(|r| r.thread.load(Acquire) == thread).and_then(read)
+}
+
+/// A row's wait, read consistently (None: no wait, or a writer kept it busy).
+fn read(r: &Row) -> Option<Wait> {
+    let thread = r.thread.load(Acquire);
+    if thread == 0 {
+        return None;
+    }
+    for _ in 0..8 {
+        let s0 = r.state.load(Acquire);
+        if s0 & 0xff == 0xff {
+            std::hint::spin_loop();
             continue;
         }
-        for _ in 0..8 {
-            let s0 = r.state.load(Acquire);
-            if s0 & 0xff == 0xff {
-                std::hint::spin_loop();
-                continue;
-            }
-            let (object, holder, since_ns) = (r.object.load(Relaxed), r.holder.load(Relaxed), r.since_ns.load(Relaxed));
-            let (l, n) = (r.label.load(Relaxed), r.label_len.load(Relaxed));
-            if r.state.load(Acquire) != s0 {
-                continue;
-            }
-            let kind = match s0 & 0xff {
-                1 => Kind::Owner,
-                2 => Kind::Pump,
-                3 => Kind::Query,
-                4 => Kind::Build,
-                5 => Kind::Futex,
-                6 => Kind::Join,
-                _ => break,
-            };
-            // labels are 'static strs written whole before the state word
-            let label = if l == 0 { "" } else { unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(l as *const u8, n)) } };
-            out.push(Wait { thread, kind, object, holder, since_ns, label });
-            break;
+        let (object, holder, since_ns) = (r.object.load(Relaxed), r.holder.load(Relaxed), r.since_ns.load(Relaxed));
+        let (l, n) = (r.label.load(Relaxed), r.label_len.load(Relaxed));
+        if r.state.load(Acquire) != s0 {
+            continue;
         }
+        let kind = match s0 & 0xff {
+            1 => Kind::Owner,
+            2 => Kind::Pump,
+            3 => Kind::Query,
+            4 => Kind::Build,
+            5 => Kind::Futex,
+            6 => Kind::Join,
+            7 => Kind::Token,
+            _ => return None,
+        };
+        // labels are 'static strs written whole before the state word
+        let label = if l == 0 { "" } else { unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(l as *const u8, n)) } };
+        return Some(Wait { thread, kind, object, holder, since_ns, label });
     }
-    out
+    None
 }

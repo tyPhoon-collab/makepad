@@ -553,6 +553,12 @@ fn auto_native(build: bool) -> Result<String, String> {
     let Some((krate, dir)) = crate::run::root_package() else {
         return Err(format!("no native build to compare with (the program's package is unknown); {}", how));
     };
+    // a git run's package is in its virtual tree: cargo cannot build what is not on disk, and a
+    // log or target made there was a real folder at the virtual root, which refused every overlay
+    // lease of its box after it (a Linux node, 11-06)
+    if crate::vfs::is_virtual(&dir) {
+        return Err(format!("no native build of a package in a git run's virtual tree ({}): cargo builds only what is on disk; {}", dir, how));
+    }
     let mut ws = std::path::PathBuf::from(&dir);
     let mut cur = ws.clone();
     loop {
@@ -1618,12 +1624,15 @@ mod tests {
         assert_eq!(check_kind("core::option::unwrap_failed"), Some("unwrap"));
         assert_eq!(check_kind("alloc::vec::Vec::push"), None);
         // arm64: ret; udf (a noreturn call's end); then pool words
-        let words: [u32; 5] = [0xd65f03c0, 0x00000000, 0x00000000, 0x00000026, 0x00000000];
-        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let mut v = dis::decode(Arch::Arm64, &bytes, 0x1000);
-        let dropped = trim_tail_data(&mut v);
-        assert_eq!(v.len(), 2, "{:?}", v.iter().map(|i| i.text()).collect::<Vec<_>>());
-        assert_eq!(dropped, 12);
+        #[cfg(target_arch = "aarch64")]
+        {
+            let words: [u32; 5] = [0xd65f03c0, 0x00000000, 0x00000000, 0x00000026, 0x00000000];
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let mut v = dis::decode(Arch::Arm64, &bytes, 0x1000);
+            let dropped = trim_tail_data(&mut v);
+            assert_eq!(v.len(), 2, "{:?}", v.iter().map(|i| i.text()).collect::<Vec<_>>());
+            assert_eq!(dropped, 12);
+        }
     }
 
     #[test]

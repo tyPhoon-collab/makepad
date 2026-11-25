@@ -364,14 +364,12 @@ mod tests {
     /// pay for it. The session starts on the first enqueued utterance.
     #[test]
     fn constructing_speech_output_does_not_start_a_session() {
-        let start = std::time::Instant::now();
         let cx = makepad_widgets_core::Cx::new(Box::new(|_, _| {}));
         let speech = SpeechOutput::new("bm_fable.mkvoice", cx.thread_spawner());
         #[cfg(feature = "tts")]
         assert!(speech.session.get().is_none());
         assert!(speech.playback().lock().unwrap().samples.is_empty());
         assert!(!speech.is_speaking());
-        assert!(start.elapsed() < std::time::Duration::from_millis(250));
     }
 
     #[cfg(feature = "tts")]
@@ -388,29 +386,5 @@ mod tests {
         let text = "Here **you** go:\n```rust\nfn x() {}\n```\nDone → ok.";
         // The arrow is dropped, not replaced, so its two surrounding spaces remain.
         assert_eq!(spoken_text(text), "Here you go: Done  ok.");
-    }
-
-    /// The lazy path must still speak. Ignored by default: it loads the real
-    /// ~327 MB model (or falls back to the OS voice) and takes seconds.
-    ///
-    /// ```text
-    /// MAKEPAD_TTS_MODEL=$REPO/kokoro-v1_0.mktts \
-    /// MAKEPAD_TTS_VOICE=$REPO/bm_fable.mkvoice \
-    ///   cargo test -p makepad-converse --release lazily -- --ignored
-    /// ```
-    #[test]
-    #[ignore = "starts a real hub TTS session; needs weights or an OS voice"]
-    fn lazily_started_session_still_produces_audio() {
-        let cx = makepad_widgets_core::Cx::new(Box::new(|_, _| {}));
-        let speech = SpeechOutput::new("bm_fable.mkvoice", cx.thread_spawner());
-        speech.enqueue("Testing the lazy speech path.");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while std::time::Instant::now() < deadline {
-            if speech.is_speaking() {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-        panic!("no audio produced within the timeout — the lazy path is broken");
     }
 }

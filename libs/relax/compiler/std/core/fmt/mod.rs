@@ -22,6 +22,8 @@ pub type Result = crate::result::Result<(), Error>;
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Error;
 
+impl crate::error::Error for Error {}
+
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Display::fmt("an error occurred when formatting an argument", f)
@@ -115,7 +117,7 @@ pub mod rt {
 
     impl<'a> Argument<'a> {
         /// `f` must be the formatting fn of `T`; the value is passed back to it as `&T`.
-        pub fn new<T>(x: &'a T, f: fn(&T, &mut Formatter<'_>) -> Result) -> Argument<'a> {
+        pub const fn new<T>(x: &'a T, f: fn(&T, &mut Formatter<'_>) -> Result) -> Argument<'a> {
             Argument {
                 value: x as *const T as *const u8,
                 formatter: unsafe {
@@ -501,10 +503,6 @@ impl<'a> Formatter<'a> {
 
     pub fn write_str(&mut self, data: &str) -> Result {
         self.buf.write_str(data)
-    }
-
-    pub fn write_char(&mut self, c: char) -> Result {
-        self.buf.write_char(c)
     }
 
     pub fn write_fmt(&mut self, fmt: Arguments<'_>) -> Result {

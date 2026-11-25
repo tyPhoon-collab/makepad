@@ -37,6 +37,7 @@ macro_rules! print {
 mod lexer {
     pub use relax_compiler::lexer::*;
 }
+mod cargo;
 pub mod fetch;
 mod help;
 pub mod launch;
@@ -54,6 +55,10 @@ pub struct Host {
     pub init: fn(),
     /// before a session is made: registers the provided crates and the main-thread run host
     pub provide: fn(),
+    /// the HAL's host and the main-thread run host (the window, the run's end) without the
+    /// provided crates, before the program's source is had: an app's start opens its window
+    /// first (`provide` registers them too)
+    pub run_host: fn(),
     /// how much the JIT compiles ahead of the program's calls when neither `--ahead=` nor
     /// MAKEPAD_RUN_AHEAD says (jit::AheadPolicy): the entry point's default
     pub ahead: relax_compiler::options::AheadLevel,
@@ -72,7 +77,7 @@ pub struct Host {
 
 /// The bare runner (bin `relax`): provides nothing; tests, checks and agents' boots compile only
 /// what runs.
-pub const BARE: Host = Host { provenance: env!("RELAX_RUNNER_PROVENANCE"), init: || {}, provide: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, proc_macros: relax_compiler::pmhost::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml") };
+pub const BARE: Host = Host { provenance: env!("RELAX_RUNNER_PROVENANCE"), init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, proc_macros: relax_compiler::pmhost::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml") };
 
 static HOST: std::sync::OnceLock<&'static Host> = std::sync::OnceLock::new();
 
@@ -98,25 +103,14 @@ fn provided() {
     (host().provide)()
 }
 
-/// The loader binary. Usually this process's executable; but an app the runner starts runs
-/// from its own macOS bundle (`<runner data>/bundles/<app>.app/Contents/MacOS/<Name>`, a hard
-/// link to the loader, or a copy when it is on another volume) so the Dock shows the app's name
-/// and icon. Then MAKEPAD_RUN_LOADER, inherited from the runner, names the loader itself: it is kept
-/// when it is the same file (same inode) or the same bytes, and everything the loader finds next
-/// to itself (the Builder's folder, the runner's checkout and std) is found next to that one.
+/// The loader binary: current_exe is canonicalised so a macOS bundle's in-bundle symlink
+/// resolves to the real loader. Everything found beside the loader (the runner's checkout,
+/// std and makepad-launcher) is therefore found beside that shared binary.
 pub(crate) fn loader_exe() -> Option<std::path::PathBuf> {
     static EXE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     EXE.get_or_init(|| {
         let _kept = relax_compiler::zone_alloc::kept();
-        let exe = plain(std::env::current_exe().and_then(|e| e.canonicalize()).ok()?);
-        if let Some(named) = std::env::var_os("MAKEPAD_RUN_LOADER").map(std::path::PathBuf::from) {
-            if let Ok(named) = named.canonicalize().map(plain) {
-                if named != exe && same_binary(&named, &exe) {
-                    return Some(named);
-                }
-            }
-        }
-        Some(exe)
+        Some(plain(std::env::current_exe().and_then(|e| e.canonicalize()).ok()?))
     })
     .clone()
 }
@@ -138,18 +132,6 @@ fn plain(p: std::path::PathBuf) -> std::path::PathBuf {
     p
 }
 
-fn same_binary(a: &std::path::Path, b: &std::path::Path) -> bool {
-    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else { return false };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if ma.dev() == mb.dev() && ma.ino() == mb.ino() {
-            return true;
-        }
-    }
-    ma.len() == mb.len() && matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
-}
-
 /// The runner on this process's command line, with `host` added.
 pub fn main(host: &'static Host) {
     relax_compiler::memstat::tune_malloc();
@@ -168,7 +150,6 @@ pub fn init_embedded(exe: &std::path::Path, host: &'static Host) {
     // the program's argv[0] / current_exe: the embedder has no command line of its own
     relax_compiler::os::proc::set_args(vec![exe.as_os_str().as_encoded_bytes().to_vec()]);
     std::env::set_var("MAKEPAD_RUN_LOADER", exe);
-    std::env::set_var("MAKEPAD_LOADER_STATE", fetch::home().join("cache"));
     macros::register();
 }
 
@@ -178,6 +159,50 @@ pub fn init_embedded(exe: &std::path::Path, host: &'static Host) {
 pub fn run_with_args(args: Vec<Vec<u8>>) {
     relax_compiler::os::proc::set_args(args.clone());
     run(args)
+}
+
+/// NVIDIA's shader disk cache (GL and Vulkan) for every program this loader runs. The driver keys
+/// its files by the executable's path, and every JIT build is a new executable: each binary's first
+/// runs compiled every pipeline cold (Stage held its first frame 9 s for 109 pipelines), so they
+/// all take one name. And a folder of their own, `$XDG_CACHE_HOME/makepad/nvidia`: the driver's
+/// shared folder takes no entry once it holds its 1 GB, and every other program's per-path keys
+/// fill it (a pool box at 1025 MB: every cold Fab compiled its pipelines again, the first frame
+/// held 20.5 s for 177 pipelines; in a folder of its own 0.3 s). The driver trims neither: past
+/// 3/4 of its cap this one is emptied, and the next runs fill it again. It is renamed away before
+/// it is removed, so a start beside this one finds the full folder or a new empty one, never one
+/// half removed, and a running program's open files go with the old one (its writes are lost, not
+/// mixed into the new folder).
+#[cfg(target_os = "linux")]
+fn nvidia_shader_cache() {
+    if std::env::var_os("__GL_SHADER_DISK_CACHE_APP_NAME").is_none() {
+        std::env::set_var("__GL_SHADER_DISK_CACHE_APP_NAME", "makepad");
+    }
+    if std::env::var_os("__GL_SHADER_DISK_CACHE_PATH").is_some() {
+        return;
+    }
+    let abs = |v: Option<std::ffi::OsString>| v.map(std::path::PathBuf::from).filter(|p| p.is_absolute());
+    let Some(base) = abs(std::env::var_os("XDG_CACHE_HOME")).or_else(|| abs(std::env::var_os("HOME")).map(|h| h.join(".cache"))) else {
+        return;
+    };
+    let dir = base.join("makepad").join("nvidia");
+    fn bytes(dir: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+        entries.flatten().map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => bytes(&e.path()),
+            _ => e.metadata().map_or(0, |m| m.len()),
+        }).sum()
+    }
+    if bytes(&dir) > 768 << 20 {
+        // (one name: what a killed removal left goes with the next one)
+        let old = dir.with_extension("old");
+        let _ = std::fs::remove_dir_all(&old);
+        if std::fs::rename(&dir, &old).is_ok() {
+            let _ = std::fs::remove_dir_all(&old);
+        }
+    }
+    if std::fs::create_dir_all(&dir).is_ok() {
+        std::env::set_var("__GL_SHADER_DISK_CACHE_PATH", &dir);
+    }
 }
 
 fn run(raw_args: Vec<Vec<u8>>) {
@@ -191,8 +216,8 @@ fn run(raw_args: Vec<Vec<u8>>) {
     // the boot thread compiles: its allocations go to the compiler arena (JIT calls switch back)
     let _phase = relax_compiler::zone_alloc::compiler();
     relax_compiler::clock::mark_process_start();
-    // a build script's RUSTC (Relax itself) asked for its version
-    if relax_compiler::relax_as_rustc() {
+    // A build script's CARGO / RUSTC calls are answered before normal loader commands.
+    if cargo::dispatch(&raw_args) || relax_compiler::relax_as_rustc() {
         return;
     }
     // cargo's RUSTC_WRAPPER of an --allow-c native build, or a stubbed build script of it
@@ -212,6 +237,9 @@ fn run(raw_args: Vec<Vec<u8>>) {
             std::process::exit(2);
         }
     };
+    // Windows has no exec: a run that can restart becomes the child of this process, which waits
+    #[cfg(windows)]
+    relax_compiler::restart_parent::enter(&raw_args);
     // a child started in a virtual folder of a git repository run gets the mount table
     if let Err(e) = relax_compiler::vfs::mount_from_env() {
         eprintln!("makepad: MAKEPAD_RUN_VFS: {e}");
@@ -234,12 +262,10 @@ fn run(raw_args: Vec<Vec<u8>>) {
     if let Some(e) = loader_exe() {
         std::env::set_var("MAKEPAD_RUN_LOADER", e);
     }
-    // one folder for everything makepad run and the runner keep: $MAKEPAD_RUN_HOME/cache (the entry
-    // scripts set MAKEPAD_RUN_HOME to the launcher's folder); the runner's Builder library keeps its
-    // records there too (MAKEPAD_LOADER_STATE)
-    std::env::set_var("MAKEPAD_LOADER_STATE", fetch::home().join("cache"));
     // the programs it runs (the runner app) keep their launch records in the same home
     std::env::set_var("MAKEPAD_RUN_HOME", fetch::home());
+    #[cfg(target_os = "linux")]
+    nvidia_shader_cache();
     macros::register();
     match args.get(1).map(String::as_str) {
         None => {
@@ -256,9 +282,15 @@ fn run(raw_args: Vec<Vec<u8>>) {
         // the remote hub: `hub [--listen <addr>]`, `remote-relay [--dial ..]`, `remote add|pair|list`
         Some("hub") => std::process::exit(remote::hub(&args[2..])),
         // `devhub` (or `observe`) `stream|ls|inspect|reply|inbox|hubs`: the local devhub (every JIT
-        // on the LAN from the master)
-        #[cfg(unix)]
-        Some("devhub" | "observe") => std::process::exit(makepad_devhub::cli::main(&args[2..])),
+        // on the LAN from the master), its own binary
+        Some("devhub" | "observe") => {
+            if args.get(2).map(String::as_str) == Some("ci") {
+                eprintln!("use `makepad ci`");
+                std::process::exit(2);
+            }
+            std::process::exit(devhub(&args[2..]));
+        }
+        Some("ci") => std::process::exit(devhub(&args[1..])),
         Some("remote-relay") => std::process::exit(remote::relay(&args[2..])),
         Some("remote") => std::process::exit(remote::remote(&args[2..])),
         // `pack-src [--target <triple>] <out.store> <package>...`: the source archive `run --src` runs from
@@ -270,14 +302,14 @@ fn run(raw_args: Vec<Vec<u8>>) {
             }
         },
         // `run --src <store>[@<offset>+<len>] <package> ...`: from a packed source archive, no checkout
-        Some("run") if args[2..].iter().any(|a| a == "--src") => std::process::exit(run_src(&args[2..])),
+        Some("run") if args[2..].iter().any(|a| a == "--src") => relax_compiler::os::proc::exit(run_src(&args[2..])),
         // `check --src <store>[@<offset>+<len>] <package> ...`: type/borrow-check what `run --src` would
         // compile, reading only the archive (an archive that misses a file the app needs fails here,
         // not on the phone); never through the check server
         Some("check") if args[2..].iter().any(|a| a == "--src") => {
             let mut words = vec!["--check".to_string()];
             words.extend(args[2..].iter().filter(|a| !matches!(a.as_str(), "--serve" | "--no-serve")).cloned());
-            std::process::exit(run_src(&words))
+            relax_compiler::os::proc::exit(run_src(&words))
         }
         // `run <git url>[#ref] [--mount <dir>=<git url>[#ref]]... [--cached] <package> ...`
         Some("run") => match fetch::split_args(&args[2..]) {
@@ -286,7 +318,7 @@ fn run(raw_args: Vec<Vec<u8>>) {
                 eprintln!("makepad: {e}");
                 std::process::exit(2);
             }
-            Some(Ok((opts, spec, cached, rest))) => std::process::exit(run_spec(opts, &spec, cached, rest)),
+            Some(Ok((opts, spec, cached, rest))) => relax_compiler::os::proc::exit(run_spec(opts, &spec, cached, rest)),
         },
         // `fetch <git url>[#ref] [--mount ..]`: the snapshot's folder on stdout
         Some("fetch") => match fetch::split_args(&args[2..]) {
@@ -311,21 +343,19 @@ fn run(raw_args: Vec<Vec<u8>>) {
                 std::process::exit(2);
             }
         },
+        Some("export") if args.get(2).is_some_and(|a| a == "--mounted") => {
+            let [out] = &args[3..] else {
+                eprintln!("usage: makepad export --mounted <folder>");
+                std::process::exit(2);
+            };
+            let table = std::env::var("MAKEPAD_RUN_VFS").unwrap_or_default();
+            let workspace = std::env::var("MAKEPAD_RUN_WORKSPACE").unwrap_or_default();
+            export_to(fetch::mounted(&table, &workspace), out)
+        }
         Some("export") => match fetch::split_args(&args[2..]) {
             Some(Ok((_, spec, cached, rest))) if rest.len() == 1 => {
                 let home = fetch::home();
-                let snap = if cached { fetch::cached(&home, &spec) } else { fetch::fetch(&home, &spec) };
-                let edits = std::env::var_os("MAKEPAD_RUN_EDITS").filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
-                match snap.and_then(|snap| fetch::export(&snap, edits.as_deref(), std::path::Path::new(&rest[0]))) {
-                    Ok((files, wrote)) => {
-                        println!("{files} files, {wrote} written");
-                        std::process::exit(0)
-                    }
-                    Err(e) => {
-                        eprintln!("makepad: {e}");
-                        std::process::exit(1)
-                    }
-                }
+                export_to(if cached { fetch::cached(&home, &spec) } else { fetch::fetch(&home, &spec) }, &rest[0])
             }
             Some(Err(e)) => {
                 eprintln!("makepad: {e}");
@@ -427,6 +457,41 @@ fn run_spec(opts: Vec<String>, spec: &fetch::Spec, cached: bool, rest: Vec<Strin
     if let Some(i) = opts.iter().position(|o| o == "--report-to") {
         if let Some(p) = opts.get(i + 1) {
             let _ = relax_compiler::run::report_open(p);
+        }
+    }
+    // an app's start from its launch record (`launch::resolve` named the app): its window opens
+    // first and shows the source being had, or why it could not be
+    if std::env::var_os("MAKEPAD_APP_ID").is_some() {
+        // its window keeps its geometry in the run dir, which the mount would otherwise decide
+        let workspace = fetch::workspace(&home, spec);
+        relax_compiler::dirs::preset_virtual_workspace(&workspace);
+        // what the run says of itself is set before its window's threads run (the environment is
+        // the process's: a write while another thread reads it is a race); what only its source
+        // says follows the mount (`mount_vars`)
+        std::env::set_var("MAKEPAD_RUN_SPEC", spec.args().join("\u{1f}"));
+        std::env::set_var("MAKEPAD_RUN_WORKSPACE", &workspace);
+        let words: Vec<String> = opts.iter().chain(&rest).cloned().collect();
+        let package = rest[0].clone();
+        let (home, spec, opts, rest) = (home.clone(), spec.clone(), opts.clone(), rest.clone());
+        let prepare = move || -> Result<std::sync::Arc<relax_compiler::Session>, String> {
+            // the stores, their mounts and the run's environment live for the process, as the
+            // main thread makes them for any other run: the program's heap, not the compile
+            // thread's compiler arena (the settle swap destroys it)
+            let workspace = relax_compiler::zone_alloc::kept_with(|| -> Result<String, String> {
+                let snap = if cached { fetch::cached(&home, &spec) } else { fetch::fetch(&home, &spec) }?;
+                let workspace = fetch::mount(&home, &snap)?;
+                mount_vars(&workspace, &rest[0]);
+                std::mem::forget(snap);
+                Ok(workspace)
+            })?;
+            let (sess, words, invocation) = session(opts.clone(), rest.clone());
+            // compiler-arena blocks (the compile thread's allocations go there): see boot_package
+            std::mem::forget((workspace, words, invocation));
+            Ok(sess)
+        };
+        (host().run_host)();
+        if let Some(code) = relax_compiler::run::cmd_run_app(&package, words, Box::new(prepare)) {
+            return code;
         }
     }
     let snap = match if cached { fetch::cached(&home, spec) } else { fetch::fetch(&home, spec) } {
@@ -536,25 +601,49 @@ pub fn mount_archive(file: &std::path::Path, offset: u64, len: u64, root: Option
     Ok(workspace)
 }
 
+/// `makepad export`: writes a snapshot out with `$MAKEPAD_RUN_EDITS` over it, and ends the process.
+fn export_to(snap: Result<fetch::Snapshot, String>, out: &str) -> ! {
+    let edits = std::env::var_os("MAKEPAD_RUN_EDITS").filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
+    match snap.and_then(|snap| fetch::export(&snap, edits.as_deref(), std::path::Path::new(out))) {
+        Ok((files, wrote)) => {
+            println!("{files} files, {wrote} written");
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("makepad: {e}");
+            std::process::exit(1)
+        }
+    }
+}
+
 /// Runs `rest` (the package and its flags) with `opts` (`cmd_run`'s options before the package)
 /// in `workspace`, a virtual workspace whose stores are mounted on Relax's VFS. Also the
 /// embedder's entry (the Android host mounts the APK's source store, then runs `--exports`).
 pub fn run_mounted(workspace: &str, opts: Vec<String>, rest: Vec<String>) -> i32 {
-    let workspace = workspace.to_string();
-    std::env::set_var("MAKEPAD_RUN_WORKSPACE", &workspace);
+    mount_env(workspace, &rest[0]);
+    boot_package(opts, rest)
+}
+
+/// What a run of the mounted workspace and the programs it starts see: the workspace and its
+/// mounts, its std, the package's run-env.
+fn mount_env(workspace: &str, package: &str) {
+    std::env::set_var("MAKEPAD_RUN_WORKSPACE", workspace);
+    mount_vars(workspace, package);
+}
+
+/// What only the mounted source says: its mounts, its std, the package's run-env.
+fn mount_vars(workspace: &str, package: &str) {
     // programs it starts that run on Relax (the runner's apps) mount the same repositories
     std::env::set_var("MAKEPAD_RUN_VFS", relax_compiler::vfs::mounts_text());
     // Verify the mounted std against the compiler build before any std disk probes.
     let own = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../libs/relax/compiler/std");
-    relax_compiler::std_source::select(&workspace, &own);
+    relax_compiler::std_source::select(workspace, &own);
     // the run's own files (unit graph, build script outputs, code cache): no workspace on disk,
     // so its relax dir is $MAKEPAD_RUN_HOME/target/<hash of the virtual workspace> (relax dirs.rs), one
     // per spec shape (the same across updates)
-    apply_run_env(&workspace, &rest[0]);
-    let code = boot_package(opts, rest);
+    apply_run_env(workspace, package);
     // compiler-arena blocks (the boot thread compiles): see boot_package
-    std::mem::forget((workspace, own));
-    code
+    std::mem::forget(own);
 }
 
 /// Runs `rest` (the package and its flags) with `opts` in the current directory, a checkout:
@@ -567,20 +656,8 @@ pub fn run_checkout(opts: Vec<String>, rest: Vec<String>) -> i32 {
 }
 
 fn boot_package(opts: Vec<String>, rest: Vec<String>) -> i32 {
-    // an embedder's boot thread (the Android host) compiles like the loader's main thread: the
-    // allocations go to the compiler arena, std's mpmc context is entered in the kept heap first
-    {
-        let _k = relax_compiler::zone_alloc::kept();
-        let (_tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
-        let _ = rx.recv_timeout(std::time::Duration::ZERO);
-    }
     let _phase = relax_compiler::zone_alloc::compiler();
-    provided();
-    let mut a = opts;
-    a.extend(rest);
-    let mut invocation = vec!["loader".to_string(), "run".to_string()];
-    invocation.extend_from_slice(&a);
-    let sess = relax_compiler::session_from_env(&invocation);
+    let (sess, a, invocation) = session(opts, rest);
     let code = relax_compiler::run::cmd_run(&sess, &a);
     // made in the compiler arena (the boot thread's allocations go there), which the zone swap
     // after the first present destroyed: freeing them on the way out wrote into unmapped chunks
@@ -590,3 +667,57 @@ fn boot_package(opts: Vec<String>, rest: Vec<String>) -> i32 {
     code
 }
 
+/// The run's session, its words and its invocation, made on the thread that compiles (an
+/// embedder's boot thread, as the Android host's, compiles like the loader's main thread): its
+/// allocations go to the compiler arena, std's mpmc context is entered in the kept heap first.
+fn session(opts: Vec<String>, rest: Vec<String>) -> (std::sync::Arc<relax_compiler::Session>, Vec<String>, Vec<String>) {
+    {
+        let _k = relax_compiler::zone_alloc::kept();
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let _ = rx.recv_timeout(std::time::Duration::ZERO);
+    }
+    provided();
+    let mut a = opts;
+    a.extend(rest);
+    let mut invocation = vec!["loader".to_string(), "run".to_string()];
+    invocation.extend_from_slice(&a);
+    let sess = relax_compiler::session_from_env(&invocation);
+    (sess, a, invocation)
+}
+
+
+/// `makepad devhub <words>`: the `makepad-devhub` binary of the checkout this JIT came from (else
+/// the one this folder is in), as built: the devhub master swaps a landing's build in when its
+/// rebuild finishes, so a call never waits on a build lock. A checkout with none yet goes through
+/// `cargo run`, which builds it. devhub is not linked here, so its changes never rebuild the JIT.
+/// Returns only when it could not start.
+fn devhub(words: &[String]) -> i32 {
+    let exe = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
+    let is_root = |d: &&std::path::Path| d.join("libs/devhub/Cargo.toml").is_file();
+    let root = exe.iter().flat_map(|e| e.ancestors()).find(is_root).or_else(|| cwd.iter().flat_map(|c| c.ancestors()).find(is_root));
+    let Some(root) = root else {
+        eprintln!("makepad devhub: no makepad checkout above {} or this folder (devhub builds from one)", exe.as_ref().map_or_else(String::new, |e| e.display().to_string()));
+        return 2;
+    };
+    let built = root.join("target/host").join(format!("makepad-devhub{}", std::env::consts::EXE_SUFFIX));
+    let mut command = if built.is_file() {
+        std::process::Command::new(built)
+    } else {
+        let cargo = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cargo/bin/cargo")).filter(|c| c.exists()).unwrap_or_else(|| "cargo".into());
+        let mut c = std::process::Command::new(cargo);
+        c.args(["run", "--profile", "host", "-q", "--manifest-path"]).arg(root.join("Cargo.toml")).args(["-p", "makepad-devhub", "--bin", "makepad-devhub", "--"]);
+        c
+    };
+    // (rustup counts its nested proxies in this one and refuses past 20: cargo -> makepad -> cargo must not count)
+    command.args(words).env_remove("RUST_RECURSION_COUNT");
+    #[cfg(unix)]
+    let e = std::os::unix::process::CommandExt::exec(&mut command);
+    #[cfg(not(unix))]
+    let e = match command.status() {
+        Ok(status) => return status.code().unwrap_or(1),
+        Err(e) => e,
+    };
+    eprintln!("makepad devhub: {}: {e}", command.get_program().to_string_lossy());
+    1
+}

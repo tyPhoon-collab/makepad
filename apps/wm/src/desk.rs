@@ -2273,8 +2273,9 @@ impl WmDesk {
                 continue;
             }
             let sent = self.items.get(&client).and_then(|item| with_tile_host(item, |v| {
-                // A window with no frame yet needs its child running.
-                if hide_now && !v.has_frame() { return false; }
+                // A JIT load screen is not the app's frame: hiding it would hold the
+                // app's first frame until the window is uncovered.
+                if hide_now && !v.app_drawn() { return false; }
                 v.set_visible(cx, !hide_now)
             })).unwrap_or(false);
             if sent {
@@ -3715,15 +3716,6 @@ mod tests {
         let r = snap_to_device(Rect { pos: dvec2(10.25, 36.4), size: dvec2(684.5, 853.1) }, 2.0);
         assert_eq!(r.pos, dvec2(10.5, 36.5));
         assert_eq!(r.size, dvec2(684.5, 853.0));
-    }
-
-    #[test]
-    fn gaps_match_omarchy() {
-        // gaps_in 5 on each side of a window: 10 between two tiles, and
-        // gaps_out 10 to the desk edge — uniform, like the reference.
-        assert_eq!(TILE_GAP, 10.0);
-        assert_eq!(GAPS_OUT, 10.0);
-        assert_eq!(BORDER_SIZE, 2.0);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! link on the main thread), wait (blocked in the compiler for another thread), jit (program
 //! code), host (runtime / system code called by program code).
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use relax_session::sync::Mutex;
 
@@ -20,7 +20,7 @@ struct Sample {
 }
 
 static SAMPLES: Mutex<Vec<Sample>> = Mutex::new(Vec::new());
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 static STARTED: AtomicBool = AtomicBool::new(false);
 
 pub fn enabled() -> bool {
@@ -29,7 +29,7 @@ pub fn enabled() -> bool {
 }
 
 /// Called on the main thread right before main runs.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub fn start() {
     if !enabled() || STARTED.swap(true, Ordering::SeqCst) {
         return;
@@ -45,7 +45,7 @@ pub fn start() {
     let lo = hi - unsafe { pthread_get_stacksize_np(me) } as u64;
     let port = unsafe { pthread_mach_thread_np(me) };
     let ms: u64 = std::env::var("MAKEPAD_RUN_PROFILE_MAIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000);
-    let _ = std::thread::Builder::new().name("run-mainprof".to_string()).spawn(move || {
+    let _ = crate::run_threads::spawn("run-mainprof", move || {
         extern "C" {
             fn pthread_set_qos_class_self_np(qos: u32, rel: i32) -> i32;
             fn thread_suspend(t: u32) -> i32;
@@ -92,7 +92,7 @@ pub fn start() {
     });
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 pub fn start() {}
 
 #[cfg(windows)]
@@ -102,25 +102,16 @@ fn host_name(pc: u64) -> String {
 
 #[cfg(unix)]
 fn host_name(pc: u64) -> String {
-    #[repr(C)]
-    struct DlInfo {
-        fname: *const i8,
-        fbase: *mut u8,
-        sname: *const i8,
-        saddr: *mut u8,
-    }
-    extern "C" {
-        fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
-    }
-    let mut info = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
+    use crate::os::proc::{dladdr, DlInfo};
+    let mut info = DlInfo::default();
     if unsafe { dladdr(pc as *const u8, &mut info) } == 0 || info.sname.is_null() {
         return format!("?{:x}", pc);
     }
-    let s = unsafe { std::ffi::CStr::from_ptr(info.sname.cast()) }.to_string_lossy().to_string();
+    let s = unsafe { std::ffi::CStr::from_ptr(info.sname) }.to_string_lossy().to_string();
     let lib = if info.fname.is_null() {
         String::new()
     } else {
-        let f = unsafe { std::ffi::CStr::from_ptr(info.fname.cast()) }.to_string_lossy().to_string();
+        let f = unsafe { std::ffi::CStr::from_ptr(info.fname) }.to_string_lossy().to_string();
         f.rsplit('/').next().unwrap_or("").to_string()
     };
     format!("{}!{}", lib, s)
@@ -204,4 +195,12 @@ fn short_name(n: &str) -> &str {
         k += 1;
     }
     &s[k..]
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&SAMPLES, Mutex::new(Vec::new()));
+    #[cfg(target_vendor = "apple")]
+    reset(&STARTED, AtomicBool::new(false));
 }

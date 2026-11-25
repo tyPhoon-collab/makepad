@@ -13,7 +13,7 @@
 //! import errors; modules of crates that are not checked are answered by Relax's tables (a crate
 //! the checked crates import from is resolved completely).
 //!
-//! Not modelled (nothing in these crates' imports needs them): macro-namespace bindings, macro
+//! Not modelled (nothing in these crates' imports needs them): macro
 //! expansion rounds (every item exists from the start; `expansion` only orders the output of
 //! different macros), hygiene, tool modules, derive helpers.
 use super::*;
@@ -109,14 +109,14 @@ enum Warn { Glob, Vis }
 
 pub enum SimKind { Error, Lint(&'static str) }
 
-/// A macro the replay resolved: a definition, or a std-family built-in (name, std's `panic`).
+/// A macro the replay resolved: a definition, a std-family built-in, or a hosted entry identity.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MacRes { Def(DefId), Builtin(Sym, bool) }
+pub enum MacRes { Def(DefId), Builtin(Sym, bool), ProcMacro(u32) }
 
 /// What a checked module binds in the macro namespace: its own binding (an item or a single import)
 /// and its glob binding, with the glob's ambiguity (0 none, 1 an error, 2 the lint ambiguous_glob_imports).
 #[derive(Clone, Copy, Default, Debug)]
-pub struct MacBinding { pub non_glob: Option<MacRes>, pub glob: Option<MacRes>, pub glob_amb: u8 }
+pub struct MacBinding { pub non_glob: Option<MacRes>, pub glob: Option<MacRes>, pub glob_amb: u8, pub non_glob_vis: BindVis, pub glob_vis: BindVis }
 
 pub struct SimDiag {
     pub file: u32,
@@ -155,8 +155,9 @@ struct Sim<'a> {
     unexpanded: crate::fxhash::HashSet<u32>,
     indeterminate: Vec<u32>,
     determined: Vec<u32>,
-    /// the std-family built-in macros given an identity so far: (name, std's `panic`)
-    builtin: Vec<(Sym, bool)>,
+    /// Macros without a collected definition, given synthetic identities for namespace replay.
+    synthetic_macros: Vec<MacRes>,
+    proc_macros: Vec<(usize, String)>,
 }
 
 fn ns_type(ns: usize) -> bool { ns == 0 }
@@ -189,8 +190,8 @@ impl StdMacros {
     }
 }
 
-/// A synthetic definition id of a std-family built-in macro in the replay (index `k` of `Sim::builtin`).
-fn builtin_macro_id(k: usize) -> DefId { DefId(u32::MAX - 1 - k as u32) }
+/// A synthetic definition id of a built-in or hosted macro (index `k` of `Sim::synthetic_macros`).
+fn synthetic_macro_id(k: usize) -> DefId { DefId(u32::MAX - 1 - k as u32) }
 
 impl Program {
     /// What rustc's import resolution reports for the imports of the checked crates beyond the
@@ -236,48 +237,27 @@ impl Program {
         // names some checked module binds through a glob: only their calls can be ambiguous
         let globbed: crate::fxhash::HashSet<Sym> = table.iter().filter(|(_, b)| b.glob.is_some()).map(|(&(_, n), _)| n).collect();
         if globbed.is_empty() { return out; }
+        // (each path's first file, as a search of the paths finds it)
+        let mut by_path: crate::fxhash::HashMap<&str, u32> = Default::default();
+        for (i, p) in self.file_paths.iter().enumerate() { by_path.entry(p.as_str()).or_insert(i as u32); }
         let mut seen = crate::fxhash::HashSet::default();
-        let mut items_of: crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>> = Default::default();
-        let mut blocks_of: crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>> = Default::default();
+        let mut todo: Vec<(u32, u32, Sym, u32)> = Vec::new();
         for (path, pos, name) in calls {
             let Some(name) = self.syms.get(&name) else { continue };
             if !globbed.contains(&name) { continue; }
-            let Some(file) = self.file_paths.iter().position(|p| *p == path) else { continue };
-            let file = file as u32;
+            let Some(&file) = by_path.get(path.as_str()) else { continue };
             let krate = self.file_crate.get(file as usize).copied().unwrap_or(u32::MAX);
             if !own.get(krate as usize).copied().unwrap_or(false) || !seen.insert((file, pos)) { continue; }
-            let Some(module) = self.call_module(file, pos, &mut items_of, &mut blocks_of) else { continue };
-            if self.textual_macro_at(module, file, pos, name) { continue; }
+            todo.push((file, pos, name, krate));
+        }
+        if todo.is_empty() { return out; }
+        let ix = CallScopes::new(self, todo.iter().map(|t| t.0).collect());
+        for (file, pos, name, krate) in todo {
+            let Some(module) = ix.call_module(self, file, pos) else { continue };
+            if ix.textual_macro_at(self, module, file, pos, name) { continue; }
             if let Some(d) = self.macro_call_ambiguity(table, module, krate, name) { out.push((file, pos, d.0, d.1)); }
         }
         out
-    }
-
-    /// The module whose scope a call at `pos` of `file` resolves in: the innermost body block that is a
-    /// module, else the scope of the innermost item holding it.
-    fn call_module(&self, file: u32, pos: u32, items_of: &mut crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>>, blocks_of: &mut crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>>) -> Option<u32> {
-        let ast = &self.files.get(file as usize)?.ast;
-        let blocks = blocks_of.entry(file).or_insert_with(|| {
-            self.block_mods.iter().filter(|((f, _), _)| *f == file).map(|(&(_, b), &m)| { let bl = ast.block(BlockId(b)); (bl.lo, bl.hi, m) }).collect()
-        });
-        if let Some(&(_, _, m)) = blocks.iter().filter(|(lo, hi, _)| *lo <= pos && pos < *hi).min_by_key(|(lo, hi, _)| hi - lo) { return Some(m); }
-        let items = items_of.entry(file).or_insert_with(|| {
-            // (an inline `mod` item: the calls written in it resolve in that module)
-            self.defs.iter().filter(|d| d.file == file && d.item.0 != u32::MAX && !matches!(d.kind, DefKind::Closure | DefKind::AnonConst | DefKind::OpaqueTy | DefKind::Prim(_) | DefKind::Field | DefKind::Variant | DefKind::MacroRules))
-                .map(|d| { let it = ast.item(d.item); (it.lo, it.hi, if d.kind == DefKind::Mod { d.sub } else { d.scope }) }).collect()
-        });
-        if let Some(&(_, _, m)) = items.iter().filter(|(lo, hi, _)| *lo <= pos && pos < *hi).min_by_key(|(lo, hi, _)| hi - lo) { return Some(m); }
-        (0..self.mods.len()).find(|&i| { let md = &self.mods[i]; md.file == file && md.lexical_parent.is_none() && self.def(md.def).kind == DefKind::Mod && self.def(md.def).sub as usize == i }).map(|m| m as u32)
-    }
-
-    /// A `macro_rules! name` written before `pos` of `file` in the call's module or an enclosing one
-    /// (rustc's MacroRules scopes, searched first: a result there is never ambiguous with a module's).
-    fn textual_macro_at(&self, module: u32, file: u32, pos: u32, name: Sym) -> bool {
-        let mut chain = Vec::new();
-        let mut m = Some(module);
-        while let Some(x) = m { chain.push(self.mods[x as usize].def); m = self.mods[x as usize].lexical_parent.or(self.mods[x as usize].parent_mod); }
-        let Some(f) = self.files.get(file as usize) else { return false };
-        self.defs.iter().any(|d| d.kind == DefKind::MacroRules && d.name == name && d.file == file && chain.contains(&d.parent) && f.ast.item(d.item).lo < pos)
     }
 
     fn macro_call_ambiguity(&self, table: &HashMap<(u32, Sym), MacBinding>, module: u32, krate: u32, name: Sym) -> Option<(Option<&'static str>, String)> {
@@ -336,7 +316,7 @@ impl<'a> Sim<'a> {
             busy: Default::default(), ext_names: Default::default(), ext_decls: Default::default(),
             amb: Vec::new(), cannot_determine: Vec::new(), unresolved: Vec::new(), privacy_errors: 0, priv_list: Vec::new(), hack_applied: false, cur_imp: 0,
             no_prelude: Default::default(), extern_items: Default::default(), dummy: 0, unexpanded: Default::default(),
-            indeterminate: Vec::new(), determined: Vec::new(), builtin: Vec::new(),
+            indeterminate: Vec::new(), determined: Vec::new(), synthetic_macros: Vec::new(), proc_macros: Vec::new(),
         };
         s.dummy = s.alloc(Decl { def: None, import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 });
         s
@@ -461,19 +441,34 @@ impl<'a> Sim<'a> {
     }
 
     fn builtin_macro(&mut self, name: Sym, std_panic: bool) -> DefId {
-        let key = (name, std_panic);
-        let k = match self.builtin.iter().position(|x| *x == key) { Some(k) => k, None => { self.builtin.push(key); self.builtin.len() - 1 } };
-        builtin_macro_id(k)
+        self.synthetic_macro(MacRes::Builtin(name, std_panic))
+    }
+
+    fn synthetic_macro(&mut self, key: MacRes) -> DefId {
+        let k = match self.synthetic_macros.iter().position(|x| *x == key) { Some(k) => k, None => { self.synthetic_macros.push(key); self.synthetic_macros.len() - 1 } };
+        synthetic_macro_id(k)
     }
 
     /// The macro `name` of an unchecked module: a `#[macro_export]` macro_rules! of a crate root, or a
-    /// built-in of the std family.
+    /// built-in of the std family, or a registered proc macro through its public re-exports.
     fn ext_macro(&mut self, m: u32, name: Sym) -> Option<DefId> {
         if let Some(&d) = self.p.mods[m as usize].macros.get(&name) { return Some(d); }
-        let set = self.std_macro_module(m)?;
         let n = self.p.syms.str(name);
-        if !set.names().contains(&n) { return None; }
-        Some(self.builtin_macro(name, set == StdMacros::Std && n == "panic"))
+        if let Some(set) = self.std_macro_module(m) {
+            if set.names().contains(&n) { return Some(self.builtin_macro(name, set == StdMacros::Std && n == "panic")); }
+        }
+        let md = &self.p.mods[m as usize];
+        let krate = self.p.syms.str(self.p.crates[md.krate as usize].name);
+        let module = self.p.def_path(md.def);
+        let scope = crate::macros::MacroScope::new(self.p.macros.clone());
+        for kind in [crate::macro_reg::Kind::Bang, crate::macro_reg::Kind::Attr, crate::macro_reg::Kind::Derive] {
+            if let Some(entry) = scope.proc_macro_path(krate, &module, &[n.to_string()], kind, &mut Default::default()) {
+                let key = (entry.unit, entry.fname);
+                let k = match self.proc_macros.iter().position(|x| *x == key) { Some(k) => k, None => { self.proc_macros.push(key); self.proc_macros.len() - 1 } };
+                return Some(self.synthetic_macro(MacRes::ProcMacro(k as u32)));
+            }
+        }
+        None
     }
 
     /// rustc's MacroRules scopes at import `i`: a `macro_rules! name` written before it in its file, in its
@@ -819,6 +814,16 @@ impl<'a> Sim<'a> {
                     }
                     _ => {}
                 }
+            }
+        }
+        // the proc macros the module exports (its crate's own, or re-exported): `ext_macro` answers
+        // them, so a glob of the module binds them -- unlisted, a glob lookup of the name would find
+        // a binding the glob never planted and stay undetermined
+        for n in crate::macro_reg::proc_macro_names() {
+            let Some(name) = self.p.syms.get(&n) else { continue };
+            if !have.contains(&(name, 2)) && self.ext_macro(t, name).is_some() {
+                have.insert((name, 2));
+                names.push((name, 2));
             }
         }
         let r = std::rc::Rc::new(names);
@@ -1418,9 +1423,8 @@ impl<'a> Sim<'a> {
 
     fn mac_res(&self, d: DeclId) -> Option<MacRes> {
         let def = self.dres(d)?;
-        if def.0 < u32::MAX && ((u32::MAX - 1 - def.0) as usize) < self.builtin.len() {
-            let (n, std) = self.builtin[(u32::MAX - 1 - def.0) as usize];
-            return Some(MacRes::Builtin(n, std));
+        if def.0 < u32::MAX && ((u32::MAX - 1 - def.0) as usize) < self.synthetic_macros.len() {
+            return Some(self.synthetic_macros[(u32::MAX - 1 - def.0) as usize]);
         }
         Some(MacRes::Def(def))
     }
@@ -1431,7 +1435,8 @@ impl<'a> Sim<'a> {
         for (&(m, name, ns), r) in &self.res {
             if ns != 2 { continue; }
             let glob_amb = r.glob.map_or(0, |g| { let amb = self.chain_ambiguities(g); if amb.is_empty() { 0 } else if amb.iter().any(|w| w.is_none()) { 1 } else { 2 } });
-            let b = MacBinding { non_glob: r.non_glob.and_then(|d| self.mac_res(d)), glob: r.glob.and_then(|d| self.mac_res(d)), glob_amb };
+            let b = MacBinding { non_glob: r.non_glob.and_then(|d| self.mac_res(d)), glob: r.glob.and_then(|d| self.mac_res(d)), glob_amb,
+                non_glob_vis: r.non_glob.and_then(|d| self.decls[d as usize].vis), glob_vis: r.glob.and_then(|d| self.decls[d as usize].vis) };
             if b.non_glob.is_some() || b.glob.is_some() { t.insert((m, name), b); }
         }
         t
@@ -1532,8 +1537,8 @@ impl<'a> Sim<'a> {
         // `use a::{self}` has the source `self` in rustc, which names the module in the type namespace only
         let self_only = self.p.imports[self.imps[i as usize].pi].bound & BOUND_SELF_ONLY != 0;
         let mut all_ns_err = true;
-        for ns in 0..2 {
-            if self_only && ns == 1 { continue; }
+        for ns in 0..3 {
+            if self_only && ns != 0 { continue; }
             let fin = Fin { imp: Some(summ), report_private: false };
             let binding = self.resolve_ident_in_module(module, source, ns, ps, Some(fin), decls[ns].decl(), Some(i));
             if let Ok(b) = binding {
@@ -1543,10 +1548,17 @@ impl<'a> Sim<'a> {
                 if decls[ns].decl().is_none() && self.privacy_errors == 0 { self.cannot_determine.push(i); }
             }
         }
+        // the macro namespace: what the import found there (a textual `macro_rules!` included) counts
+        // when it can see it
+        if !self_only {
+            if let Some((_, source_decl)) = decls[2].decl().and_then(|d| self.decls[d as usize].import) {
+                if self.accessible(self.dvis(source_decl), ps.module) { all_ns_err = false; }
+            }
+        }
         if all_ns_err {
             let mut all_failed = true;
-            for ns in 0..2 {
-                if self_only && ns == 1 { continue; }
+            for ns in 0..3 {
+                if self_only && ns != 0 { continue; }
                 let fin = Fin { imp: None, report_private: true };
                 if self.resolve_ident_in_module(module, source, ns, ps, Some(fin), None, None).is_ok() { all_failed = false; }
             }
@@ -1677,5 +1689,64 @@ mod tests {
         let k = k.unwrap();
         let expansions: usize = prog.files.iter().zip(&prog.file_crate).filter(|(_, &c)| c == k).map(|(f, _)| f.exp_map.len()).sum();
         assert_eq!(expansions, 9, "expansions of a chain of 9 calls");
+    }
+}
+
+/// What `macro_call_ambiguities` looks up in each file with calls, gathered in one pass over the
+/// definitions, block modules and modules (in their order: the first of equally small spans wins,
+/// as a search finds it).
+struct CallScopes {
+    /// by file: the innermost-first candidates of a call's scope, (lo, hi, module)
+    blocks: crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>>,
+    items: crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>>,
+    /// the file's own module (no lexical parent)
+    file_mod: crate::fxhash::HashMap<u32, u32>,
+    /// the `macro_rules!` definitions by (file, name)
+    rules: crate::fxhash::HashMap<(u32, Sym), Vec<DefId>>,
+}
+
+impl CallScopes {
+    fn new(p: &Program, files: crate::fxhash::HashSet<u32>) -> Self {
+        let mut blocks: crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>> = Default::default();
+        for (&(f, b), &m) in p.block_mods.iter() {
+            if !files.contains(&f) { continue; }
+            let bl = p.files[f as usize].ast.block(BlockId(b));
+            blocks.entry(f).or_default().push((bl.lo, bl.hi, m));
+        }
+        let mut items: crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>> = Default::default();
+        let mut rules: crate::fxhash::HashMap<(u32, Sym), Vec<DefId>> = Default::default();
+        for (i, d) in p.defs.iter().enumerate() {
+            if !files.contains(&d.file) { continue; }
+            if d.kind == DefKind::MacroRules { rules.entry((d.file, d.name)).or_default().push(DefId(i as u32)); }
+            // (an inline `mod` item: the calls written in it resolve in that module)
+            if d.item.0 != u32::MAX && !matches!(d.kind, DefKind::Closure | DefKind::AnonConst | DefKind::OpaqueTy | DefKind::Prim(_) | DefKind::Field | DefKind::Variant | DefKind::MacroRules) {
+                let it = p.files[d.file as usize].ast.item(d.item);
+                items.entry(d.file).or_default().push((it.lo, it.hi, if d.kind == DefKind::Mod { d.sub } else { d.scope }));
+            }
+        }
+        let mut file_mod: crate::fxhash::HashMap<u32, u32> = Default::default();
+        for (i, md) in p.mods.iter().enumerate() {
+            if !files.contains(&md.file) || md.lexical_parent.is_some() || p.def(md.def).kind != DefKind::Mod || p.def(md.def).sub as usize != i { continue; }
+            file_mod.entry(md.file).or_insert(i as u32);
+        }
+        CallScopes { blocks, items, file_mod, rules }
+    }
+
+    /// The module whose scope a call at `pos` of `file` resolves in: the innermost body block that is a
+    /// module, else the scope of the innermost item holding it.
+    fn call_module(&self, p: &Program, file: u32, pos: u32) -> Option<u32> {
+        p.files.get(file as usize)?;
+        let inner = |v: Option<&Vec<(u32, u32, u32)>>| v.into_iter().flatten().filter(|(lo, hi, _)| *lo <= pos && pos < *hi).min_by_key(|(lo, hi, _)| hi - lo).map(|x| x.2);
+        inner(self.blocks.get(&file)).or_else(|| inner(self.items.get(&file))).or_else(|| self.file_mod.get(&file).copied())
+    }
+
+    /// A `macro_rules! name` written before `pos` of `file` in the call's module or an enclosing one
+    /// (rustc's MacroRules scopes, searched first: a result there is never ambiguous with a module's).
+    fn textual_macro_at(&self, p: &Program, module: u32, file: u32, pos: u32, name: Sym) -> bool {
+        let mut chain = Vec::new();
+        let mut m = Some(module);
+        while let Some(x) = m { chain.push(p.mods[x as usize].def); m = p.mods[x as usize].lexical_parent.or(p.mods[x as usize].parent_mod); }
+        let Some(f) = p.files.get(file as usize) else { return false };
+        self.rules.get(&(file, name)).into_iter().flatten().any(|&d| { let d = p.def(d); chain.contains(&d.parent) && f.ast.item(d.item).lo < pos })
     }
 }

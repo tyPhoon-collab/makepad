@@ -329,6 +329,17 @@ fn closure_clone_requires_captured_places_not_storage_roots() {
 }
 
 #[test]
+fn closure_storage_keeps_nested_owned_paths() {
+    let (p,t) = program("struct Good(u32); struct Inner { good: Good, retained: u64 } struct Outer { inner: Inner, other: u64 } fn owner(pair: Outer) { let closure = move || pair.inner.good; }", "nested_storage");
+    let state = crate::tcx::EvalState::new();
+    let cx = crate::tcx::EvalCx::new(&p, &t, crate::tcx::TypingEnv::fully_monomorphized(&p), &state);
+    let body = crate::typeck::instantiate_body(&cx, &p, &t, named(&p,"owner"), &[]);
+    assert!(body.errors.is_empty(), "{:?}", body.errors);
+    let storage = crate::layout::ClosureStorage::new(&t, &body, body.closures[0]);
+    assert_eq!(storage.owned_paths, vec![Some(vec![vec![0, 0]])]);
+}
+
+#[test]
 fn closure_storage_layout_keeps_root_slots_and_drop_flags() {
     let (p,t) = program("struct Good(u32); struct Pair { good: Good, bad: u64 } fn owner(pair: Pair) { let closure = move || pair.good; }", "storage_layout");
     let state = crate::tcx::EvalState::new();
@@ -339,7 +350,7 @@ fn closure_storage_layout_keeps_root_slots_and_drop_flags() {
     let storage = crate::layout::ClosureStorage::new(&t,&body,expr);
     assert!(storage.drop_flags); assert_eq!(storage.fields.len(),2);
     assert_eq!(storage.fields[1],t.tys.u8_);
-    assert_eq!(storage.owned_fields,vec![Some(vec![0])]);
+    assert_eq!(storage.owned_paths,vec![Some(vec![vec![0]])]);
     let layouts = crate::layout::Layouts::new(); let lcx = crate::layout::LayoutCx::new(&p);
     let record = layouts.closure_storage_layout(&lcx,&t,closure);
     let tuple = t.tys.intern(TyKind::Tuple(t.tys.mk_list(&storage.fields)));
@@ -1367,6 +1378,17 @@ fn round41_preempted_typeck_can_be_checked_later() {
     drop(writer);
     let body = tcx.typeck(&prog, def);
     assert!(body.errors.is_empty(), "{:?}", body.errors);
+}
+
+/// The panic of a check that reaches an anonymous const nobody fed names it: this message is the
+/// reason of the ledger's checker_panic record.
+#[test]
+fn an_unfed_anonymous_const_panic_names_the_const() {
+    let (prog, tcx) = program("static NS: [u8; 2] = [0; 1 + 1];", "unfed_anon_const");
+    let messages: Vec<String> = (0..prog.defs.len()).map(|i| DefId(i as u32)).filter(|d| prog.def(*d).kind == crate::program::DefKind::AnonConst).filter_map(|d| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { tcx.typeck(&prog, d); })).err().map(|p| p.downcast_ref::<String>().cloned().unwrap_or_default())
+    }).collect();
+    assert!(messages.iter().any(|m| m.starts_with("anonymous const type of `unfed_anon_const::NS::{constant#") && m.contains("its holder never fed it")), "{messages:?}");
 }
 
 #[test]

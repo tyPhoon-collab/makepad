@@ -221,7 +221,7 @@ mod tests {
         table.s2_fmt = true;
         let mut s = crate::program::ParseSnapshot {
             old: 0, path: "/tmp/relax-parse-reuse.rs".into(), edition: 2021,
-            kname: "test".into(), mod_path: "test".into(),
+            kname: "test".into(), mod_path: "test".into(), dir: "/tmp".into(), root: "/tmp/relax-parse-reuse.rs".into(), together: Vec::new(),
             cfg: crate::cfg::CfgSet::host(sess, &[]), macros: std::sync::Arc::new(table),
             reuse: Default::default(), previous: None,
             context: crate::source_context::Context::new("/tmp/relax-parse-reuse.rs", Default::default(), sess),
@@ -238,6 +238,7 @@ mod tests {
             assert_eq!(v.pf.tok_origin, full.pf.tok_origin);
             assert_eq!(v.pf.token_origins, full.pf.token_origins);
             assert_eq!(v.pf.body_origin, full.pf.body_origin);
+            assert_eq!(v.pf.pm_editions, full.pf.pm_editions);
             s.reuse = v.reuse;
         }
         assert!(s.reuse.expansions.is_empty() && s.reuse.rules.is_empty());

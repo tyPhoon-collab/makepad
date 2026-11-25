@@ -443,47 +443,28 @@ pub mod portable {
     unsafe impl Send for NativeThread {}
     unsafe impl Sync for NativeThread {}
 
-    struct StartArg {
-        f: fn(*mut u8),
-        arg: *mut u8,
-        /// the starting thread's domain static block (relax domain.rs): the new thread runs in it
-        domain: u64,
-        token: u64,
+    impl NativeThread {
+        pub fn raw(&self) -> usize {
+            self.0 as usize
+        }
+        /// The handle, no longer closed by this value.
+        pub fn into_raw(self) -> usize {
+            let t = core::mem::ManuallyDrop::new(self);
+            t.0 as usize
+        }
     }
 
     extern "C" {
-        fn __relax_on_program_stack(f: extern "C" fn(*mut u8), arg: *mut u8);
-        fn __relax_domain_base() -> u64;
-        fn __relax_domain_enter(base: u64, token: u64);
-        fn __relax_domain_reserve(base: u64) -> u64;
-        fn __relax_domain_failed(base: u64, token: u64);
+        fn __relax_thread_spawn(out: *mut *mut c_void, stack_size: usize, f: fn(*mut u8), arg: *mut u8) -> i32;
     }
 
-    extern "system" fn windows_thread_start(p: *mut c_void) -> DWORD {
-        // first, before anything that may name a static
-        unsafe { __relax_domain_enter((*(p as *const StartArg)).domain, (*(p as *const StartArg)).token) };
-        // the thread's body runs on a program stack (relax_base::stack::on_program_stack)
-        unsafe { __relax_on_program_stack(start_body, p as *mut u8) };
-        0
-    }
-
-    extern "C" fn start_body(p: *mut u8) {
-        let a = unsafe { alloc::boxed::Box::from_raw(p as *mut StartArg) };
-        (a.f)(a.arg);
-    }
-
-    /// CreateThread with `stack_size` reserved (STACK_SIZE_PARAM_IS_A_RESERVATION, as real std).
+    /// Starts a thread running `f(arg)` with `stack_size` bytes reserved; Err(os error). (The
+    /// runtime starts it: its native code runs around the thread's JIT code.)
     pub fn spawn_thread(stack_size: usize, f: fn(*mut u8), arg: *mut u8) -> Result<NativeThread, i32> {
-        const STACK_SIZE_PARAM_IS_A_RESERVATION: DWORD = 0x0001_0000;
-        let domain = unsafe { __relax_domain_base() };
-        let token = unsafe { __relax_domain_reserve(domain) };
-        let start = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(StartArg { f, arg, domain, token })) as *mut c_void;
-        let h = unsafe { CreateThread(core::ptr::null_mut(), stack_size, windows_thread_start, start, STACK_SIZE_PARAM_IS_A_RESERVATION, core::ptr::null_mut()) };
-        if h.is_null() {
-            let e = errno();
-            drop(unsafe { alloc::boxed::Box::from_raw(start as *mut StartArg) });
-            unsafe { __relax_domain_failed(domain, token); }
-            return Err(e);
+        let mut h: *mut c_void = core::ptr::null_mut();
+        let r = unsafe { __relax_thread_spawn(&mut h as *mut *mut c_void, stack_size, f, arg) };
+        if r != 0 {
+            return Err(r);
         }
         Ok(NativeThread(h))
     }
@@ -515,7 +496,8 @@ pub mod portable {
     pub fn key_get(key: Key) -> *mut c_void { unsafe { __relax_key_get(key) } }
     pub fn key_set(key: Key, value: *const c_void) { unsafe { __relax_key_set(key, value); } }
 
-    fn std_handle(fd: i32) -> HANDLE {
+    /// GetStdHandle for fd 0, 1 or 2 (null when no console is attached).
+    pub fn std_handle(fd: i32) -> HANDLE {
         let which = match fd {
             0 => STD_INPUT_HANDLE,
             1 => STD_OUTPUT_HANDLE,

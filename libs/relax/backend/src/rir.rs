@@ -153,6 +153,10 @@ pub enum VX {
     PackUsS,
     /// d[i] = b[i] & 0x80 ? 0 : a[b[i] & 15] (pshufb)
     ByteShuffle,
+    /// carry-less product of one 64-bit lane of a and one of b, 128 bits (x64 `pclmulqdq`, Arm
+    /// `pmull` .1q): bit 0 of the selector picks a's high lane, bit 1 b's high lane (the x86
+    /// immediate's bits 0 and 4)
+    Clmul(u8),
     // SHA instruction semantics are architecture-specific (not interchangeable lane orders).
     X86Sha1Rnds4(u8),
     X86Sha1NextE,
@@ -298,6 +302,28 @@ pub enum IOp {
     /// optimiser from that mask idiom (bit readers' `bitbuf & bitmask(n)`): x64 BMI2 `bzhi`,
     /// arm64 `lsl` of all ones + `bic`
     Bzhi,
+    /// CRC-32 (IEEE 802.3, reflected polynomial 0xEDB88320) of the low 8 / 16 / 32 / 64 bits of
+    /// b folded into the 32-bit crc in a, no pre/post inversion: Arm's `__crc32b/h/w/d`
+    /// (`crc32b/h/w/x`); the result is the u32, zero-extended. IntTy is U64, so no pass takes
+    /// either operand for a narrow one (crc32x reads all of b). Arm only: x64 has no instruction
+    /// for this polynomial (std's aarch64 module computes it in software elsewhere)
+    Crc32B,
+    Crc32H,
+    Crc32W,
+    Crc32X,
+}
+
+impl IOp {
+    /// the payload bits of a Crc32 op (8, 16, 32, 64)
+    pub fn crc32_bits(self) -> Option<u8> {
+        match self {
+            IOp::Crc32B => Some(8),
+            IOp::Crc32H => Some(16),
+            IOp::Crc32W => Some(32),
+            IOp::Crc32X => Some(64),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -460,7 +486,7 @@ pub struct RelocAt {
 }
 
 /// Where the function slots live. A slot (u32 id) owns a thunk (its permanent callable
-/// address), a lazy stub, a table word and a tier record; they sit in segments that are
+/// address), a lazy stub, a table word (two when an entry wraps its body) and a tier record; they sit in segments that are
 /// reserved when the ids first reach them, so the number of functions has no fixed bound
 /// (ids are u32; the rest is address space). Segment 0 holds ids `0..2^18`, segment k >= 1 the
 /// ids `2^(17+k)..2^(18+k)`: doubling, so 4G ids take 15 reservations. Nothing needs the
@@ -560,6 +586,10 @@ impl SlotTable {
     pub fn stub(&self, id: u32) -> u64 { self.addr(SK_STUB, id) }
     /// The function table word of a slot.
     pub fn table(&self, id: u32) -> u64 { self.addr(SK_TABLE, id) }
+    /// The replaceable target. With two words per slot, `table` holds a permanent entry
+    /// wrapper and this second word holds its body; with one word they are the same address.
+    pub fn body(&self, id: u32) -> u64 { self.table(id) + self.stride[SK_TABLE] - 8 }
+    pub fn table_stride(&self) -> u64 { self.stride[SK_TABLE] }
     pub fn tier(&self, id: u32) -> u64 { self.addr(SK_TIER, id) }
 
     /// The id whose entry of `kind` (0 thunk, 1 stub, 2 table, 3 tier) starts at or contains
@@ -925,9 +955,12 @@ pub enum Inst {
     // ---- 128-bit vectors (Cls::V128; four 32-bit lanes)
     /// d = bitwise m ? a : b (m: lane masks)
     VSel(VReg, VReg, VReg, VReg), // d, m, a, b
-    /// f32 lanes, one rounding: (neg_prod ? -a : a) * b + (neg_add ? -c : c) (operand negations
-    /// and NaN lanes as `FMulAdd`)
-    VFma(bool, bool, VReg, VReg, VReg, VReg), // neg_prod, neg_add, d, a, b, c
+    /// float lanes (`w`: f64, else f32), one rounding: (neg_prod ? -a : a) * b + (neg_add ? -c : c)
+    /// (operand negations and NaN lanes as `FMulAdd`). `keep_nan`: a negation leaves a NaN operand
+    /// as it is, the x86 rule (vfmsub / vfnmadd / vfnmsub negate the product or addend inside the
+    /// fused op, so the NaN passes on with its own sign; without it a NaN's sign flips, as NEON's
+    /// fmls).
+    VFma(bool, bool, bool, bool, VReg, VReg, VReg, VReg), // neg_prod, neg_add, keep_nan, w, d, a, b, c
     /// every lane = the low 32 bits of s (an I or F32 vreg)
     VSplat(VReg, VReg),
     /// every lane = a 32-bit constant (a constant-pool load: cheap to rematerialise)
@@ -1044,7 +1077,7 @@ impl Inst {
             Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::TlsAddr(d, _) | Inst::TlsStatic(d, _) | Inst::VConst(d, _) => f(*d),
             Inst::Mov(d, _) | Inst::INeg(_, d, _) | Inst::INot(_, d, _) | Inst::IBit(_, d, _) | Inst::FUnary(_, _, d, _) | Inst::Conv(_, d, _) | Inst::IBinI(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) | Inst::Load(_, d, _, _) | Inst::VSplat(d, _) | Inst::VExtract(d, _, _) | Inst::VLoad(d, _, _) | Inst::VAny(d, _) | Inst::AtomicLoad(_, _, d, _) => f(*d),
             Inst::IBin(_, _, d, _, _) | Inst::ICmp(_, _, d, _, _) | Inst::FBin(_, _, d, _, _) | Inst::FCmp(_, _, d, _, _) | Inst::VGather(d, _, _) | Inst::VTbl(d, _, _, _) | Inst::VShuffle(d, _, _, _) | Inst::VX(_, d, _, _) | Inst::AtomicRmw(_, _, _, d, _, _) | Inst::LoadX(_, d, _, _, _, _) | Inst::VLoadX(d, _, _, _, _) => f(*d),
-            Inst::Sel(d, _, _, _) | Inst::VX3(_, d, _, _, _) | Inst::VSel(d, _, _, _) | Inst::VFma(_, _, d, _, _, _) | Inst::FMulAdd(_, _, _, d, _, _, _) | Inst::AtomicCas(_, _, _, d, _, _, _) => f(*d),
+            Inst::Sel(d, _, _, _) | Inst::VX3(_, d, _, _, _) | Inst::VSel(d, _, _, _) | Inst::VFma(_, _, _, _, d, _, _, _) | Inst::FMulAdd(_, _, _, d, _, _, _) | Inst::AtomicCas(_, _, _, d, _, _, _) => f(*d),
             Inst::VInsert(d, _, _, _) => f(*d),
             Inst::Call(_, _, rets) => rets.iter().for_each(|r| f(*r)),
             Inst::FpEnv(_, v) => f(*v),
@@ -1076,7 +1109,7 @@ impl Inst {
                 f(b);
                 f(c);
             }
-            Inst::Sel(d, a, b, c) | Inst::VX3(_, d, a, b, c) | Inst::VSel(d, a, b, c) | Inst::VFma(_, _, d, a, b, c) | Inst::FMulAdd(_, _, _, d, a, b, c) | Inst::AtomicCas(_, _, _, d, a, b, c) => {
+            Inst::Sel(d, a, b, c) | Inst::VX3(_, d, a, b, c) | Inst::VSel(d, a, b, c) | Inst::VFma(_, _, _, _, d, a, b, c) | Inst::FMulAdd(_, _, _, d, a, b, c) | Inst::AtomicCas(_, _, _, d, a, b, c) => {
                 f(d);
                 f(a);
                 f(b);
@@ -1271,6 +1304,48 @@ pub struct Func {
     /// computes values in halves made them (compute's eight-lane kernels): `pair256` seeds.
     /// A hint only (pair256 checks every pairing itself); `compact_vregs` renames it.
     pub halves: Vec<(VReg, VReg)>,
+    /// A live session (hot reload): the byte a patch of this fn sets (`SlotTable::patch` of its
+    /// slot). An inlined copy of the body runs only while it reads 0; once a patch sets it, the
+    /// copy's site calls the slot, which holds the patched body (`guard_calls`). Side metadata of
+    /// the callee for its callers' inliner: the body's own code does not read it.
+    pub patch_flag: Option<Sym>,
+    /// The calls a guarded inline copy falls back to (call position, slot): never inlined again.
+    pub guard_calls: Vec<(u64, u32)>,
+    /// A live session: the patch flags of the copies this body inlined unguarded (no call and no
+    /// loop on any path from its entry to the site: a frame there cannot wait for a patch; the
+    /// patch rebuilds the callers that inlined the body). A guarded copy of this body elsewhere
+    /// reads them with its own (`opt::inline_site`). Side metadata, like `patch_flag`.
+    pub unguarded_flags: Vec<Sym>,
+    /// A live session: the copy version of the slot this body is built for (a word of its tier
+    /// record) and the value the build read. The guards its inliner makes compare the word with
+    /// the value before they read their flags: the word moves once a flag the slot's code reads
+    /// is set (`opt::inline_site`). Side metadata of the build, like `patch_flag`.
+    pub copy_ver: Option<(Sym, u64)>,
+    /// A live session: the size of the guards of the copies this body inlined (`opt::inline_site`):
+    /// code only a patch runs, which a caller's inliner prices the body without, so a live session
+    /// inlines what a run without patches does.
+    pub guard_size: GuardSize,
+}
+
+/// The guards' share of a body (`Func::guard_size`): their compares at the sites (the check and
+/// slow blocks they branch to are found from the slow calls: `opt::guard_blocks`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct GuardSize {
+    pub insts: u32,
+    /// their rustc inline cost (`opt::rustc_inline_cost`; the sites' branches included)
+    pub cost: u32,
+}
+
+impl GuardSize {
+    pub fn add(&mut self, o: GuardSize) {
+        self.insts += o.insts;
+        self.cost += o.cost;
+    }
+
+    pub fn sub(&mut self, o: GuardSize) {
+        self.insts = self.insts.saturating_sub(o.insts);
+        self.cost = self.cost.saturating_sub(o.cost);
+    }
 }
 
 /// A named local of the source and its storage (`Func::dbg`).
@@ -1335,13 +1410,16 @@ impl Func {
         for c in &mut self.inl_slots {
             f(c);
         }
+        for (_, c) in &mut self.guard_calls {
+            f(c);
+        }
     }
 
     /// Structural equality of everything but `name`, with the function slots each side names
     /// compared through its own map (`ma` for self, `mb` for `o`; block counts by bits). With
     /// injective maps: the bodies are equal up to a renaming of their slots.
     pub fn same_body_mapped(&self, ma: &mut dyn FnMut(u32) -> u32, o: &Func, mb: &mut dyn FnMut(u32) -> u32) -> bool {
-        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves } = self;
+        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, copy_ver: _, guard_size } = self;
         let callee_eq = |a: &Callee, ma: &mut dyn FnMut(u32) -> u32, b: &Callee, mb: &mut dyn FnMut(u32) -> u32| match (a, b) {
             (Callee::Fn(x), Callee::Fn(y)) => ma(*x) == mb(*y),
             (Callee::CFn(x, xs), Callee::CFn(y, ys)) => ma(*x) == mb(*y) && xs == ys,
@@ -1394,12 +1472,15 @@ impl Func {
             && inl_slots.iter().zip(&o.inl_slots).all(|(x, y)| ma(*x) == mb(*y))
             && *dbg == o.dbg
             && *halves == o.halves
+            && guard_calls.len() == o.guard_calls.len()
+            && guard_calls.iter().zip(&o.guard_calls).all(|(x, y)| x.0 == y.0 && ma(x.1) == mb(y.1))
+            && *guard_size == o.guard_size
     }
 
     /// A hash of what `same_body_mapped` compares, the function slots replaced by `m(slot)`.
     pub fn hash_body_mapped<H: std::hash::Hasher>(&self, h: &mut H, m: &mut dyn FnMut(u32) -> u32) {
         use std::hash::Hash;
-        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves } = self;
+        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, copy_ver: _, guard_size } = self;
         fn callee<H: std::hash::Hasher>(c: &Callee, h: &mut H, m: &mut dyn FnMut(u32) -> u32) {
             match c {
                 Callee::Fn(x) => {
@@ -1470,6 +1551,13 @@ impl Func {
         // (only when present: bodies without the hint keep the hash they had before it existed)
         if !halves.is_empty() {
             halves.hash(h);
+        }
+        if !guard_calls.is_empty() {
+            guard_calls.len().hash(h);
+            for (p, x) in guard_calls {
+                (p, m(*x)).hash(h);
+            }
+            guard_size.hash(h);
         }
     }
 
@@ -1611,7 +1699,7 @@ pub fn inline_pc_entries(f: &Func) -> impl Iterator<Item = (u32, u64)> + '_ {
 
 impl Func {
     pub fn new(name: String, file: u32) -> Func {
-        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, owned: Vec::new(), nonnull: Vec::new(), param_ints: Vec::new(), ranged: Vec::new(), naked: false, inl: Vec::new(), inl_slots: Vec::new(), dbg: Vec::new(), halves: Vec::new() }
+        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, owned: Vec::new(), nonnull: Vec::new(), param_ints: Vec::new(), ranged: Vec::new(), naked: false, inl: Vec::new(), inl_slots: Vec::new(), dbg: Vec::new(), halves: Vec::new(), patch_flag: None, guard_calls: Vec::new(), unguarded_flags: Vec::new(), copy_ver: None, guard_size: GuardSize::default() }
     }
     pub fn vreg(&mut self, c: Cls) -> VReg {
         self.vregs.push(c);
@@ -1624,6 +1712,17 @@ impl Func {
     pub fn slot(&mut self, size: u32, align: u32) -> u32 {
         self.slots.push(Slot { size: size.max(1), align: align.max(1), arg: false, born: false, ret: false });
         self.slots.len() as u32 - 1
+    }
+
+    /// Is the call at `blocks[bi].insts[ii]` a guarded inline copy's slow call (`guard_calls`)?
+    /// It runs only once a live patch replaced its callee.
+    pub fn guard_call(&self, bi: usize, ii: usize) -> bool {
+        if self.guard_calls.is_empty() {
+            return false;
+        }
+        let Some(Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), _, _)) = self.blocks[bi].insts.get(ii) else { return false };
+        let p = self.blocks[bi].pos.get(ii).copied().unwrap_or(0);
+        self.guard_calls.iter().any(|&(q, s)| q == p && s == *id)
     }
 
     /// Text dump for debugging and the crash report.
@@ -1764,7 +1863,7 @@ impl Func {
                         regs.push(*a);
                         regs.push(*b);
                     }
-                    Inst::VX3(_, d, a, b, c) | Inst::VSel(d, a, b, c) | Inst::VFma(_, _, d, a, b, c) => {
+                    Inst::VX3(_, d, a, b, c) | Inst::VSel(d, a, b, c) | Inst::VFma(_, _, _, _, d, a, b, c) => {
                         regs.push(*d);
                         regs.push(*a);
                         regs.push(*b);
@@ -1959,7 +2058,7 @@ pub fn slot_offsets(f: &Func) -> Vec<Option<(u32, i64)>> {
 
 /// `v` re-extended to integer type `it` (how RIR keeps narrow integers in registers).
 /// The NaN result of `FMulAdd` / `VFma` lanes: `fma(a, b, c)` with the operands already negated
-/// (`neg_prod` / `neg_add`), on this host (Rust leaves it unspecified; the back ends fix it so
+/// (`neg_prod` / `neg_add`; under `keep_nan` a NaN operand stays as it is), on this host (Rust leaves it unspecified; the back ends fix it so
 /// that every tier and register assignment gives the same bits, and compute kernels match their
 /// interpreter, makepad_script_compute::ir::fma_nan):
 /// - x86-64: the first NaN of b, a, c, quieted (vfmadd213 with a in the destination, b in vvvv,
@@ -2032,10 +2131,16 @@ pub fn extend_const(v: i64, it: IntTy) -> i64 {
 /// words, read backwards from the end): (ret, stub).., saved registers as bytes (n | 0x80 for
 /// a float register) four per word, sp_off, then UNWIND_MAGIC << 24 | n_saved << 19 | n_pads.
 pub const UNWIND_MAGIC: u32 = 0xA5;
+/// The same trailer for a function with staged calls (calls that move the stack pointer below the
+/// body's for their stack arguments, x86-64): (ret, bytes) of each after the pads, their count
+/// before sp_off. With them the frame pointer of a frame is known from its stack pointer alone at
+/// any of its calls (`UnwindInfo::fp_from_sp`): a thread walked without its registers (blocked in
+/// a syscall). A function without staged calls keeps UNWIND_MAGIC and costs nothing more.
+pub const UNWIND_MAGIC_STAGED: u32 = 0xA6;
 
-pub fn unwind_info_words(saved: &[u32], pads: &[(u32, u32)], sp_off: u32) -> Vec<u32> {
-    let mut w = Vec::with_capacity(2 * pads.len() + saved.len() / 4 + 3);
-    for (r, s) in pads {
+pub fn unwind_info_words(saved: &[u32], pads: &[(u32, u32)], staged: &[(u32, u32)], sp_off: u32) -> Vec<u32> {
+    let mut w = Vec::with_capacity(2 * pads.len() + 2 * staged.len() + saved.len() / 4 + 4);
+    for (r, s) in pads.iter().chain(staged) {
         w.push(*r);
         w.push(*s);
     }
@@ -2047,16 +2152,35 @@ pub fn unwind_info_words(saved: &[u32], pads: &[(u32, u32)], sp_off: u32) -> Vec
         }
         w.push(x);
     }
+    let magic = if staged.is_empty() { UNWIND_MAGIC } else { w.push(staged.len() as u32); UNWIND_MAGIC_STAGED };
     w.push(sp_off);
-    w.push(UNWIND_MAGIC << 24 | (saved.len() as u32) << 19 | pads.len() as u32);
+    w.push(magic << 24 | (saved.len() as u32) << 19 | pads.len() as u32);
     w
 }
 
-/// Parsed trailer of a function's code (see `unwind_info_words`).
+/// Parsed trailer of a function's code (see `unwind_info_words`). Boxed slices: the code tables
+/// keep one per installed body.
 pub struct UnwindInfo {
-    pub saved: Vec<u32>,
-    pub pads: Vec<(u32, u32)>,
+    pub saved: Box<[u32]>,
+    pub pads: Box<[(u32, u32)]>,
     pub sp_off: u32,
+    /// (return offset, bytes below the body's stack pointer) of each staged call
+    pub staged: Box<[(u32, u32)]>,
+}
+
+impl UnwindInfo {
+    /// u32 words of the trailer
+    fn words(&self) -> usize {
+        2 * self.pads.len() + 2 * self.staged.len() + (self.saved.len() + 3) / 4 + 2 + usize::from(!self.staged.is_empty())
+    }
+
+    /// The frame pointer of this function's frame from its stack pointer at the call whose
+    /// return address is `ret_off` bytes into the code: the body's frame below it, and the
+    /// call's stack arguments when it staged them.
+    pub fn fp_from_sp(&self, ret_off: u32, sp: u64) -> u64 {
+        let staged = self.staged.iter().find(|s| s.0 == ret_off).map_or(0, |s| s.1);
+        sp + self.sp_off as u64 + staged as u64
+    }
 }
 
 /// Reads the trailer at the end of `code` (`len` bytes at `code`, a multiple of 4).
@@ -2070,20 +2194,24 @@ pub unsafe fn read_unwind_info(code: u64, len: u64) -> Option<UnwindInfo> {
     let rd = |off: u64| -> u32 { std::ptr::read_unaligned((code + off) as *const u32) };
     let end = len & !3;
     let head = rd(end - 4);
-    if head >> 24 != UNWIND_MAGIC {
-        return None;
-    }
+    let n_staged = match head >> 24 {
+        UNWIND_MAGIC => 0,
+        UNWIND_MAGIC_STAGED if end >= 12 => rd(end - 12) as u64,
+        _ => return None,
+    };
     let n_saved = ((head >> 19) & 0x1f) as u64;
     let n_pads = (head & 0x7_ffff) as u64;
     let sp_off = rd(end - 8);
     let saved_words = (n_saved + 3) / 4;
-    let words = 2 * n_pads + saved_words + 2;
+    let words = 2 * n_pads + 2 * n_staged + saved_words + 2 + u64::from(n_staged != 0);
     if words * 4 > end {
         return None;
     }
     let base = end - words * 4;
-    let pads = (0..n_pads).map(|k| (rd(base + 8 * k), rd(base + 8 * k + 4))).collect();
-    let sbase = base + 8 * n_pads;
+    let pair = |k: u64| (rd(base + 8 * k), rd(base + 8 * k + 4));
+    let pads = (0..n_pads).map(pair).collect();
+    let staged = (n_pads..n_pads + n_staged).map(pair).collect();
+    let sbase = base + 8 * (n_pads + n_staged);
     let saved = (0..n_saved)
         .map(|k| {
             let b = (rd(sbase + 4 * (k / 4)) >> (8 * (k % 4))) & 0xff;
@@ -2094,7 +2222,7 @@ pub unsafe fn read_unwind_info(code: u64, len: u64) -> Option<UnwindInfo> {
             }
         })
         .collect();
-    Some(UnwindInfo { saved, pads, sp_off })
+    Some(UnwindInfo { saved, pads, sp_off, staged })
 }
 
 /// Splits a compiled function into its code and its unwind trailer: (code length without
@@ -2106,10 +2234,7 @@ pub fn split_unwind_info(code: &[u8]) -> (usize, Option<UnwindInfo>) {
     }
     let info = unsafe { read_unwind_info(code.as_ptr() as u64, n as u64) };
     match info {
-        Some(i) => {
-            let words = 2 * i.pads.len() + (i.saved.len() + 3) / 4 + 2;
-            (n - 4 * words, Some(i))
-        }
+        Some(i) => (n - 4 * i.words(), Some(i)),
         None => (code.len(), None),
     }
 }
@@ -2171,6 +2296,33 @@ mod slot_table_tests {
     }
 }
 
+#[cfg(test)]
+mod unwind_trailer_tests {
+    /// A trailer reads back as written behind its code, with and without staged calls; a frame's
+    /// pointer from sp adds the staged bytes at that call only. Without staged calls the trailer
+    /// keeps the plain magic (and its size).
+    #[test]
+    fn trailer_round_trip_and_fp_from_sp() {
+        let code = [0x90u8; 12];
+        let saved = [3u32, 12, 0x108];
+        let pads = [(8u32, 40u32)];
+        for staged in [&[][..], &[(8u32, 16u32), (12, 32)][..]] {
+            let mut bytes = code.to_vec();
+            for w in super::unwind_info_words(&saved, &pads, staged, 48) {
+                bytes.extend_from_slice(&w.to_le_bytes());
+            }
+            let (n, info) = super::split_unwind_info(&bytes);
+            let info = info.expect("a trailer");
+            assert_eq!(n, code.len());
+            assert_eq!((&info.saved[..], &info.pads[..], &info.staged[..], info.sp_off), (&saved[..], &pads[..], staged, 48));
+            let extra = staged.iter().find(|s| s.0 == 12).map_or(0, |s| s.1 as u64);
+            assert_eq!(info.fp_from_sp(12, 0x1000), 0x1000 + 48 + extra);
+            assert_eq!(info.fp_from_sp(4, 0x1000), 0x1000 + 48);
+        }
+        assert_eq!(super::unwind_info_words(&saved, &pads, &[], 48).last().map(|h| h >> 24), Some(super::UNWIND_MAGIC));
+    }
+}
+
 /// MAKEPAD_RUN_VERIFY_PASSES (any value), `force_verify_passes`, or a debug build:
 /// `Func::verify_after` checks.
 pub fn verify_passes_on() -> bool {
@@ -2184,4 +2336,10 @@ static FORCE_VERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// per process, and test targets may share one).
 pub fn force_verify_passes() {
     FORCE_VERIFY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&UNWIND_STATS, [const { std::sync::atomic::AtomicU64::new(0) }; 4]);
 }

@@ -24,27 +24,52 @@ pub struct CollectedCache {
     pub(super) kept: Option<(usize, usize)>,
 }
 
-fn enabled() -> bool { std::env::var("MAKEPAD_RUN_COLLECTED").map_or(true, |v| v != "0") }
+impl CollectedCache {
+    /// The cache opens for the first `n` crates only: the ones a boot loaded (crates added at run
+    /// time have no fingerprint in the cache, so nothing of theirs is cached; their front entries
+    /// are not in its index).
+    pub(crate) fn boot_crates(&mut self, n: usize) {
+        self.fps.truncate(n);
+        self.ifaces.truncate(n);
+        if let Some(ix) = &mut self.indexes { ix.stores.truncate(n); }
+    }
+}
 
 /// MAKEPAD_RUN_COLLECTED_TRACE: the collected encode's parts, timed.
 struct Parts(Option<(std::time::Instant, String)>);
 impl Parts {
     fn new() -> Self {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        Parts(ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_COLLECTED_TRACE").is_some()).then(|| (std::time::Instant::now(), String::new())))
+        Parts(ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_COLLECTED_TRACE").is_some()).then(|| (std::time::Instant::now(), format!(" at t={:.0} ms:", crate::clock::ms_since_start()))))
     }
-    fn lap(&mut self, what: &str, bytes: usize) {
+    fn lap(&mut self, what: &str, image: &crate::image::Writer<'_>) {
         if let Some((t, line)) = &mut self.0 {
-            line.push_str(&format!(" {what} {:.1} ms ({:.1} MB);", t.elapsed().as_secs_f64() * 1e3, bytes as f64 / 1048576.0));
+            let (rss, _, extra) = crate::memstat::process_rss();
+            line.push_str(&format!(" {what} {:.1} ms ({:.1} MB, {:.1} MB owned; rss {} MB, {});", t.elapsed().as_secs_f64() * 1e3,
+                image.len() as f64 / 1048576.0, image.owned_len() as f64 / 1048576.0, rss >> 20, extra.split(';').next().unwrap_or("")));
             *t = std::time::Instant::now();
         }
     }
 }
 impl Drop for Parts {
     fn drop(&mut self) {
-        if let Some((_, line)) = &self.0 { if !line.is_empty() { eprintln!("makepad-run collected: encode parts:{line}"); } }
+        if let Some((_, line)) = &self.0 { if line.contains(';') { eprintln!("makepad-run collected: encode parts{line}"); } }
     }
 }
+/// `dirty` grown by the crates that load again with a dirty one: the ones depending on it and the
+/// ones of its name (a lib and its bin share a name: collected_prefix keeps neither when one
+/// changes).
+fn with_dependents(pre: &[crate::preload::PreCrate], dirty: &mut [bool]) {
+    loop {
+        let names: std::collections::HashSet<&str> = pre.iter().zip(dirty.iter()).filter(|(_, d)| **d).map(|(c, _)| c.name.as_str()).collect();
+        let mut changed = false;
+        for j in 0..pre.len() {
+            if !dirty[j] && (names.contains(pre[j].name.as_str()) || pre[j].image_deps.iter().any(|&k| dirty[k])) { dirty[j] = true; changed = true; }
+        }
+        if !changed { break; }
+    }
+}
+
 fn key(identity: u128) -> u128 {
     let mut h = Sip128::new();
     h.str("collected-graph-v1"); h.u128(front_graph_key(identity)); h.finish128()
@@ -61,13 +86,25 @@ fn certificate(graph: &crate::crate_image::GraphImage) -> u128 {
 /// types. A definition/crate prefix alone is not enough: module compilation can demand
 /// boot signatures and deferred boot files between its own additions. Keep their original
 /// IDs and lazy state together, without trying to prune the live interner afterwards.
-pub(super) struct CollectedBoot {
+/// `'p`: the program and types sections borrow the arrays of the program they were captured
+/// from (`'static` once frozen: CollectedBoot::into_owned).
+pub(super) struct CollectedBoot<'p> {
     recipe: GraphRecipe,
-    program: Arc<crate::image::Writer<'static>>,
-    types: Arc<crate::image::Writer<'static>>,
+    program: Arc<crate::image::Writer<'p>>,
+    types: Arc<crate::image::Writer<'p>>,
     definitions: Arc<crate::image::Writer<'static>>,
     files: Vec<(u32, String, u128)>,
     interfaces: Vec<MappedKey>,
+}
+
+impl CollectedBoot<'_> {
+    /// The boot with its borrowed arrays copied: it outlives the program's locks. None: `stop`
+    /// said yes between two copies (image::Writer::into_owned).
+    fn into_owned(self, stop: &dyn Fn() -> bool) -> Option<CollectedBoot<'static>> {
+        let own = |w: Arc<crate::image::Writer<'_>>| Some(Arc::new(Arc::unwrap_or_clone(w).into_owned(stop)?));
+        Some(CollectedBoot { recipe: self.recipe, program: own(self.program)?, types: own(self.types)?,
+            definitions: self.definitions, files: self.files, interfaces: self.interfaces })
+    }
 }
 
 impl FrontImages {
@@ -83,7 +120,7 @@ impl FrontImages {
             || graph.crates.iter().zip(&recipe.crates).any(|((key, _), want)| key != want) { return None; }
         let present = pre.iter().map(|c| c.name.clone()).collect();
         let mut late = HashMap::new();
-        Some(pre.iter().zip(&graph.crates).enumerate().map(|(i, (c, ((_, _), fp)))| {
+        Some(pre.iter().zip(&graph.crates).enumerate().map(|(i, (c, (_, fp)))| {
             let reopened;
             let store = match opened.and_then(|o| o.get(i)) {
                 Some(store) => &**store,
@@ -153,9 +190,9 @@ impl FrontImages {
     // certified prefix resident, including its resolved imports and collected types.
     // `selection(ci)`: this load's demand selection of crate ci, None while it is not known yet.
     // Ok((prefix, unknown)): `unknown` when the prefix ends at a crate whose selection is not
-    // known yet (a later look may find it longer).
+    // known yet (a later look may find it longer). `trace`: MAKEPAD_RUN_BOOT_TRACE names the prefix.
     fn collected_prefix(pre: &[crate::preload::PreCrate], records: &[Result<(u128, Vec<String>), &'static str>],
-        selection: &dyn Fn(usize) -> Option<(u128, Vec<String>)>) -> Option<(usize, bool)> {
+        selection: &dyn Fn(usize) -> Option<(u128, Vec<String>)>, trace: bool) -> Option<(usize, bool)> {
         let mut dirty = Vec::new();
         let mut unknown = false;
         let mut first_why = "";
@@ -181,7 +218,7 @@ impl FrontImages {
         // cannot be told apart from it there, so the suffix starts at the first such crate (an app
         // edit in its bin collects its lib again too, not every crate below it).
         while let Some(i) = pre[..first].iter().position(|c| pre[first..].iter().any(|d| d.name == c.name)) { first = i; }
-        if crate::preload::trace() {
+        if trace {
             eprintln!("makepad-run collected: prefix {} of {} crates, ends at {} ({}{})", first, pre.len(), pre[dirty.iter().position(|d| *d)?].name, first_why, if unknown { "; waiting" } else { "" });
         }
         // Every crate from the first changed one on is collected again: changed ones parse,
@@ -191,18 +228,41 @@ impl FrontImages {
         (first >= crate::std_pre_crates(&pre[0].cfg.session, false).len()).then_some((first, unknown))
     }
 
+    /// How many leading crates of `pre` a restore keeps when every record holds but the
+    /// reloaded crates' (reload_crates): collected_prefix with only those refused, so the crates
+    /// depending on them and the ones named as them load again too.
+    pub fn reload_prefix(&self, pre: &[crate::preload::PreCrate]) -> usize {
+        let records: PrefixRecords = pre.iter().map(|c| if self.reloads(&c.name, &c.root) { Err("reloaded (a checked crate)") } else { Ok((0, Vec::new())) }).collect();
+        match Self::collected_prefix(pre, &records, &|_| Some((0, Vec::new())), false) {
+            Some((prefix, _)) => prefix,
+            // (nothing loads again, or the std crates would)
+            None if !records.iter().any(Result::is_err) => pre.len(),
+            None => 0,
+        }
+    }
+
     /// The load order for `pre` (std first, every crate after its dependencies), as positions
     /// in `pre`: the order the last collected image of these crates was recorded in, with the
     /// crates whose records no longer hold, the crates of their names and every crate depending
     /// on them moved to its end (in that order). The restore keeps every crate before them
     /// (restore_collected, BaseOrder), and the next edit of the same crates finds them last
     /// already: an edit of a library collects it and its dependents again, not every crate a
-    /// dependency order happened to put after it. None: `pre`'s own order.
+    /// dependency order happened to put after it. With no stored order, a check's reloaded crates
+    /// and their dependents last (reload_crates). None: `pre`'s own order.
     pub fn load_order(&self, pre: &[crate::preload::PreCrate], std_count: usize) -> Option<Vec<usize>> {
         let recipe = GraphRecipe::new(pre);
-        let stored = read_front_order(&self.dir, recipe.set)?;
-        let at: HashMap<(&str, &str), usize> = pre.iter().enumerate().map(|(i, c)| ((c.name.as_str(), c.root.as_str()), i)).collect();
-        let order: Vec<usize> = stored.iter().map(|(n, r)| at.get(&(n.as_str(), r.as_str())).copied()).collect::<Option<_>>()?;
+        let Some(stored) = read_front_order(&self.dir, recipe.set) else {
+            // a first check: the crates that load again at every check (the reloaded ones and
+            // the ones depending on them) go last from the start, so the image it records is
+            // the one the next check restores
+            if !self.reloading() { return None; }
+            let mut dirty: Vec<bool> = pre.iter().map(|c| self.reloads(&c.name, &c.root)).collect();
+            with_dependents(pre, &mut dirty);
+            let moved: Vec<usize> = (0..pre.len()).filter(|&j| !dirty[j]).chain((0..pre.len()).filter(|&j| dirty[j])).collect();
+            return (moved.iter().take(std_count).copied().eq(0..std_count) && moved.iter().enumerate().any(|(j, k)| j != *k)).then_some(moved);
+        };
+        let at: HashMap<_, usize> = pre.iter().enumerate().map(|(i, c)| (c.key(), i)).collect();
+        let order: Vec<usize> = stored.iter().map(|key| at.get(key).copied()).collect::<Option<_>>()?;
         if !order.iter().copied().take(std_count).eq(0..std_count) { return None; }
         let base = crate::preload::reorder(pre, &order)?;
         self.begin_load(&base);
@@ -210,15 +270,7 @@ impl FrontImages {
         let graph = self.graph_read.lock().unwrap().clone()?;
         let records = self.prefix_records(&graph, &base, None)?;
         let mut dirty: Vec<bool> = records.iter().map(Result::is_err).collect();
-        // (a lib and its bin share a name: collected_prefix keeps neither when one changes)
-        loop {
-            let names: std::collections::HashSet<&str> = base.iter().zip(&dirty).filter(|(_, d)| **d).map(|(c, _)| c.name.as_str()).collect();
-            let mut changed = false;
-            for j in 0..base.len() {
-                if !dirty[j] && (names.contains(base[j].name.as_str()) || base[j].image_deps.iter().any(|&k| dirty[k])) { dirty[j] = true; changed = true; }
-            }
-            if !changed { break; }
-        }
+        with_dependents(&base, &mut dirty);
         let moved: Vec<usize> = (0..base.len()).filter(|&j| !dirty[j]).chain((0..base.len()).filter(|&j| dirty[j])).collect();
         let common = moved.iter().enumerate().take_while(|(j, k)| j == *k).count();
         if common == base.len() {
@@ -250,19 +302,23 @@ impl FrontImages {
         Some((self.front_graph(base.identity)?, Some((base.pre.clone(), base.common))))
     }
 
-    pub fn restore_collected(&self, session: &Arc<crate::Session>, pre: &[crate::preload::PreCrate]) -> Option<(Program, Tcx, Option<CollectedCache>)> {
+    /// The program and type context restored from the collected image of `pre`'s graph. Err:
+    /// which check refused it (the settle rebuild's deferral line and the boot's trace name it).
+    pub fn restore_collected(&self, session: &Arc<crate::Session>, pre: &[crate::preload::PreCrate]) -> Result<(Program, Tcx, Option<CollectedCache>), String> {
         let _profile = crate::load_profile::span(session.runtime.profile, "front-collected-restore", "main");
         // This handoff is scoped to one immutable load, never a later edit.
         self.pending_plan.lock().unwrap().take();
-        let mut why = "disabled";
+        let mut why = "symbol perturbation on";
+        // (the crate or file the refusing check was about)
+        let mut detail = String::new();
         let started = std::time::Instant::now();
         let phase = |name: &str| if crate::preload::trace() {
             eprintln!("makepad-run collected: {} at {:.1} ms", name, started.elapsed().as_secs_f64() * 1e3);
         };
         let restored = (|| {
-        if !enabled() || crate::syms::perturb(&session.options) != 0 { return None; }
+        if crate::syms::perturb(&session.options) != 0 { return None; }
         self.begin_load(pre);
-        why = "certificate";
+        why = "certificate lock poisoned";
         let cert = self.certificate.lock().ok()?;
         let stale;
         // a reordered load's base graph: its crates in its order, of which `common` lead `pre` too
@@ -274,6 +330,7 @@ impl FrontImages {
         let (graph, mut prefix) = match cert.as_ref().filter(|_| !self.reloading()) {
             Some(graph) => (graph, pre.len()),
             None => {
+                why = "no stored graph of this crate set";
                 let (graph, b) = self.graph_for(pre)?;
                 stale = graph;
                 base = b;
@@ -292,7 +349,8 @@ impl FrontImages {
                         let release = release_after.clone();
                         // (detached: the restore takes its prefix as soon as the plan's early
                         // selection covers it, and the load goes on while the plan completes)
-                        std::thread::Builder::new().name("run-demand".into()).spawn(move || {
+                        why = "demand worker not started";
+                        crate::run_threads::spawn("run-demand", move || {
                             crate::macro_reg::set_in_world(in_world);
                             worker.complete();
                             let mut r = release.lock().unwrap_or_else(|e| e.into_inner());
@@ -302,53 +360,67 @@ impl FrontImages {
                     }
                 }
                 let prefix = if plan.is_some() { 0 } else {
+                    why = "the graph's crate records";
                     let (rpre, common) = base.as_ref().map_or((pre, pre.len()), |(p, n): &(Vec<_>, usize)| (p.as_slice(), *n));
-                    Self::collected_prefix(rpre, &self.records_for(&stale, rpre, common, None)?, &|_| Some((0, Vec::new())))?.0
+                    Self::collected_prefix(rpre, &self.records_for(&stale, rpre, common, None)?, &|_| Some((0, Vec::new())), crate::preload::trace())?.0
                 };
                 (&stale, prefix)
             }
         };
         let (rpre, common) = base.as_ref().map_or((pre, pre.len()), |(p, n)| (p.as_slice(), *n));
         phase("validated");
-        why = "store";
+        why = "collected store missing or unreadable";
         let st = Arc::new(Store::open(&path(&self.dir, graph.identity))?);
         // Like a front image: structure only here (bounds; the image reader checks every
         // section), the checksum in the background (verify_front_images), so the boot reads
         // only the pages of the tables it uses, not the whole image.
+        why = "no collected entry in its store";
         let at = st.index.binary_search_by(|e| { let k = e.key; k.cmp(&key(graph.identity)) }).ok()?;
+        why = "collected entry unreadable";
         let (kind, bytes) = st.get_at(at, key(graph.identity))?;
+        why = "collected entry of another kind";
         if kind != KIND_COLLECTED { return None; }
         pin_front(&st, Some(at));
         // The checked, immutable mapping is pinned for the Program's mapped definition arena.
         let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
+        why = "collected image header";
         let image = crate::image::Reader::new(bytes)?;
-        why = "certificate identity";
-        if image.len() != 6 || image.bytes(0, 0)? != certificate(graph).to_le_bytes() { return None; }
+        why = "collected image sections (format)";
+        if image.len() != 6 { return None; }
+        why = "certificate mismatch (the crate graph changed since the image)";
+        if image.bytes(0, 0)? != certificate(graph).to_le_bytes() { return None; }
+        why = "interface count differs from the graph's crates";
         let ifaces: &[MappedKey] = image.slice(5, 5)?;
         if ifaces.len() != graph.crates.len() { return None; }
+        why = "collected image sections (format)";
         let program = image.bytes(1, 1)?;
         let types = image.bytes(2, 2)?;
         let definitions = image.bytes(3, 3)?;
         phase("mapped");
         let options = crate::crate_image::parse_options(&session.options);
         let store_paths: Vec<PathBuf> = graph.crates.iter()
-            .map(|((name, _), fp)| self.dir.join(front_store_name_with(options, name, *fp))).collect();
+            .map(|((name, _, _), fp)| self.dir.join(front_store_name_with(options, name, *fp))).collect();
         let indexes = MappedIndexes::read(image.bytes(4, 4)?, &self.dir).filter(|ix| {
             ix.stores.len() == graph.crates.len()
                 && ix.stores.iter().zip(&store_paths).all(|(s, path)| s.path.as_os_str() == path.as_os_str())
         });
         let mut stores = Vec::new();
         let mut late = HashMap::new();
-        let present = graph.crates.iter().map(|((name, _), _)| name.clone()).collect();
-        why = "crate stores / late inputs";
+        let present = graph.crates.iter().map(|((name, _, _), _)| name.clone()).collect();
         for (i, store_path) in store_paths.iter().enumerate() {
+            detail = graph.crates[i].0 .0.clone();
+            why = "crate store missing or unreadable";
             let store = indexes.as_ref().and_then(|ix| ix.stores.get(i)).cloned()
                 .or_else(|| Store::open(store_path).map(Arc::new))?;
+            why = "late inputs changed (crate ledger)";
             if i < prefix && !ledger_current(&store, &present, &mut late) { return None; }
             stores.push(store);
         }
+        detail.clear();
         phase("crate stores");
         why = "Program";
+        // (the first file whose front image did not restore)
+        let mut failed_file: Option<String> = None;
         let mut file_times = [std::time::Duration::ZERO; 3];
         let timed = crate::preload::trace();
         let mut lap = |slot: usize, at: &mut Option<std::time::Instant>| if let Some(t) = at {
@@ -356,7 +428,7 @@ impl FrontImages {
             file_times[slot] += now - *t;
             *t = now;
         };
-        let mut prog = Program::restore_collected(session, program, rpre, |f, k, cfg, meta| {
+        let prog = Program::restore_collected(session, program, rpre, |f, k, cfg, meta| {
             let restored = (|| {
             let mut at = timed.then(std::time::Instant::now);
             let store = stores.get(k as usize)?;
@@ -384,19 +456,34 @@ impl FrontImages {
             lap(2, &mut at);
             Some(pf)
             })();
-            if restored.is_none() && crate::preload::trace() { eprintln!("makepad-run collected: file not restored: {}", meta.path); }
+            if restored.is_none() {
+                if crate::preload::trace() { eprintln!("makepad-run collected: file not restored: {}", meta.path); }
+                failed_file.get_or_insert_with(|| meta.path.to_string());
+            }
             restored
-        })?;
+        });
+        let Some(mut prog) = prog else {
+            if let Some(f) = failed_file {
+                why = "a file's front image did not restore";
+                detail = f;
+            }
+            return None;
+        };
         if crate::preload::trace() {
             eprintln!("makepad-run collected: files lookup {:.1}, restore {:.1}, parts {:.1} ms",
                 file_times[0].as_secs_f64() * 1e3, file_times[1].as_secs_f64() * 1e3, file_times[2].as_secs_f64() * 1e3);
         }
         phase("Program");
         prog.front_sink = self.sink();
-        why = "crate identities";
-        if prog.crates.len() != graph.crates.len() || prog.crates.iter().zip(&graph.crates)
-            .any(|(c, ((name, root), _))| prog.syms.str(c.name) != name || c.root_path() != root) { return None; }
-        why = "Tcx";
+        why = "crate count differs from the graph's";
+        if prog.crates.len() != graph.crates.len() { return None; }
+        why = "crate identity differs from the graph's";
+        if let Some(c) = prog.crates.iter().zip(&graph.crates)
+            .find(|(c, (key, _))| crate::preload::crate_key(prog.syms.str(c.name), c.root_path(), &c.cfg) != *key) {
+            detail = prog.syms.str(c.0.name).to_string();
+            return None;
+        }
+        why = "type context (Tcx)";
         let mut tcx = Tcx::restore_collected(types, prog.files.len(), prog.crates.len())?;
         phase("Tcx");
         if let Some(plan) = plan.as_deref() {
@@ -411,19 +498,25 @@ impl FrontImages {
                     Some(r) => Some((r.selection_identity(ci), r.deferred(ci))),
                     None => (ci < seen).then(Vec::new).map(|d| (0, d)),
                 };
-                let (p, unknown) = Self::collected_prefix(rpre, &records, &selection)?;
+                let (p, unknown) = Self::collected_prefix(rpre, &records, &selection, crate::preload::trace())?;
                 if !unknown || ready.is_some() { break p; }
                 plan.wait_progress(seen);
             };
             phase("prefix chosen");
-            why = "demand selection: ledger";
-            for store in stores.iter().take(prefix) {
+            why = "late inputs changed (crate ledger, demand selection)";
+            for (i, store) in stores.iter().take(prefix).enumerate() {
+                detail = graph.crates[i].0 .0.clone();
                 if !ledger_current(store, &present, &mut late) { return None; }
             }
+            detail.clear();
             phase("selection validated");
         }
-        why = "ledger replay";
-        for store in stores.iter().take(prefix) { replay_front_ledger(store)?; }
+        why = "front ledger replay";
+        for (i, store) in stores.iter().take(prefix).enumerate() {
+            detail = graph.crates[i].0 .0.clone();
+            replay_front_ledger(store)?;
+        }
+        detail.clear();
         phase("ledger replayed");
         prog.front_graph = Some(GraphRecipe { base: base.is_some().then_some(graph.identity), ..GraphRecipe::new(pre) });
         let image_defs = prog.defs.len();
@@ -437,9 +530,9 @@ impl FrontImages {
             phase("Tcx prefix retained");
             if session.options.verbose { eprintln!("makepad-run collected: retained {} crates; rebuilding {} changed/dependent crates", prefix, pre.len() - prefix); }
             // the crates loaded after them find these as their dependencies (full_deps)
-            *self.retained.lock().unwrap() = graph.crates[..prefix].iter().map(|((name, _), fp)| (name.clone(), *fp)).collect();
+            *self.retained.lock().unwrap() = graph.crates[..prefix].iter().map(|((name, _, _), fp)| (name.clone(), *fp)).collect();
             *self.retained_proc.lock().unwrap() = graph.crates[..prefix].iter().enumerate().filter(|(k, _)| prog.crates.get(*k).is_some_and(|c| c.proc_macro))
-                .map(|(_, ((name, _), fp))| (name.clone(), *fp)).collect();
+                .map(|(_, ((name, _, _), fp))| (name.clone(), *fp)).collect();
         }
         if let Some(plan) = plan {
             self.pending_plan.lock().unwrap().take();
@@ -468,10 +561,13 @@ impl FrontImages {
         }
         Some((prog, tcx, cache))
         })();
-        if restored.is_none() && (crate::preload::trace() || session.runtime.profile) {
-            eprintln!("makepad-run collected: not restored: {}; demand plan retained={}", why, self.pending_plan.lock().unwrap().is_some());
-        }
-        restored
+        restored.ok_or_else(|| {
+            let why = if detail.is_empty() { why.to_string() } else { format!("{why} ({detail})") };
+            if crate::preload::trace() || session.runtime.profile {
+                eprintln!("makepad-run collected: not restored: {}; demand plan retained={}", why, self.pending_plan.lock().unwrap().is_some());
+            }
+            why
+        })
     }
 
 }
@@ -485,10 +581,13 @@ struct Encoder<'a> {
     iface_plain: &'a [u128],
     crate_path: &'a [PathBuf],
     crate_ident: &'a [u128],
-    boot: Option<&'a CollectedBoot>,
+    boot: Option<&'a CollectedBoot<'static>>,
     committed: bool,
     /// the definition tables the cache restored, with the definition count they were restored for
     mapped: Option<(&'a MappedDefinitions, usize)>,
+    /// the graph the image is of when it is not the program's own (crates added at run time:
+    /// CollectedInputs::with_added)
+    recipe: Option<&'a GraphRecipe>,
 }
 
 
@@ -504,17 +603,42 @@ pub(crate) struct CollectedInputs {
     crate_path: Vec<PathBuf>,
     crate_ident: Vec<u128>,
     mapped: Option<(MappedDefinitions, usize)>,
+    recipe: Option<GraphRecipe>,
 }
 
 impl CollectedInputs {
     /// The collected image of the program as it is now: neither a committed mark nor a frozen
     /// boot snapshot short-circuits it, so the image covers every type, definition and file
     /// added since the first encode (the settle rebuild restores from it, and compares the counts).
-    pub(crate) fn encode_now(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> CollectedRecord {
+    /// It borrows the program's arrays: commit it while the caller's front read holds them.
+    pub(crate) fn encode_now<'p>(&self, prog: &'p Program, tcx: &'p Tcx, stop: &dyn Fn() -> bool) -> CollectedRecord<'p> {
         Encoder { mode: self.mode, dir: &self.dir, fps: &self.fps, iface_plain: &self.iface_plain,
             crate_path: &self.crate_path, crate_ident: &self.crate_ident, boot: None, committed: false,
-            mapped: self.mapped.as_ref().map(|(m, n)| (m, *n)) }
-            .encode_as(prog, tcx, stop, true)
+            mapped: self.mapped.as_ref().map(|(m, n)| (m, *n)), recipe: self.recipe.as_ref() }
+            .encode_as(prog, tcx, stop, true, Some)
+    }
+
+    /// These inputs for a program whose crates from `boot` on were added at run time
+    /// (modules::add_crates: an app domain's), described by `pre`: the image covers them too.
+    /// Their fingerprints and interfaces are computed as a boot's (from their files only), their
+    /// stores and the graph of `pre` written (record_added_crates). The cache's own tables stay
+    /// the boot's (the crate identities: definition keys are the ones it computes). Under the
+    /// caller's front read.
+    pub(crate) fn with_added(&self, prog: &Program, pre: &[crate::preload::PreCrate], boot: usize) -> Result<CollectedInputs, String> {
+        if self.fps.len() != boot || self.iface_plain.len() != boot || self.crate_path.len() != boot || pre.len() != prog.crates.len() || boot > pre.len() {
+            return Err("the cache does not describe the boot's crates".into());
+        }
+        let fps = crate::stable::crate_fingerprints_from(prog, &self.fps);
+        let want: Vec<usize> = (0..prog.files.len()).filter(|&f| prog.file_crate.get(f).is_some_and(|&k| k as usize >= boot)).collect();
+        let mut digests = vec![None; prog.files.len()];
+        super::items::file_digests_of(prog, &want, &mut digests);
+        let iface_plain = super::items::crate_ifaces_from(prog, &fps, &digests, &self.iface_plain);
+        let recipe = GraphRecipe::new(pre);
+        let fps = record_added_crates(prog, &self.dir, &GraphRecipe::new(&pre[..boot]), &recipe, &fps)?;
+        let crate_path = self.crate_path.iter().cloned().chain((boot..pre.len())
+            .map(|ci| self.dir.join(front_store_name(&prog.session.options, &pre[ci].name, fps[ci])))).collect();
+        Ok(CollectedInputs { mode: self.mode, dir: self.dir.clone(), fps, iface_plain, crate_path, crate_ident: self.crate_ident.clone(),
+            mapped: self.mapped.clone(), recipe: Some(recipe) })
     }
 }
 
@@ -522,13 +646,13 @@ impl Cache {
     pub(crate) fn collected_inputs(&self) -> CollectedInputs {
         CollectedInputs { mode: self.mode, dir: self.dir.clone(), fps: self.fps.clone(), iface_plain: self.iface_plain.clone(),
             crate_path: self.crate_path.clone(), crate_ident: self.crate_ident.clone(),
-            mapped: self.mapped_definitions.clone().map(|m| (m, self.crate_defs_n)) }
+            mapped: self.mapped_definitions.clone().map(|m| (m, self.crate_defs_n)), recipe: None }
     }
 
     fn encoder(&self) -> Encoder<'_> {
         Encoder { mode: self.mode, dir: &self.dir, fps: &self.fps, iface_plain: &self.iface_plain,
             crate_path: &self.crate_path, crate_ident: &self.crate_ident, boot: self.collected_boot.as_ref(),
-            committed: self.collected_committed, mapped: self.mapped_definitions.as_ref().map(|m| (m, self.crate_defs_n)) }
+            committed: self.collected_committed, mapped: self.mapped_definitions.as_ref().map(|m| (m, self.crate_defs_n)), recipe: None }
     }
 
 
@@ -536,10 +660,10 @@ impl Cache {
     /// crate stores, the graph certificate and the collected store are still published
     /// by the ordinary post-present/exit writer. Repeated module loads reuse the snapshot.
     pub(crate) fn preserve_collected_boot(&mut self, prog: &Program, tcx: &Tcx) {
-        if self.collected_committed || self.collected_boot.is_some() || !enabled() || self.mode == Mode::ReadOnly { return; }
+        if self.collected_committed || self.collected_boot.is_some() || self.mode == Mode::ReadOnly { return; }
         let started = std::time::Instant::now();
         let mut why = "recipe";
-        self.collected_boot = self.encoder().capture_boot(prog, tcx, &|| false, &mut why);
+        self.collected_boot = self.encoder().capture_boot(prog, tcx, &|| false, &mut why).and_then(|boot| boot.into_owned(&|| false));
         if crate::preload::trace() {
             match &self.collected_boot {
                 Some(boot) => eprintln!("makepad-run collected: boot snapshot {} crates, {} definitions, {} types, {} files, {} bytes in {:.1} ms",
@@ -573,8 +697,9 @@ impl Cache {
     /// Called with compilation quiescent. Never performs collection or forces a lazy query.
     /// Per-crate file images are flushed first, then the complete graph is committed last.
     pub fn record_collected(&mut self, prog: &Program, tcx: &Tcx) -> Option<()> {
-        match self.encode_collected(prog, tcx, &|| false) {
-            CollectedRecord::Ready(dest, payload) => { Self::commit_collected(prog.session.options.verbose.then_some(self.collected_crates(prog)), dest, payload)?; }
+        // committed under the caller's quiescence: the image borrows the program's arrays
+        match self.encoder().encode_as(prog, tcx, &|| false, false, Some) {
+            CollectedRecord::Ready(dest, payload) => { Self::commit_collected(prog.session.options.verbose.then_some(self.collected_crates(prog)), dest, payload, &|| false)?; }
             CollectedRecord::Current => (),
             CollectedRecord::Yielded | CollectedRecord::Failed => return None,
         }
@@ -590,38 +715,40 @@ impl Cache {
     }
 
     /// The collected program's image, encoded under the unit and front-end locks (the caller's).
-    /// `stop` is asked between parts and every 1024 definitions: when it says yes (the main
-    /// thread waits for the unit lock) the encode is dropped and Yielded comes back, so the
-    /// record never holds a frame up; the caller retries later. The store write
-    /// (commit_collected) needs no lock.
-    pub fn encode_collected(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> CollectedRecord {
-        self.encoder().encode_as(prog, tcx, stop, false)
+    /// `stop` is asked between parts and every 1024 definitions: when it says yes (a program
+    /// request waits for the owner) the encode is dropped and Yielded comes back, so the record
+    /// never holds a frame or a live edit up; the caller retries later. The image owns its arrays: the
+    /// store write (commit_collected) needs no lock.
+    pub fn encode_collected(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> CollectedRecord<'static> {
+        self.encoder().encode_as(prog, tcx, stop, false, |boot| boot.into_owned(stop))
     }
 }
 
 impl Encoder<'_> {
-    fn capture_boot(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool, why: &mut &'static str) -> Option<CollectedBoot> {
+    fn capture_boot<'p>(&self, prog: &'p Program, tcx: &'p Tcx, stop: &dyn Fn() -> bool, why: &mut &'static str) -> Option<CollectedBoot<'p>> {
+        // a live edit's versions (a refused or undone one's too, with their definitions) are in
+        // the tables: they are no boot's (a boot captured before them still is: preserve_collected_boot)
+        *why = "the program holds a live edit's file versions";
+        if prog.has_edit_versions() { return None; }
         *why = "recipe";
-        let recipe = prog.front_graph.as_ref()?;
+        let recipe = self.recipe.or(prog.front_graph.as_ref())?;
         if recipe.crates.len() != prog.crates.len() || recipe.crates.iter().zip(&prog.crates)
-            .any(|(key, c)| prog.syms.str(c.name) != key.0 || c.root_path() != key.1) { return None; }
+            .any(|(key, c)| crate::preload::crate_key(prog.syms.str(c.name), c.root_path(), &c.cfg) != *key) { return None; }
         *why = "Program";
         let mut parts = Parts::new();
         crate::run::yield_section("collected Program");
-        let program = Arc::new(prog.collected_writer_with(stop)?.into_owned());
-        parts.lap("Program", program.len());
+        let program = Arc::new(prog.collected_writer_with(stop)?);
+        parts.lap("Program", &program);
         if stop() { return None; }
         *why = "Tcx";
         crate::run::yield_section("collected Tcx");
-        let w = tcx.collected_writer_with(stop)?;
-        parts.lap("Tcx writer", 0);
-        let types = Arc::new(w.into_owned());
-        parts.lap("Tcx", types.len());
+        let types = Arc::new(tcx.collected_writer_with(stop)?);
+        parts.lap("Tcx", &types);
         if stop() { return None; }
         *why = "definitions";
         crate::run::yield_section("collected definitions");
         let definitions = Arc::new(self.definitions(prog, tcx, stop)?);
-        parts.lap("definitions", definitions.len());
+        parts.lap("definitions", &definitions);
         if stop() { return None; }
         *why = "interfaces";
         if self.iface_plain.len() != recipe.crates.len() { return None; }
@@ -648,12 +775,17 @@ impl Encoder<'_> {
             if i % 128 == 127 && stop() { return None; }
             keys.push(MappedKey::new(def_key_in(prog, tcx, self.crate_ident, &mut memo, &mut files, DefId(i as u32))));
         }
-        // per crate: its definitions by key, without the keys two of them have
+        // per crate: its definitions by key, without the keys two of them have (asked between
+        // crates and every 4096 definitions too: a large app's sorts held the owner 64-70 ms between checks)
         let mut maps: Vec<Vec<(u128, u32)>> = vec![Vec::new(); prog.crates.len()];
-        for (i, k) in keys.iter().enumerate() { maps[prog.def(DefId(i as u32)).krate as usize].push((k.get(), i as u32)); }
+        for (i, k) in keys.iter().enumerate() {
+            if i % 4096 == 4095 && stop() { return None; }
+            maps[prog.def(DefId(i as u32)).krate as usize].push((k.get(), i as u32));
+        }
         let mut image = crate::image::Writer::default();
         image.add_owned(0, &keys);
         for (c, mut map) in maps.into_iter().enumerate() {
+            if stop() { return None; }
             map.sort_unstable();
             let unique = |i: usize| (i == 0 || map[i - 1].0 != map[i].0) && map.get(i + 1).is_none_or(|n| n.0 != map[i].0);
             let (keys, defs): (Vec<MappedKey>, Vec<u32>) = (0..map.len()).filter(|&i| unique(i)).map(|i| (MappedKey::new(map[i].0), map[i].1)).unzip();
@@ -663,14 +795,18 @@ impl Encoder<'_> {
         Some(image)
     }
 
-    fn encode_as(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool, fresh: bool) -> CollectedRecord {
-        if !enabled() || self.mode == Mode::ReadOnly { return CollectedRecord::Failed; }
+    /// `keep`: what a boot captured now becomes before the image takes it (CollectedBoot::into_owned
+    /// for an image that outlives the program's locks; as it is for one committed under them).
+    /// None: it stopped for `stop`.
+    fn encode_as<'p, 'b>(&self, prog: &'p Program, tcx: &'p Tcx, stop: &dyn Fn() -> bool, fresh: bool,
+        keep: impl FnOnce(CollectedBoot<'p>) -> Option<CollectedBoot<'b>>) -> CollectedRecord<'b> {
+        if self.mode == Mode::ReadOnly { return CollectedRecord::Failed; }
         if self.committed && !fresh { return CollectedRecord::Current; }
         let mut why = "recipe";
         let mut yielded = false;
         let recorded = (|| {
         let frozen = self.boot.filter(|_| !fresh);
-        let recipe = frozen.map(|boot| &boot.recipe).or(prog.front_graph.as_ref())?;
+        let recipe = frozen.map(|boot| &boot.recipe).or(self.recipe).or(prog.front_graph.as_ref())?;
         why = "graph certificate";
         let graph = read_front_graph(self.dir, recipe.identity)?;
         why = "fingerprints";
@@ -678,9 +814,15 @@ impl Encoder<'_> {
             || graph.crates.iter().map(|(_, fp)| fp).ne(self.fps.iter()) { return None; }
         let mut check = || { yielded = yielded || stop(); (!yielded).then_some(()) };
         let captured;
-        let boot = match frozen {
+        let boot: &CollectedBoot<'b> = match frozen {
             Some(boot) => boot,
-            None => { captured = self.capture_boot(prog, tcx, stop, &mut why)?; &captured }
+            None => {
+                let boot = self.capture_boot(prog, tcx, stop, &mut why)?;
+                why = "copy";
+                crate::run::yield_section("collected copy");
+                captured = keep(boot)?;
+                &captured
+            }
         };
         check()?;
         crate::run::yield_section("collected image");
@@ -710,17 +852,19 @@ impl Encoder<'_> {
 }
 
 impl Cache {
-    /// `report`: the crate count to print (verbose). The entry as the store now holds it.
-    pub fn commit_collected(report: Option<usize>, CollectedDest { dest, key, recipe }: CollectedDest, payload: crate::image::Writer<'static>) -> Option<CollectedWritten> {
+    /// `report`: the crate count to print (verbose). `stop` is asked every few MB of the image
+    /// (its write holds the caller's locks when it borrows the program): yes drops the write
+    /// and None comes back. The entry as the store now holds it.
+    pub fn commit_collected(report: Option<usize>, CollectedDest { dest, key, recipe }: CollectedDest, payload: crate::image::Writer<'_>, stop: &dyn Fn() -> bool) -> Option<CollectedWritten> {
         front_run::commit_marks(&front_run::run_marks()).ok()?;
-        // Hash/verify outside the compiler locks, alongside the store write. The
-        // immutable snapshot is already complete; a current store needs no replacement.
-        let (len, sum) = crate::store::entry_sum(&CollectedEntry { key, payload: &payload })?;
+        // The image streams from its sections twice, for the sum and into the store: neither
+        // pass assembles it.
+        let (len, sum) = crate::store::entry_sum(&CollectedEntry { key, payload: &payload, stop })?;
         let written = CollectedWritten { dest: dest.clone(), key, len, sum };
         // the next start of these crates loads in this order (load_order)
         let order = |written| { if let Some(dir) = dest.parent() { write_front_order(dir, &recipe); } Some(written) };
         if Store::open(&dest).is_some_and(|s| s.matches_sum(key, KIND_COLLECTED, len, sum)) { return order(written); }
-        if crate::store::append(&dest, vec![CollectedEntry { key, payload: &payload }], true).is_err() {
+        if crate::store::append(&dest, vec![CollectedEntry { key, payload: &payload, stop }], true).is_err() {
             if crate::preload::trace() { eprintln!("makepad-run collected: not recorded: write"); }
             return None;
         }
@@ -769,12 +913,13 @@ pub struct CollectedDest {
     recipe: GraphRecipe,
 }
 
-pub enum CollectedRecord {
-    /// encoded; commit_collected writes it (no lock needed)
-    Ready(CollectedDest, crate::image::Writer<'static>),
+/// `'p`: what the image borrows (`'static`: nothing; else commit it under the program's locks).
+pub enum CollectedRecord<'p> {
+    /// encoded; commit_collected writes it
+    Ready(CollectedDest, crate::image::Writer<'p>),
     /// the store already holds this exact image
     Current,
-    /// stopped for the main thread: try again later
+    /// stopped for a program request: try again later
     Yielded,
     Failed,
 }
@@ -922,21 +1067,43 @@ impl MappedIndexes {
     }
     pub(super) fn get(&self, key: u128) -> Option<(u32, u32)> {
         let loc = self.locations.get(find_key(self.keys, key)?)?;
-        Some((loc.store, loc.entry))
+        // (an entry of a store the cache does not open: CollectedCache::boot_crates)
+        ((loc.store as usize) < self.stores.len()).then_some((loc.store, loc.entry))
     }
     pub(super) fn len(&self) -> usize { self.keys.len() }
 }
 
-struct CollectedEntry<'a> {
+struct CollectedEntry<'a, 'p> {
     key: u128,
-    payload: &'a crate::image::Writer<'static>,
+    payload: &'a crate::image::Writer<'p>,
+    stop: &'a dyn Fn() -> bool,
 }
-impl crate::store::Entry for CollectedEntry<'_> {
+impl crate::store::Entry for CollectedEntry<'_, '_> {
     fn key(&self) -> u128 { self.key }
     fn kind(&self) -> u32 { KIND_COLLECTED }
     fn write_payload(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
-        self.payload.write_to(out)
+        self.payload.write_to(&mut Stoppable { out, stop: self.stop, since: 0 })
     }
+}
+
+/// A write that asks `stop` every STOP_EVERY bytes: yes fails it.
+struct Stoppable<'a> {
+    out: &'a mut dyn std::io::Write,
+    stop: &'a dyn Fn() -> bool,
+    since: usize,
+}
+const STOP_EVERY: usize = 4 << 20;
+impl std::io::Write for Stoppable<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.since >= STOP_EVERY {
+            self.since = 0;
+            if (self.stop)() { return Err(std::io::Error::other("the collected image write gave way")); }
+        }
+        let n = self.out.write(&b[..b.len().min(STOP_EVERY)])?;
+        self.since += n;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> { self.out.flush() }
 }
 
 #[cfg(test)]

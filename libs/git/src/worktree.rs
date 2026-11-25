@@ -43,12 +43,24 @@ pub struct Status {
     pub entries: Vec<StatusEntry>,
 }
 
+/// One path's status from [`crate::Repository::status_of_paths`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathStatus {
+    pub path: String,
+    /// `None`: the path is as HEAD has it (or untracked and ignored, or absent everywhere)
+    pub status: Option<FileStatus>,
+    /// HEAD's tree has a file at the path
+    pub in_head: bool,
+}
+
 /// Options controlling status traversal behavior.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StatusOptions {
     pub skip_hidden: bool,
     pub skip_target_dirs: bool,
     pub skip_worktree_content_compare: bool,
+    /// Report tracked changes only (`git status --untracked-files=no`).
+    pub skip_untracked: bool,
 }
 
 /// Compute full working tree status by comparing HEAD tree, index, and worktree.
@@ -138,16 +150,18 @@ pub fn compute_status_cancellable(
     }
 
     // 3. Untracked files
-    let mut ignore = status_ignore(workdir)?;
-    collect_untracked(
-        workdir,
-        workdir,
-        &index_map,
-        &mut entries,
-        options,
-        &mut ignore,
-        cancel,
-    )?;
+    if !options.skip_untracked {
+        let mut ignore = status_ignore(workdir)?;
+        collect_untracked(
+            workdir,
+            workdir,
+            &index_map,
+            &mut entries,
+            options,
+            &mut ignore,
+            cancel,
+        )?;
+    }
 
     // Sort by path for deterministic output
     entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -210,16 +224,18 @@ pub fn compute_status_worktree_only_cancellable(
     }
 
     // Untracked files
-    let mut ignore = status_ignore(workdir)?;
-    collect_untracked(
-        workdir,
-        workdir,
-        &index_map,
-        &mut entries,
-        options,
-        &mut ignore,
-        cancel,
-    )?;
+    if !options.skip_untracked {
+        let mut ignore = status_ignore(workdir)?;
+        collect_untracked(
+            workdir,
+            workdir,
+            &index_map,
+            &mut entries,
+            options,
+            &mut ignore,
+            cancel,
+        )?;
+    }
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Status { entries })
@@ -322,7 +338,7 @@ fn symlink_text(path: &Path) -> Result<Vec<u8>, GitError> {
     }
 }
 
-fn worktree_vs_index_status_for_path(
+pub(crate) fn worktree_vs_index_status_for_path(
     idx_entry: &IndexEntry,
     workdir: &Path,
     path: &str,
@@ -362,7 +378,12 @@ fn worktree_vs_index_status_for_path(
         return Ok(Some(FileStatus::Modified));
     }
 
-    let stat_matches = metadata_mtime_sec(&metadata) == idx_entry.mtime_sec
+    // as git: the size and mtime, to the nanosecond where the entry has it (an entry written
+    // without it keeps 0). A racily clean entry is smudged to size 0 first (see
+    // `smudge_racily_clean`), so its content is compared.
+    let (sec, nsec) = metadata_mtime(&metadata);
+    let stat_matches = sec == idx_entry.mtime_sec
+        && (idx_entry.mtime_nsec == 0 || nsec == idx_entry.mtime_nsec)
         && metadata.len() as u32 == idx_entry.file_size;
     if stat_matches {
         return Ok(None);
@@ -439,11 +460,11 @@ fn is_ignored_path(root: &Path, rel_path: &str, is_dir: bool) -> Result<bool, Gi
 
 /// The ignore rules `git status` applies: per-directory `.gitignore`,
 /// `info/exclude` and the user's excludes file.
-fn status_ignore(root: &Path) -> Result<GitIgnore, GitError> {
+pub(crate) fn status_ignore(root: &Path) -> Result<GitIgnore, GitError> {
     GitIgnore::with_user_excludes(root).map_err(ignore_error)
 }
 
-fn ignore_error(error: IgnoreError) -> GitError {
+pub(crate) fn ignore_error(error: IgnoreError) -> GitError {
     match error {
         IgnoreError::Io(message) => GitError::Io(std::io::Error::other(message)),
         IgnoreError::Git(message) => GitError::InvalidIndex(message),
@@ -680,11 +701,12 @@ pub fn index_entry_from_metadata(
     mode: u32,
     metadata: &fs::Metadata,
 ) -> IndexEntry {
+    let (mtime_sec, mtime_nsec) = metadata_mtime(metadata);
     IndexEntry {
-        ctime_sec: metadata_mtime_sec(metadata),
+        ctime_sec: mtime_sec,
         ctime_nsec: 0,
-        mtime_sec: metadata_mtime_sec(metadata),
-        mtime_nsec: 0,
+        mtime_sec,
+        mtime_nsec,
         dev: metadata_dev(metadata),
         ino: metadata_ino(metadata),
         mode,
@@ -773,11 +795,12 @@ pub fn stage_file(
         }
     };
 
+    let (mtime_sec, mtime_nsec) = metadata_mtime(&metadata);
     let entry = IndexEntry {
-        ctime_sec: metadata_mtime_sec(&metadata),
+        ctime_sec: mtime_sec,
         ctime_nsec: 0,
-        mtime_sec: metadata_mtime_sec(&metadata),
-        mtime_nsec: 0,
+        mtime_sec,
+        mtime_nsec,
         dev: metadata_dev(&metadata),
         ino: metadata_ino(&metadata),
         mode,
@@ -850,13 +873,25 @@ fn remove_empty_dirs_inner(dir: &Path, stop: &Path) -> Result<(), std::io::Error
     Ok(())
 }
 
-fn metadata_mtime_sec(metadata: &fs::Metadata) -> u32 {
+/// A file's mtime as the index keeps it: seconds and their nanoseconds.
+fn metadata_mtime(metadata: &fs::Metadata) -> (u32, u32) {
     metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs().min(u32::MAX as u64) as u32)
-        .unwrap_or(0)
+        .map_or((0, 0), |d| (d.as_secs().min(u32::MAX as u64) as u32, d.subsec_nanos()))
+}
+
+/// Git's racy-git rule, for an index about to be compared with its worktree: an entry whose
+/// mtime is not older than the index file's (`index_mtime`, read before the index was) is
+/// racily clean. Its file can have been rewritten in that second after it was staged, with its
+/// size and its mtime second kept, so its stat proves nothing: its size is smudged to 0, as git
+/// writes such an entry, and status compares its content.
+pub fn smudge_racily_clean(index: &mut Index, index_mtime: &fs::Metadata) {
+    let (sec, _) = metadata_mtime(index_mtime);
+    for entry in index.entries.iter_mut().filter(|e| e.mtime_sec >= sec) {
+        entry.file_size = 0;
+    }
 }
 
 #[cfg(unix)]

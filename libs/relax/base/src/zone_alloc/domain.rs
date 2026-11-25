@@ -1,6 +1,8 @@
-//! JIT program heaps. Native allocations never select these heaps: only the program allocator
-//! ABI does. This boundary keeps provided crates and runtime process-wide state shared, even
-//! when called by a domain thread; pointers are still freed according to their owning range.
+//! JIT program heaps. The program allocator ABI selects these heaps, and so does an op of a crate
+//! whose objects are the program's (the run phase). Other native allocations never do: this keeps
+//! the runtime's and other provided crates' process-wide state shared, even when called by a domain
+//! thread. A static of a crate with such ops fills in its blocks through `process_heap`, for the same
+//! reason. Pointers are still freed according to their owning range.
 use super::compiler::{self, Arena};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::UnsafeCell;
@@ -67,7 +69,7 @@ impl DomainHeap {
         self.inner.arena.detail()
     }
     /// Chunk states with resident bytes (arena.rs `states`).
-    pub fn states(&self) -> [usize; 28] {
+    pub fn states(&self) -> [usize; 29] {
         self.inner.arena.states()
     }
     pub fn range(&self) -> (usize, usize) {
@@ -116,6 +118,13 @@ pub unsafe fn enter(heap: *const DomainHeap) {
 /// a scoped entry (a foreign thread calling one domain's code) puts back what it found.
 pub fn current() -> *const () {
     compiler::current_domain().cast()
+}
+
+/// The calling thread's domain heap as it accounts itself (`DomainHeap::stats`): (bytes in use,
+/// bytes committed); None on the system heap.
+pub fn current_stats() -> Option<(usize, usize)> {
+    let arena = unsafe { compiler::current_domain().as_ref() }?;
+    Some((arena.requested_bytes(), arena.committed()))
 }
 
 /// Puts the calling thread back in the heap `current` returned.
@@ -206,8 +215,9 @@ pub fn trim_all() {
     }
 }
 
-/// Every live domain heap gives its dense chunks huge pages and takes them from sparse ones
-/// (arena.rs `densify`); at most `budget` collapses per heap. Returns the collapses done.
+/// Every live domain heap's once-a-second pass (arena.rs `densify`): its next trim epoch, the
+/// waiting threads' current chunks settled, and (Linux) huge pages for dense chunks, taken from
+/// sparse ones; at most `budget` collapses per heap. Returns the collapses done.
 pub fn densify_all(budget: usize) -> usize {
     lease().iter().flatten().map(|h| h.arena.densify(budget)).sum()
 }
@@ -354,12 +364,13 @@ pub unsafe extern "C" fn program_resize(p: *mut u8, old: usize, align: usize, si
 }
 
 extern "C" {
-    fn malloc(size: usize) -> *mut u8;
-    fn calloc(n: usize, size: usize) -> *mut u8;
-    fn realloc(p: *mut u8, size: usize) -> *mut u8;
-    fn free(p: *mut u8);
+    // the C runtime's own signatures (rustc checks them against the symbols std uses)
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void;
+    fn realloc(p: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
     #[cfg(unix)]
-    fn posix_memalign(out: *mut *mut u8, align: usize, size: usize) -> i32;
+    fn posix_memalign(out: *mut *mut core::ffi::c_void, align: usize, size: usize) -> i32;
     #[cfg(windows)]
     fn _aligned_malloc(size: usize, align: usize) -> *mut u8;
     #[cfg(windows)]
@@ -368,7 +379,7 @@ extern "C" {
 pub unsafe extern "C" fn program_malloc(size: usize) -> *mut u8 {
     match compiler::domain_here() {
         Some(a) => allocate(a, size, 16, false),
-        None => malloc(size),
+        None => malloc(size).cast(),
     }
 }
 pub unsafe extern "C" fn program_calloc(n: usize, size: usize) -> *mut u8 {
@@ -377,12 +388,12 @@ pub unsafe extern "C" fn program_calloc(n: usize, size: usize) -> *mut u8 {
     };
     match compiler::domain_here() {
         Some(a) => allocate(a, total, 16, true),
-        None => calloc(n, size),
+        None => calloc(n, size).cast(),
     }
 }
 pub unsafe extern "C" fn program_free(p: *mut u8) {
     if !p.is_null() && !dealloc(p) {
-        free(p);
+        free(p.cast());
     }
 }
 pub unsafe extern "C" fn program_realloc(p: *mut u8, size: usize) -> *mut u8 {
@@ -394,7 +405,7 @@ pub unsafe extern "C" fn program_realloc(p: *mut u8, size: usize) -> *mut u8 {
         return std::ptr::null_mut();
     }
     // Shared blocks stay shared even when a domain happens to grow them.
-    realloc_owned(p, size).unwrap_or_else(|| realloc(p, size))
+    realloc_owned(p, size).unwrap_or_else(|| realloc(p.cast(), size).cast())
 }
 pub unsafe extern "C" fn program_memalign(out: *mut *mut u8, align: usize, size: usize) -> i32 {
     if !align.is_power_of_two() || align < std::mem::size_of::<usize>() {
@@ -410,7 +421,7 @@ pub unsafe extern "C" fn program_memalign(out: *mut *mut u8, align: usize, size:
     }
     #[cfg(unix)]
     {
-        posix_memalign(out, align, size)
+        posix_memalign(out.cast(), align, size)
     }
     #[cfg(windows)]
     {
@@ -450,7 +461,7 @@ pub unsafe extern "C" fn program_malloc_trim(pad: usize) -> i32 {
     }
     malloc_trim(pad)
 }
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub unsafe extern "C" fn program_pressure_relief(zone: *const u8, goal: usize) -> usize {
     extern "C" {
         fn malloc_zone_pressure_relief(zone: *const u8, goal: usize) -> usize;
@@ -476,7 +487,7 @@ pub fn symbol(name: &[u8]) -> Option<usize> {
         b"posix_memalign" => program_memalign as *const () as usize,
         #[cfg(target_os = "linux")]
         b"malloc_trim" => program_malloc_trim as *const () as usize,
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         b"malloc_zone_pressure_relief" => program_pressure_relief as *const () as usize,
         #[cfg(windows)]
         b"_aligned_malloc" => program_aligned_malloc as *const () as usize,
@@ -542,6 +553,51 @@ mod tests {
         }
     }
 
+    /// A free that leaves a detached chunk sparse gives its whole free pages back at once, with no
+    /// trim (a program at rest gets none); the blocks still live keep their bytes.
+    #[test]
+    fn a_sparse_detached_chunk_gives_its_free_pages_back_on_free() {
+        symbol(b"relax_alloc");
+        let heap = DomainHeap::new().unwrap();
+        // (a failed assert: this thread leaves the heap before the heap goes, a failure and no crash)
+        struct Leave;
+        impl Drop for Leave {
+            fn drop(&mut self) {
+                unsafe { enter(std::ptr::null()) };
+            }
+        }
+        let _leave = Leave;
+        unsafe {
+            enter(&*heap);
+            // 1 KB blocks: the first chunk (2048 of them) is carved whole and left behind
+            let blocks: Vec<*mut u8> = (0..3000).map(|i| {
+                let p = program_alloc(1024, 8);
+                std::ptr::write_bytes(p, (i % 251) as u8, 1024);
+                p
+            }).collect();
+            let resident = || {
+                let c = heap.inner.arena.states();
+                c[3] + c[7] + c[15]
+            };
+            let before = resident();
+            let kept = |i: usize| i >= 2048 || i % 64 == 0;
+            for (i, p) in blocks.iter().enumerate() {
+                if !kept(i) {
+                    program_dealloc(*p, 1024, 8);
+                }
+            }
+            let after = resident();
+            assert!(after + (1 << 20) < before, "the sparse chunk's free pages go back as it is freed: {before} -> {after} bytes");
+            for (i, p) in blocks.iter().enumerate() {
+                if kept(i) {
+                    assert!(std::slice::from_raw_parts(*p, 1024).iter().all(|b| *b == (i % 251) as u8), "live block {i} damaged");
+                    program_dealloc(*p, 1024, 8);
+                }
+            }
+            assert_eq!(heap.stats().0, 0);
+        }
+    }
+
     #[test]
     fn large_runs_stay_warm_and_zeroed_allocs_stay_zero() {
         symbol(b"relax_alloc");
@@ -558,6 +614,7 @@ mod tests {
             assert_eq!(heap.stats().1, committed, "the run stays committed (warm)");
             let q = program_alloc(500_000, 8);
             assert_eq!(q, p, "the warm run serves the next large block of its order");
+            assert!(heap.stats().1 < committed, "a smaller block gives back the run's pages beyond it");
             program_dealloc(q, 500_000, 8);
             // a zeroed large block out of the warm list is zero (the run holds 0xAB)
             let z = program_alloc_zeroed(600_000, 8);
@@ -848,7 +905,7 @@ mod tests {
     /// `heap_check_child` (the check is read once per process).
     fn heap_check_run(mode: &str) -> std::process::Output {
         std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "zone_alloc::domain::tests::heap_check_child", "--ignored", "--nocapture", "--test-threads=1"])
+            .args(["--exact", "zone_alloc::domain::tests::heap_check_child", "--nocapture", "--test-threads=1"])
             .env("MAKEPAD_RUN_HEAP_CHECK", "1")
             .env("RELAX_HEAP_CHECK_CHILD", mode)
             .output()
@@ -856,7 +913,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "run by heap_check_* in a child process"]
     fn heap_check_child() {
         let Ok(mode) = std::env::var("RELAX_HEAP_CHECK_CHILD") else { return };
         assert!(compiler::heap_check_on());

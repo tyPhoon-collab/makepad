@@ -19,7 +19,12 @@ use makepad_remote::watch::WatchSink;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How often the master asks a node for the JIT's hot records past the ones it has (and at once
+/// after its link came back). It asked once for each record the node's feed brought, a route
+/// through its own hub each time: about 100 routes a second, 2.8k threads in 25 s (11-06).
+const HOT_LOOK: Duration = Duration::from_secs(2);
 
 /// Where records go besides the control feed (the inbox, the tray).
 pub type OnRecord = Arc<dyn Fn(&Record) + Send + Sync>;
@@ -32,6 +37,10 @@ pub struct Master {
     followed: Mutex<HashSet<String>>,
     /// nodes learned from the nodes' `peers` (their signed LAN announcements)
     heard: Arc<Mutex<Vec<Heard>>>,
+    /// each node's last `peers` answer, and the nodes asked right now: one silent node holds
+    /// only its own ask, never the others' discovery
+    heard_from: Mutex<std::collections::BTreeMap<String, Vec<Heard>>>,
+    asking_peers: Mutex<HashSet<String>>,
     on_record: OnRecord,
     /// what the user has not cleared yet (err / warn / req records of every machine)
     pub inbox: Arc<Mutex<Inbox>>,
@@ -44,6 +53,31 @@ pub struct Master {
     pub flow: Option<crate::sync::FlowServe>,
     /// the landing train (`land`): its queue and its pause
     pub land: Arc<crate::land::Train>,
+}
+
+/// A master's nice level is handed to what it starts without a level of its own: the apps
+/// `devhub show` opens on the Mac. Only root can lower a level there, so nothing can undo it later,
+/// and an exec restart keeps it. A fresh start at a level refuses; a restart goes on, since refusing
+/// would end the running master, and names the way back.
+fn niced_start(nice: i32, restart: bool, pid: u32) -> Result<Option<String>, String> {
+    if nice <= 0 {
+        return Ok(None);
+    }
+    if restart {
+        return Ok(Some(format!("the master runs at nice {nice}, and the apps it shows start at that level: `sudo renice 0 -p {pid}` brings it back without a restart")));
+    }
+    Err(format!("the master would run at nice {nice} for good, and the apps it shows with it. A background job in zsh (`&`) adds 5: start it from a foreground shell with `makepad devhub master start`"))
+}
+
+/// [`niced_start`] for this process, on the Mac (a node's hub runs where its service puts it). A
+/// restart is the same pid in the pid file: exec keeps the pid.
+pub(crate) fn start_level() -> Result<Option<String>, String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(None);
+    }
+    let pid = std::process::id();
+    let restart = std::fs::read_to_string(pid_file()).is_ok_and(|p| p.trim().parse() == Ok(pid));
+    niced_start(crate::os::own_nice(), restart, pid)
 }
 
 /// The running master's pid (`~/.makepad/devhub/master.pid`): what a switch-over stops it by.
@@ -66,9 +100,9 @@ pub fn seeds() -> Hosts {
     for line in std::fs::read_to_string(nodes_conf()).unwrap_or_default().lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         let mut w = line.split_whitespace();
-        let Some(name) = w.next().filter(|n| crate::trust::valid_name(n)) else { continue };
+        let Some(name) = w.next().filter(|n| makepad_devhub_conf::valid_name(n)) else { continue };
         let Some(addr) = w.find_map(|kv| kv.strip_prefix("addr=")) else { continue };
-        let addr = if addr.contains(':') { addr.to_string() } else { format!("{addr}:{}", proto::NODE_PORT) };
+        let addr = if addr.contains(':') { addr.to_string() } else { format!("{addr}:{}", makepad_devhub_conf::NODE_PORT) };
         if !out.hosts.iter().any(|h| h.name == name) {
             out.hosts.push(Host { name: name.to_string(), via: Via::Fleet { addr } });
         }
@@ -94,7 +128,7 @@ pub struct Heard {
 /// The machines the master dials: every `nodes.conf` seed, then each heard node that is not one
 /// of them. Machines are matched by fleet identity (a seed's identity is what its certificate
 /// proved when it was dialled: `identity(addr)`), and by address before a seed was reached, so
-/// `n1` in nodes.conf and the node announcing itself as `100` are one machine.
+/// `n1` in nodes.conf and the node announcing itself as `node-a` are one machine.
 pub fn merge(seeds: &Hosts, heard: &[Heard], identity: &dyn Fn(&str) -> Option<String>) -> Hosts {
     let mut out = seeds.clone();
     let seed_ids: Vec<String> = seeds.hosts.iter().filter_map(|h| identity(fleet_addr(h))).collect();
@@ -115,10 +149,16 @@ impl Master {
     pub fn start(name: &str, hitch_ms: f64, trust: Option<Arc<dyn Trust>>, on_record: OnRecord) -> Result<Arc<Master>, String> {
         // a second master stops before it starts anything (its landing train, its jobs): one
         // already serves the control socket
-        if Client::new(Target::Unix(proto::control_socket()), "probe").conn().is_ok() {
+        // (one this master's previous image kept open for it answers no probe: it queues the dial)
+        if !crate::node::control_kept() && Client::new(Target::Unix(proto::control_socket()), "probe").conn().is_ok() {
             return Err(format!("a devhub already serves {}", proto::control_socket().display()));
         }
+        let niced = start_level()?;
+        // Validate and retain the shared state before starting any master services.
+        let _state = crate::state::Store::open_quiet(&proto::home(), name)?;
         crate::os::raise_fd_limit();
+        // its heap's large holders, as the node hubs' (`devhub heap master`): its RSS climbs
+        crate::heap::sample();
         let inbox = Arc::new(Mutex::new(Inbox::open(proto::home().join("inbox.jsonl"))));
         let (ib, user) = (inbox.clone(), on_record);
         let recent: Arc<Mutex<std::collections::VecDeque<Record>>> = Arc::new(Mutex::new(std::collections::VecDeque::new()));
@@ -126,6 +166,9 @@ impl Master {
         let board = Arc::new(crate::sync::prewarm::Board::new(proto::home()));
         let pw = board.clone();
         let on_record: OnRecord = Arc::new(move |r| {
+            if let Some(hot) = makepad_remote::hot::Record::parse(&r.detail) {
+                if let Err(e) = crate::hot::ingest(hot) { eprintln!("devhub hot: {e}"); }
+            }
             #[cfg(feature = "checkout")]
             crate::orch::on_record(r);
             pw.see(&r);
@@ -163,9 +206,13 @@ impl Master {
         // the control socket: route + hosts (the hub's), `watch` with every machine's records,
         // and `ps` / `reply` for this Mac's JITs (local inspect stays `makepad inspect`)
         let ep = hub.client_endpoint();
+        crate::hot::register(&ep);
         let sink = ep.register_watch();
         let l = local.clone();
         ep.register("ps", 1, makepad_remote::lines::service("ps", Arc::new(move |_, out| l.ps(out))));
+        ep.register("heap", 1, makepad_remote::lines::service("heap", Arc::new(|line, out| {
+            out.extend(crate::heap::report(line.strip_prefix("heap").unwrap_or(line).trim().parse().unwrap_or(12)));
+        })));
         // `reply <id> <status> <message>`: to the JIT that posted request <id>, on whichever
         // machine its record came from (request ids carry the poster's host name, not the hub's)
         let (l, ib, me) = (local.clone(), inbox.clone(), name.to_string());
@@ -208,9 +255,16 @@ impl Master {
         {
             let (s, o) = (sink.clone(), on_record.clone());
             crate::orch::start(&ep, name, leases.clone(), Arc::new(move |r: Record| {
-                s.emit(&r.to_json());
+                let seq = s.emit(&r.to_json());
                 o(&r);
+                seq
             }));
+            if let (Some(line), Some(ctx)) = (&niced, crate::orch::ctx()) {
+                ctx.store.event("update", Sev::Warn, line.clone(), None);
+            }
+        }
+        if let Some(line) = &niced {
+            eprintln!("devhub: {line}");
         }
         // the landing train: `land` (DESIGN: devhub land), its records on the same feed
         let (s, o) = (sink.clone(), on_record.clone());
@@ -218,6 +272,37 @@ impl Master {
             s.emit(&r.to_json());
             o(&r);
         }));
+        #[cfg(feature = "checkout")]
+        {
+            let home = proto::home();
+            let repo = crate::lease::wt::default_repo();
+            let proofs = Arc::new(crate::gateproof::Store::open(&home));
+            let run = crate::bucket::fast(repo.clone(), home.clone(), proofs);
+            let (s, o) = (sink.clone(), on_record.clone());
+            let timing = crate::bucket::Timing::after(Duration::from_secs(60), Duration::from_secs(10 * 60));
+            crate::bucket::spawn("fast", timing, repo.clone(), home.clone(), Arc::new(move |r: Record| {
+                s.emit(&r.to_json());
+                o(&r);
+            }), run, |_| None);
+            let run = crate::bucket::hot(repo.clone(), home.clone());
+            let (s, o) = (sink.clone(), on_record.clone());
+            let timing = crate::bucket::Timing::after(Duration::ZERO, Duration::ZERO);
+            crate::bucket::spawn("hot", timing, repo.clone(), home.clone(), Arc::new(move |r: Record| {
+                s.emit(&r.to_json());
+                o(&r);
+            }), run, |_| None);
+            let run = crate::orch::ci::regression(repo.clone());
+            let (s, o) = (sink.clone(), on_record.clone());
+            // once a night, 02:00 on this Mac's clock, of the tip then (user, 11-05)
+            let timing = crate::bucket::Timing { every: Duration::ZERO, quiet: Duration::ZERO, cap: Duration::ZERO, daily: Some(2) };
+            crate::bucket::spawn("ci", timing, repo, home.clone(), Arc::new(move |r: Record| {
+                s.emit(&r.to_json());
+                o(&r);
+            }), run, crate::orch::ci::last_rolling);
+            ep.register("bucket", 1, makepad_remote::lines::service("bucket", Arc::new(move |_, out| {
+                out.extend(crate::bucket::status(&home));
+            })));
+        }
         // `jitcache plan|clear`: this Mac's JIT caches (a node's through `route <node> jitcache`)
         let (s, o, me) = (sink.clone(), on_record.clone(), name.to_string());
         ep.register(
@@ -246,9 +331,12 @@ impl Master {
         crate::orch::go();
         let _ = std::fs::write(pid_file(), format!("{}\n", std::process::id()));
         *slot.lock().unwrap() = Some((sink.clone(), on_record.clone()));
-        let m = Arc::new(Master { name: name.to_string(), local, hub, sink, followed: Mutex::new(HashSet::new()), heard, on_record, inbox, leases, recent, flow, land });
+        local.ready();
+        let m = Arc::new(Master { name: name.to_string(), local, hub, sink, followed: Mutex::new(HashSet::new()), heard, heard_from: Mutex::new(Default::default()), asking_peers: Mutex::new(HashSet::new()), on_record, inbox, leases, recent, flow, land });
         let m2 = m.clone();
         let _ = std::thread::Builder::new().name("devhub-master".into()).spawn(move || m2.follow_loop());
+        let m2 = m.clone();
+        let _ = std::thread::Builder::new().name("devhub-trim".into()).spawn(move || m2.trim_loop());
         let m3 = m.clone();
         m.leases.start(Arc::new(move || {
             m3.hosts()
@@ -262,8 +350,9 @@ impl Master {
                     (h.name, addr)
                 })
                 .collect()
-        }));
-        crate::sync::start_autosync(proto::control_socket());
+        }), crate::lease::master::Pace::FLEET);
+        let (leases, pins) = (m.leases.clone(), m.leases.clone());
+        crate::sync::start_autosync(proto::control_socket(), Box::new(move |node: &str, why: Option<String>| leases.update_waits(node, "deployment", why)), Arc::new(move |node: &str| pins.update_pin(node)));
         Ok(m)
     }
 
@@ -274,27 +363,42 @@ impl Master {
 
     /// Follows every node's `watch` (new nodes as nodes.conf and gossip add them).
     fn follow_loop(self: Arc<Self>) {
-        let me = Client::new(Target::Unix(proto::control_socket()), "devhub-master");
         loop {
             let hosts = self.hosts();
             self.hub.sync(&hosts);
             // one link per machine: drop names that turned out to be another name of a seed
             let names: Vec<String> = hosts.hosts.iter().map(|h| h.name.clone()).collect();
             self.hub.retain(&|n| names.iter().any(|x| x == n));
-            // what the reachable nodes have heard on their LAN
-            let mut heard: Vec<Heard> = Vec::new();
+            // what the reachable nodes have heard on their LAN, each asked on its own thread
             for h in hosts.hosts.iter() {
-                let _ = makepad_remote::hub::ask(&me, &h.name, "peers", "", "peers", &mut |l| {
-                    if let Ok(v) = makepad_strict_json::parse(l.as_bytes()) {
-                        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-                        let (name, addr, fleet) = (s("hub"), s("addr"), s("fleet"));
-                        if crate::trust::valid_name(&name) && !fleet.is_empty() && addr.parse::<std::net::SocketAddr>().is_ok_and(|a| crate::trust::lan_peer(a.ip())) && !heard.iter().any(|x| x.fleet == fleet) {
-                            heard.push(Heard { name, addr, fleet });
+                if !self.asking_peers.lock().unwrap().insert(h.name.clone()) { continue; }
+                let (m, host) = (self.clone(), h.name.clone());
+                let _ = std::thread::Builder::new().name("devhub-peers".into()).spawn(move || {
+                    let me = Client::new(Target::Unix(proto::control_socket()), "devhub-master");
+                    let mut heard: Vec<Heard> = Vec::new();
+                    let _ = makepad_remote::hub::ask(&me, &host, "peers", "", "peers", &mut |l| {
+                        if let Ok(v) = makepad_strict_json::parse(l.as_bytes()) {
+                            let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                            let (name, addr, fleet) = (s("hub"), s("addr"), s("fleet"));
+                            if makepad_devhub_conf::valid_name(&name) && !fleet.is_empty() && addr.parse::<std::net::SocketAddr>().is_ok_and(|a| crate::trust::lan_peer(a.ip())) && !heard.iter().any(|x| x.fleet == fleet) {
+                                heard.push(Heard { name, addr, fleet });
+                            }
                         }
-                    }
-                    true
+                        true
+                    });
+                    m.heard_from.lock().unwrap().insert(host.clone(), heard);
+                    m.asking_peers.lock().unwrap().remove(&host);
                 });
             }
+            let heard: Vec<Heard> = {
+                let mut from = self.heard_from.lock().unwrap();
+                from.retain(|n, _| names.iter().any(|x| x == n));
+                let mut heard: Vec<Heard> = Vec::new();
+                for x in from.values().flatten() {
+                    if !heard.iter().any(|y| y.fleet == x.fleet) { heard.push(x.clone()); }
+                }
+                heard
+            };
             *self.heard.lock().unwrap() = heard;
             for h in self.hosts().hosts {
                 if !self.followed.lock().unwrap().insert(h.name.clone()) {
@@ -304,6 +408,20 @@ impl Master {
                 let _ = std::thread::Builder::new().name("devhub-follow".into()).spawn(move || m.follow(h.name));
             }
             std::thread::sleep(Duration::from_secs(10));
+        }
+    }
+
+    /// What a burst of work freed goes back to the system once the heap fell 64 MB below its high
+    /// mark (a node hub trims at every lease end; the master's work has no such end). Without it
+    /// a landing burst left the master's freed pages resident: 380 to 780 MB with its heap back
+    /// down (11-03).
+    fn trim_loop(self: Arc<Self>) {
+        loop {
+            std::thread::sleep(Duration::from_secs(10));
+            if crate::heap::burst_freed() < 64 << 20 { continue; }
+            if let Some(held) = crate::heap::trim() {
+                self.publish(hub_record(&self.name, "", 0, "hub", Sev::Warn, format!("master memory: {held} (devhub heap master)"), String::new()));
+            }
         }
     }
 
@@ -317,11 +435,35 @@ impl Master {
         let me = Client::new(Target::Unix(proto::control_socket()), "devhub-master");
         let mut feed = Client::routed(&me, &host).watch();
         let mut up = false;
+        let mut hot_cursor = 0usize;
+        let (mut hot, mut hot_asked) = (crate::cli::NodeAsks::new(&host, "hot"), None::<Instant>);
         loop {
             if !self.hosts().hosts.iter().any(|h| h.name == host) {
                 // another name of a machine followed under its nodes.conf name
                 self.followed.lock().unwrap().remove(&host);
                 return;
+            }
+            // The durable JIT channel is independent of the lossy event ring.
+            // Replay after reconnect/start; identical record ids are idempotent.
+            if hot_asked.is_none_or(|t| t.elapsed() >= HOT_LOOK) {
+                hot_asked = Some(Instant::now());
+                let mut next_cursor = hot_cursor;
+                let mut imported = true;
+                let replay = hot.ask(&me, &format!("records {hot_cursor}"));
+                for line in replay.iter().flatten() {
+                    if let Some(mut hot) = makepad_remote::hot::Record::parse(line) {
+                        hot.node = host.clone();
+                        match crate::hot::ingest(hot.clone()) {
+                            Ok(true) => self.publish(crate::proto::from_hot(&hot)),
+                            Ok(false) => {},
+                            Err(e) => { eprintln!("devhub hot: {e}"); imported = false; },
+                        }
+                    } else if let Ok(v) = makepad_strict_json::parse(line.as_bytes()) {
+                        if let Some(cursor) = v.get("cursor").and_then(|v| v.as_u64()) { next_cursor = cursor as usize; }
+                        if v.get("err").is_some() { imported = false; }
+                    }
+                }
+                if replay.is_ok() && imported { hot_cursor = next_cursor; }
             }
             match feed.next(Duration::from_secs(2), 1) {
                 Ok(Some((_, line))) => {
@@ -349,6 +491,7 @@ impl Master {
                     }
                     std::thread::sleep(Duration::from_secs(15));
                     feed = Client::routed(&me, &host).watch();
+                    hot_asked = None;
                 }
             }
         }
@@ -361,6 +504,7 @@ fn inbox_cmd(ib: &Mutex<Inbox>, line: &str, out: &mut Vec<String>) {
     let mut ib = ib.lock().unwrap();
     match (w.next(), w.next()) {
         (Some("list"), all) => ib.list(all == Some("all"), out),
+        (Some("counts"), None) => out.push(ib.counts()),
         (Some("show"), Some(id)) => match ib.get(id) {
             Some(e) => out.push(e.record.to_json()),
             None => out.push(format!("{{\"err\":{}}}", makepad_remote::json_str(&format!("no inbox entry {id}")))),
@@ -373,7 +517,7 @@ fn inbox_cmd(ib: &Mutex<Inbox>, line: &str, out: &mut Vec<String>) {
             let n = ib.clear(id);
             out.push(format!("{{\"cleared\":{n},\"left\":{}}}", ib.entries.len()));
         }
-        _ => out.push("{\"err\":\"inbox list [all] | show <id> | seen <id|all> | clear <id|all>\"}".into()),
+        _ => out.push("{\"err\":\"inbox list [all] | counts | show <id> | seen <id|all> | clear <id|all>\"}".into()),
     }
 }
 
@@ -382,24 +526,113 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_fresh_master_refuses_a_nice_level_and_a_restart_names_the_way_back() {
+        assert_eq!(niced_start(0, false, 7), Ok(None));
+        assert_eq!(niced_start(0, true, 7), Ok(None));
+        let why = niced_start(5, false, 7).unwrap_err();
+        assert!(why.contains("nice 5") && why.contains("`makepad devhub master start`"), "{why}");
+        let line = niced_start(5, true, 7).unwrap().unwrap();
+        assert!(line.contains("`sudo renice 0 -p 7`"), "{line}");
+    }
+
+    #[test]
     fn one_machine_one_host_by_fleet_identity() {
-        let seeds = Hosts { hosts: vec![Host { name: "n1".into(), via: Via::Fleet { addr: "192.0.2.38:8797".into() } }, Host { name: "mini".into(), via: Via::Fleet { addr: "192.0.2.92:8797".into() } }] };
+        let seeds = Hosts { hosts: vec![Host { name: "n1".into(), via: Via::Fleet { addr: "192.0.2.38:8797".into() } }, Host { name: "n2".into(), via: Via::Fleet { addr: "192.0.2.92:8797".into() } }] };
         let heard = vec![
             // n1 announcing under its default name: same address
-            Heard { name: "100".into(), addr: "192.0.2.38:8797".into(), fleet: "a node".into() },
-            // the mini on its Wi-Fi address: same fleet identity as the dialled seed
-            Heard { name: "mini".into(), addr: "192.0.2.75:8797".into(), fleet: "mini".into() },
+            Heard { name: "node-a".into(), addr: "192.0.2.38:8797".into(), fleet: "fleet-a".into() },
+            // n2 on another address of its own: same fleet identity as the dialled seed
+            Heard { name: "n2".into(), addr: "192.0.2.75:8797".into(), fleet: "fleet-n2".into() },
             // a machine nodes.conf lacks
-            Heard { name: "217".into(), addr: "192.0.2.89:8797".into(), fleet: "a node".into() },
+            Heard { name: "node-c".into(), addr: "192.0.2.89:8797".into(), fleet: "fleet-b".into() },
             // the same machine heard twice
-            Heard { name: "217b".into(), addr: "192.0.2.90:8797".into(), fleet: "a node".into() },
+            Heard { name: "node-c2".into(), addr: "192.0.2.90:8797".into(), fleet: "fleet-b".into() },
         ];
         let identity = |addr: &str| match addr {
-            "192.0.2.92:8797" => Some("mini".to_string()),
+            "192.0.2.92:8797" => Some("fleet-n2".to_string()),
             _ => None,
         };
         let names: Vec<String> = merge(&seeds, &heard, &identity).hosts.into_iter().map(|h| h.name).collect();
-        assert_eq!(names, vec!["n1", "mini", "217"]);
+        assert_eq!(names, vec!["n1", "n2", "node-c"]);
+    }
+
+    /// The role of [`a_dial_during_the_masters_exec_waits_for_the_next_build`]: a master's control
+    /// socket whose "ping" names the image that answers. "before" execs into "after" as
+    /// `restart_master` does; "after" listens only once the test has dialed.
+    #[cfg(unix)]
+    #[test]
+    fn exec_role_master() {
+        let Ok(role) = std::env::var("DEVHUB_EXEC_ROLE") else { return };
+        let base = std::path::PathBuf::from(std::env::var_os("DEVHUB_EXEC_BASE").unwrap());
+        let wait_for = |f: &str| {
+            while !base.join(f).exists() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let hub = Hub::new(&Hosts::default());
+        let ep = hub.client_endpoint();
+        let me = role.clone();
+        ep.register("ping", 1, makepad_remote::lines::service("ping", Arc::new(move |_, out: &mut Vec<String>| out.push(me.clone()))));
+        if role == "after" {
+            std::fs::write(base.join("kept"), crate::node::control_kept().to_string()).unwrap();
+            std::fs::write(base.join("execd"), "").unwrap();
+            wait_for("dialed");
+        }
+        crate::node::listen_control(&ep).unwrap();
+        std::fs::write(base.join(format!("{role} listens")), "").unwrap();
+        if role == "before" {
+            wait_for("exec");
+            assert!(!crate::node::control_kept());
+            let mut cmd = crate::testenv::role("master::tests::exec_role_master", &base);
+            cmd.args(["--nocapture", "--test-threads=1"]).env("DEVHUB_EXEC_ROLE", "after");
+            crate::node::keep_control_over_exec(&mut cmd);
+            panic!("exec: {}", std::os::unix::process::CommandExt::exec(&mut cmd));
+        }
+        wait_for("done");
+    }
+
+    /// The control socket's listener stays open over the master's exec into its next build: a dial
+    /// while that build starts queues and is answered by it, where the closed socket refused it
+    /// and every lease holder said "master not reachable: waiting" (11-05).
+    #[cfg(unix)]
+    #[test]
+    fn a_dial_during_the_masters_exec_waits_for_the_next_build() {
+        let base = std::env::temp_dir().join(format!("devhub-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let log = base.join("role.log");
+        let mut role = crate::testenv::role("master::tests::exec_role_master", &base);
+        role.args(["--nocapture", "--test-threads=1"]).env("DEVHUB_EXEC_ROLE", "before").env("DEVHUB_EXEC_BASE", &base).env("MAKEPAD_HOME", base.join("home")).env_remove("DEVHUB_CONTROL_FD");
+        let mut child = role.stdin(std::process::Stdio::null()).stdout(std::fs::File::create(&log).unwrap()).stderr(std::process::Stdio::from(std::fs::File::options().append(true).open(&log).unwrap())).spawn().unwrap();
+        let mut wait_for = |f: &str| {
+            while !base.join(f).exists() {
+                if let Some(st) = child.try_wait().unwrap() {
+                    panic!("the role ended ({st}) before {f}: {}", std::fs::read_to_string(&log).unwrap_or_default());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let sock = base.join("home/devhub/devhub.sock");
+        let ask = {
+            let sock = sock.clone();
+            move || crate::cli::ask(&Client::new(Target::Unix(sock.clone()), "exec-test"), None, "ping", "ping")
+        };
+        wait_for("before listens");
+        assert_eq!(ask().unwrap(), vec!["before".to_string()]);
+        std::fs::write(base.join("exec"), "").unwrap();
+        // the next build runs and does not listen yet: it waits for "dialed"
+        wait_for("execd");
+        let queued = std::os::unix::net::UnixStream::connect(&sock);
+        assert!(queued.is_ok(), "a dial during the exec was refused: {:?}", queued.err());
+        assert_eq!(std::fs::read_to_string(base.join("kept")).unwrap(), "true", "the next build has the listener");
+        let answer = std::thread::spawn(ask.clone());
+        std::fs::write(base.join("dialed"), "").unwrap();
+        assert_eq!(answer.join().unwrap().unwrap(), vec!["after".to_string()]);
+        wait_for("after listens");
+        std::fs::write(base.join("done"), "").unwrap();
+        drop(queued);
+        assert!(child.wait().unwrap().success(), "{}", std::fs::read_to_string(&log).unwrap_or_default());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The open fds of this process.
@@ -440,14 +673,17 @@ mod tests {
         for _ in 0..300 {
             call();
         }
-        // the server side sees the last closes a moment later
+        // the server side sees the last closes a moment later. The count is the whole test
+        // process's: tests running beside this one open files and pipes meanwhile (a bound of 12
+        // failed on that noise), while a leak of even one fd per call leaves 300 or more
+        const BOUND: usize = 75;
         let t = std::time::Instant::now();
-        while fds() > before + 12 && t.elapsed() < std::time::Duration::from_secs(10) {
+        while fds() > before + BOUND && t.elapsed() < std::time::Duration::from_secs(10) {
             std::thread::sleep(std::time::Duration::from_millis(20));
             call();
         }
         let after = fds();
         let _ = std::fs::remove_file(&sock);
-        assert!(after <= before + 12, "300 CLI calls left {} fds open ({before} -> {after})", after.saturating_sub(before));
+        assert!(after <= before + BOUND, "300 CLI calls left {} fds open ({before} -> {after})", after.saturating_sub(before));
     }
 }

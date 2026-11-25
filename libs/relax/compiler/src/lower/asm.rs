@@ -15,31 +15,49 @@ use super::*;
 use relax_backend::asm::{self as rasm, Arch, Arg, PReg, Piece};
 use relax_backend::rir::{AsmBlock, ASM_NORETURN as R_NORETURN, ASM_NOMEM as R_NOMEM, ASM_NOSTACK as R_NOSTACK, ASM_PRESERVES_FLAGS as R_PF, ASM_PURE as R_PURE, ASM_READONLY as R_READONLY};
 
-/// A register class (rustc_target asm/{x86,aarch64}.rs `def_reg_class!`).
+/// A register class of the host's architecture (rustc_target asm/{x86,aarch64}.rs `def_reg_class!`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Class {
+    #[cfg(not(target_arch = "aarch64"))]
     X86Reg,
+    #[cfg(not(target_arch = "aarch64"))]
     X86RegAbcd,
+    #[cfg(not(target_arch = "aarch64"))]
     X86RegByte,
+    #[cfg(not(target_arch = "aarch64"))]
     X86Xmm,
+    #[cfg(not(target_arch = "aarch64"))]
     X86Ymm,
+    #[cfg(target_arch = "aarch64")]
     A64Reg,
+    #[cfg(target_arch = "aarch64")]
     A64Vreg,
+    #[cfg(target_arch = "aarch64")]
     A64VregLow16,
 }
 
 impl Class {
     fn parse(arch: Arch, name: &str) -> Result<Class, String> {
         Ok(match (arch, name) {
+            #[cfg(not(target_arch = "aarch64"))]
             (Arch::X64, "reg") => Class::X86Reg,
+            #[cfg(not(target_arch = "aarch64"))]
             (Arch::X64, "reg_abcd") => Class::X86RegAbcd,
+            #[cfg(not(target_arch = "aarch64"))]
             (Arch::X64, "reg_byte") => Class::X86RegByte,
+            #[cfg(not(target_arch = "aarch64"))]
             (Arch::X64, "xmm_reg") => Class::X86Xmm,
+            #[cfg(not(target_arch = "aarch64"))]
             (Arch::X64, "ymm_reg") => Class::X86Ymm,
+            #[cfg(not(target_arch = "aarch64"))]
             (Arch::X64, "zmm_reg" | "kreg" | "kreg0" | "mmx_reg" | "x87_reg" | "tmm_reg") => return Err(format!("register class `{}` is not supported by Relax's assembler yet", name)),
+            #[cfg(target_arch = "aarch64")]
             (Arch::Arm64, "reg") => Class::A64Reg,
+            #[cfg(target_arch = "aarch64")]
             (Arch::Arm64, "vreg") => Class::A64Vreg,
+            #[cfg(target_arch = "aarch64")]
             (Arch::Arm64, "vreg_low16") => Class::A64VregLow16,
+            #[cfg(target_arch = "aarch64")]
             (Arch::Arm64, "preg") => return Err("register class `preg` can only be used as a clobber, not as an input or output".to_string()),
             _ => return Err(format!("invalid register class `{}`: unknown register class", name)),
         })
@@ -50,22 +68,34 @@ impl Class {
     /// name, `vreg` the v name.
     fn default_modifier(self) -> char {
         match self {
+            #[cfg(not(target_arch = "aarch64"))]
             Class::X86Reg | Class::X86RegAbcd => 'r',
+            #[cfg(not(target_arch = "aarch64"))]
             Class::X86RegByte => 'l',
+            #[cfg(not(target_arch = "aarch64"))]
             Class::X86Xmm => 'x',
+            #[cfg(not(target_arch = "aarch64"))]
             Class::X86Ymm => 'y',
+            #[cfg(target_arch = "aarch64")]
             Class::A64Reg => 'x',
+            #[cfg(target_arch = "aarch64")]
             Class::A64Vreg | Class::A64VregLow16 => 'v',
         }
     }
     /// The modifiers the class takes (rustc_target asm `valid_modifiers`).
     fn modifiers(self) -> &'static [char] {
         match self {
+            #[cfg(not(target_arch = "aarch64"))]
             Class::X86Reg => &['l', 'x', 'e', 'r'],
+            #[cfg(not(target_arch = "aarch64"))]
             Class::X86RegAbcd => &['l', 'h', 'x', 'e', 'r'],
+            #[cfg(not(target_arch = "aarch64"))]
             Class::X86RegByte => &[],
+            #[cfg(not(target_arch = "aarch64"))]
             Class::X86Xmm | Class::X86Ymm => &['x', 'y', 'z'],
+            #[cfg(target_arch = "aarch64")]
             Class::A64Reg => &['w', 'x'],
+            #[cfg(target_arch = "aarch64")]
             Class::A64Vreg | Class::A64VregLow16 => &['b', 'h', 's', 'd', 'q', 'v'],
         }
     }
@@ -76,13 +106,19 @@ impl Class {
         match self {
             // rax rcx rdx rsi rdi r8 r9, r10 r11 (backend scratch), r12..r15 (callee-saved);
             // rbx, rbp, rsp are not operands
+            #[cfg(not(target_arch = "aarch64"))]
             Class::X86Reg | Class::X86RegByte => ints(&[0, 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+            #[cfg(not(target_arch = "aarch64"))]
             Class::X86RegAbcd => ints(&[0, 1, 2]),
+            #[cfg(not(target_arch = "aarch64"))]
             Class::X86Xmm | Class::X86Ymm => vecs(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
             // x0..x13 x15 (caller-saved; x14 / x15 / x16 / x17 are backend scratch, last), x20..x28
             // (callee-saved); x18 (platform), x19 (LLVM), x29 (fp), x30 (lr) are not taken
+            #[cfg(target_arch = "aarch64")]
             Class::A64Reg => ints(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28]),
+            #[cfg(target_arch = "aarch64")]
             Class::A64Vreg => vecs(&[0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 8, 9, 10, 11, 12, 13, 14, 15]),
+            #[cfg(target_arch = "aarch64")]
             Class::A64VregLow16 => vecs(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
         }
     }
@@ -93,6 +129,7 @@ impl Class {
 fn explicit_reg(arch: Arch, name: &str) -> Result<PReg, String> {
     let l = name.to_ascii_lowercase();
     match arch {
+        #[cfg(not(target_arch = "aarch64"))]
         Arch::X64 => {
             match l.as_str() {
                 "bp" | "bpl" | "ebp" | "rbp" => return Err("invalid register `rbp`: the frame pointer cannot be used as an operand for inline asm".to_string()),
@@ -106,6 +143,7 @@ fn explicit_reg(arch: Arch, name: &str) -> Result<PReg, String> {
                 None => Err(format!("invalid register `{}`: unknown register", name)),
             }
         }
+        #[cfg(target_arch = "aarch64")]
         Arch::Arm64 => {
             match l.as_str() {
                 "x19" | "w19" => return Err(format!("invalid register `{}`: x19 is used internally by LLVM and cannot be used as an operand for inline asm", name)),
@@ -124,6 +162,7 @@ fn explicit_reg(arch: Arch, name: &str) -> Result<PReg, String> {
 }
 
 /// rustc_target asm/aarch64.rs target_reserves_x18: Darwin, Android, Windows (and Fuchsia, OHOS).
+#[cfg(target_arch = "aarch64")]
 fn reserves_x18() -> bool {
     cfg!(any(target_vendor = "apple", target_os = "android", windows))
 }
@@ -135,6 +174,7 @@ fn clobber_abi_mask(arch: Arch, bits: u32) -> u64 {
     let int = |l: &[u8]| l.iter().fold(0u64, |a, &n| a | 1 << n);
     let all_vec = 0xffff_ffffu64 << 32;
     match arch {
+        #[cfg(not(target_arch = "aarch64"))]
         Arch::X64 => {
             let sysv = int(&[0, 1, 2, 6, 7, 8, 9, 10, 11]) | all_vec;
             let win = int(&[0, 1, 2, 8, 9, 10, 11]) | all_vec;
@@ -148,6 +188,7 @@ fn clobber_abi_mask(arch: Arch, bits: u32) -> u64 {
                 m |= win;
             }
         }
+        #[cfg(target_arch = "aarch64")]
         Arch::Arm64 => {
             if bits & (ASM_CLOBBER_C | ASM_CLOBBER_SYSV64 | ASM_CLOBBER_WIN64) != 0 {
                 m |= int(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 30]) | all_vec;
@@ -229,19 +270,33 @@ impl<'a> Lcx<'a> {
     /// rustc_target `supported_types` per class, as far as the representation tells.
     fn asm_type_ok(&self, c: Class, r: Rep) -> bool {
         match (c, r) {
+            #[cfg(not(target_arch = "aarch64"))]
             (Class::X86RegByte, Rep::Int(8, _)) => true,
+            #[cfg(not(target_arch = "aarch64"))]
             (Class::X86RegByte, _) => false,
+            #[cfg(not(target_arch = "aarch64"))]
             (Class::X86Reg | Class::X86RegAbcd, Rep::Int(b, _)) => b >= 16,
+            #[cfg(not(target_arch = "aarch64"))]
             (Class::X86Reg | Class::X86RegAbcd, Rep::Float(_)) => true,
+            #[cfg(not(target_arch = "aarch64"))]
             (Class::X86Reg | Class::X86RegAbcd, _) => false,
+            #[cfg(not(target_arch = "aarch64"))]
             (Class::X86Xmm, Rep::Int(b, _)) => b >= 32,
+            #[cfg(not(target_arch = "aarch64"))]
             (Class::X86Xmm, Rep::Float(_) | Rep::V128) => true,
+            #[cfg(not(target_arch = "aarch64"))]
             (Class::X86Xmm, Rep::V64) => false,
+            #[cfg(not(target_arch = "aarch64"))]
             (Class::X86Ymm, Rep::Int(b, _)) => b >= 32,
+            #[cfg(not(target_arch = "aarch64"))]
             (Class::X86Ymm, Rep::Float(_) | Rep::V128) => true,
+            #[cfg(not(target_arch = "aarch64"))]
             (Class::X86Ymm, _) => false,
+            #[cfg(target_arch = "aarch64")]
             (Class::A64Reg, Rep::Int(..) | Rep::Float(_)) => true,
+            #[cfg(target_arch = "aarch64")]
             (Class::A64Reg, _) => false,
+            #[cfg(target_arch = "aarch64")]
             (Class::A64Vreg | Class::A64VregLow16, _) => true,
         }
     }
@@ -352,10 +407,11 @@ impl<'a> Lcx<'a> {
             return Ok(self.u.syms.intern(crate::syms::SymKind::Thunk(id), self.u.entry(id)));
         }
         if let Some(Res::Def(d)) = self.b.res.get(&x.0).copied() {
-            if self.u.prog.def(d).kind == DefKind::ForeignStatic {
+            if self.u.prog.def(d).kind == DefKind::ForeignStatic && !self.u.is_section_bound(d) {
                 return self.u.foreign_sym(d).ok_or_else(|| format!("sym operand: `{}` has no address on this host", self.u.prog.name(d)));
             }
-            if self.u.prog.def(d).kind == DefKind::Static {
+            // a static, or a section bound (the end of the program's laid-out section)
+            if matches!(self.u.prog.def(d).kind, DefKind::Static | DefKind::ForeignStatic) {
                 // the compile domain's copy (assembly cannot add a thread's domain base)
                 let a = self.static_addr(d);
                 return Ok(self.u.syms.intern(crate::syms::SymKind::StaticAddr(d), a));
@@ -441,12 +497,12 @@ impl<'a> Lcx<'a> {
             })
             .collect();
         if spec.options & ASM_CLOBBER_UNKNOWN != 0 {
-            return Err(format!("invalid ABI for `clobber_abi`: valid ABIs are {}", if arch == Arch::X64 { "`C`, `system`, `efiapi`, `win64`, `sysv64`" } else { "`C`, `system`, `efiapi`" }));
+            return Err(format!("invalid ABI for `clobber_abi`: valid ABIs are {}", if cfg!(not(target_arch = "aarch64")) { "`C`, `system`, `efiapi`, `win64`, `sysv64`" } else { "`C`, `system`, `efiapi`" }));
         }
         if spec.options & ASM_MAY_UNWIND != 0 {
             return Err("asm! with `options(may_unwind)` is not supported by Relax".to_string());
         }
-        if spec.options & ASM_ATT_SYNTAX != 0 && arch != Arch::X64 {
+        if spec.options & ASM_ATT_SYNTAX != 0 && cfg!(target_arch = "aarch64") {
             return Err("the `att_syntax` option is only supported on x86".to_string());
         }
         let ops: Vec<AsmOp> = ast.list(spec.ops).to_vec();
@@ -454,7 +510,7 @@ impl<'a> Lcx<'a> {
         let mut used: u64 = 0;
         let mut regs: Vec<Option<(PReg, Option<Class>)>> = vec![None; ops.len()];
         for (k, op) in ops.iter().enumerate() {
-            if !op.explicit || matches!(op.dir, AsmDir::Const | AsmDir::Sym) {
+            if !op.explicit || matches!(op.dir, AsmDir::Const | AsmDir::Sym | AsmDir::Label) {
                 continue;
             }
             let name = crate::lit::unescape_str(&self.src_text(op.reg.lo, op.reg.hi));
@@ -466,7 +522,7 @@ impl<'a> Lcx<'a> {
             regs[k] = Some((r, None));
         }
         for (k, op) in ops.iter().enumerate() {
-            if op.explicit || matches!(op.dir, AsmDir::Const | AsmDir::Sym) {
+            if op.explicit || matches!(op.dir, AsmDir::Const | AsmDir::Sym | AsmDir::Label) {
                 continue;
             }
             let c = Class::parse(arch, &self.src_text(op.reg.lo, op.reg.hi))?;
@@ -480,8 +536,19 @@ impl<'a> Lcx<'a> {
         let mut outs: Vec<(VReg, (Place, TyId), Rep, bool)> = Vec::new();
         let mut writes: u64 = clobber_abi_mask(arch, spec.options);
         let mut args: Vec<Arg> = Vec::with_capacity(ops.len());
+        let mut labels: Vec<(String, ExprId)> = Vec::new();
         for (k, op) in ops.iter().enumerate() {
             match op.dir {
+                AsmDir::Label => {
+                    if naked {
+                        return Err("the `label` operand is not allowed in `naked_asm!`".to_string());
+                    }
+                    let name = format!(".Lrelax_asm_goto_{k}");
+                    // (its place in the template is the label's name, a label of the block's own stubs)
+                    args.push(Arg::Const(0));
+                    labels.push((name, op.input.ok_or("label operand without a block")?));
+                    continue;
+                }
                 AsmDir::Sym => {
                     let s = self.asm_sym(op.input.ok_or("sym operand without a path")?)?;
                     args.push(Arg::Sym(rasm::SymRef::Sym(s)));
@@ -553,17 +620,54 @@ impl<'a> Lcx<'a> {
                         Some(x) if !c.modifiers().contains(x) => return Err(format!("invalid asm template modifier `{}` for this register class", x)),
                         Some(_) => {}
                     },
-                    None if m.is_some() && matches!(op.dir, AsmDir::Const | AsmDir::Sym) => return Err("asm template modifiers are not allowed for `const` or `sym` arguments".to_string()),
+                    None if m.is_some() && matches!(op.dir, AsmDir::Const | AsmDir::Sym | AsmDir::Label) => return Err("asm template modifiers are not allowed for `const` or `sym` arguments".to_string()),
                     None => {}
                 }
             }
         }
+        for p in &mut pieces {
+            if let Piece::Op(k, _) = p {
+                if ops[*k as usize].dir == AsmDir::Label { *p = Piece::Text(format!(".Lrelax_asm_goto_{k}")); }
+            }
+        }
+        // `label` operands: RIR has no multi-successor asm, so the block ends in a stub that says how it
+        // was left. Falling through sets a free register to 0, the stub of label k sets it to k + 1, and
+        // a plain branch on that output reaches the label's block.
+        let selector = if labels.is_empty() { None } else {
+            let c = Class::parse(arch, "reg")?;
+            let r = c.candidates().into_iter().find(|r| used & (1 << r.bit()) == 0).ok_or("inline assembly requires more registers than available")?;
+            used |= 1 << r.bit();
+            writes |= 1 << r.bit();
+            let at = args.len() as u32;
+            args.push(Arg::Reg(r));
+            #[cfg(not(target_arch = "aarch64"))]
+            let att = spec.options & ASM_ATT_SYNTAX != 0;
+            let set = |pieces: &mut Vec<Piece>, value: usize| {
+                match arch {
+                    #[cfg(not(target_arch = "aarch64"))]
+                    Arch::X64 if att => { pieces.push(Piece::Text(format!("\nmov ${value}, "))); pieces.push(Piece::Op(at, Some(c.default_modifier()))); }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    Arch::X64 => { pieces.push(Piece::Text("\nmov ".to_string())); pieces.push(Piece::Op(at, Some(c.default_modifier()))); pieces.push(Piece::Text(format!(", {value}"))); }
+                    #[cfg(target_arch = "aarch64")]
+                    Arch::Arm64 => { pieces.push(Piece::Text("\nmov ".to_string())); pieces.push(Piece::Op(at, Some(c.default_modifier()))); pieces.push(Piece::Text(format!(", #{value}"))); }
+                }
+                let jump = if cfg!(not(target_arch = "aarch64")) { "jmp" } else { "b" };
+                pieces.push(Piece::Text(format!("\n{jump} .Lrelax_asm_goto_end\n")));
+            };
+            set(&mut pieces, 0);
+            for (i, (name, _)) in labels.iter().enumerate() {
+                pieces.push(Piece::Text(format!("{name}:")));
+                set(&mut pieces, i + 1);
+            }
+            pieces.push(Piece::Text(".Lrelax_asm_goto_end:\n".to_string()));
+            Some((r, self.f.vreg(Cls::I)))
+        };
         let out = rasm::assemble(arch, rasm::Format::host(), rasm::Kind::Inline, &pieces, &args, spec.options & ASM_ATT_SYNTAX != 0).map_err(|e| format!("asm!: {}", e))?;
         if out.sections.len() != 1 {
             return Err("asm!: an inline block has one section".to_string());
         }
         let code = out.sections[0].bytes.clone();
-        if arch == Arch::Arm64 && code.len() % 4 != 0 {
+        if cfg!(target_arch = "aarch64") && code.len() % 4 != 0 {
             return Err("asm!: the block's size is not a multiple of 4 bytes".to_string());
         }
         let mut fixups = Vec::new();
@@ -574,7 +678,9 @@ impl<'a> Lcx<'a> {
                 _ => return Err("asm!: a label of this block used as an address".to_string()),
             };
             let ok = match arch {
+                #[cfg(not(target_arch = "aarch64"))]
                 Arch::X64 => matches!(f.kind, rasm::FixKind::X64Branch32 | rasm::FixKind::X64Rel32 { .. } | rasm::FixKind::Abs64 | rasm::FixKind::Abs32),
+                #[cfg(target_arch = "aarch64")]
                 Arch::Arm64 => matches!(f.kind, rasm::FixKind::A64Branch26 | rasm::FixKind::A64Page21 | rasm::FixKind::A64Lo12 { scale: 0 | 3 } | rasm::FixKind::Abs64 | rasm::FixKind::Abs32),
             };
             if !ok {
@@ -592,22 +698,52 @@ impl<'a> Lcx<'a> {
         if naked {
             opts |= R_NORETURN;
         }
-        if opts & R_NORETURN != 0 && !outs.is_empty() {
+        if opts & R_NORETURN != 0 && !outs.is_empty() && labels.is_empty() {
             return Err("asm outputs are not allowed with the `noreturn` option".to_string());
         }
-        let block = AsmBlock { code, fixups, ins: in_regs, outs: outs.iter().map(|o| regs_of(&ops, &regs, o.0, &outs)).collect(), regs: used | writes, writes, opts };
-        let rets: Vec<VReg> = outs.iter().map(|o| o.0).collect();
+        // (the stubs return through the selector: the block as RIR sees it falls through)
+        let noreturn = opts & R_NORETURN != 0;
+        if selector.is_some() { opts &= !R_NORETURN; }
+        let mut out_regs: Vec<PReg> = outs.iter().map(|o| regs_of(&ops, &regs, o.0, &outs)).collect();
+        let mut rets: Vec<VReg> = outs.iter().map(|o| o.0).collect();
+        if let Some((r, d)) = selector {
+            out_regs.push(r);
+            rets.push(d);
+        }
+        let block = AsmBlock { code, fixups, ins: in_regs, outs: out_regs, regs: used | writes, writes, opts };
         self.emit(Inst::Call(Callee::Asm(Box::new(block)), ins, rets));
         if naked {
             self.f.naked = true;
         }
-        if opts & R_NORETURN != 0 {
+        if noreturn && selector.is_none() {
             self.term(Term::Unreachable);
             self.dead();
             return Ok(self.unit());
         }
         for (d, place, rep, vec) in outs {
             self.asm_out(&place, d, rep, vec);
+        }
+        if let Some((_, selector)) = selector {
+            let join = self.f.block();
+            for (i, (_, block)) in labels.iter().enumerate() {
+                let value = self.iconst(i as i64 + 1);
+                let taken = self.icmp(Cond::Eq, false, selector, value);
+                let (yes, next) = (self.f.block(), self.f.block());
+                self.term(Term::Branch(taken, yes, next));
+                self.switch(yes);
+                let mark = self.stmt_temps.len();
+                self.lower_expr(*block);
+                self.drop_stmt_temps_from(mark);
+                self.goto(join);
+                self.switch(next);
+            }
+            if noreturn {
+                self.term(Term::Unreachable);
+                self.dead();
+            } else {
+                self.goto(join);
+            }
+            self.switch(join);
         }
         Ok(self.unit())
     }

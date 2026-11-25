@@ -15,9 +15,8 @@ const INDEX: Id = Id::new(2, 1);
 const PIPE: Id = Id::new(1, 1);
 const WINDOW: Id = Id::new(1, 1);
 
-fn open() -> Option<(std::sync::Arc<Hal>, HalInfo)> {
-    // Probe availability separately: once a graphics device exists, a HAL open failure is a
-    // test failure, not a skip that could conceal a regression in device initialization.
+fn open() -> (std::sync::Arc<Hal>, HalInfo) {
+    // Require a graphics device and successful HAL initialization.
     // The probe runs once per process: the system loader's first instance creation is not safe
     // against other threads doing the same (it crashed inside vkCreateInstance when the tests'
     // probes raced); the HAL itself creates its instance under Device::shared's lock.
@@ -36,12 +35,12 @@ fn open() -> Option<(std::sync::Arc<Hal>, HalInfo)> {
         unsafe { instance.destroy_instance(None); }
         if found { Ok(()) } else { Err(format!("no Vulkan 1.1 graphics device ({devices:?})")) }
     })());
-    if let Err(reason) = probe { eprintln!("SKIP Vulkan: {reason}"); return None; }
+    probe.as_ref().expect("Vulkan graphics device");
     let hal = Hal::new();
     let info = hal.open(&OpenReq { backend: backend_id::VULKAN, flags: open_flags::OFFSCREEN_WINDOWS, ..Default::default() });
     assert_eq!(info.backend, backend_id::VULKAN, "a Vulkan device exists but HAL initialization failed");
     assert_eq!(info.dialect, dialect::SPIRV);
-    Some((hal, info))
+    (hal, info)
 }
 
 fn until(hal: &Hal, sid: u32, mut accept: impl FnMut(HalEvent<'_>) -> bool) {
@@ -210,12 +209,8 @@ fn sampled_shader() -> Vec<u8> {
 #[cfg(target_os = "linux")]
 #[test]
 fn dmabuf_export_import_second_session_samples_identical_pixels() {
-    let Some((hal, owner)) = open() else { return };
-    if let Err(reason) = hal.dmabuf_supported(owner.session) {
-        eprintln!("SKIP DMA-BUF: {reason}");
-        assert!(hal.close(owner.session));
-        return;
-    }
+    let (hal, owner) = open();
+    hal.dmabuf_supported(owner.session).expect("Vulkan DMA-BUF support");
     let reader = hal.open(&OpenReq { backend: backend_id::VULKAN, ..Default::default() });
     assert_ne!(reader.session, 0);
     let input: Vec<u8> = (0..16u8).flat_map(|i| [i * 11, 255 - i * 13, i * 7, 255]).collect();
@@ -282,9 +277,75 @@ fn dmabuf_export_import_second_session_samples_identical_pixels() {
     assert!(hal.close(reader.session));
 }
 
+/// A program that goes takes its descriptor pools with it: live edits and restarts replace programs
+/// for as long as the device lives, and a batch slot keeps a pool per program for the next frames.
+/// The programs take turns between two shapes: a layout's handle may come back for the other shape,
+/// and a pool of the old shape would not serve it, so each turn's pixels are checked.
+#[cfg(target_os = "linux")]
+#[test]
+fn programs_that_go_leave_no_descriptor_pools() {
+    const TURNS: u32 = 40;
+    let (hal, info) = open();
+    let sid = info.session;
+    resources(&hal, sid);
+    let source = Id::new(2, 1);
+    let mut w = CmdWriter::new(sid);
+    w.texture_create(source, usage::SAMPLED, format::RGBA8, 1, 1, [1, 1], Attr::default());
+    w.texture_update(source, 0, [0, 0, 1, 1], 0, &[0, 255, 0, 255]);
+    w.pipeline_destroy(PIPE);
+    hal.submit(&w.buf());
+    let bindings = |textures| [u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, textures];
+    let plain = CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, ..Default::default() }, &shader(), &bindings(0), &[16]);
+    let sampled = CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, ..Default::default() }, &sampled_shader(), &bindings(1), &[16]);
+    let mut frame = 0;
+    for turn in 0..TURNS {
+        let (blob, color) = if turn % 2 == 0 { (&plain, [255, 255, 255, 255]) } else { (&sampled, [0, 255, 0, 255]) };
+        let id = Id::new(PIPE.index, PIPE.gen + 1 + turn);
+        let mut w = CmdWriter::new(sid);
+        w.pipeline_create(id, dialect::SPIRV, Attr::default(), blob);
+        hal.submit(&w.buf());
+        until(&hal, sid, |e| matches!(e, HalEvent::PipelineReady { pipeline } if pipeline == id));
+        loop {
+            frame += 1;
+            let before = hal.with_world(|world| world.session(sid).unwrap().stats);
+            w.clear();
+            w.frame_begin(frame, FrameMeta::default());
+            w.pass(pass(TEX, 32, 32, [0.0, 0.0, 0.0, 1.0]));
+            let mut d = draw();
+            d.pipeline = id;
+            if turn % 2 == 1 { d.tex = w.put_ids(&[source]); }
+            w.draw(d);
+            w.frame_end(TEX, target::TEXTURE);
+            hal.submit(&w.buf());
+            frame_done(&hal, sid, frame);
+            let after = hal.with_world(|world| world.session(sid).unwrap().stats);
+            assert_eq!(after.bad_args, 0);
+            if before.skipped_draws == after.skipped_draws { break; }
+        }
+        w.clear();
+        w.texture_readback(TEX, turn + 1, [0, 0, 32, 32]);
+        w.pipeline_destroy(id);
+        hal.submit(&w.buf());
+        let image = pixels(&hal, sid, turn + 1);
+        assert_eq!(&image[(27 * 32 + 16) * 4..][..4], &color, "turn {turn}");
+    }
+    // (the row is written at a frame, at most every 250 ms)
+    std::thread::sleep(Duration::from_millis(300));
+    frame += 1;
+    let mut w = CmdWriter::new(sid);
+    w.frame_begin(frame, FrameMeta::default());
+    w.pass(pass(TEX, 32, 32, [0.0; 4]));
+    w.frame_end(TEX, target::TEXTURE);
+    hal.submit(&w.buf());
+    frame_done(&hal, sid, frame);
+    let kept = hal.with_world(|world| world.session(makepad_hal::session::HOST).unwrap().ledger.get(Kind::Backend, makepad_hal::ledger::Pool::DescriptorPools as u32).map_or(0, |row| row.objects));
+    assert!(kept <= 8, "descriptor pools kept after {TURNS} programs: {kept}");
+    assert!(hal.close(sid));
+}
+
 #[test]
 fn offscreen_two_passes_three_draws_and_timestamp() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     resources(&hal, info.session);
     let (_, ns) = rendered(&hal, info.session, TEX, target::TEXTURE, [32, 32], 1);
     if info.flags & info_flags::GPU_TIMESTAMPS != 0 { assert!(ns > 0); }
@@ -300,7 +361,7 @@ fn offscreen_two_passes_three_draws_and_timestamp() {
 
 #[test]
 fn cleared_target_readback_is_exact() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     let mut w = CmdWriter::new(info.session);
     w.texture_create(TEX, usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 7, 5, [1, 1], Attr::default());
     w.frame_begin(1, FrameMeta::default());
@@ -317,7 +378,7 @@ fn cleared_target_readback_is_exact() {
 /// without those frees racing the driver's exit handlers -- the test binary exits right after.
 #[test]
 fn closing_the_last_session_with_frames_in_flight() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     resources(&hal, info.session);
     let (frame, _) = rendered(&hal, info.session, TEX, target::TEXTURE, [32, 32], 1);
     let mut w = CmdWriter::new(info.session);
@@ -342,7 +403,7 @@ fn closing_the_last_session_with_frames_in_flight() {
 /// counts as stale or bad.
 #[test]
 fn device_reset_keeps_ids_and_renders_again() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     let sid = info.session;
     resources(&hal, sid);
     let mut w = CmdWriter::new(sid);
@@ -370,7 +431,7 @@ fn device_reset_keeps_ids_and_renders_again() {
         let n = hal.pump(10_000_000, &mut buf);
         for (_, event) in store.reader(n, buf.arena_len) {
             match event {
-                HalEvent::DeviceLost { generation } => {
+                HalEvent::DeviceLost { generation, .. } => {
                     assert!(reset.is_none(), "DeviceLost after DeviceReset");
                     lost.push(generation);
                 }
@@ -420,7 +481,7 @@ fn ledger(hal: &Hal, sid: u32) -> Vec<(Kind, u32, u32, u64)> {
 
 #[test]
 fn session_close_frees_exactly_its_ledger() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     let other = hal.open(&OpenReq { backend: backend_id::VULKAN, ..Default::default() }).session;
     resources(&hal, info.session); resources(&hal, other);
     let own = ledger(&hal, info.session); let survivor = ledger(&hal, other);
@@ -436,7 +497,7 @@ fn session_close_frees_exactly_its_ledger() {
 
 #[test]
 fn swapchainless_resize_keeps_textures_buffers_and_pipelines() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     resources(&hal, info.session);
     let mut w = CmdWriter::new(info.session);
     w.window_create(WINDOW, window_kind::NORMAL, Id::NONE, [0.0, 0.0, 32.0, 32.0], false); hal.submit(&w.buf());
@@ -496,7 +557,7 @@ fn check_tail(hal: &Hal, sid: u32, req: u32, size: [u32; 2], expect: &[u8]) {
 /// Reused arenas carry the previous frames' bytes: the readback shows the newest upload.
 #[test]
 fn steady_upload_frames_allocate_no_arenas() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     let sid = info.session;
     resources(&hal, sid);
     let size = [1024, 512]; // 2 MiB a frame
@@ -520,7 +581,7 @@ fn steady_upload_frames_allocate_no_arenas() {
 /// allocate nothing again.
 #[test]
 fn a_frame_larger_than_the_arena_pool_still_uploads() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     let sid = info.session;
     resources(&hal, sid);
     let size = [2048, 2048]; // 16 MiB an upload, 80 MiB in the big frame
@@ -544,7 +605,7 @@ fn a_frame_larger_than_the_arena_pool_still_uploads() {
 fn a_child_frame_wakes_the_parent_at_its_completion_without_the_child_pumping() {
     // the WM pumps; the child presents an embedded window frame and then does not pump (it is
     // building its next frame): the completion itself must wake the WM with the ChildFrame
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     let parent = info.session;
     let child = hal.open_domain(&OpenReq { backend: backend_id::VULKAN, app_key: 77, flags: open_flags::OFFSCREEN_WINDOWS, dpi_hint: 0.0, parent }, Caps::default()).session;
     assert_ne!(child, 0);
@@ -589,7 +650,7 @@ fn a_shared_program_compile_wakes_every_session_that_waits_for_it() {
     // Programs are shared by shader content: a second session that creates the same pipeline
     // while the first one's compile runs waits on that compile and must be woken by its answer,
     // not only the session that started it.
-    let Some((hal, first)) = open() else { return };
+    let (hal, first) = open();
     let second = hal.open(&OpenReq { backend: backend_id::VULKAN, flags: open_flags::OFFSCREEN_WINDOWS, ..Default::default() });
     assert_ne!(second.session, 0);
     let blob = CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, ..Default::default() }, &shader(),
@@ -621,7 +682,7 @@ fn a_pipeline_on_an_already_compiled_shared_program_is_answered_without_another_
     // Session A compiles program P and hears it is ready; then an otherwise idle session B
     // creates a pipeline on the same P. B must hear PipelineReady from its own pump, with no
     // other session submitting anything.
-    let Some((hal, first)) = open() else { return };
+    let (hal, first) = open();
     let second = hal.open(&OpenReq { backend: backend_id::VULKAN, flags: open_flags::OFFSCREEN_WINDOWS, ..Default::default() });
     assert_ne!(second.session, 0);
     let blob = CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, ..Default::default() }, &shader(),
@@ -656,7 +717,7 @@ fn a_pipeline_on_an_already_compiled_shared_program_is_answered_without_another_
 /// the pass drew nothing every frame (Scope's Glass look and History view on a node).
 #[test]
 fn a_pass_a_pixel_larger_than_its_target_still_draws() {
-    let Some((hal, info)) = open() else { return };
+    let (hal, info) = open();
     let sid = info.session;
     resources(&hal, sid);
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -685,5 +746,93 @@ fn a_pass_a_pixel_larger_than_its_target_still_draws() {
     // the clear in the top corners, the triangle's base along the bottom
     for x in [0, 31] { assert_eq!(&image[x * 4..][..4], &[17, 34, 51, 255]); }
     for x in [6, 16, 26] { assert_eq!(&image[(29 * 32 + x) * 4..][..4], &[255; 4], "x {x}"); }
+    assert!(hal.close(sid));
+}
+
+/// A retained buffer reads as zeros wherever the app has not written: never written, written in
+/// part, filled in order by its first updates (those are not zeroed first: it would write the
+/// bytes twice), or written in order only up to a point. The reads are in the batch that made
+/// the buffers, so the zeroing the backend defers to the submission is in place before the GPU
+/// copies them. The memory of a destroyed buffer full of 0xee goes back first, for the driver to
+/// hand out again.
+#[test]
+fn a_retained_buffer_reads_zero_where_it_was_not_written() {
+    let (hal, info) = open();
+    let sid = info.session;
+    let (old, never, part, whole, prefix) = (Id::new(4, 1), Id::new(5, 1), Id::new(6, 1), Id::new(7, 1), Id::new(8, 1));
+    let mut w = CmdWriter::new(sid);
+    w.buffer_create(old, buffer_kind::INSTANCE, 4096, Attr::default());
+    w.buffer_update(old, 0, &[0xee; 4096]);
+    w.buffer_destroy(old);
+    hal.submit(&w.buf());
+    let mut w = CmdWriter::new(sid);
+    for id in [never, part, whole, prefix] { w.buffer_create(id, buffer_kind::INSTANCE, 4096, Attr::default()); }
+    w.buffer_update(part, 64, &[0xab; 32]);
+    w.buffer_update(whole, 0, &[0xcd; 1024]);
+    w.buffer_update(whole, 1024, &[0xcd; 3072]);
+    w.buffer_update(whole, 16, &[0x01; 16]);
+    w.buffer_update(prefix, 0, &[0x77; 1000]);
+    w.buffer_update(prefix, 1000, &[0x78; 24]);
+    for (req, id) in [(1, never), (2, part), (3, whole), (4, prefix)] { w.read_buffers(req, &[BufferReadRange { id: id, offset: 0, len: 4096 }]); }
+    hal.submit(&w.buf());
+    let mut got: [Vec<u8>; 4] = Default::default();
+    until(&hal, sid, |e| {
+        if let HalEvent::BufferLeases { req: req @ 1..=4, status, records } = e {
+            assert_eq!(status, readback::OK);
+            use makepad_hal::buffers::Wire;
+            let record = makepad_hal::lease::Record::read(records);
+            got[req as usize - 1] = unsafe { std::slice::from_raw_parts(record.ptr as *const u8, record.len as usize) }.to_vec();
+            hal_lease_release(record.token);
+        }
+        got.iter().all(|g| !g.is_empty())
+    });
+    assert!(got[0].iter().all(|&b| b == 0), "a buffer never written reads zero");
+    let want_part: Vec<u8> = (0..4096).map(|i| if (64..96).contains(&i) { 0xab } else { 0 }).collect();
+    assert!(got[1] == want_part, "a buffer written in part reads zero around the write");
+    let want_whole: Vec<u8> = (0..4096).map(|i| if (16..32).contains(&i) { 0x01 } else { 0xcd }).collect();
+    assert!(got[2] == want_whole, "a buffer written whole reads its writes");
+    let want_prefix: Vec<u8> = (0..4096).map(|i| if i < 1000 { 0x77 } else if i < 1024 { 0x78 } else { 0 }).collect();
+    assert!(got[3] == want_prefix, "a buffer written in order up to a point reads zero after it");
+    assert_eq!(hal.with_world(|w| w.session(sid).unwrap().stats.bad_args), 0);
+    assert!(hal.close(sid));
+}
+
+/// An upload from a temporary (`&vec![..]`: freed at the end of its statement, its block handed
+/// out again before the submit) lands the bytes of the call: the writer copied them at the call.
+#[test]
+fn uploads_from_freed_temporaries_land_the_bytes_of_the_call() {
+    let (hal, info) = open();
+    let sid = info.session;
+    let (buffer, texture) = (Id::new(9, 1), Id::new(9, 1));
+    let want_buffer: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3) as u8).collect();
+    let want_texels: Vec<u8> = (0..16 * 16 * 4u32).map(|i| (i * 13 + 5) as u8).collect();
+    let mut w = CmdWriter::new(sid);
+    w.buffer_create(buffer, buffer_kind::INSTANCE, 4096, Attr::default());
+    w.texture_create(texture, usage::SAMPLED | usage::RENDER_TARGET, format::RGBA8, 16, 16, [1, 1], Attr::default());
+    w.buffer_update(buffer, 0, &want_buffer.clone());
+    w.texture_update(texture, 0, [0, 0, 16, 16], 0, &want_texels.clone());
+    let scribble = [vec![0xeeu8; 4096], vec![0xee; 1024]];
+    w.read_buffers(1, &[BufferReadRange { id: buffer, offset: 0, len: 4096 }]);
+    w.texture_readback(texture, 2, [0, 0, 16, 16]);
+    hal.submit(&w.buf());
+    drop(scribble);
+    let mut got: [Vec<u8>; 2] = Default::default();
+    until(&hal, sid, |e| {
+        if let HalEvent::BufferLeases { req: 1, status, records } = e {
+                use makepad_hal::buffers::Wire;
+                assert_eq!(status, readback::OK);
+                let record = makepad_hal::lease::Record::read(records);
+                got[0] = unsafe { std::slice::from_raw_parts(record.ptr as *const u8, record.len as usize) }.to_vec();
+                hal_lease_release(record.token);
+            }
+            if let HalEvent::Readback { req: req @ 1..=2, status, pixels, .. } = e {
+            assert_eq!(status, readback::OK);
+            got[req as usize - 1] = pixels.to_vec();
+        }
+        got.iter().all(|g| !g.is_empty())
+    });
+    assert!(got[0] == want_buffer, "the buffer holds other bytes than its upload's");
+    assert!(got[1] == want_texels, "the texture holds other bytes than its upload's");
+    assert_eq!(hal.with_world(|w| w.session(sid).unwrap().stats.bad_args), 0);
     assert!(hal.close(sid));
 }

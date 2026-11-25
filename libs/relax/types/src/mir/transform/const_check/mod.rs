@@ -133,11 +133,39 @@ impl<'a> ConstCx<'a> {
     }
 }
 
-fn is_live_default(prog: &Program, d: DefId) -> bool {
+/// rustc `find_attr!(tcx, def_id, RustcDoNotConstCheck)` of the body's own definition (an inline or
+/// anonymous constant is a definition without attributes).
+pub(crate) fn do_not_const_check(prog: &Program, body: &Body) -> bool {
+    if matches!(body.source.kind, BodyKind::InlineConst | BodyKind::AnonConst) { return false; }
+    let d = prog.def(body.source.owner);
+    let ast = &prog.files[d.file as usize].ast;
+    let src = prog.src(d.file);
+    ast.list(ast.item(d.item).attrs).iter().any(|a| a.toks.hi > a.toks.lo && crate::cfg::tok_str(src, a.toks.lo as usize) == b"rustc_do_not_const_check")
+}
+
+/// A Relax intrinsic (an `extern "relax-intrinsic"` item, which cannot be written `const`) that
+/// stands for one of rustc's `const fn` intrinsics: it carries the const-stability attribute rustc
+/// puts on that intrinsic (`rustc_const_stable`, `rustc_const_unstable`,
+/// `rustc_intrinsic_const_stable_indirect`: rustc accepts them on const fns only). Any other
+/// foreign fn is not const.
+pub(crate) fn const_intrinsic(prog: &Program, d: DefId) -> bool {
     let def = prog.def(d);
     let ast = &prog.files[def.file as usize].ast;
     let src = prog.src(def.file);
-    ast.list(ast.item(def.item).attrs).iter().any(|a| crate::cfg::tok_str(src, a.toks.lo as usize) == b"relax_live_default")
+    ast.list(ast.item(def.item).attrs).iter().any(|a| a.toks.hi > a.toks.lo
+        && matches!(crate::cfg::tok_str(src, a.toks.lo as usize), b"rustc_const_stable" | b"rustc_const_unstable" | b"rustc_intrinsic_const_stable_indirect"))
+}
+
+/// A `#[relax_live_default]` const is made by the front (derive.rs default_consts) in live
+/// sessions, never part of the program rustc sees. Whole-crate checks skip it; it is checked
+/// on demand when a live edit adds its field.
+pub fn is_live_default(prog: &Program, d: DefId) -> bool {
+    let def = prog.def(d);
+    let ast = &prog.files[def.file as usize].ast;
+    // child defs share their owner's item, including anonymous consts in its type
+    let Some(item) = ast.items.get(def.item.0 as usize) else { return false };
+    let src = prog.src(def.file);
+    ast.list(item.attrs).iter().any(|a| a.toks.hi > a.toks.lo && crate::cfg::tok_str(src, a.toks.lo as usize) == b"relax_live_default")
 }
 
 /// The result of const-checking one body.

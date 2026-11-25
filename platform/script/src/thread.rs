@@ -133,7 +133,7 @@ pub struct ScriptThread {
     pub(crate) slots: Vec<ScriptValue>,
     /// Base of the CURRENT slot frame (see CallFrame::prev_slot_base).
     pub(crate) slot_base: usize,
-    pub(crate) instruction_limit_remaining: Option<usize>,
+    pub(crate) instruction_limit_remaining: Option<u64>,
     /// The innermost scope when the root frame returned, kept alive so
     /// the body can hand it to host->script calls.
     pub(crate) root_end_scope: Option<ScriptObjectRef>,
@@ -451,6 +451,17 @@ impl ScriptThread {
         // alright if we are shadowing a value, we need to make a new scope
         if let Some(new_scope) = heap.def_scope_value(*self.scopes.last().unwrap(), id, value) {
             self.scopes.push(new_scope);
+        }
+    }
+
+    /// [`Self::def_scope_value`] for each of `items` in order (a glob `use`).
+    pub fn def_scope_values(&mut self, heap: &mut ScriptHeap, mut items: &[(LiveId, ScriptValue)]) {
+        while !items.is_empty() {
+            let (taken, shadow) = heap.def_scope_values(*self.scopes.last().unwrap(), items);
+            if let Some(scope) = shadow {
+                self.scopes.push(scope);
+            }
+            items = &items[taken..];
         }
     }
 }

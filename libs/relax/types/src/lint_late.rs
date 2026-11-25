@@ -36,6 +36,7 @@ pub const SUSPICIOUS_DOUBLE_REF_OP: Lint = lint::lint("suspicious_double_ref_op"
 pub const DEREF_NULLPTR: Lint = lint::lint("deref_nullptr");
 pub const TRIVIAL_CASTS: Lint = lint::lint("trivial_casts");
 pub const TRIVIAL_NUMERIC_CASTS: Lint = lint::lint("trivial_numeric_casts");
+pub const DANGEROUS_IMPLICIT_AUTOREFS: Lint = lint::lint("dangerous_implicit_autorefs");
 
 /// Body-level passes over one typed body owner.
 pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
@@ -413,7 +414,54 @@ impl<'a> Late<'a> {
         }
     }
 
+    /// rustc_lint autorefs.rs ImplicitAutorefs: a deref of a raw pointer, place projections, an
+    /// implicit reference (autoref or overloaded deref, after any number of derefs) and then a place
+    /// projection, a `&raw` of a deref, or a method marked `#[rustc_no_implicit_autorefs]`.
+    fn check_implicit_autorefs(&mut self, e: ExprId) {
+        let ex = *self.ast.expr(e);
+        // the node whose operand adjustments hold the autoderef, and the adjusted operand
+        let (node, inner) = match ex.kind {
+            ExprKind::AddrOf(true, _, x) => {
+                let u = unparen(self.ast, x);
+                match self.ast.expr(u).kind { ExprKind::Unary(UnOp::Deref, y) => (u, y), _ => return }
+            }
+            ExprKind::Index(base, _) => (e, base),
+            ExprKind::MethodCall(recv, _) => (e, recv),
+            ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => (e, x),
+            _ => return,
+        };
+        let steps = self.body.adjustments(node.0).map(|a| &a.operand[..]).unwrap_or(&[]);
+        let last_overloaded = matches!(steps.last().map(|a| a.kind), Some(crate::typeck::adjustments::Adjust::Deref(Some(_))));
+        let adjusted = steps.last().map(|a| a.target).or_else(|| self.expr_ty(inner));
+        let is_array = adjusted.is_some_and(|t| matches!(self.tcx.tys.kind(t), TyKind::Array(..)));
+        // (rustc's trailing Unsize after the borrow: more than one adjustment is left, no lint)
+        let method = self.body.methods.get(&e.0).copied().filter(|_| matches!(ex.kind, ExprKind::MethodCall(..)));
+        let borrow = match ex.kind {
+            ExprKind::Index(..) => (self.body.ov_index.get(&e.0).is_some() || self.body.std_index.get(&e.0).is_some()) && !is_array,
+            ExprKind::MethodCall(..) => method.is_some_and(|m| m.autoref != 0 && !(is_array && self.prog.def(self.prog.def(m.def).parent).kind != DefKind::Trait)),
+            _ => false,
+        };
+        if !borrow && !last_overloaded { return; }
+        let mut place = unparen(self.ast, inner);
+        loop {
+            match self.ast.expr(place).kind {
+                ExprKind::Index(base, _) => place = unparen(self.ast, base),
+                ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => place = unparen(self.ast, x),
+                _ => break,
+            }
+        }
+        let ExprKind::Unary(UnOp::Deref, dereferenced) = self.ast.expr(place).kind else { return };
+        if !self.expr_ty(dereferenced).is_some_and(|t| matches!(self.tcx.tys.kind(t), TyKind::Ptr(..))) { return; }
+        if let Some(m) = method {
+            let d = self.prog.def(m.def);
+            let attrs = self.prog.files[d.file as usize].ast.list(self.prog.files[d.file as usize].ast.item(d.item).attrs);
+            if !lint::has_attr(self.prog, d.file, attrs, "rustc_no_implicit_autorefs") { return; }
+        }
+        self.emit_ext(&DANGEROUS_IMPLICIT_AUTOREFS, ex.lo, "implicit autoref creates a reference to the dereference of a raw pointer");
+    }
+
     fn check_expr(&mut self, e: ExprId) {
+        self.check_implicit_autorefs(e);
         let ex = *self.ast.expr(e);
         match ex.kind {
             ExprKind::Call(f, args) => {
@@ -1642,7 +1690,7 @@ fn is_text_flow_control(c: char) -> bool {
 /// doc comments and string / char literals containing characters that change the visible
 /// direction of text. Reported while lexing, at the crate root's lint level.
 fn text_direction(prog: &Program, own: &[bool]) {
-    use crate::lexer::{LexOptions, Mode, T};
+    use crate::lexer::{LexOptions, T};
     let mut seen = std::collections::HashSet::new();
     for m in &prog.mods {
         if !own.get(m.krate as usize).copied().unwrap_or(false) { continue; }
@@ -1657,7 +1705,7 @@ fn text_direction(prog: &Program, own: &[bool]) {
         if !std::str::from_utf8(src).map_or(false, |s| s.chars().any(is_text_flow_control)) { continue; }
         let root = prog.mods[prog.crates[m.krate as usize].root_mod as usize].def;
         let mut toks = Vec::new();
-        let opts = LexOptions { edition: pf.edition, mode: Mode::Rust, trivia: true };
+        let opts = LexOptions { edition: pf.edition, trivia: true };
         if crate::lexer::lex_with(src, &opts, &mut toks).is_err() { continue; }
         for t in &toks {
             let flow = |s: &[u8]| std::str::from_utf8(s).map_or(false, |s| s.chars().any(is_text_flow_control));
@@ -2438,12 +2486,12 @@ pub const VARIANT_SIZE_DIFFERENCES: Lint = lint::lint("variant_size_differences"
 
 /// rustc_lint types.rs `VariantSizeDifferences`: a tagged enum whose largest variant is more than
 /// three times larger than the second largest (sizes without the tag).
-pub fn variant_size_differences(prog: &Program, tcx: &Tcx, own: &[bool]) {
+/// `defs`: one checked crate's definitions.
+pub fn variant_size_differences(prog: &Program, tcx: &Tcx, defs: &[DefId]) {
     if !lint::enabled() { return; }
-    for i in 0..prog.defs.len() {
-        let d = DefId(i as u32);
+    for &d in defs {
         let def = prog.def(d);
-        if def.kind != DefKind::Enum || !own.get(def.krate as usize).copied().unwrap_or(false) || lint::generated(prog, d) { continue; }
+        if def.kind != DefKind::Enum || lint::generated(prog, d) { continue; }
         let Some(adt) = tcx.adts.get(&d) else { continue };
         if adt.n_generics != 0 { continue; }
         // (rustc computes the layout of every non-generic enum here, projections in its fields normalized:
@@ -2490,7 +2538,8 @@ pub const REPR_TRANSPARENT_NON_ZST_FIELDS: Lint = lint::lint("repr_transparent_n
 
 /// rustc_hir_analysis check.rs `check_transparent`, the lint half: a zero-sized field of a
 /// `repr(transparent)` struct that contains a `repr(C)` type, next to a non-zero-sized field.
-pub fn repr_transparent_fields(prog: &Program, tcx: &Tcx, own: &[bool]) {
+/// `defs`: one checked crate's definitions.
+pub fn repr_transparent_fields(prog: &Program, tcx: &Tcx, defs: &[DefId]) {
     if !lint::enabled() { return; }
     fn contains_repr_c(prog: &Program, tcx: &Tcx, t: TyId, depth: u32) -> bool {
         if depth > 16 { return false; }
@@ -2505,10 +2554,9 @@ pub fn repr_transparent_fields(prog: &Program, tcx: &Tcx, own: &[bool]) {
             _ => false,
         }
     }
-    for i in 0..prog.defs.len() {
-        let d = DefId(i as u32);
+    for &d in defs {
         let def = prog.def(d);
-        if def.kind != DefKind::Struct || !own.get(def.krate as usize).copied().unwrap_or(false) || lint::generated(prog, d) { continue; }
+        if def.kind != DefKind::Struct || lint::generated(prog, d) { continue; }
         let pf = &prog.files[def.file as usize];
         let ast = &pf.ast;
         let item = ast.item(def.item);
@@ -2545,12 +2593,12 @@ pub fn repr_transparent_fields(prog: &Program, tcx: &Tcx, own: &[bool]) {
 pub const ASYNC_FN_IN_TRAIT: Lint = lint::lint("async_fn_in_trait");
 
 /// rustc_lint async_fn_in_trait.rs: an `async fn` in a publicly reachable trait.
-pub fn async_fn_in_trait(prog: &Program, own: &[bool], reach: &crate::lint_dead::Reach) {
+/// `defs`: one checked crate's definitions; `reach`: that crate's.
+pub fn async_fn_in_trait(prog: &Program, defs: &[DefId], reach: &crate::lint_dead::Reach) {
     if !lint::enabled() { return; }
-    for i in 0..prog.defs.len() {
-        let d = DefId(i as u32);
+    for &d in defs {
         let def = prog.def(d);
-        if def.kind != DefKind::AssocFn || !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
+        if def.kind != DefKind::AssocFn { continue; }
         if prog.def(def.parent).kind != DefKind::Trait || !reach.defs.contains(&def.parent) || lint::generated(prog, d) { continue; }
         let pf = &prog.files[def.file as usize];
         let ast = &pf.ast;
@@ -2569,15 +2617,15 @@ pub fn async_fn_in_trait(prog: &Program, own: &[bool], reach: &crate::lint_dead:
 /// rustc builtin.rs `MissingCopyImplementations`: a reachable, non-generic ADT with no
 /// destructor, no raw pointer field, no `Iterator` impl, at most 256 bytes and only `Copy`
 /// fields could implement `Copy`.
-pub fn missing_copy_implementations(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::Reach) {
+/// `defs`: one checked crate's definitions; `reach`: that crate's.
+pub fn missing_copy_implementations(prog: &Program, tcx: &Tcx, defs: &[DefId], reach: &crate::lint_dead::Reach) {
     if !lint::enabled() { return; }
     let Some(copy) = tcx.copy_trait else { return };
     let iter = tcx.lang_items.get(LangItem::Iterator);
-    for i in 0..prog.defs.len() {
-        let d = DefId(i as u32);
+    for &d in defs {
         let def = prog.def(d);
         if !matches!(def.kind, DefKind::Struct | DefKind::Enum | DefKind::Union) { continue; }
-        if !own.get(def.krate as usize).copied().unwrap_or(false) || !reach.defs.contains(&d) { continue; }
+        if !reach.defs.contains(&d) { continue; }
         if lint::generated(prog, d) { continue; }
         let Some(adt) = tcx.adts.get(&d) else { continue };
         if adt.n_generics != 0 || adt.flags.contains(crate::tcx::AdtFlags::IS_VARIANT_LIST_NON_EXHAUSTIVE) { continue; }

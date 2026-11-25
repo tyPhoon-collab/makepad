@@ -300,6 +300,10 @@ pub fn resolve_in(prog: &Program, def: DefId, inner_file: u32, inner: &[Attr], l
             spec.forbid_from_group = w == Level::Forbid;
         }
     }
+    // `--cap-lints`: no lint above it, whatever set it (rustc_middle lint.rs reveal_actual_level)
+    if let Some(cap) = cmdline().cap {
+        spec.level = spec.level.min(cap);
+    }
     spec
 }
 
@@ -310,46 +314,92 @@ pub fn fulfilled_expectations() -> Vec<AttrKey> {
     std::mem::take(&mut *FULFILLED.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// The lint levels of the command line, from `MAKEPAD_RUN_LINT_FLAGS` (rustc's `-A/-W/-D/-F`
-/// flags, e.g. `-A unused -D warnings`), in order. The UI test harness passes `-A unused`, as
-/// rustc's compiletest does.
 /// Whether the command line sets any lint level (MAKEPAD_RUN_LINT_FLAGS).
 pub fn cmdline_set() -> bool {
     !cmdline_levels().is_empty()
 }
 
 fn cmdline_levels() -> &'static [(Level, String)] {
-    static FLAGS: std::sync::OnceLock<Vec<(Level, String)>> = std::sync::OnceLock::new();
-    FLAGS.get_or_init(|| {
-        let Ok(v) = std::env::var("MAKEPAD_RUN_LINT_FLAGS") else { return Vec::new() };
-        let mut out = Vec::new();
-        let mut it = v.split_whitespace();
-        while let Some(w) = it.next() {
-            let (level, rest) = match w {
-                "-A" | "--allow" => (Level::Allow, None),
-                "-W" | "--warn" => (Level::Warn, None),
-                "-D" | "--deny" => (Level::Deny, None),
-                "-F" | "--forbid" => (Level::Forbid, None),
-                _ if w.starts_with("-A") => (Level::Allow, Some(&w[2..])),
-                _ if w.starts_with("-W") => (Level::Warn, Some(&w[2..])),
-                _ if w.starts_with("-D") => (Level::Deny, Some(&w[2..])),
-                _ if w.starts_with("-F") => (Level::Forbid, Some(&w[2..])),
-                _ => continue,
-            };
-            if let Some(name) = rest.map(str::to_string).or_else(|| it.next().map(str::to_string)) {
-                out.push((level, name));
-            }
+    &cmdline().levels
+}
+
+/// The lint flags of the command line, from `MAKEPAD_RUN_LINT_FLAGS`: rustc's `-A/-W/-D/-F`
+/// flags in order (e.g. `-A unused -D warnings`; the UI test harness passes `-A unused`, as
+/// rustc's compiletest does) and `--cap-lints <level>`.
+struct CmdLine {
+    levels: Vec<(Level, String)>,
+    cap: Option<Level>,
+}
+
+fn cmdline() -> &'static CmdLine {
+    static FLAGS: std::sync::OnceLock<CmdLine> = std::sync::OnceLock::new();
+    FLAGS.get_or_init(|| parse_cmdline(&std::env::var("MAKEPAD_RUN_LINT_FLAGS").unwrap_or_default()))
+}
+
+fn parse_cmdline(v: &str) -> CmdLine {
+    let word = |w: &str| match w { "allow" => Some(Level::Allow), "warn" => Some(Level::Warn), "deny" => Some(Level::Deny), "forbid" => Some(Level::Forbid), _ => None };
+    let mut levels = Vec::new();
+    let mut cap = None;
+    let mut it = v.split_whitespace();
+    while let Some(w) = it.next() {
+        if w == "--cap-lints" {
+            cap = it.next().and_then(word).or(cap);
+            continue;
         }
-        out
-    })
+        if let Some(l) = w.strip_prefix("--cap-lints=") {
+            cap = word(l).or(cap);
+            continue;
+        }
+        let (level, rest) = match w {
+            "-A" | "--allow" => (Level::Allow, None),
+            "-W" | "--warn" => (Level::Warn, None),
+            "-D" | "--deny" => (Level::Deny, None),
+            "-F" | "--forbid" => (Level::Forbid, None),
+            _ if w.starts_with("-A") => (Level::Allow, Some(&w[2..])),
+            _ if w.starts_with("-W") => (Level::Warn, Some(&w[2..])),
+            _ if w.starts_with("-D") => (Level::Deny, Some(&w[2..])),
+            _ if w.starts_with("-F") => (Level::Forbid, Some(&w[2..])),
+            _ => continue,
+        };
+        if let Some(name) = rest.map(str::to_string).or_else(|| it.next().map(str::to_string)) {
+            levels.push((level, name));
+        }
+    }
+    CmdLine { levels, cap }
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
-static SINK: Mutex<Vec<(Level, String)>> = Mutex::new(Vec::new());
+static SINK: Mutex<Vec<Reported>> = Mutex::new(Vec::new());
+static REPORT_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// One report of the check: its level, the lint (`""`: a hard error of the check, no lint), the
+/// definition whose scope it was reported in (its place in rustc's order: the body owner of a
+/// body's lint, the module of an item's), when it was reported (`seq`: in report order on each
+/// thread -- a body's lints are reported by one) and its line.
+pub struct Reported {
+    pub level: Level,
+    pub lint: &'static str,
+    pub def: DefId,
+    pub seq: u32,
+    pub line: String,
+}
 
 /// `makepad check` collects lints (nothing else does).
 pub fn enable() { ENABLED.store(true, Ordering::Relaxed); }
-pub fn enabled() -> bool { ENABLED.load(Ordering::Relaxed) }
+pub fn enabled() -> bool { ENABLED.load(Ordering::Relaxed) && !SUPPRESSED.with(|s| s.get()) }
+
+thread_local! {
+    static SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Errors-only checks leave other threads' lint collection alone.
+pub struct Suppress(bool);
+impl Suppress {
+    pub fn new() -> Self { Self(SUPPRESSED.with(|s| s.replace(true))) }
+}
+impl Drop for Suppress {
+    fn drop(&mut self) { SUPPRESSED.with(|s| s.set(self.0)); }
+}
 
 /// Reports `lint` at `pos` of `file` in `def`'s scope: "path:line:col: error|warning: msg".
 pub fn emit(prog: &Program, def: DefId, lint: &Lint, file: u32, pos: u32, msg: &str) {
@@ -363,12 +413,21 @@ pub fn hard_error(prog: &Program, file: u32, pos: u32, msg: &str) {
     let (l, c) = prog.files[file as usize].line_col(pos);
     let line = format!("{}:{}:{}: error: {}", prog.file_paths[file as usize], l, c, msg);
     let _k = crate::zone_alloc::kept();
-    SINK.lock().unwrap_or_else(|e| e.into_inner()).push((Level::Deny, line));
+    let seq = REPORT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SINK.lock().unwrap_or_else(|e| e.into_inner()).push(Reported { level: Level::Deny, lint: "", def: NO_DEF, seq, line });
 }
 
-/// `emit` under the attributes `inner` of a node inside `def`'s body.
+/// `emit` under the attributes `inner` of a node inside `def`'s body; none given: those around
+/// `pos` in it (attrs_at).
 pub fn emit_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u32, pos: u32, msg: &str) {
     if !enabled() { return; }
+    let around;
+    let inner = if inner.is_empty() && def != NO_DEF {
+        around = attrs_at(prog, def, file, pos, pos);
+        &around[..]
+    } else {
+        inner
+    };
     let spec = resolve_in(prog, def, file, inner, lint, None);
     let level = spec.level;
     if level == Level::Allow {
@@ -379,21 +438,68 @@ pub fn emit_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u3
     let kind = if level >= Level::Deny { "error" } else { "warning" };
     let line = format!("{}:{}:{}: {}: {} [{}]", prog.file_paths[file as usize], l, c, kind, msg, lint.name);
     let _k = crate::zone_alloc::kept();
-    SINK.lock().unwrap_or_else(|e| e.into_inner()).push((level, line));
+    let seq = REPORT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SINK.lock().unwrap_or_else(|e| e.into_inner()).push(Reported { level, lint: lint.name, def, seq, line });
+}
+
+/// `f` on each of `items` on the pool's workers (MAKEPAD_RUN_JOBS), the next free worker taking
+/// the next item (the biggest first balance them), results in item order. A lint pass may run
+/// its crates or items so: the sink takes reports from any thread, and the check's sort orders
+/// them (check_order.rs), never the order they came in.
+pub(crate) fn par_each<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let jobs = crate::preload::jobs().min(items.len());
+    if jobs < 2 { return items.iter().map(&f).collect(); }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut parts: Vec<(usize, R)> = crate::pool::scope(|sc| {
+        let hs: Vec<_> = (0..jobs).map(|_| sc.spawn(|| {
+            let mut out = Vec::new();
+            loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(x) = items.get(k) else { break };
+                out.push((k, f(x)));
+            }
+            out
+        })).collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    parts.sort_by_key(|p| p.0);
+    parts.into_iter().map(|p| p.1).collect()
 }
 
 /// The lints reported since the last take: (errors, warnings).
 pub fn take() -> (Vec<String>, Vec<String>) {
-    let all = std::mem::take(&mut *SINK.lock().unwrap_or_else(|e| e.into_inner()));
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
     // (a diagnostic reported twice -- a body checked again by the second borrowck -- is one)
     let mut seen = std::collections::HashSet::new();
-    for (l, s) in all {
-        if !seen.insert(s.clone()) { continue; }
-        if l >= Level::Deny { errors.push(s) } else { warnings.push(s) }
+    for r in take_reported() {
+        if !seen.insert(r.line.clone()) { continue; }
+        if r.level >= Level::Deny { errors.push(r.line) } else { warnings.push(r.line) }
     }
     (errors, warnings)
+}
+
+/// How many reports `take_reported` would return now: the reports a pass made are the ones
+/// between its start's and its end's count (`makepad check`'s verdict reuse tags them).
+pub fn reported_len() -> usize {
+    SINK.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+/// Everything reported since the last take, in report order (a report made twice is there twice).
+pub fn take_reported() -> Vec<Reported> {
+    std::mem::take(&mut *SINK.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Whether a hard error of the check (no lint) was reported since the last take.
+pub fn has_hard_error() -> bool {
+    SINK.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|r| r.lint.is_empty())
+}
+
+/// rustc's late lints: what its late lint pass and the checks after the required analyses
+/// (misc_checking_3: dead code, private interfaces, lint expectations) report. A check whose
+/// required analyses failed reports none of them (rustc_interface passes.rs analysis).
+pub fn is_late(lint: &str) -> bool {
+    crate::lint_table::LATE.binary_search(&lint).is_ok()
 }
 
 // ---------------------------------------------------------------- overflowing_literals
@@ -407,11 +513,13 @@ pub fn check_literals(prog: &Program, tcx: &crate::tcx::Tcx, body: &crate::typec
     let pf = &prog.files[body.file as usize];
     let ast = &pf.ast;
     let n = body.expr_ty.len();
-    let mut negated = std::collections::HashSet::new();
+    // (the negated literal -> where the negation starts: rustc reports a negated literal at the
+    // negation, literal.rs lint_int_literal `negated_expr_span`)
+    let mut negated = std::collections::HashMap::new();
     for i in 0..n {
         let e = body.expr_at(i);
         if !body.expr_typed.get(i) { continue; }
-        if let ExprKind::Unary(UnOp::Neg, x) = ast.expr(e).kind { negated.insert(x.0); }
+        if let ExprKind::Unary(UnOp::Neg, x) = ast.expr(e).kind { negated.insert(x.0, ast.expr(e).lo); }
     }
     for i in 0..n {
         let e = body.expr_at(i);
@@ -420,7 +528,8 @@ pub fn check_literals(prog: &Program, tcx: &crate::tcx::Tcx, body: &crate::typec
         let kind = match ex.kind { ExprKind::Lit(k @ (LitKind::Int | LitKind::Float)) => k, _ => continue };
         let t = body.expr_ty[i];
         let text = std::str::from_utf8(pf.bytes(ex.lo, ex.hi)).unwrap_or("");
-        let neg = negated.contains(&e.0);
+        let neg_at = negated.get(&e.0).copied();
+        let neg = neg_at.is_some();
         match (kind, tcx.tys.kind(t)) {
             (LitKind::Int, TyKind::Int(p)) => {
                 let (bytes, signed) = tcx.tys.int_info(*p);
@@ -433,7 +542,7 @@ pub fn check_literals(prog: &Program, tcx: &crate::tcx::Tcx, body: &crate::typec
                     let ty = crate::typeck::ty_to_string(false, prog, tcx, t);
                     let lit = if neg { format!("-{}", text) } else { text.to_string() };
                     let range = if signed { format!("-{}..={}", min_abs, max) } else { format!("0..={}", max) };
-                    emit(prog, body.def, &OVERFLOWING_LITERALS, body.file, ex.lo,
+                    emit_in(prog, body.def, &attrs_around_expr(prog, body.def, body.file, e), &OVERFLOWING_LITERALS, body.file, neg_at.unwrap_or(ex.lo),
                         &format!("literal out of range for `{}` -- the literal `{}` does not fit into the type `{}` whose range is `{}`", ty, lit, ty, range));
                 }
             }
@@ -447,7 +556,7 @@ pub fn check_literals(prog: &Program, tcx: &crate::tcx::Tcx, body: &crate::typec
                     _ => false,
                 };
                 if inf {
-                    emit(prog, body.def, &OVERFLOWING_LITERALS, body.file, ex.lo,
+                    emit_in(prog, body.def, &attrs_around_expr(prog, body.def, body.file, e), &OVERFLOWING_LITERALS, body.file, ex.lo,
                         &format!("literal out of range for `{}` -- the literal `{}` does not fit into the type `{}` and will be converted to `{}::INFINITY`", ty, text, ty, ty));
                 }
             }
@@ -552,6 +661,44 @@ fn stmt_attrs_around(prog: &Program, owner: DefId, file: u32, item: crate::ast::
     f.found.unwrap_or_default()
 }
 
+/// The attributes of the statements, arms and blocks around expression `target` in the body that
+/// holds `def` (outermost first): rustc's lint level builder has a level per HIR node.
+fn attrs_around_expr(prog: &Program, def: DefId, file: u32, target: crate::ast::ExprId) -> Vec<Attr> {
+    use crate::ast::*;
+    use crate::ast_visit::{self, Visitor};
+    struct Find<'a> { ast: &'a Ast, target: ExprId, stack: Vec<Attr>, found: Option<Vec<Attr>> }
+    impl<'a> Visitor<'a> for Find<'a> {
+        fn ast(&self) -> &'a Ast { self.ast }
+        fn enter_attrs(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
+        fn leave_attrs(&mut self, attrs: List<Attr>) {
+            let n = self.ast.list(attrs).len();
+            self.stack.truncate(self.stack.len() - n);
+        }
+        fn expr(&mut self, e: ExprId) {
+            if self.found.is_some() { return; }
+            if e == self.target { self.found = Some(self.stack.clone()); return; }
+            ast_visit::walk_expr(self, e);
+        }
+    }
+    let mut owner = def;
+    while owner != NO_DEF && matches!(prog.def(owner).kind, DefKind::Closure | DefKind::AnonConst) { owner = prog.def(owner).parent; }
+    if owner == NO_DEF { return Vec::new(); }
+    let od = prog.def(owner);
+    if od.file != file || od.item.0 == u32::MAX { return Vec::new(); }
+    let ast = &prog.files[od.file as usize].ast;
+    let mut f = Find { ast, target, stack: Vec::new(), found: None };
+    match ast.item(od.item).kind {
+        ItemKind::Fn(..) => {
+            if let Ok(Some(b)) = prog.fn_body(od.file, od.item) { f.block(b); }
+        }
+        ItemKind::Const(..) | ItemKind::Static(..) => {
+            if let Ok(Some(e)) = prog.const_body(od.file, od.item) { f.expr(e); }
+        }
+        _ => {}
+    }
+    f.found.unwrap_or_default()
+}
+
 /// The attributes of the statements, arms and blocks around the expression the macro call written at
 /// `call` expanded to, in the body of `owner` (outermost first): rustc's lint level builder sees them
 /// at the call's expansion.
@@ -574,7 +721,7 @@ pub fn attrs_at_call(prog: &Program, owner: DefId, file: u32, call: u32) -> Vec<
         }
     }
     let od = prog.def(owner);
-    if od.file != file || od.item.0 == u32::MAX { return Vec::new(); }
+    if od.file != file || od.item.0 == u32::MAX || !has_body_item(od.kind) { return Vec::new(); }
     let pf = &prog.files[od.file as usize];
     let ast = &pf.ast;
     let mut f = Find { ast, pf, call: pf.diagnostic_pos(call), stack: Vec::new(), found: None };
@@ -601,45 +748,72 @@ pub fn is_automatically_derived(prog: &Program, d: DefId) -> bool {
         || derived(prog, d)
 }
 
-/// The attributes of the parameters, statements and arms around the binding written at `pos` in
-/// the body of `owner` (outermost first).
-pub fn attrs_at_binding(prog: &Program, owner: DefId, pos: u32) -> Vec<Attr> {
+/// Whether a definition of this kind is an item with parameters or a body whose nodes can sit
+/// under attributes (fns, consts, statics). A module's def has none: a crate root's, or a module
+/// whose def names no item of its own, carries a placeholder item id (no item of that file).
+fn has_body_item(kind: DefKind) -> bool {
+    matches!(kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Const | DefKind::AssocConst | DefKind::Static | DefKind::ForeignStatic)
+}
+
+/// The attributes of the parameters, statements, arms, blocks and fields around the source span
+/// `lo..hi` of the body that holds `def` (outermost first). rustc's lint level builder gives every
+/// HIR node the levels of the attributes around it (`#[allow(unused_mut)] let mut x = ..`, an
+/// attributed block statement, a match arm), and a lint reported at a node of a body is under
+/// them. The node is a binding whose name lies in the span, else the innermost expression that
+/// holds it; a span no node of the body holds has none (an item's own position).
+pub fn attrs_at(prog: &Program, def: DefId, file: u32, lo: u32, hi: u32) -> Vec<Attr> {
     use crate::ast::*;
     use crate::ast_visit::{self, Visitor};
-    struct Find<'a> { ast: &'a Ast, pos: u32, stack: Vec<Attr>, found: Option<Vec<Attr>> }
+    struct Find<'a> { ast: &'a Ast, lo: u32, hi: u32, stack: Vec<Attr>, expr: Option<Vec<Attr>>, binding: Option<Vec<Attr>> }
     impl<'a> Visitor<'a> for Find<'a> {
         fn ast(&self) -> &'a Ast { self.ast }
         fn enter_attrs(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
-        fn leave_attrs(&mut self, attrs: List<Attr>) {
-            let n = self.ast.list(attrs).len();
-            self.stack.truncate(self.stack.len() - n);
+        fn leave_attrs(&mut self, attrs: List<Attr>) { ast_visit::pop_attrs(&mut self.stack, self.ast, attrs); }
+        fn expr(&mut self, e: ExprId) {
+            if self.binding.is_some() { return; }
+            let x = self.ast.expr(e);
+            // (pre-order: a node inside one that holds the span comes later and is deeper)
+            if x.lo <= self.lo && if self.hi > self.lo { self.hi <= x.hi } else { self.lo < x.hi } {
+                self.expr = Some(self.stack.clone());
+            }
+            ast_visit::walk_expr(self, e);
         }
         fn pat(&mut self, p: PatId) {
-            if self.found.is_some() { return; }
+            if self.binding.is_some() { return; }
             if let Pat::Ident { name, .. } = *self.ast.pat(p) {
-                if name.lo == self.pos { self.found = Some(self.stack.clone()); return; }
+                if name.lo >= self.lo && name.lo < self.hi.max(self.lo + 1) {
+                    self.binding = Some(self.stack.clone());
+                    return;
+                }
             }
             ast_visit::walk_pat(self, p);
         }
     }
+    let mut owner = def;
+    while owner != NO_DEF && matches!(prog.def(owner).kind, DefKind::Closure | DefKind::AnonConst) { owner = prog.def(owner).parent; }
+    if owner == NO_DEF { return Vec::new(); }
     let od = prog.def(owner);
+    if od.file != file || od.item.0 == u32::MAX || !has_body_item(od.kind) { return Vec::new(); }
     let ast = &prog.files[od.file as usize].ast;
-    let mut f = Find { ast, pos, stack: Vec::new(), found: None };
-    match ast.item(od.item).kind {
+    let item = ast.item(od.item);
+    // (a span outside the item is none of its body's nodes)
+    if lo < item.lo || lo >= item.hi { return Vec::new(); }
+    let mut f = Find { ast, lo, hi, stack: Vec::new(), expr: None, binding: None };
+    match item.kind {
         ItemKind::Fn(sig, _, _) => {
             for p in ast.list(ast.fn_sig(sig).params) {
                 f.enter_attrs(p.attrs);
                 f.pat(p.pat);
                 f.leave_attrs(p.attrs);
             }
-            if f.found.is_none() { if let Ok(Some(b)) = prog.fn_body(od.file, od.item) { f.block(b); } }
+            if let Ok(Some(b)) = prog.fn_body(od.file, od.item) { f.block(b); }
         }
         ItemKind::Const(..) | ItemKind::Static(..) => {
             if let Ok(Some(e)) = prog.const_body(od.file, od.item) { f.expr(e); }
         }
         _ => {}
     }
-    f.found.unwrap_or_default()
+    f.binding.or(f.expr).unwrap_or_default()
 }
 
 /// The innermost item of `file` whose source contains `pos` (the scope a lint reported from a
@@ -776,4 +950,12 @@ pub fn diagnostic_item(prog: &Program, d: DefId) -> Option<String> {
 /// Whether `d` is the standard library item with diagnostic name `name` (`Box`, `PhantomData`).
 pub fn is_diagnostic_item(prog: &Program, d: DefId, name: &str) -> bool {
     prog.name(d) == name && diagnostic_item(prog, d).as_deref() == Some(name)
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&FULFILLED, Mutex::new(Vec::new()));
+    reset(&ENABLED, AtomicBool::new(false));
+    reset(&SINK, Mutex::new(Vec::new()));
 }

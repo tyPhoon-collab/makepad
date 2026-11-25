@@ -519,7 +519,7 @@ pub fn start_sampler(
     ),
     makepad_widgets::makepad_platform::thread::SpawnError,
 > {
-    use makepad_widgets::makepad_platform::thread::{CancellationToken, SignalToUI, ThreadOptions};
+    use makepad_widgets::makepad_platform::thread::{CancellationToken, ThreadOptions};
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = spawner.spawn_worker(
         ThreadOptions { name: Some("wm-temps".into()), ..Default::default() },
@@ -539,10 +539,11 @@ pub fn start_sampler(
                 let changed = sent.as_ref().is_none_or(|s| !Arc::ptr_eq(s, &sensors));
                 let frame = Frame { at, sensors: changed.then(|| sensors.clone()), values };
                 sent = Some(sensors);
+                // No UI signal: the WM's second tick takes the frames
+                // (`update_temps`).
                 if tx.send(frame).is_err() {
                     break;
                 }
-                SignalToUI::set_ui_signal();
                 round = round.wrapping_add(1);
                 let _ = wait.wait_until(at + 1.0);
             }
@@ -941,20 +942,6 @@ mod linux {
                 NvmlWhat::Fan => self.uint(self.fns.get_fan, d).map(|p| p as f32),
             };
             v.unwrap_or(f32::NAN)
-        }
-    }
-
-    /// What this machine reports, for a look on a node:
-    /// `cargo test --release -p makepad-app-wm temps_here -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn temps_here() {
-        let mut r = Reader::open();
-        let _ = r.read(0.0);
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        let v = r.read(1.0);
-        for (s, v) in r.sensors().iter().zip(v) {
-            println!("{:?}/{:?} {} [{}] = {} limit {:?} crit {:?} ({})", s.group, s.kind, s.name(true), s.device, s.unit.format(v), s.limit, s.crit, s.key);
         }
     }
 }

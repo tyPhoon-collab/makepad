@@ -101,7 +101,7 @@ script_mod! {
 /// The arrival crossfade length: the wash fades out while the first
 /// frames fade in, smoothstepped, long enough to read as a resolve
 /// rather than a zap.
-const ARRIVAL_FADE_SECS: f32 = 0.28;
+pub(crate) const ARRIVAL_FADE_SECS: f32 = 0.28;
 
 #[derive(Clone, Debug, Default)]
 pub enum MpRunViewAction {
@@ -158,6 +158,9 @@ pub struct MpRunView {
     /// The protocol state with the child.
     #[rust(HostedApp::new(crate::host::CLOCK))]
     pub hosted: HostedApp,
+    /// The app's own first frame, as reported by the WM.
+    #[rust]
+    app_drawn: bool,
     /// `hosted.present_serial()` as the quad last took it.
     #[rust]
     quad_serial: u64,
@@ -317,6 +320,7 @@ impl MpRunView {
     /// What a changed target resets in the tile (the protocol state reset
     /// itself in `HostedApp::set_target`).
     fn target_changed(&mut self, cx: &mut Cx, had_target: bool) {
+        self.app_drawn = false;
         self.sent_focus = None;
         self.remote_cursor = MouseCursor::Default;
         self.is_hovered = false;
@@ -334,6 +338,7 @@ impl MpRunView {
         self.redraw(cx);
     }
 
+    #[track_caller]
     fn redraw(&mut self, cx: &mut Cx) {
         self.draw_bg.redraw(cx);
         self.draw_app.redraw(cx);
@@ -538,6 +543,10 @@ impl MpRunView {
         self.hosted.has_frame()
     }
 
+    pub fn set_app_drawn(&mut self, drawn: bool) {
+        self.app_drawn = drawn;
+    }
+
     fn local_from_area(&self, cx: &Cx, abs: Vec2d) -> Option<Vec2d> {
         if !self.area.is_valid(cx) {
             return None;
@@ -589,12 +598,12 @@ impl Widget for MpRunView {
         }
         self.sync_quad(cx);
 
-        // A cargo build has no protocol target yet. Its launch panel must
-        // still be visible before the application connects.
+        // A cargo build has no protocol target yet: its launch panel shows
+        // until the application presents. The panel is still; it draws again
+        // when its status line changes (`set_status_line`) or the first frame
+        // lands (`presented_frame`), never on every frame while it waits.
         let waiting_for_framebuffer = !self.hosted.has_frame();
-        if waiting_for_framebuffer {
-            self.redraw(cx);
-        } else if self.redraw_countdown > 0 {
+        if !waiting_for_framebuffer && self.redraw_countdown > 0 {
             self.redraw_countdown -= 1;
             self.redraw(cx);
         }
@@ -827,6 +836,10 @@ impl crate::tile::TileHost for MpRunView {
 
     fn has_frame(&self) -> bool {
         MpRunView::has_frame(self)
+    }
+
+    fn app_drawn(&self) -> bool {
+        self.app_drawn
     }
 
     fn arrival_fade(&self) -> f32 {

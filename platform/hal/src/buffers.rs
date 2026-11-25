@@ -30,6 +30,17 @@ fn r64(b: &[u8], at: usize) -> u64 {
     r32(b, at) as u64 | (r32(b, at + 4) as u64) << 32
 }
 
+impl Wire for BufferReadRange {
+    const SIZE: usize = 24;
+    fn write(&self, out: &mut Vec<u8>) { w32(out, self.id.index); w32(out, self.id.gen); w64(out, self.offset); w64(out, self.len); }
+    fn read(b: &[u8]) -> Self { Self { id: Id::new(r32(b, 0), r32(b, 4)), offset: r64(b, 8), len: r64(b, 16) } }
+}
+impl Wire for crate::lease::Record {
+    const SIZE: usize = 32;
+    fn write(&self, out: &mut Vec<u8>) { w64(out, self.ptr); w64(out, self.len); w64(out, self.token); w32(out, self.order); w32(out, self.reserved); }
+    fn read(b: &[u8]) -> Self { Self { ptr: r64(b, 0), len: r64(b, 8), token: r64(b, 16), order: r32(b, 24), reserved: r32(b, 28) } }
+}
+
 impl Wire for DragItem {
     const SIZE: usize = 8;
     fn write(&self, out: &mut Vec<u8>) {
@@ -210,7 +221,7 @@ impl Wire for Layer {
 }
 
 impl Wire for PipelineDesc {
-    const SIZE: usize = 72;
+    const SIZE: usize = 92;
     fn write(&self, out: &mut Vec<u8>) {
         for r in [self.code, self.bindings, self.vertex_layout] {
             w32(out, r.off);
@@ -222,6 +233,8 @@ impl Wire for PipelineDesc {
         for v in [self.blend, self.flags, self.shader, self.name, self.source, self.instance_stride, self.varyings, self.outputs] {
             w32(out, v);
         }
+        for r in [self.storage_buffers, self.compute] { w32(out, r.off); w32(out, r.len); }
+        w32(out, self.storage_push_size);
     }
     fn read(b: &[u8]) -> Self {
         let rg = |at| Range { off: r32(b, at), len: r32(b, at + 4) };
@@ -238,6 +251,9 @@ impl Wire for PipelineDesc {
             instance_stride: r32(b, 60),
             varyings: r32(b, 64),
             outputs: r32(b, 68),
+            storage_buffers: rg(72),
+            compute: rg(80),
+            storage_push_size: r32(b, 88),
         }
     }
 }
@@ -415,6 +431,7 @@ pub fn read_domains(b: &[u8], count: u32) -> Vec<DomainInfo> {
 
 /// A parsed `PipelineCreate` blob.
 pub struct PipelineBlob<'a> {
+    pub raw: &'a [u8],
     pub desc: PipelineDesc,
     pub code: &'a [u8],
     pub bindings: Vec<u32>,
@@ -433,7 +450,7 @@ impl<'a> PipelineBlob<'a> {
             blob.get(a..a.checked_add(r.len as usize)?)
         };
         let words = |r: Range| part(r).map(|b| b.chunks_exact(4).map(|c| r32(c, 0)).collect::<Vec<u32>>());
-        Some(PipelineBlob { desc, code: part(desc.code)?, bindings: words(desc.bindings)?, vertex_layout: words(desc.vertex_layout)? })
+        Some(PipelineBlob { raw: blob, desc, code: part(desc.code)?, bindings: words(desc.bindings)?, vertex_layout: words(desc.vertex_layout)? })
     }
 }
 
@@ -470,8 +487,72 @@ fn merge_closest(rects: &mut [[f32; 4]; 9]) {
     rects[best.3] = rects[8];
 }
 
+/// The bytes of a writer's upload commands and kept runs: copied in at the call (or moved in
+/// whole, `*_owned`) and held until [`CmdWriter::clear`], so the caller's memory may change or go
+/// away before the submit. A chunk never grows past the capacity it was made with, so a run in it
+/// never moves; runs start 16-byte aligned.
+#[derive(Default)]
+struct Uploads {
+    chunks: Vec<Vec<u8>>,
+    /// the chunk being filled
+    at: usize,
+    /// payloads moved in whole, dropped at `clear`
+    owned: Vec<Vec<u8>>,
+}
+
+/// The smallest chunk: the first holds a frame's small uploads (glyph rects, uniforms) for good.
+const UPLOAD_CHUNK: usize = 256 << 10;
+
+impl Uploads {
+    fn keep(&mut self, bytes: &[u8]) -> Slice {
+        if bytes.is_empty() {
+            return Slice::EMPTY;
+        }
+        loop {
+            if self.at == self.chunks.len() {
+                // geometric: a turn's uploads take a few chunks, however many there are
+                let used: usize = self.chunks.iter().map(Vec::len).sum();
+                self.chunks.push(Vec::with_capacity((bytes.len() + 15).max(UPLOAD_CHUNK).max(used)));
+            }
+            let chunk = &mut self.chunks[self.at];
+            let base = chunk.as_ptr() as usize;
+            let start = (base + chunk.len()).next_multiple_of(16) - base;
+            if start + bytes.len() <= chunk.capacity() {
+                chunk.resize(start, 0);
+                chunk.extend_from_slice(bytes);
+                return Slice { ptr: chunk[start..].as_ptr(), len: bytes.len() };
+            }
+            self.at += 1;
+        }
+    }
+
+    fn own(&mut self, bytes: Vec<u8>) -> Slice {
+        // a Vec's heap block does not move with the Vec
+        let run = Slice { ptr: bytes.as_ptr(), len: bytes.len() };
+        self.owned.push(bytes);
+        run
+    }
+
+    /// After the submit. A chunk this turn filled stays for the next, as does the first small
+    /// one; a chunk the turn did not touch is freed, so a one-off upload does not stay resident.
+    fn clear(&mut self) {
+        let mut first = true;
+        self.chunks.retain_mut(|chunk| {
+            let keep = !chunk.is_empty() || (first && chunk.capacity() <= UPLOAD_CHUNK);
+            first = false;
+            chunk.clear();
+            keep
+        });
+        self.at = 0;
+        self.owned.clear();
+    }
+}
+
 /// Cx's builder of one loop turn's CmdBuf. Every vector keeps its capacity across [`clear`], so a
 /// steady-state frame allocates nothing.
+///
+/// Nothing the writer encodes points at the caller's memory unless the caller built that
+/// [`Slice`] itself (unsafe [`Slice::of`]): upload bytes are copied in at the call.
 ///
 /// [`clear`]: CmdWriter::clear
 #[derive(Default)]
@@ -479,6 +560,7 @@ pub struct CmdWriter {
     session: u32,
     cmds: Vec<Cmd>,
     arena: Vec<u8>,
+    uploads: Uploads,
     frames: Vec<FramePacket>,
     passes: Vec<Pass>,
     draws: Vec<Draw>,
@@ -528,6 +610,51 @@ impl CmdWriter {
 
     pub fn arena(&self) -> &[u8] {
         &self.arena
+    }
+
+    /// Copies `v` into the writer's upload memory, for a [`Pass`] / [`Draw`] / [`Inst`] field:
+    /// valid until [`CmdWriter::clear`], whatever happens to `v`.
+    pub fn keep<T: Scalar>(&mut self, v: &[T]) -> Slice {
+        // SAFETY: a `Scalar` has no padding: every byte of `v` is initialized
+        let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) };
+        self.uploads.keep(bytes)
+    }
+
+    /// [`CmdWriter::buffer_update`] with bytes the writer takes: they move in without a copy.
+    pub fn buffer_update_owned(&mut self, id: Id, off: u64, bytes: Vec<u8>) {
+        let bytes = self.uploads.own(bytes);
+        self.push(Cmd::buffer_update(id, off, bytes));
+    }
+
+    /// [`CmdWriter::texture_update`] with bytes the writer takes: they move in without a copy.
+    pub fn texture_update_owned(&mut self, id: Id, mip: u16, rect: [u32; 4], layer: u32, mut bytes: Vec<u8>) {
+        // the run's length is one word (`k::slice32`)
+        bytes.truncate(u32::MAX as usize);
+        let bytes = self.uploads.own(bytes);
+        self.push(Cmd::texture_update(id, mip, rect, layer, bytes));
+    }
+
+    /// [`CmdWriter::buffer_update`] without the copy: the command points at `bytes`.
+    ///
+    /// # Safety
+    /// `bytes` must stay alive and unchanged until this batch has been submitted.
+    pub unsafe fn buffer_update_borrowed(&mut self, id: Id, off: u64, bytes: &[u8]) {
+        self.push(Cmd::buffer_update(id, off, Slice::from_bytes(bytes)));
+    }
+
+    /// [`CmdWriter::texture_update`] without the copy: the command points at `bytes`.
+    ///
+    /// # Safety
+    /// As [`CmdWriter::buffer_update_borrowed`].
+    pub unsafe fn texture_update_borrowed(&mut self, id: Id, mip: u16, rect: [u32; 4], layer: u32, bytes: &[u8]) {
+        self.push(Cmd::texture_update(id, mip, rect, layer, Slice::from_bytes(&bytes[..bytes.len().min(u32::MAX as usize)])));
+    }
+
+    /// One ordered buffer-read request; only its range metadata is copied into the command.
+    pub fn read_buffers(&mut self, req: u32, ranges: &[BufferReadRange]) {
+        let mut bytes = Vec::with_capacity(ranges.len() * BufferReadRange::SIZE);
+        for range in ranges { range.write(&mut bytes); }
+        self.buffer_readbacks(req, &bytes);
     }
 
     /// Copies a typed record array into the arena.
@@ -750,14 +877,17 @@ impl CmdWriter {
     /// `hal_submit` and [`clear`](CmdWriter::clear).
     pub fn buf(&self) -> CmdBuf {
         assert!(self.open_frame.is_none(), "CmdWriter: buf inside a frame");
-        CmdBuf {
-            session: self.session,
-            cmds: Slice::of(&self.cmds),
-            arena: Slice::from_bytes(&self.arena),
-            frames: Slice::of(&self.frames),
-            passes: Slice::of(&self.passes),
-            draws: Slice::of(&self.draws),
-            layers: Slice::of(&self.layers),
+        // SAFETY: the writer's own memory, valid until it is next changed (the contract above)
+        unsafe {
+            CmdBuf {
+                session: self.session,
+                cmds: Slice::of(&self.cmds),
+                arena: Slice::from_bytes(&self.arena),
+                frames: Slice::of(&self.frames),
+                passes: Slice::of(&self.passes),
+                draws: Slice::of(&self.draws),
+                layers: Slice::of(&self.layers),
+            }
         }
     }
 
@@ -765,6 +895,7 @@ impl CmdWriter {
     pub fn clear(&mut self) {
         self.cmds.clear();
         self.arena.clear();
+        self.uploads.clear();
         self.frames.clear();
         self.passes.clear();
         self.draws.clear();
@@ -774,10 +905,11 @@ impl CmdWriter {
         self.open_frame = None;
     }
 
-    /// Capacities (cmds, arena bytes, frames, passes, draws, layers): tests show a steady
-    /// state does not grow.
-    pub fn capacities(&self) -> [usize; 6] {
-        [self.cmds.capacity(), self.arena.capacity(), self.frames.capacity(), self.passes.capacity(), self.draws.capacity(), self.layers.capacity()]
+    /// Capacities (cmds, arena bytes, frames, passes, draws, layers, upload bytes): tests show a
+    /// steady state does not grow.
+    pub fn capacities(&self) -> [usize; 7] {
+        let uploads = self.uploads.chunks.iter().map(Vec::capacity).sum();
+        [self.cmds.capacity(), self.arena.capacity(), self.frames.capacity(), self.passes.capacity(), self.draws.capacity(), self.layers.capacity(), uploads]
     }
 }
 
@@ -786,6 +918,9 @@ impl ArenaSink for CmdWriter {
         let off = self.arena.len();
         self.arena.extend_from_slice(bytes);
         self.range_from(off)
+    }
+    fn keep_bytes(&mut self, bytes: &[u8]) -> Slice {
+        self.uploads.keep(bytes)
     }
 }
 
@@ -829,9 +964,20 @@ pub struct EventQueue {
     now_ns: u64,
     /// events delivered with a payload cut because the caller's arena was too small
     pub truncated: u64,
+    leases: std::collections::HashSet<u64>,
 }
 
 impl EventQueue {
+    pub fn buffer_leases(&mut self, req: u32, status: u32, leases: Vec<crate::lease::Lease>) {
+        let mut records = Vec::with_capacity(leases.len() * crate::lease::Record::SIZE);
+        for lease in leases {
+            let record = lease.into_record();
+            self.leases.insert(record.token);
+            record.write(&mut records);
+        }
+        self.buffer_lease_records(req, status, &records);
+    }
+
     pub fn new() -> EventQueue {
         EventQueue::default()
     }
@@ -884,6 +1030,9 @@ impl EventQueue {
             let start = event.data.off as usize;
             let payload = start.checked_add(event.data.len as usize)
                 .and_then(|end| self.arena.get(start..end)).unwrap_or(&[]);
+            if event.tag == crate::events::event_tag::BufferLeases {
+                for record in payload.chunks_exact(crate::lease::Record::SIZE).map(crate::lease::Record::read) { self.leases.remove(&record.token); }
+            }
             deliver(event, payload);
         }
         self.arena.clear();
@@ -900,7 +1049,14 @@ impl EventQueue {
             }
             self.events.push_back(e);
         }
+        self.leases.extend(other.leases.drain());
         other.arena.clear();
+    }
+
+    /// A quit request is queued here, not yet delivered.
+    pub fn quit_queued(&self) -> bool {
+        self.events.iter().any(|e| e.tag == crate::events::event_tag::Lifecycle
+            && matches!(e.decode(&[]), Some(HalEvent::Lifecycle { kind: lifecycle::QUIT_REQUESTED })))
     }
 
     /// Moves queued events into the caller's buffer while they fit (events and arena); returns
@@ -918,8 +1074,12 @@ impl EventQueue {
                 if n > 0 {
                     break;
                 }
+                assert_ne!(e.tag, crate::events::event_tag::BufferLeases, "buffer lease records must never be truncated");
                 len = out.arena_cap as usize;
                 self.truncated += 1;
+            }
+            if e.tag == crate::events::event_tag::BufferLeases {
+                for record in payload.chunks_exact(crate::lease::Record::SIZE).map(crate::lease::Record::read) { self.leases.remove(&record.token); }
             }
             let mut e = *e;
             // SAFETY: the caller's EventBuf names `cap` events and `arena_cap` bytes it owns
@@ -943,11 +1103,18 @@ impl EventQueue {
     }
 }
 
+impl Drop for EventQueue {
+    fn drop(&mut self) { for token in self.leases.drain() { crate::hal_lease_release(token); } }
+}
+
 impl ArenaSink for EventQueue {
     fn put_bytes(&mut self, bytes: &[u8]) -> Range {
         let off = self.arena.len();
         self.arena.extend_from_slice(bytes);
         Range { off: off as u32, len: bytes.len() as u32 }
+    }
+    fn keep_bytes(&mut self, _bytes: &[u8]) -> Slice {
+        unreachable!("the event table has no upload field (asserted by hal_events!)")
     }
 }
 

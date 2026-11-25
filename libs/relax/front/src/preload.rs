@@ -34,6 +34,17 @@ pub struct PreCrate {
     pub image_dep_names: Vec<(String, String)>,
 }
 
+/// Test and build crates can share both their name and root file.
+pub type CrateKey = (String, String, bool);
+
+pub fn crate_key(name: &str, root: &str, cfg: &CfgSet) -> CrateKey {
+    (name.to_string(), root.to_string(), cfg.holds("test"))
+}
+
+impl PreCrate {
+    pub fn key(&self) -> CrateKey { crate_key(&self.name, &self.root, &self.cfg) }
+}
+
 /// `crates` in the load order `order` (positions in `crates`, each once), the dependency indices
 /// renumbered; None when that order puts a crate before one of its dependencies.
 pub fn reorder(crates: &[PreCrate], order: &[usize]) -> Option<Vec<PreCrate>> {
@@ -75,6 +86,37 @@ pub struct CrateAhead {
     pub deferred: Vec<String>,
     /// Only this crate's indexed/reached selection, compared after demand planning.
     pub demand_plan: u128,
+}
+
+/// Publish against the loader's dependency imports, without the prescan's resolved scopes.
+pub(crate) fn publish_macros(table: &mut MacroTable, name: &str, defs: &[MacroRef],
+    aliases: &[((String, String), (String, String))], mods: &crate::macros::CrateMods,
+    macro_use: &[String], deps: &[(String, String)]) {
+    for d in defs { table.push(d.clone()); }
+    for (k, v) in aliases { table.add_alias(k.0.clone(), k.1.clone(), v.clone()); }
+    let mut externs = mods.externs.clone();
+    for (n, dep) in deps {
+        // std / core / alloc are in every extern prelude already.
+        if !matches!(n.as_str(), "std" | "core" | "alloc") { externs.insert(n.clone(), dep.clone()); }
+    }
+    // A single-crate prescan does not know the dependency names yet. Retry extern aliases
+    // (`use ::dep as alias`) now that they are available, while leaving unavailable crates
+    // named in discarded macro input out of the extern prelude.
+    for u in mods.uses.values().flatten() {
+        if let Some(bind) = &u.bind {
+            if u.module == mods.root && u.path.len() == 2 && u.path[0].is_empty() {
+                if let Some(target) = crate::macros::extern_target(&externs, &u.path[1]) { externs.insert(bind.clone(), target); }
+            }
+        }
+    }
+    let mods = Arc::new(crate::macros::CrateMods { root: mods.root.clone(), src: mods.src.clone(), mods: mods.mods.clone(), items: mods.items.clone(), uses: mods.uses.clone(), externs, renames: mods.renames.clone(), recursion_limit: mods.recursion_limit, ..Default::default() });
+    table.add_crate(name.to_string(), mods);
+    if !macro_use.is_empty() {
+        let v = table.macro_use.entry(name.to_string()).or_default();
+        for u in macro_use {
+            if !v.contains(u) { v.push(u.clone()); }
+        }
+    }
 }
 
 pub struct Preparsed {
@@ -139,8 +181,10 @@ type ScanPriority = (usize, u64);
 struct PoolState {
     stopped: bool,
     planning: bool,
-    /// Crates whose loader has published the dependency macro imports and own definitions.
+    /// Crates whose parse scope has dependency imports and their own scan publication.
     parse_ready: HashSet<u32>,
+    /// Crates successfully collected and sealed by the loader.
+    loaded: Vec<bool>,
     images: Vec<Option<crate::crate_image::CrateImage>>,
     pending_images: Vec<Option<crate::crate_image::CrateImage>>,
     /// per crate: its record validated (restored or fingerprint only)
@@ -204,8 +248,11 @@ enum Work {
 }
 
 impl Pool {
-    /// Start this crate's parses only once the sequential loader has the macro environment
-    /// its dependencies produced (including imports emitted by macro expansions).
+    /// The demand plan's outline macro definitions of crate `ci` (PendingPlan::outline_macros).
+    pub(crate) fn outline_macros(&self, ci: u32) -> Option<Vec<MacroRef>> {
+        self.demand_plan.as_ref()?.outline_macros(ci as usize + self.plan_offset)
+    }
+    /// Set queued jobs' scope; entering the crate replaces an early snapshot with the loader's.
     pub fn start_parsing(&self, ci: u32, table: Arc<MacroTable>) {
         let mut st = self.st.lock().unwrap();
         let c = &self.crates[ci as usize];
@@ -213,6 +260,27 @@ impl Pool {
         for job in st.jobs.values_mut().filter(|j| j.krate == ci) { job.ctx = ctx.clone(); }
         st.parse_ready.insert(ci);
         self.cv.notify_all();
+    }
+
+    /// Start published crates as soon as all their dependencies have been collected.
+    pub fn crate_loaded(&self, loaded: u32, table: Arc<MacroTable>) {
+        let ready: Vec<_> = {
+            let mut st = self.st.lock().unwrap();
+            st.loaded[loaded as usize] = true;
+            if st.through.is_some() { return; }
+            self.crates.iter().enumerate().filter_map(|(ci, c)| {
+                if st.parse_ready.contains(&(ci as u32)) || !c.image_deps.iter().all(|&d| st.loaded[d]) { return None; }
+                let a = st.ahead.get(&(ci as u32))?;
+                Some((ci as u32, a.defs.clone(), a.aliases.clone(), a.mods.clone(), a.macro_use.clone()))
+            }).collect()
+        };
+        for (ci, defs, aliases, mods, macro_use) in ready {
+            let c = &self.crates[ci as usize];
+            let mut table = table.clone();
+            publish_macros(Arc::make_mut(&mut table), &c.name, &defs, &aliases, &mods, &macro_use, &c.deps);
+            self.start_parsing(ci, table);
+            if trace() { eprintln!("boot-trace: early parse {} after {}", c.name, self.crates[loaded as usize].name); }
+        }
     }
 
     pub fn context(&self, ci: u32) -> Arc<crate::source_context::Context> { self.contexts[ci as usize].clone() }
@@ -523,8 +591,7 @@ impl Pool {
                         if u.path.len() == 1 && u.path[0] == "crate" {
                             cmods.externs.insert(b.clone(), c.name.clone());
                         } else if u.path.len() == 2 && u.path[0].is_empty() {
-                            let target = cmods.externs.get(&u.path[1]).cloned().unwrap_or_else(|| u.path[1].clone());
-                            cmods.externs.insert(b.clone(), target);
+                            if let Some(target) = crate::macros::extern_target(&cmods.externs, &u.path[1]) { cmods.externs.insert(b.clone(), target); }
                         }
                     }
                 }
@@ -539,7 +606,7 @@ impl Pool {
             }
             // Stack traversal must publish sibling definitions in source order.
             stack.extend(s.children.into_iter().rev());
-            if !self.demand_plan.as_ref().is_some_and(|p| p.skips(&c.root, &path)) {
+            if !self.demand_plan.as_ref().is_some_and(|p| p.skips(&c.root, c.cfg.holds("test"), &path)) {
                 lexed.push((path, s.src[..s.src_len].to_vec(), s.toks.into_vec()));
             }
         }
@@ -672,7 +739,11 @@ fn parse_job(_sess: &std::sync::Arc<crate::Session>, job: Job, in_scope: bool) -
             None
         }
     };
-    let prep = parsed.as_mut().map(|(pf, _)| crate::program::prepare_file(pf, &ctx.cfg));
+    let prep = parsed.as_mut().map(|(pf, _)| {
+        let prep = crate::program::prepare_file(pf, &ctx.cfg);
+        if pf.lazy.is_some() { let _ = pf.part(&ctx.cfg); }
+        prep
+    });
     let verify = ctx.cfg.session.runtime.parse_verify.then(|| VERIFY.get().copied()).flatten();
     ((krate, path), Preparsed { parsed, prep, mod_path, src_len, verify, error })
 }
@@ -1002,11 +1073,46 @@ fn scan_text_mode(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16,
     if declarations_only && !cfg.session.options.rs_lazy {
         toks = lazy::demand::active_tokens(&src, &toks, cfg);
     }
-    scan_tokens(path, dir, mpath, krate, edition, cfg, src_len, src, toks, context, macro_surface)
+    scan_tokens(path, dir, mpath, krate, edition, cfg, src_len, src, toks, context, if macro_surface { ScanSurface::Macros } else { ScanSurface::Modules })
+}
+
+/// What an edit to the snapshot's file changes in its crate's imports (None: nothing, or text
+/// the lexer refuses, which the parse reports). The macro definitions it adds come from the parse.
+pub(crate) fn import_edit(s: &crate::program::ParseSnapshot, src: &[u8]) -> Option<crate::macros::ImportEdit> {
+    let previous = s.previous.as_ref()?;
+    let old = &previous.src[..previous.src_len as usize];
+    if old == src { return None; }
+    let imports = |text: &[u8]| file_imports(&s.path, &s.dir, &s.mod_path, &s.kname, s.edition, &s.cfg, text, &s.context);
+    let (was, now) = (imports(old)?, imports(src)?);
+    if was.same_as(&now) { return None; }
+    Some(crate::macros::ImportEdit { krate: s.kname.clone(), root: s.root.clone(), was, now })
+}
+
+/// A module file a live edit declared: no prescan read its imports.
+pub(crate) fn new_file_imports(path: &str, mpath: &str, krate: &str, root: &str, edition: u16, cfg: &CfgSet, src: &[u8], context: &crate::source_context::Context) -> Option<crate::macros::ImportEdit> {
+    let dir = if path.ends_with("/mod.rs") { crate::program::dir_of(path).to_string() } else { format!("{}/{}", crate::program::dir_of(path), crate::program::stem_of(path)) };
+    let now = file_imports(path, &dir, mpath, krate, edition, cfg, src, context)?;
+    Some(crate::macros::ImportEdit { krate: krate.to_string(), root: root.to_string(), was: Default::default(), now })
+}
+
+fn file_imports(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, src: &[u8], context: &crate::source_context::Context) -> Option<crate::macros::FileImports> {
+    let mut toks = Vec::with_capacity(src.len() / 4);
+    crate::lexer::lex(src, edition, &mut toks).ok()?;
+    let scan = scan_tokens(path, dir, mpath, krate, edition, cfg, src.len(), src.to_vec().into(), toks, context, ScanSurface::Imports)?;
+    Some(crate::macros::FileImports { uses: scan.uses, aliases: scan.aliases, macro_use: scan.macro_use, mods: scan.mods, mod_items: scan.mod_items })
+}
+
+/// What a scan reads besides the file's modules.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum ScanSurface {
+    Modules,
+    Imports,
+    /// imports and macro definitions, running the hosted item macros that can define them
+    Macros,
 }
 
 fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, src_len: usize,
-    src: ScanBytes, toks: Vec<Tok>, context: &crate::source_context::Context, macro_surface: bool,
+    src: ScanBytes, toks: Vec<Tok>, context: &crate::source_context::Context, surface: ScanSurface,
 ) -> Option<Scanned> {
     let mut defs = Vec::new();
     let mut children = Vec::new();
@@ -1074,7 +1180,7 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                     };
                     // Demand discovery extracts module bindings in Names::scan;
                     // it never consumes this macro prescan's imports or aliases.
-                    if !macro_surface { i = j + 1; continue; }
+                    if surface == ScanSurface::Modules { i = j + 1; continue; }
                     let attrs = decl_attrs(&src, &toks, i, cfg);
                     // its bindings, for the module (an import in a fn body is block-scoped in
                     // rustc; macro calls inside that body see it -- the module's lookups also do
@@ -1122,7 +1228,7 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                 }
                 // `#[macro_use] extern crate dep;`: dep's exported macros in scope (rustc's
                 // macro_use prelude)
-                T::KwExtern if macro_surface && i + 2 < toks.len() && toks[i + 1].kind == T::KwCrate && matches!(toks[i + 2].kind, T::Ident | T::RawIdent | T::KwSelfValue) => {
+                T::KwExtern if surface != ScanSurface::Modules && i + 2 < toks.len() && toks[i + 1].kind == T::KwCrate && matches!(toks[i + 2].kind, T::Ident | T::RawIdent | T::KwSelfValue) => {
                     let attrs = decl_attrs(&src, &toks, i, cfg);
                     let n = String::from_utf8_lossy(text(i + 2)).trim_start_matches("r#").to_string();
                     if attrs.active && dirs.last().map_or(true, |l| l.3) {
@@ -1158,7 +1264,8 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                     let active = attrs.active;
                     let pa = attrs.path;
                     if cur_active && active {
-                        mod_items.push((child_path.clone(), crate::macros::ModItem { pos: toks[i].lo, end: toks[i + 2].hi, macro_use: attrs.macro_use }));
+                        let is_pub = i >= 1 && toks[i - 1].kind == T::KwPub;
+                        mod_items.push((child_path.clone(), crate::macros::ModItem { pos: toks[i].lo, end: toks[i + 2].hi, macro_use: attrs.macro_use, is_pub }));
                     }
                     if toks[i + 2].kind == T::Semi {
                         if cur_active && active {
@@ -1197,18 +1304,15 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                 T::Ident
                     if i + 2 < toks.len()
                         && toks[i + 1].kind == T::Not
-                        && toks[i + 2].kind == T::OpenParen
+                        && matches!(toks[i + 2].kind, T::OpenParen | T::OpenBracket | T::OpenBrace)
                         && dirs.last().map_or(false, |l| l.0 == depth && l.3)
                         && crate::builtins::prescan_hosted(&String::from_utf8_lossy(text(i))) =>
                 {
                     // item macros that may define macro_rules!: function-like proc macros of
                     // the JIT host called at item position (run here, their macro_rules! kept;
                     // builtins.rs prescan_defs)
-                    let mut close = i + 2;
-                    while close < toks.len() && toks[close].kind != T::CloseParen {
-                        close += 1;
-                    }
-                    if close < toks.len() && macro_surface && decl_attrs(&src, &toks, i, cfg).active {
+                    let close = lazy::demand::close(&toks, i + 2);
+                    if close < toks.len() && surface == ScanSurface::Macros && decl_attrs(&src, &toks, i, cfg).active {
                         let arg = &src[toks[i + 2].hi as usize..toks[close].lo as usize];
                         defs.extend(crate::builtins::prescan_defs(cfg, &String::from_utf8_lossy(text(i)), arg, krate));
                     }
@@ -1234,7 +1338,7 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                     }
                     // The demand outline only needs the definition's tokens.
                     // Building matcher trees here duplicates the real preload.
-                    if !macro_surface { i = close + 1; continue; }
+                    if surface != ScanSurface::Macros { i = close + 1; continue; }
                     // A cfg-false definition must never reach either textual scope or
                     // the crate-root export table, including inside an inactive module.
                     let attrs = decl_attrs(&src, &toks, i, cfg);
@@ -1358,6 +1462,7 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         stopped: false,
         planning,
         parse_ready: Default::default(),
+        loaded: vec![false; n],
         images: restored,
         pending_images,
         valid,
@@ -1414,7 +1519,7 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         let weak = Arc::downgrade(&pool);
         let plan = pool.demand_plan.clone().expect("a planning pool has a plan");
         let in_world = crate::macro_reg::in_world();
-        let _ = std::thread::Builder::new().name("run-demand-select".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+        let _ = relax_base::run_threads::spawn("run-demand-select", move || { let _z = crate::zone_alloc::compiler_thread();
             crate::macro_reg::set_in_world(in_world);
             plan.complete();
             if let Some(pool) = weak.upgrade() {
@@ -1432,7 +1537,7 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         for worker in 0..jobs {
             let p = pool.clone();
             let sess = sess.clone();
-            if let Ok(h) = std::thread::Builder::new().name(format!("run-parse-{worker}")).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+            if let Ok(h) = relax_base::run_threads::spawn_sized(&format!("run-parse-{worker}"), relax_base::run_threads::COMPILER_STACK, move || { let _z = crate::zone_alloc::compiler_thread();
                 crate::macro_reg::set_in_world(in_world);
                 let _mem = crate::memstat::tag(if in_world { crate::memstat::Tag::PmHost } else { crate::memstat::Tag::Parse });
                 p.work(&sess, worker)
@@ -1483,20 +1588,7 @@ pub fn check_macros(prog: &mut crate::program::Program, krate: u32, files: &[(u3
             table.macro_use.entry(name.clone()).or_default().extend(scan.macro_use);
             mods.mods.extend(scan.mods);
             mods.items.extend(scan.mod_items);
-            for u in scan.uses {
-                if let Some(b) = &u.bind {
-                    if u.path.last() != Some(b) { mods.renames.insert(b.clone()); }
-                    if u.module == name {
-                        if u.path.len() == 1 && u.path[0] == "crate" {
-                            mods.externs.insert(b.clone(), name.clone());
-                        } else if u.path.len() == 2 && u.path[0].is_empty() {
-                            let target = mods.externs.get(&u.path[1]).cloned().unwrap_or_else(|| u.path[1].clone());
-                            mods.externs.insert(b.clone(), target);
-                        }
-                    }
-                }
-                mods.uses.entry(u.module.clone()).or_default().push(u);
-            }
+            for u in scan.uses { mods.add_use(u); }
         }
         table.add_crate(name.clone(), std::sync::Arc::new(mods));
         reached.push((k, reachable));
@@ -1800,4 +1892,15 @@ mod lowered_scope_tests {
     }
 
 
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&PREVIOUS_FILES, std::sync::atomic::AtomicU64::new(0));
+    reset(&PHASE_NS, [const { std::sync::atomic::AtomicU64::new(0) }; 5]);
+    reset(&BY_NAME, Mutex::new(Vec::new()));
+    reset(&WAIT_NS, std::sync::atomic::AtomicU64::new(0));
+    reset(&PUBLISH_NS, std::sync::atomic::AtomicU64::new(0));
+    reset(&PARSE_NS, std::sync::atomic::AtomicU64::new(0));
 }

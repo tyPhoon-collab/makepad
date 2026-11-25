@@ -240,6 +240,9 @@ impl<'p> LayoutCx<'p> {
 /// instead of freeing it, since references into it may still be held).
 pub struct Layouts {
     closure_storage: crate::conc::MemoMap<TyId, ClosureStorage>,
+    /// The environments every checked or lowered version gave its closures. Unlike the layouts they
+    /// outlive `clear`: once a version is replaced nothing can derive them again.
+    version_storage: crate::conc::MemoMap<TyId, ClosureStorage>,
     table: std::sync::atomic::AtomicPtr<LTable>,
     retired: relax_session::sync::Mutex<Vec<Box<LTable>>>,
     /// the distinct layouts, never freed before the Layouts (`of` hands out 'static references)
@@ -366,7 +369,7 @@ fn tz(x: u64) -> u64 {
 
 impl Layouts {
     pub fn new() -> Layouts {
-        Layouts { closure_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), ents: crate::conc::AppendVec::with_capacity(1 << 24), pool: Default::default(), opaque: Default::default(), lenient_fields: false }
+        Layouts { closure_storage: Default::default(), version_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), ents: crate::conc::AppendVec::with_capacity(1 << 24), pool: Default::default(), opaque: Default::default(), lenient_fields: false }
     }
 
     /// Layouts of types whose parameters were erased (see `lenient_fields`).
@@ -387,18 +390,21 @@ impl Layouts {
     /// A closure's environment. Its type names the file version whose body made it: the
     /// storages of every lowered body are recorded (`note_closure_storages`), so a closure of a
     /// version a live edit replaced keeps the environment that version gave it. Only the
-    /// current version is derived from the owner's type check here (a replaced version's
-    /// expression ids name other expressions, or none, in the current body).
+    /// current version is derived from the owner's type check here: a replaced version's
+    /// expression ids name other expressions, or none, in its owner's current body, and an owner
+    /// the edit removed has no body of the program at all (it keeps the replaced version's file,
+    /// and a check of it now resolves against names the edit took away).
     pub fn closure_storage(&self, prog: &crate::program::Program, tcx: &Tcx, ty: TyId) -> ClosureStorage {
         let ty = tcx.tys.erase_regions(ty);
         if let Some(storage) = self.closure_storage.get(&ty) { return storage; }
         let TyKind::Closure(file, ce, crate::types::ClosureArgs { parent_args: owner, .. }) = tcx.tys.kind(ty) else { panic!("closure storage for non-closure") };
         let TyKind::FnDef(def, args, _) = tcx.tys.kind(*owner) else { panic!("closure owner") };
-        let body = crate::typeck::codegen_body(prog, tcx, *def, tcx.tys.list(*args));
-        if body.file != *file {
+        if !prog.is_current_version(*file) {
+            if let Some(storage) = self.version_storage.get(&ty) { return storage; }
             panic!("the environment of a closure of a replaced version of {} (expression {}) is unknown: no body of that version was lowered in this process",
                 prog.file_paths.get(*file as usize).map_or("?", |p| p.as_str()), ce & !crate::tcx::ASYNC_FN_BODY);
         }
+        let body = crate::typeck::codegen_body(prog, tcx, *def, tcx.tys.list(*args));
         let storage = ClosureStorage::for_codegen(prog, tcx, &body, *ce);
         self.closure_storage.insert(ty, storage.clone());
         storage
@@ -409,15 +415,24 @@ impl Layouts {
     /// version: a recorded storage that differs (the owner was checked again) is replaced.
     pub fn note_closure_storages<'a>(&self, prog: &crate::program::Program, tcx: &Tcx, body: &crate::typeck::Body, storages: impl Iterator<Item = (u32, &'a ClosureStorage)>) {
         for (ce, storage) in storages {
-            if ce & crate::tcx::ASYNC_FN_BODY != 0 || !body.has_expr(crate::ast::ExprId(ce)) {
+            // an async fn's body is its coroutine, the fn's return type (the hidden type of its
+            // opaque `impl Future`); any other closure is the type of its expression
+            let ty = if ce & crate::tcx::ASYNC_FN_BODY != 0 {
+                body.ret
+            } else if body.has_expr(crate::ast::ExprId(ce)) {
+                body.ty(crate::ast::ExprId(ce))
+            } else {
                 continue;
-            }
-            let ty = tcx.tys.erase_regions(tcx.normalize_erasing_regions(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), body.ty(crate::ast::ExprId(ce))));
+            };
+            let ty = tcx.tys.erase_regions(tcx.normalize_erasing_regions(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), ty));
             if !matches!(tcx.tys.kind(ty), TyKind::Closure(f, e, _) if *f == body.file && *e == ce) {
                 continue;
             }
             if self.closure_storage.get(&ty).as_ref() != Some(storage) {
                 self.closure_storage.insert(ty, storage.clone());
+            }
+            if self.version_storage.get(&ty).as_ref() != Some(storage) {
+                self.version_storage.insert(ty, storage.clone());
             }
         }
     }
@@ -588,25 +603,34 @@ impl Layouts {
 
     /// Live sessions (M10, hotreload.md section 13): a struct in the application's scope that
     /// edits may give fields in place -- named fields, no repr other than Rust's, not Copy (a
-    /// bitwise copy would share the extension block).
+    /// bitwise copy would share the extension block). Never a provided crate's (`rustc_laid`):
+    /// its values are rustc's bytes, and an application whose tree holds the framework's sources
+    /// has the crate in its scope.
     pub fn live_editable(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, d: crate::program::DefId, adt: &crate::tcx::AdtT, t: TyId) -> bool {
+        self.live_editable_form(lcx, d, adt) && Self::is_copy(lcx, tcx, t) == Some(false)
+    }
+
+    /// What live_editable asks of a struct but its Copy impl: of the application's scope (not a
+    /// provided crate's), named fields, Rust's repr, in a live session.
+    pub fn live_editable_form(&self, lcx: &LayoutCx<'_>, d: crate::program::DefId, adt: &crate::tcx::AdtT) -> bool {
         if !LIVE_SESSION.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
         let prog = lcx.prog;
-        if !crate::borrowck::event::app_crate(prog, prog.def(d).krate) || adt.is_enum || adt.is_union {
+        let krate = prog.def(d).krate;
+        if prog.crates[krate as usize].rustc_laid || !crate::borrowck::event::app_crate(prog, krate) || adt.is_enum || adt.is_union {
             return false;
         }
         if adt.repr_c || adt.repr_packed != 0 || adt.repr_align != 0 || adt.repr_int.is_some() || adt.no_niche || adt.valid_start.is_some() || adt.valid_end.is_some() {
             return false;
         }
-        if adt.variants.first().map_or(true, |v| v.shape != 2) {
-            return false;
-        }
-        match tcx.copy_trait {
-            Some(c) => !tcx.type_implements_trait(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), TraitRef { def_id: c, args: vec![GenericArg::Type(t)] }).may_apply(),
-            None => false,
-        }
+        adt.variants.first().is_some_and(|v| v.shape == 2)
+    }
+
+    /// Whether `t` may be Copy (None: there is no Copy trait to ask).
+    pub fn is_copy(lcx: &LayoutCx<'_>, tcx: &Tcx, t: TyId) -> Option<bool> {
+        let c = tcx.copy_trait?;
+        Some(tcx.type_implements_trait(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), TraitRef { def_id: c, args: vec![GenericArg::Type(t)] }).may_apply())
     }
 
     /// Live sessions (M10): an enum of the program's own crate with Rust's repr, which variants
@@ -616,7 +640,8 @@ impl Layouts {
             return false;
         }
         let prog = lcx.prog;
-        prog.def(d).krate == root_crate() && !adt.repr_c && adt.repr_int.is_none() && adt.repr_align == 0 && adt.repr_packed == 0 && !adt.no_niche
+        let krate = prog.def(d).krate;
+        krate == root_crate() && !prog.crates[krate as usize].rustc_laid && !adt.repr_c && adt.repr_int.is_none() && adt.repr_align == 0 && adt.repr_packed == 0 && !adt.no_niche
     }
 
     /// Is `t` 4 GiB or larger (its layout saturated)?
@@ -634,6 +659,15 @@ impl Layouts {
         if !self.is_too_big(t) { return false; }
         let bound: u128 = if tcx.tys.ptr_bytes == 4 { 1 << 31 } else { 1 << 61 };
         self.wide_size(lcx, tcx, t, &mut Default::default()) >= bound
+    }
+
+    /// `size_of::<T>()` of a type whose u32 layout saturated (`is_too_big`) but which is no
+    /// SizeOverflow: its exact size (rustc lays it out; only Relax's u32 layout cannot hold it).
+    pub fn saturated_size(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, t: TyId) -> Option<u64> {
+        let t = tcx.tys.erase_regions(t);
+        let _ = self.of(lcx, tcx, t);
+        if !self.is_too_big(t) || self.size_overflows(lcx, tcx, t) { return None; }
+        u64::try_from(self.wide_size(lcx, tcx, t, &mut Default::default())).ok()
     }
 
     /// The exact size of `t` where its u32 layout saturated, with the same choices the layout made
@@ -1180,8 +1214,9 @@ impl Layouts {
 
     fn tagged(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, adt: &crate::tcx::AdtT, vfl: &[Vec<FieldL>], vls: &[Vec<&'static Layout>], repr: Repr) -> Layout {
         let nv = vfl.len();
-        // the discriminants of inhabited variants, and the largest gap between them (wrapping)
-        let mut ds: Vec<i128> = (0..nv).filter(|&i| adt.repr_c || !vfl[i].iter().any(|f| f.uninhabited)).map(|i| adt.discriminant_for_variant(tcx, lcx.prog, i as u32).expect("existing layout variant").signed_value()).collect();
+        // the tags of inhabited variants (their discriminants, or the tags a live edit kept), and
+        // the largest gap between them (wrapping)
+        let mut ds: Vec<i128> = (0..nv).filter(|&i| adt.repr_c || !vfl[i].iter().any(|f| f.uninhabited)).map(|i| adt.tag_for_variant(tcx, lcx.prog, i as u32).expect("existing layout variant").signed_value()).collect();
         ds.sort();
         ds.dedup();
         let discr_signed = match adt.repr_int {
@@ -1335,7 +1370,10 @@ impl Layouts {
                         if !self.decl_maybe_unsized(lcx, tcx, d2, depth + 1) {
                             return false;
                         }
-                        let s = self.field_ty(lcx, tcx, d2, 0, adt2.variants[0].fields.len() as u32 - 1, tcx.tys.list(a2));
+                        // This is the declaration's generic sizedness, not a concrete layout.
+                        // Substitute its tail without normalizing projections in unrelated
+                        // generic arguments (e.g. RefCell<Vec<Rc<C::Node>>> is always Sized).
+                        let s = tcx.tys.subst(lt, tcx.tys.list(a2));
                         self.ty_maybe_unsized(lcx, tcx, s, params, depth + 1)
                     }
                 }
@@ -1470,4 +1508,11 @@ pub fn root_crate() -> u32 {
 /// `makepad live`: the crate under test is the program's own crate (live_editable).
 pub fn set_root_crate(c: u32) {
     ROOT_CRATE.store(c, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&LIVE_SESSION, std::sync::atomic::AtomicBool::new(false));
+    reset(&ROOT_CRATE, std::sync::atomic::AtomicU32::new(0));
 }

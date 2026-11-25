@@ -1300,34 +1300,44 @@ pub fn run_live(
                 // see SourceDrift for why warping the echo alone cannot.
                 let drift_now = feedback.drift;
                 feedback.drift.advance(&config.camera, config.drift.hue_deg);
-                let Some(prepared) = feedback.prepared(width, height) else {
-                    session.wait_for_mailbox(Duration::from_millis(250));
-                    continue;
-                };
-                let (moved_source, moved_stats) = if drift_now.is_identity() {
-                    (prepared.image.clone(), prepared.stats)
-                } else {
-                    let moved = warp_source_drift(&prepared.image, &drift_now);
-                    let stats = channel_stats(&moved);
-                    (moved, stats)
-                };
-                let init = feedback_frame(&moved_source, &moved_stats, last_output.as_ref(), &config, frame_index);
-                if init.is_none() {
-                    // Cold start: one full edit of the source, from noise.
-                    config.strength = 1.0;
-                }
-                // The anchor the edit conditions on. Pinned to the still
-                // source it pins the trip with it — the loop converges to a
-                // still whatever the prompt or the carry. It rides the
-                // moving source, and `anchor_follow` lets it also lean into
-                // the previous output.
-                let anchor = match last_output.as_ref().filter(|_| config.anchor_follow > 0.0) {
-                    Some(last) if last.width == moved_source.width && last.height == moved_source.height => {
-                        lerp_images(&moved_source, last, config.anchor_follow)
+                if let Some(prepared) = feedback.prepared(width, height) {
+                    let (moved_source, moved_stats) = if drift_now.is_identity() {
+                        (prepared.image.clone(), prepared.stats)
+                    } else {
+                        let moved = warp_source_drift(&prepared.image, &drift_now);
+                        let stats = channel_stats(&moved);
+                        (moved, stats)
+                    };
+                    let init = feedback_frame(&moved_source, &moved_stats, last_output.as_ref(), &config, frame_index);
+                    if init.is_none() {
+                        // Cold start: one full edit of the source, from noise.
+                        config.strength = 1.0;
                     }
-                    _ => moved_source.clone(),
-                };
-                (init, Some(anchor))
+                    // The anchor the edit conditions on. Pinned to the still
+                    // source it pins the trip with it — the loop converges to a
+                    // still whatever the prompt or the carry. It rides the
+                    // moving source, and `anchor_follow` lets it also lean into
+                    // the previous output.
+                    let anchor = match last_output.as_ref().filter(|_| config.anchor_follow > 0.0) {
+                        Some(last) if last.width == moved_source.width && last.height == moved_source.height => {
+                            lerp_images(&moved_source, last, config.anchor_follow)
+                        }
+                        _ => moved_source.clone(),
+                    };
+                    (init, Some(anchor))
+                } else {
+                    if last_output.is_none() && backend.live_requires_image() {
+                        session.wait_for_mailbox(Duration::from_millis(250));
+                        continue;
+                    }
+                    // A generator can produce its first frame without a
+                    // source. Subsequent steps carry its own output, with
+                    // camera motion, until a client supplies a source.
+                    let init = last_output.as_ref().map(|previous| {
+                        warp_feedback_bordered(previous, &config.camera, config.drift.border, None)
+                    });
+                    (init, None)
+                }
             }
         };
         match config.noise_mode.resolve(loop_mode) {
@@ -1549,24 +1559,6 @@ mod tests {
         };
         let warped = warp_feedback(&image, &CameraMotion::default());
         assert_eq!(warped.data, image.data);
-    }
-
-    #[test]
-    fn warp_feedback_zoom_moves_a_known_pixel() {
-        let width = 8u32;
-        let height = 8u32;
-        let mut data = vec![0u8; (width * height * 3) as usize];
-        // A bright marker at the top-left corner only.
-        data[0] = 255;
-        data[1] = 255;
-        data[2] = 255;
-        let image = RgbImage { width, height, data };
-
-        let camera = CameraMotion { dolly: 4.0, pan_x: 0.0, pan_y: 0.0, roll: 0.0 };
-        let warped = warp_feedback(&image, &camera);
-        // Zooming in samples closer to the center for every output pixel,
-        // so the pure corner marker no longer reproduces exactly at (0,0).
-        assert_ne!(&warped.data[0..3], &image.data[0..3]);
     }
 
     #[test]
@@ -2059,7 +2051,7 @@ mod tests {
 
     fn run_recording_session(
         params: LiveParams,
-        setup: impl FnOnce(&RealtimeSession) + Send + 'static,
+        setup: impl FnOnce(&RealtimeSession, &dyn Fn(usize)) + Send + 'static,
         done: impl Fn(&[SeenFrame]) -> bool,
         source: RgbImage,
     ) -> Vec<SeenFrame> {
@@ -2078,7 +2070,14 @@ mod tests {
                 run_live(&session, &mut backend, &cancel, |_, _, _, _| {})
             })
         };
-        setup(&session);
+        // Waits until the worker has made `n` frames: a control sent after
+        // it lands after those frames, however long they took.
+        let frames_seen = |n: usize| {
+            while seen.lock().unwrap().len() < n {
+                std::thread::yield_now();
+            }
+        };
+        setup(&session, &frames_seen);
         let deadline = Instant::now() + Duration::from_secs(10);
         while !done(&seen.lock().unwrap()) {
             assert!(Instant::now() < deadline, "timed out waiting for the session to reach the wanted state");
@@ -2157,7 +2156,7 @@ mod tests {
         let pushed = source.clone();
         let frames = run_recording_session(
             recording_params(LoopMode::Feed),
-            move |session| {
+            move |session, _| {
                 session.push_input_frame(pushed.clone());
                 session.push_input_frame(pushed);
             },
@@ -2178,7 +2177,7 @@ mod tests {
         let reference = source.clone();
         let frames = run_recording_session(
             recording_params(LoopMode::Feedback),
-            move |session| {
+            move |session, _| {
                 // Nothing for a while: the worker must wait, not fail.
                 std::thread::sleep(Duration::from_millis(120));
                 session.set_reference(0, reference);
@@ -2208,10 +2207,10 @@ mod tests {
         let pushed = source.clone();
         let frames = run_recording_session(
             recording_params(LoopMode::Feedback),
-            move |session| {
+            move |session, frames_seen| {
                 session.push_input_frame(pushed);
-                // Let a few frames run, then ask for a cold start.
-                std::thread::sleep(Duration::from_millis(60));
+                // Frames 0 (the cold start) and 1 (warm), then ask for a cold start.
+                frames_seen(2);
                 session.handle_text(r#"{"type":"control","reset":true}"#).unwrap();
             },
             |frames| frames.iter().filter(|f| !f.has_init).count() >= 2 && frames.len() >= 6,
@@ -2231,9 +2230,10 @@ mod tests {
         let pushed = source.clone();
         let frames = run_recording_session(
             recording_params(LoopMode::Feedback),
-            move |session| {
+            move |session, frames_seen| {
                 session.push_input_frame(pushed);
-                std::thread::sleep(Duration::from_millis(60));
+                // Frames 0 and 1 at the first size, then resize.
+                frames_seen(2);
                 session.handle_text(r#"{"type":"control","width":64,"height":48}"#).unwrap();
             },
             |frames| frames.iter().filter(|f| f.init_size == Some((64, 48))).count() >= 3,

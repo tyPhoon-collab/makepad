@@ -6,7 +6,7 @@ use std::process::Command;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use makepad_platform::thread::{CancellationToken, Lane, SignalToUI, TaskHandle, TaskPool, ThreadSpawner};
+use makepad_platform::thread::{CancellationToken, Class, SignalToUI, TaskHandle, TaskPool, ThreadSpawner};
 use makepad_platform::Cx;
 
 use crate::hub::ClientId;
@@ -19,11 +19,13 @@ pub const GROUP_KILL_GRACE: std::time::Duration = std::time::Duration::from_mill
 pub const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Reap a child after its host has sent `StudioToApp::Kill`. The returned
-/// task fences a replacement launch; a busy pool returns ownership to retry.
+/// task fences a replacement launch; a closed pool returns ownership for cleanup.
 /// The owner's cleanup runs on the same worker, after the process has exited.
-pub fn reap_closed_child(mut child: Child, pool: &TaskPool, after_exit: impl FnOnce() + Send + 'static) -> Result<TaskHandle<()>, Child> {
-    let Ok(slot) = pool.reserve(Lane::Heavy) else { return Err(child) };
-    Ok(slot.submit(move || {
+pub fn reap_closed_child(child: Child, pool: &TaskPool, after_exit: impl FnOnce() + Send + 'static) -> Result<TaskHandle<()>, Child> {
+    let pending = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let work = pending.clone();
+    pool.submit(Class::Background, move || {
+        let mut child = work.lock().unwrap().take().unwrap();
         let wait = CancellationToken::new();
         let deadline = Cx::monotonic_now() + CLOSE_GRACE.as_secs_f64();
         loop {
@@ -48,7 +50,7 @@ pub fn reap_closed_child(mut child: Child, pool: &TaskPool, after_exit: impl FnO
         let _ = child.wait();
         after_exit();
         SignalToUI::set_ui_signal();
-    }))
+    }).map_err(|_| pending.lock().unwrap().take().unwrap())
 }
 
 /// Block until process `pid` has exited, without reaping it: its owner's
@@ -155,6 +157,23 @@ pub fn configure(cmd: &mut Command, hub_port: u16, id: ClientId, bin: &str) {
 #[cfg(unix)]
 pub fn own_process_group(cmd: &mut Command) {
     cmd.process_group(0);
+}
+
+/// A process meant to outlive this one (unix only): a session of its own, which is also a group of
+/// its own, so a negative-pid signal still reaches it. Under `makepad run` that is what says a
+/// process stays when the run that started it ends; anything else ends with the run.
+#[cfg(unix)]
+pub fn own_session(cmd: &mut Command) {
+    extern "C" {
+        fn setsid() -> i32;
+    }
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            setsid();
+            Ok(())
+        });
+    }
 }
 
 /// The child (and everything it starts: a build's rustc) runs at `nice` (a lower priority than
@@ -318,7 +337,7 @@ pub fn kill_group_pid(pid: u32, grace: std::time::Duration, pool: &TaskPool) {
     let pid = pid as i32;
     signal::kill_group(pid, signal::SIGTERM);
     let wait = CancellationToken::new();
-    let submitted = pool.submit(Lane::Heavy, move || {
+    let submitted = pool.submit(Class::Background, move || {
         let _ = wait.wait_until(Cx::monotonic_now() + grace.as_secs_f64());
         if signal::alive(-pid) {
             signal::kill_group(pid, signal::SIGKILL);
@@ -336,40 +355,65 @@ pub fn kill_child_group(child: &mut Child, _grace: std::time::Duration, _pool: &
     let _ = child.kill();
 }
 
+/// A host on its way out ends the children it asked to close (`StudioToApp::Kill` sent): they
+/// share one `grace`, the same on every OS, and what is left after it is killed. This blocks,
+/// because a child ends with its host: its time to save is only as long as the host's own.
+pub fn end_asked_children(children: &mut [Child], grace: std::time::Duration) {
+    let deadline = std::time::Instant::now() + grace;
+    let ended = |child: &mut Child| matches!(child.try_wait(), Ok(Some(_)));
+    while !children.iter_mut().all(ended) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    }
+    for child in children.iter_mut().filter_map(|child| (!ended(child)).then_some(child)) {
+        #[cfg(unix)]
+        signal::kill_group(child.id() as i32, signal::SIGKILL);
+        #[cfg(not(unix))]
+        let _ = child.kill();
+    }
+}
+
 /// Final slot teardown owns the child from here on. Signal and reap it wholly
 /// on a heavy pool worker; dropping a slot on the UI thread never waits for a
 /// process or decoder wrapper to exit.
-pub fn reap_child_group(mut child: Child, grace: std::time::Duration, pool: &TaskPool) {
+pub fn reap_child_group(child: Child, grace: std::time::Duration, pool: &TaskPool) {
     #[cfg(unix)]
     let pid = {
         let pid = child.id() as i32;
         signal::kill_group(pid, signal::SIGTERM);
         pid
     };
-    match pool.reserve(Lane::Heavy) {
-        Ok(slot) => slot
-            .submit(move || {
-                #[cfg(unix)]
-                {
-                    let wait = CancellationToken::new();
-                    let _ = wait.wait_until(Cx::monotonic_now() + grace.as_secs_f64());
-                    if signal::alive(-pid) {
-                        signal::kill_group(pid, signal::SIGKILL);
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = grace;
-                    let _ = child.kill();
-                }
-                let _ = child.wait();
-            })
-            .detach(),
-        Err(_) => {
-            #[cfg(unix)]
-            signal::kill_group(pid, signal::SIGKILL);
-            #[cfg(not(unix))]
+    let pending = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let work = pending.clone();
+    match pool.submit(Class::Background, move || {
+        let mut child = work.lock().unwrap().take().unwrap();
+        #[cfg(unix)]
+        {
+            let wait = CancellationToken::new();
+            let _ = wait.wait_until(Cx::monotonic_now() + grace.as_secs_f64());
+            if signal::alive(-pid) {
+                signal::kill_group(pid, signal::SIGKILL);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = grace;
             let _ = child.kill();
+        }
+        let _ = child.wait();
+    }) {
+        Ok(task) => task.detach(),
+        Err(_) => {
+            let child = pending.lock().unwrap().take().unwrap();
+            #[cfg(unix)]
+            {
+                signal::kill_group(pid, signal::SIGKILL);
+                drop(child);
+            }
+            #[cfg(not(unix))]
+            {
+                let mut child = child;
+                let _ = child.kill();
+            }
         }
     }
 }
@@ -379,6 +423,41 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::process::Stdio;
+
+    /// Children asked to close end the wait as soon as they have gone; one that ignores the
+    /// ask is killed when the grace is up.
+    #[test]
+    fn children_asked_to_close_share_one_grace() {
+        fn child(secs: u32) -> Child {
+            #[cfg(unix)]
+            let mut command = {
+                let mut command = makepad_remote::group::command("sleep");
+                command.arg(secs.to_string());
+                own_process_group(&mut command);
+                command
+            };
+            #[cfg(not(unix))]
+            let mut command = {
+                let mut command = makepad_remote::group::command("cmd.exe");
+                command.args(["/c", &format!("ping -n {} 127.0.0.1 >nul", secs + 1)]);
+                command
+            };
+            command.spawn().unwrap()
+        }
+        let long = std::time::Duration::from_secs(20);
+        let start = std::time::Instant::now();
+        let mut gone = vec![child(0), child(0)];
+        end_asked_children(&mut gone, long);
+        assert!(start.elapsed() < long / 2, "nothing left to wait for");
+
+        let start = std::time::Instant::now();
+        let mut stuck = vec![child(0), child(30)];
+        end_asked_children(&mut stuck, std::time::Duration::from_millis(100));
+        for child in &mut stuck {
+            child.wait().unwrap();
+        }
+        assert!(start.elapsed() < long, "the one that stayed was killed");
+    }
 
     /// The exit watch returns when the process ends, and leaves it for the
     /// owner's own `try_wait` (it does not reap).

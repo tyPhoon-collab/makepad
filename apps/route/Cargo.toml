@@ -24,7 +24,7 @@ required-features = ["standalone"]
 [features]
 default = ["tweaker", "standalone", "localai"]
 # The design overlay (Shift+F10 with the dev overlays on). On for development
-# builds; the Builder's releases build without it (--no-default-features).
+# builds; the Runner's releases build without it (--no-default-features).
 tweaker = ["dep:makepad-widgets-tweaker", "makepad-widgets/data", "makepad-widgets/dock", "makepad-widgets/fab"]
 # The local models route's own brain runs on (the Qwen dispatcher, Whisper,
 # spoken replies) are part of `native`; `localai` is that, under the name
@@ -74,6 +74,3 @@ makepad-strict-json = { path = "../../libs/strict_json", optional = true }  # cl
 
 # Planned wiring (see route.md milestones) — enable as each phase lands:
 # makepad-tesla   = { path = "../../libs/tesla" }          # M5: vehicle SoC / charge state
-
-[dev-dependencies]
-makepad-test = { path = "../../libs/makepad_test", version = "0.1.0" }

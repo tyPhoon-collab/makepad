@@ -7,12 +7,14 @@
 //! - `quest`: the JIT host built for the Quest on the Mac (`cargo makepad android build-host
 //!   --quest`), `adb install -r` and `am start` (never adb tcpip/usb/connect/disconnect/kill-server).
 //!
-//! A show on the Mac is gated: before it reaches the user, devhub boots the app at the exact
-//! landed pair headless under the JIT on a box of the same OS (a Mac node, mini), keeps it up for the
-//! settle window ([`SETTLE`]) and requires no panic, pause, hang, deadlock, patch or script error
-//! on any thread and no early exit. Only then does it launch on the user's Mac. A failed pre-boot
-//! never reaches the user: it is a `show_blocked` event (the inbox: the manager, and the lane that
-//! asked, by name). A pair that passed is not booted again for later shows of that app.
+//! A show on the Mac opens at once: the user is waiting, and testing is deferred. Alongside it,
+//! devhub boots the app at the exact landed pair headless under the JIT on a box of the same OS (a
+//! Mac node), keeps it up for the settle window ([`SETTLE`]) and requires no panic, pause, hang,
+//! deadlock, patch or script error on any thread and no early exit. A failed pre-boot is an error
+//! on the running show: a `show_failed` event (the inbox: the manager, and the lane that asked, by
+//! name). A pair that passed is not booted again for later shows of that app. A landing builds
+//! nothing on the Mac: a show builds the JIT first, then opens, and a running app offers the update
+//! (reload_host). The devboxes have theirs from the prebuild ([`super::warm`]).
 //!
 //! A show that is running is never replaced silently: it may hold unsaved work, so `show` refuses
 //! and says so (ask the user, then `--replace`). When the user closes the app (its process ends
@@ -57,10 +59,14 @@ fn event(ctx: &Ctx, sev: Sev, line: String, x: Option<&Show>) {
 /// A failure in a shown app (a panic, a hang, a patch or compile error, a crash): a `show_failed`
 /// event, so the manager hears it without the user (`devhub watch show --until fail`).
 fn failed(ctx: &Ctx, x: &Show, what: String) {
-    ctx.store.event("show_failed", Sev::Err, format!("show_failed {} on {}: {what}", x.app, x.device), Some(crate::state::show_value(x).to_json()));
+    ctx.store.event("show_failed", Sev::Err, format!("show_failed {} at {} on {}: {what}", x.app, super::short(&x.sha), x.device), Some(crate::state::show_value(x).to_json()));
 }
 
 fn set(ctx: &Ctx, id: &str, f: impl FnOnce(&mut Show)) -> Option<Show> {
+    try_set(ctx, id, f).unwrap_or_else(|e| { eprintln!("devhub state: {e}"); None })
+}
+
+fn try_set(ctx: &Ctx, id: &str, f: impl FnOnce(&mut Show)) -> Result<Option<Show>, String> {
     ctx.store.update(|d| {
         let x = d.shows.iter_mut().find(|x| x.id == id)?;
         f(x);
@@ -83,7 +89,7 @@ pub fn device(ctx: &Ctx, on: &str) -> Result<String, String> {
     }
 }
 
-/// The JIT's app name for a package (`makepad-app-fab` and `makepad-fab` are `fab`).
+/// The JIT's app name for a package (`makepad-app-foo` and `makepad-foo` are `foo`).
 fn short_app(pkg: &str) -> &str {
     pkg.strip_prefix("makepad-app-").or_else(|| pkg.strip_prefix("makepad-")).unwrap_or(pkg)
 }
@@ -106,7 +112,7 @@ pub fn start(ctx: Arc<Ctx>) {
             }
         }
         out
-    });
+    }).unwrap_or_else(|e| { eprintln!("devhub state: {e}"); Default::default() });
     for x in lost {
         event(&ctx, Sev::Info, format!("show {} on mac ended while the master was down", x.app), Some(&x));
     }
@@ -118,14 +124,14 @@ pub fn start(ctx: Arc<Ctx>) {
             x.stages.clear();
             x.clone()
         }).collect()
-    });
+    }).unwrap_or_else(|e| { eprintln!("devhub state: {e}"); Default::default() });
     for x in again {
         event(&ctx, Sev::Info, format!("show {} on {}: the master restarted during its launch; starting again", x.app, x.device), Some(&x));
         let c = ctx.clone();
         let _ = std::thread::Builder::new().name("devhub-show".into()).spawn(move || launch(&c, &x));
     }
     let _ = std::thread::Builder::new().name("devhub-shows".into()).spawn(move || {
-        let mut work = git(&ctx.repo, &["rev-parse", "refs/heads/work"]).unwrap_or_default();
+        let mut work = crate::gitread::rev(&ctx.repo, "refs/heads/work").unwrap_or_default();
         loop {
             tick(&ctx, &mut work);
             ctx.store.wait(TICK);
@@ -134,9 +140,11 @@ pub fn start(ctx: Arc<Ctx>) {
 }
 
 fn tick(ctx: &Arc<Ctx>, work: &mut String) {
+    let mut pass = crate::gitread::Pass::default();
     let shows: Vec<Show> = ctx.store.read(|d| d.shows.iter().filter(|x| x.active()).cloned().collect());
+    reap(&shows);
     // a landing while a show runs: the JIT patches it live; said once per landing
-    let now_work = git(&ctx.repo, &["rev-parse", "refs/heads/work"]).unwrap_or_default();
+    let now_work = pass.rev(&ctx.repo, "refs/heads/work").unwrap_or_default();
     let landed = !now_work.is_empty() && now_work != *work;
     if landed {
         *work = now_work.clone();
@@ -145,7 +153,7 @@ fn tick(ctx: &Arc<Ctx>, work: &mut String) {
     for x in shows {
         match x.state.as_str() {
             "waiting" => {
-                let (met, cond) = super::after::cond_met(ctx, &x.cond, x.added_ms);
+                let (met, cond) = super::after::cond_met_in(ctx, &x.cond, x.added_ms, &mut pass);
                 if cond != x.cond {
                     set(ctx, &x.id, |s| s.cond = cond.clone());
                 }
@@ -162,8 +170,15 @@ fn tick(ctx: &Arc<Ctx>, work: &mut String) {
             "running" | "paused" => {
                 // pinned: an operation runs on it; the JIT holds still and is told so again after a restart
                 if x.pinned && x.pid > 0 {
-                    let _ = pin_jit(ctx, &x, true);
+                    let _ = pin_jit(&x, true);
                 }
+                // (a pin set in the JIT itself, `devhub inspect .. pin on`, is a pin: it read as
+                // updated while it held still)
+                let x = if landed && x.device != "quest" && !x.pinned && x.pid > 0 && jit_pinned(&x) {
+                    set(ctx, &x.id, |s| s.pinned = true).unwrap_or(x)
+                } else {
+                    x
+                };
                 let x = if landed && x.device != "quest" && !x.pinned {
                     let x = set(ctx, &x.id, |s| s.sha = now_work.clone()).unwrap_or(x);
                     event(ctx, Sev::Info, format!("show {} on {}: work moved to {}; the JIT patches it live (`devhub show {} --on {} --replace` restarts it)", x.app, x.device, super::short(&now_work), x.app, x.device), Some(&x));
@@ -172,6 +187,7 @@ fn tick(ctx: &Arc<Ctx>, work: &mut String) {
                     x
                 };
                 if x.device == "mac" {
+                    watch_log(ctx, &x);
                     mac_watch(ctx, &x);
                 } else {
                     let row = ps.entry(x.device.clone()).or_insert_with(|| crate::cli::ask(&ctl(), Some(&x.device), "ps", "ps").ok().map(|l| crate::explorer::parse_ps(&x.device, &l)));
@@ -181,6 +197,14 @@ fn tick(ctx: &Arc<Ctx>, work: &mut String) {
             _ => {}
         }
     }
+}
+
+/// The processes of shows no longer followed (stopped, replaced) are waited for once they exit:
+/// none stays a zombie of the master.
+fn reap(active: &[Show]) {
+    let mut g = CHILDREN.lock().unwrap();
+    let Some(m) = g.as_mut() else { return };
+    m.retain(|id, child| active.iter().any(|x| x.id == *id) || matches!(child.try_wait(), Ok(None)));
 }
 
 /// A Mac show's process: its exit decides closed (0) or crashed.
@@ -260,34 +284,53 @@ fn cargo() -> PathBuf {
 fn log_file(ctx: &Ctx, x: &Show) -> Result<(PathBuf, std::fs::File), String> {
     let dir = ctx.logs("shows");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!("{}-{}.log", x.app, x.device));
+    let name = format!("{}-{}", x.app, x.device);
+    let path = dir.join(format!("{name}.log"));
+    keep_previous(&dir, &name, &path);
     let f = std::fs::File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok((path, f))
 }
 
-/// Starts the show on its device.
-fn launch(ctx: &Ctx, x: &Show) {
-    set(ctx, &x.id, |s| s.launch_ms = wall_ms());
-    let sha = git(&ctx.repo, &["rev-parse", "refs/heads/work"]).unwrap_or_default();
-    let main = git(&ctx.commercial(), &["rev-parse", "refs/heads/main"]).unwrap_or_default();
-    // the user's Mac sees only a build a devbox booted cleanly at these commits
-    if x.device == "mac" {
-        if let Err(e) = preboot(ctx, x, &sha, &main) {
-            let x = set(ctx, &x.id, |s| {
-                s.state = "blocked".into();
-                s.ended_ms = wall_ms();
-                s.note = crate::proto::clean(&e, 300);
-            });
-            let by = x.as_ref().map_or(String::new(), |x| x.by.clone());
-            ctx.store.event(
-                "show_blocked",
-                Sev::Err,
-                format!("show_blocked {} at {},{}: {e} (not shown on the Mac{})", x.as_ref().map_or("", |x| &x.app), super::short(&sha), super::short(&main), if by.is_empty() { String::new() } else { format!("; for {by}") }),
-                x.as_ref().map(|x| crate::state::show_value(x).to_json()),
-            );
-            return;
-        }
+/// The previous runs' logs a show keeps beside its current one.
+const KEPT_LOGS: usize = 8;
+
+/// A new show of the same app on the same device keeps the previous run's log (what a run that
+/// went wrong said is wanted after the person started it again): `<name>.<unix time it ended>.log`,
+/// the newest [`KEPT_LOGS`] of them.
+fn keep_previous(dir: &std::path::Path, name: &str, path: &std::path::Path) {
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    let ended = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    if let Err(e) = std::fs::rename(path, dir.join(format!("{name}.{ended}.log"))) {
+        eprintln!("devhub show: keeping {}: {e}", path.display());
+        return;
     }
+    let prefix = format!("{name}.");
+    let mut kept: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let file = e.file_name().into_string().ok()?;
+            let stamp = file.strip_prefix(&prefix)?.strip_suffix(".log")?.parse::<u64>().ok()?;
+            Some((stamp, e.path()))
+        })
+        .collect();
+    kept.sort();
+    let extra = kept.len().saturating_sub(KEPT_LOGS);
+    for (_, old) in kept.into_iter().take(extra) {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
+/// Starts the show on its device.
+fn launch(ctx: &Arc<Ctx>, x: &Show) {
+    set(ctx, &x.id, |s| {
+        s.launch_ms = wall_ms();
+        // a new log, and nothing said of it yet
+        (s.log_read, s.log_said, s.events_said) = (0, Vec::new(), Vec::new());
+    });
+    let sha = crate::gitread::rev(&ctx.repo, "refs/heads/work").unwrap_or_default();
+    let main = crate::gitread::rev(&ctx.commercial(), "refs/heads/main").unwrap_or_default();
     let r = match x.device.as_str() {
         "mac" => mac_launch(ctx, x),
         "quest" => quest_launch(ctx, x),
@@ -305,6 +348,9 @@ fn launch(ctx: &Ctx, x: &Show) {
                 s.started_ms = wall_ms();
                 s.log = log;
             });
+            if x.as_ref().is_some_and(|x| x.device == "mac") {
+                preboot_alongside(ctx, x.clone().unwrap(), sha.clone(), main.clone());
+            }
             if let Some(x) = x {
                 event(ctx, Sev::Info, format!("show {} on {}: running{} at {}", x.app, x.device, if pid > 0 { format!(" as pid {pid}") } else { String::new() }, super::short(&sha)), Some(&x));
             }
@@ -327,16 +373,24 @@ fn launch(ctx: &Ctx, x: &Show) {
 /// commercial repo), and of the workspace's Cargo inputs.
 fn inputs_key(ctx: &Ctx, dirs: &std::collections::BTreeSet<String>, work: &str, main: &str) -> String {
     let mut text = String::new();
-    let tree = |dir: &std::path::Path, at: &str, p: &str| git(dir, &["rev-parse", &format!("{at}:{p}")]).unwrap_or_default();
-    for p in ["Cargo.toml", "Cargo.lock", ".cargo/config.toml"] {
-        text.push_str(&tree(&ctx.repo, work, p));
+    // `git rev-parse <at>:<p>` of each, read in-process
+    let mut mk_paths: Vec<&str> = vec!["Cargo.toml", "Cargo.lock", ".cargo/config.toml"];
+    let mut com_paths: Vec<&str> = Vec::new();
+    for d in dirs {
+        match d.strip_prefix("apps/commercial/") {
+            Some(c) => com_paths.push(c),
+            None => mk_paths.push(d),
+        }
+    }
+    let mk = crate::gitread::entries_at(&ctx.repo, work, &mk_paths).unwrap_or_default();
+    let com = crate::gitread::entries_at(&ctx.commercial(), main, &com_paths).unwrap_or_default();
+    let (mut mk, mut com) = (mk.into_iter(), com.into_iter());
+    for _ in 0..3 {
+        text.push_str(&mk.next().unwrap_or_default());
     }
     for d in dirs {
         text.push_str(d);
-        text.push_str(&match d.strip_prefix("apps/commercial/") {
-            Some(c) => tree(&ctx.commercial(), main, c),
-            None => tree(&ctx.repo, work, d),
-        });
+        text.push_str(&if d.starts_with("apps/commercial/") { com.next() } else { mk.next() }.unwrap_or_default());
     }
     let mut h: u64 = 0xcbf29ce484222325;
     for b in text.bytes() {
@@ -357,8 +411,43 @@ fn package_dir(ctx: &Ctx, app: &str, work: &str, main: &str) -> Option<String> {
 
 /// Boots `x.app` at `work`,`main` headless under the JIT on a macOS devbox and keeps it up until
 /// it settled: Ok when nothing failed on any thread and it did not exit early. The app's crates
-/// and the JIT's unchanged since a passed boot: that pass counts. The JIT's sources unchanged since
-/// a box built them: its stashed binary runs, no build. Each stage's time goes to `devhub shows`.
+/// and the JIT's unchanged since a passed boot: that pass counts. The box's dev JIT of the pin runs
+/// (its store builds one per JIT id, shared with the landing's prebuild). Each stage's time goes to
+/// `devhub shows`.
+/// The pre-boot of a show already open on the Mac: its failure is an error on the running show.
+fn preboot_alongside(ctx: &Arc<Ctx>, x: Show, work: String, main: String) {
+    let ctx = ctx.clone();
+    let _ = std::thread::Builder::new().name("devhub-show-check".into()).spawn(move || {
+        let Err(e) = preboot(&ctx, &x, &work, &main) else {
+            set(&ctx, &x.id, |s| s.note = "pre-boot passed".into());
+            return;
+        };
+        let now = set(&ctx, &x.id, |s| s.note = format!("pre-boot failed: {}", crate::proto::clean(&e, 280)));
+        let by = if x.by.is_empty() { String::new() } else { format!("; asked by {}", x.by) };
+        ctx.store.event(
+            "show_failed",
+            Sev::Err,
+            format!("show_failed {} at {},{}: {e} (it is running on the Mac{by})", x.app, super::short(&work), super::short(&main)),
+            now.as_ref().map(|x| crate::state::show_value(x).to_json()),
+        );
+    });
+}
+
+/// The box's dev JIT of the lease's pin, from its store: built once per (box, JIT id), so the
+/// prebuild of the same landing and this share one build (the second waits for the first's, two
+/// a landing on a Mac devbox, 11-02).
+fn ensure_jit(held: &super::leg::Held, out: &mut std::fs::File) -> Result<(), String> {
+    held.ship_nothing()?;
+    match held.run(&JIT_VERSION.map(String::from), out) {
+        Ok(0) => Ok(()),
+        Ok(c) => Err(format!("the dev JIT on {} failed (exit {c})", held.node)),
+        Err(e) => Err(format!("the dev JIT on {}: {e}", held.node)),
+    }
+}
+
+/// A run of the box's dev JIT (the node selects it for the lease's pin) that only says its version.
+const JIT_VERSION: [&str; 10] = ["cargo", "run", "--profile", "host", "-p", "makepad-run", "--bin", "makepad", "--", "--version"];
+
 fn preboot(ctx: &Ctx, x: &Show, work: &str, main: &str) -> Result<(), String> {
     let began = std::time::Instant::now();
     let stage = |line: String| {
@@ -372,15 +461,15 @@ fn preboot(ctx: &Ctx, x: &Show, work: &str, main: &str) -> Result<(), String> {
         stage("pre-boot reused (the app's and the JIT's sources are unchanged since a pass)".into());
         return Ok(());
     }
-    set(ctx, &x.id, |s| s.note = format!("pre-boot at {},{} on a macOS devbox", super::short(work), super::short(main)));
+    try_set(ctx, &x.id, |s| s.note = format!("pre-boot at {},{} on a macOS devbox", super::short(work), super::short(main)))?;
     event(ctx, Sev::Info, format!("show {} on mac: pre-boot at {},{} on a macOS devbox first", x.app, super::short(work), super::short(main)), Some(x));
     let rev = if main.is_empty() { format!("work@{work}") } else { format!("work@{work},main@{main}") };
-    let spec = super::leg::Spec { only: false, lane: "show-preboot".into(), agent: "devhub-show".into(), kind: crate::lease::Kind::Test, needs: "os=macos".into(), prio: SHOW_PRIO, rev, repo_dir: ctx.repo.to_string_lossy().into_owned(), node: None };
+    let spec = super::leg::Spec { since_ms: None, lane: "show-preboot".into(), agent: "devhub-show".into(), kind: crate::lease::Kind::Test, needs: "os=macos".into(), prio: SHOW_PRIO, rev, repo_dir: ctx.repo.to_string_lossy().into_owned(), node: None };
     // a box that refuses the start (its tree still held for another lease) is no verdict on the
     // app: ask again (another box, or the same once it is free)
     let mut tries = 0;
     let held = loop {
-        match super::leg::Held::acquire(&spec, &mut |_| {}, &|| false) {
+        match super::leg::Held::acquire_with(&spec, &|r| { r.src = crate::lease::Src::Overlay; r.class = format!("leg:{}", spec.lane); }, &mut |_| {}, &|| false) {
             Ok(h) => break h,
             Err(e) if e.contains("refused") && tries < 5 => {
                 tries += 1;
@@ -390,38 +479,23 @@ fn preboot(ctx: &Ctx, x: &Show, work: &str, main: &str) -> Result<(), String> {
         }
     };
     let node = held.node.clone();
-    stage(format!("box {node} {} s", began.elapsed().as_secs()));
+    // its queue wait and the tree's move to the pair (what a box costs is one or the other)
+    let tree_ms = ctx.leases.view().iter().find(|l| l.id == held.id).and_then(|l| l.setup_ms).unwrap_or(0);
+    stage(format!("box {node}: queue {} s, tree {} s", began.elapsed().as_secs().saturating_sub(tree_ms / 1000), tree_ms / 1000));
     let log = ctx.logs("show").join(format!("{}-preboot.log", x.id));
     let _ = std::fs::create_dir_all(ctx.logs("show"));
     let file = std::fs::File::create(&log).map_err(|e| e.to_string())?;
-    // the JIT of these sources: stashed on the box when it built them before (a tree that moved
-    // away and back has new mtimes, and cargo builds 16 crates again)
-    let stash = format!("target/host/makepad.jit-{jit_key}");
     let t = std::time::Instant::now();
-    let have = held.output(&["test", "-x", &stash]).is_ok_and(|(c, _)| c == 0);
-    if have {
-        stage("jit reused".into());
-    } else {
-        let build: Vec<String> = ["cargo", "build", "--profile", "host", "-p", "makepad-run", "--bin", "makepad"].iter().map(|s| s.to_string()).collect();
-        let mut out = file.try_clone().map_err(|e| e.to_string())?;
-        match held.run(&build, &mut out) {
-            Ok(0) => {}
-            Ok(c) => {
-                let _ = crate::cli::ask(&ctl(), None, "release", &held.id);
-                return Err(format!("the JIT's build on {node} failed (exit {c}); {}", log.display()));
-            }
-            Err(e) => {
-                let _ = crate::cli::ask(&ctl(), None, "release", &held.id);
-                return Err(format!("the JIT's build on {node}: {e}"));
-            }
+    let mut out = file.try_clone().map_err(|e| e.to_string())?;
+    match ensure_jit(&held, &mut out) {
+        Ok(()) => stage(format!("jit {} s", t.elapsed().as_secs())),
+        Err(e) => {
+            let _ = crate::cli::ask(&ctl(), None, "release", &held.id);
+            return Err(format!("{e}; {}", log.display()));
         }
-        // one stash per box: this one replaces the last
-        let _ = held.output(&["find", "target/host", "-maxdepth", "1", "-name", "makepad.jit-*", "-delete"]);
-        let _ = held.output(&["cp", "-p", "target/host/makepad", &stash]);
-        stage(format!("jit build {} s", t.elapsed().as_secs()));
     }
     let boot = std::time::Instant::now();
-    let argv: Vec<String> = ["env", "MAKEPAD_HIDE_WINDOWS=1", &stash, "run", &x.app].iter().map(|s| s.to_string()).collect();
+    let argv: Vec<String> = ["env", "MAKEPAD_HIDE_WINDOWS=1"].into_iter().chain(JIT_VERSION[..9].iter().copied()).chain(["run", x.app.as_str()]).map(str::to_string).collect();
     // the run on its own thread; this one watches the JIT come up and settle
     struct Out {
         file: std::fs::File,
@@ -510,8 +584,76 @@ fn preboot(ctx: &Ctx, x: &Show, work: &str, main: &str) -> Result<(), String> {
 /// The failure lines of a pre-boot's output (a panic, a compile or script error).
 fn log_errors(text: &Arc<Mutex<Vec<u8>>>) -> String {
     let t = String::from_utf8_lossy(&text.lock().unwrap()).into_owned();
-    let bad: Vec<String> = t.lines().filter(|l| l.contains("panicked at") || l.contains("PANIC") || l.trim_start().starts_with("error") || l.contains("RC error") || l.contains("script error")).take(4).map(|l| crate::proto::clean(l, 200)).collect();
-    bad.join(" | ")
+    failure_lines(&t).into_iter().take(4).collect::<Vec<_>>().join(" | ")
+}
+
+/// What in a JIT's output says it failed, on any thread: a panic, an internal compiler error, a
+/// compile or script error.
+fn failure_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.contains("panicked at") || t.contains("PANIC") || t.contains("panic parked") || t.contains("stale access parked") || t.starts_with("error") || t.starts_with("[E]") || t.contains("RC error") || t.contains("compile error") || t.contains("internal compiler error") || t.contains("FATAL")
+        })
+        .map(|l| crate::proto::clean(l, 300))
+        .collect()
+}
+
+/// The kinds of failure line, and the app records, a show remembers it said (the oldest go).
+const SAID_MAX: usize = 64;
+/// How far a show's log read runs ahead of what its record keeps: a master started again (each
+/// landing re-execs it) reads up to this much again, and the kinds its record says it said keep
+/// that quiet; the record is written only when this much was read or a failure was said.
+const LOG_KEPT_EVERY: u64 = 256 * 1024;
+
+fn remember(said: &mut Vec<String>, key: String) {
+    said.push(key);
+    let over = said.len().saturating_sub(SAID_MAX);
+    said.drain(..over);
+}
+
+/// A kind of failure line as the show's record keeps it: the line without its numbers, hashed
+/// (FNV-1a: the same in every process and build).
+fn line_kind(line: &str) -> String {
+    let h = line.bytes().filter(|b| !b.is_ascii_digit()).fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    format!("{h:016x}")
+}
+
+/// The running app's own output, through and after its startup: what the JIT's events do not carry
+/// (a compile error, an internal compiler error) reaches the manager too. Each kind of line once
+/// per launch, by what the show's record keeps: a master started again reads on from there.
+fn watch_log(ctx: &Ctx, x: &Show) {
+    use std::io::{Read, Seek, SeekFrom};
+    if x.log.is_empty() {
+        return;
+    }
+    let Ok(mut f) = std::fs::File::open(&x.log) else { return };
+    // (a log shorter than what was read is a new one: read from its start)
+    let from = if f.metadata().map_or(0, |m| m.len()) < x.log_read { 0 } else { x.log_read };
+    let mut bytes = Vec::new();
+    if f.seek(SeekFrom::Start(from)).is_err() || f.read_to_end(&mut bytes).is_err() {
+        return;
+    }
+    // whole lines only: the rest comes with the next look
+    let Some(end) = bytes.iter().rposition(|b| *b == b'\n') else { return };
+    let at = from + end as u64 + 1;
+    let mut said = x.log_said.clone();
+    let mut new = Vec::new();
+    for line in failure_lines(&String::from_utf8_lossy(&bytes[..end])) {
+        let kind = line_kind(&line);
+        if !said.contains(&kind) {
+            remember(&mut said, kind);
+            new.push(line);
+        }
+    }
+    if new.is_empty() && at.abs_diff(x.log_read) < LOG_KEPT_EVERY {
+        return;
+    }
+    // (the same launch: a relaunch starts its log and its marks again)
+    let Some(x) = set(ctx, &x.id, |s| if s.launch_ms == x.launch_ms { (s.log_read, s.log_said) = (at, said); }).filter(|s| s.launch_ms == x.launch_ms) else { return };
+    for line in new {
+        failed(ctx, &x, line);
+    }
 }
 
 /// The master's own launch on the Mac, detached in its own process group.
@@ -520,6 +662,13 @@ fn mac_launch(ctx: &Ctx, x: &Show) -> Result<(u32, String), String> {
     let err = out.try_clone().map_err(|e| e.to_string())?;
     let mut cmd = makepad_remote::group::command(cargo());
     cmd.args(["run", "--profile", "host", "-p", "makepad-run", "--bin", "makepad", "--", "run", &x.app]).current_dir(&ctx.repo).env("CARGO_INCREMENTAL", "0").stdin(std::process::Stdio::null()).stdout(out).stderr(err);
+    if !x.args.is_empty() {
+        cmd.arg("--").args(&x.args);
+    }
+    // the Mac's own settings for the app (`~/.makepad/apps/<id>.conf`, jit.env), as the dock's launch
+    if let Some(app) = makepad_app_registry::apps().iter().find(|a| a.package == x.app) {
+        cmd.envs(makepad_app_registry::machine::launch_env(app.id, true));
+    }
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let child = cmd.spawn().map_err(|e| format!("cargo: {e}"))?;
@@ -549,7 +698,7 @@ fn quest_launch(ctx: &Ctx, x: &Show) -> Result<(u32, String), String> {
             Err(format!("{what} failed (log {})", path.display()))
         }
     };
-    set(ctx, &x.id, |s| s.note = "building the Quest JIT host on the Mac".into());
+    try_set(ctx, &x.id, |s| s.note = "building the Quest JIT host on the Mac".into())?;
     let mut build = makepad_remote::group::command("nice");
     build.args(["-n", "10"]).arg(cargo()).args(["run", "--release", "-p", "cargo-makepad", "--", "android", "--abi=aarch64", "build-host", "--app", &x.app, "--devhub-name=quest", "--quest"]).current_dir(&ctx.repo).env("CARGO_INCREMENTAL", "0").env("CARGO_BUILD_JOBS", "4");
     run(&mut build, "the Quest build")?;
@@ -560,23 +709,54 @@ fn quest_launch(ctx: &Ctx, x: &Show) -> Result<(u32, String), String> {
     Ok((0, path.to_string_lossy().into_owned()))
 }
 
-/// Stops a show by its recorded pid (the Mac: its process group; a node or the Quest: the
-/// device's own stop).
-/// Tells the show's JIT its pin.
-fn pin_jit(ctx: &Ctx, x: &Show, on: bool) -> Result<(), String> {
-    let at = if x.device == "mac" { ctx.machine.as_str() } else { x.device.as_str() };
-    let mut said = String::new();
-    makepad_remote::hub::ask(&ctl(), &format!("{at}:{}", x.pid), "cmd", "", if on { "pin on" } else { "pin off" }, &mut |l| {
-        said = l.to_string();
+/// One inspect command in the show's JIT, its answer lines. The Mac's own by its socket: the hub
+/// routes to other machines' apps (`mac:<pid>` read "unknown host `mac`").
+fn ask_jit(x: &Show, line: &str) -> Result<Vec<String>, String> {
+    if x.device == "mac" {
+        let jit = makepad_remote::link::Client::connect(&x.pid.to_string()).map_err(|e| e.to_string())?;
+        return jit.cmd(line).map_err(|e| e.to_string())?.map(|l| l.map_err(|e| e.to_string())).collect();
+    }
+    let mut out = Vec::new();
+    makepad_remote::hub::ask(&ctl(), &format!("{}:{}", x.device, x.pid), "cmd", "", line, &mut |l| {
+        out.push(l.to_string());
         true
     })?;
-    if said.contains("\"pinned\"") {
+    Ok(out)
+}
+
+/// Tells the show's JIT its pin.
+fn pin_jit(x: &Show, on: bool) -> Result<(), String> {
+    let said = ask_jit(x, if on { "pin on" } else { "pin off" })?;
+    if said.iter().any(|l| l.contains("\"pinned\"")) {
         Ok(())
     } else {
-        Err(format!("its JIT does not take a pin ({})", crate::proto::clean(&said, 160)))
+        Err(format!("its JIT does not take a pin ({})", crate::proto::clean(&said.join(" "), 160)))
     }
 }
 
+/// The show's JIT holds a pin.
+fn jit_pinned(x: &Show) -> bool {
+    ask_jit(x, "pin").is_ok_and(|l| l.iter().any(|l| l.contains("\"pinned\":true")))
+}
+
+/// Pins or unpins a show that is there.
+fn pin_show(ctx: &Ctx, x: &Show, on: bool) -> Result<String, String> {
+    if x.pid > 0 {
+        pin_jit(x, on)?;
+    }
+    let shown = try_set(ctx, &x.id, |s| s.pinned = on)?;
+    event(ctx, Sev::Info, format!("show {} on {}: {}", x.app, x.device, if on { "pinned: landings go on, it stays as it is until the unpin" } else { "unpinned: it catches up" }), shown.as_ref());
+    Ok(format!("{{\"app\":{},\"device\":{},\"pinned\":{on}}}", json_str(&x.app), json_str(&x.device)))
+}
+
+/// A registry name (`calculator`, what the dock calls it) as its package
+/// (`makepad-app-calculator`): `makepad run` takes packages.
+fn package_of(app: &str) -> String {
+    makepad_app_registry::find(app).map_or(app.to_string(), |a| a.package.to_string())
+}
+
+/// Stops a show by its recorded pid (the Mac: its process group; a node or the Quest: the
+/// device's own stop).
 fn stop(x: &Show) -> Result<(), String> {
     match x.device.as_str() {
         "mac" if x.pid > 0 => {
@@ -610,6 +790,18 @@ pub fn on_record(ctx: &Ctx, r: &Record) {
     let dev = if r.machine == ctx.machine { "mac".to_string() } else { r.machine.clone() };
     let hit = ctx.store.read(|d| d.shows.iter().find(|x| matches!(x.state.as_str(), "running" | "paused") && x.device == dev && (x.pid == r.pid || same_app(&r.app, &x.app))).cloned());
     let Some(x) = hit else { return };
+    // each record once per show, across re-execs: by its id, which names a JIT event's run, so the
+    // same event heard again (a hub or master that follows the JIT again) says nothing while a run
+    // started again in place (same pid, its seq from 1 again) does
+    let key = r.id.clone();
+    let mut fresh = false;
+    let Some(x) = set(ctx, &x.id, |s| if !s.events_said.contains(&key) {
+        fresh = true;
+        remember(&mut s.events_said, key.clone());
+    }) else { return };
+    if !fresh {
+        return;
+    }
     if r.kind != "panic" {
         // a hang, a deadlock, a patch or script error: the app runs on; said, not a state
         return failed(ctx, &x, r.line.clone());
@@ -639,34 +831,51 @@ pub fn serve(ctx: &Arc<Ctx>, line: &str) -> Result<String, String> {
             if app.is_empty() || !app.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
                 return Err(format!("show: `{app}` is not a package name"));
             }
-            let dev = device(ctx, &s("on"))?;
+            let app = package_of(&app);
             let after: Vec<String> = v.get("after").and_then(|a| a.as_arr()).unwrap_or(&[]).iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+            // nothing starts on a device for a name no Cargo.toml has, landed or in a branch the
+            // show waits for (`show 518` started a pre-boot on the Mac)
+            if package_dir(ctx, &app, "work", "main").is_none() && !after.iter().any(|b| package_dir(ctx, &app, b, b).is_some()) {
+                let branches = if after.is_empty() { String::new() } else { format!(" or {}", after.join(", ")) };
+                return Err(format!("show: no package `{app}` at work or commercial main{branches} (an inbox event: `devhub show <its id=>`)"));
+            }
+            let dev = device(ctx, &s("on"))?;
             let cond = if after.is_empty() { Cond::None } else { super::after::parse_cond(ctx, &after.iter().map(String::as_str).collect::<Vec<_>>())? };
             let replace = v.get("replace").and_then(|x| x.as_bool()).unwrap_or(false);
             let pin = v.get("pin").and_then(|x| x.as_bool()).unwrap_or(false);
+            let args: Vec<String> = v.get("args").and_then(|a| a.as_arr()).unwrap_or(&[]).iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+            // (a node's show asks its WM's dock to launch or focus, the Quest's starts its activity:
+            // neither takes arguments)
+            if !args.is_empty() && dev != "mac" {
+                return Err(format!("show: `-- <args>` reaches an app on the Mac only, not on {dev}"));
+            }
             // one instance per app per device; a running one may hold unsaved work
             // one that ended since the last look is not running
             if let Some(old) = ctx.store.read(|d| d.shows.iter().find(|x| x.active() && x.app == app && x.device == dev && x.device == "mac" && x.state == "running").cloned()) {
                 mac_watch(ctx, &old);
             }
             if let Some(old) = ctx.store.read(|d| d.shows.iter().find(|x| x.active() && x.app == app && x.device == dev).cloned()) {
+                // (a pin leaves it running: nothing of it is at risk)
+                if matches!(old.state.as_str(), "running" | "paused") && !replace && pin && args.is_empty() {
+                    return pin_show(ctx, &old, true);
+                }
                 if matches!(old.state.as_str(), "running" | "paused") && !replace {
                     return Err(format!("{app} already runs on {dev} ({}, pid {}, {} s): it may hold unsaved work; ask the user, then `devhub show {app} --on {dev} --replace`", old.state, old.pid, wall_ms().saturating_sub(old.started_ms) / 1000));
                 }
                 if matches!(old.state.as_str(), "running" | "paused") {
                     stop(&old)?;
                 }
-                set(ctx, &old.id, |s| {
+                try_set(ctx, &old.id, |s| {
                     s.state = "replaced".into();
                     s.ended_ms = wall_ms();
-                });
+                })?;
             }
             let x = ctx.store.update(|d| {
                 d.shows_next += 1;
-                let x = Show { id: format!("V{}", d.shows_next), app: app.clone(), device: dev.clone(), state: if cond == Cond::None { "starting" } else { "waiting" }.into(), cond: cond.clone(), added_ms: wall_ms(), by: s("by"), pinned: pin, ..Default::default() };
+                let x = Show { id: format!("V{}", d.shows_next), app: app.clone(), device: dev.clone(), state: if cond == Cond::None { "starting" } else { "waiting" }.into(), cond: cond.clone(), added_ms: wall_ms(), by: s("by"), pinned: pin, args: args.clone(), ..Default::default() };
                 d.shows.push(x.clone());
                 x
-            });
+            })?;
             ctx.store.kick();
             if x.state == "starting" {
                 event(ctx, Sev::Info, format!("show {app} on {dev}: starting"), Some(&x));
@@ -682,29 +891,25 @@ pub fn serve(ctx: &Arc<Ctx>, line: &str) -> Result<String, String> {
             let mut w = rest.split_whitespace();
             let (Some(app), dev) = (w.next(), w.next().unwrap_or("mac")) else { return Err("show stop <app> [<device>]".into()) };
             let dev = device(ctx, dev)?;
-            let x = ctx.store.read(|d| d.shows.iter().find(|x| x.active() && x.app == app && x.device == dev).cloned()).ok_or_else(|| format!("{app} is not shown on {dev}"))?;
+            let app = &package_of(app);
+            let x = ctx.store.read(|d| d.shows.iter().find(|x| x.active() && x.app == *app && x.device == dev).cloned()).ok_or_else(|| format!("{app} is not shown on {dev}"))?;
             if matches!(x.state.as_str(), "running" | "paused") {
                 stop(&x)?;
             }
-            let x = set(ctx, &x.id, |s| {
+            let x = try_set(ctx, &x.id, |s| {
                 s.state = if s.state == "waiting" { "cancelled" } else { "stopped" }.into();
                 s.ended_ms = wall_ms();
-            });
+            })?;
             event(ctx, Sev::Info, format!("show {app} on {dev} stopped"), x.as_ref());
             Ok(format!("{{\"app\":{},\"device\":{},\"state\":\"stopped\"}}", json_str(app), json_str(&dev)))
         }
         "pin" => {
             let mut w = rest.split_whitespace();
             let (Some(app), Some(dev), Some(on)) = (w.next(), w.next(), w.next()) else { return Err("show pin <app> <device> on|off".into()) };
-            let on = on == "on";
             let dev = device(ctx, dev)?;
-            let x = ctx.store.read(|d| d.shows.iter().find(|x| x.active() && x.app == app && x.device == dev).cloned()).ok_or_else(|| format!("{app} is not shown on {dev}"))?;
-            if x.pid > 0 {
-                pin_jit(ctx, &x, on)?;
-            }
-            let x = set(ctx, &x.id, |s| s.pinned = on);
-            event(ctx, Sev::Info, format!("show {app} on {dev}: {}", if on { "pinned: landings go on, it stays as it is until the unpin" } else { "unpinned: it catches up" }), x.as_ref());
-            Ok(format!("{{\"app\":{},\"device\":{},\"pinned\":{on}}}", json_str(app), json_str(&dev)))
+            let app = &package_of(app);
+            let x = ctx.store.read(|d| d.shows.iter().find(|x| x.active() && x.app == *app && x.device == dev).cloned()).ok_or_else(|| format!("{app} is not shown on {dev}"))?;
+            pin_show(ctx, &x, on == "on")
         }
         "list" => {
             let all = rest == "all";
@@ -723,6 +928,23 @@ mod tests {
     use crate::lease::master::LeaseMaster;
     use crate::state::Store;
 
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_shows_process_is_reaped() {
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        CHILDREN.lock().unwrap().get_or_insert_with(HashMap::new).insert("reap-test".into(), child);
+        // no show follows it any more (stopped): once it exited, a tick waits for it
+        let t = std::time::Instant::now();
+        while CHILDREN.lock().unwrap().as_ref().is_some_and(|m| m.contains_key("reap-test")) {
+            assert!(t.elapsed() < Duration::from_secs(10), "pid {pid} was not reaped");
+            reap(&[]);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // gone, not a zombie (a zombie still answers signal 0)
+        assert!(!crate::os::pid_alive(pid), "pid {pid} is still there");
+    }
+
     #[test]
     fn a_show_waits_for_its_landing_is_one_per_device_and_stops() {
         let home = std::env::temp_dir().join(format!("devhub-show-test-{}", std::process::id()));
@@ -735,9 +957,15 @@ mod tests {
         g(&["config", "user.name", "t"]);
         g(&["commit", "-q", "--allow-empty", "-m", "base"]);
         g(&["branch", "rc-x"]);
+        std::fs::create_dir_all(repo.join("apps/foo")).unwrap();
+        std::fs::write(repo.join("apps/foo/Cargo.toml"), "[package]\nname = \"makepad-foo\"\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-q", "-m", "foo"]);
         let leases = Arc::new(LeaseMaster::new("mac", home.clone(), Arc::new(|_: &str, _: &str, _: &str| Err("no nodes".to_string())), Arc::new(|_| {}), Arc::new(|| 1), None, true));
-        let ctx = Arc::new(Ctx { store: Store::open(&home, "mac", Arc::new(|_| {})), leases, machine: "mymac".into(), monitor: crate::monitor::Monitor::start(&[]), repo: repo.clone(), home: home.clone() });
-        let add = |on: &str| serve(&ctx, &format!("show add {{\"app\":\"makepad-fab\",\"on\":\"{on}\",\"after\":[\"landed\",\"rc-x\"],\"by\":\"t\"}}"));
+        let ctx = Arc::new(Ctx { store: Store::open(&home, "mac", Arc::new(|_| 0)).unwrap(), leases, machine: "mymac".into(), monitor: crate::monitor::Monitor::start(&[]), repo: repo.clone(), home: home.clone() });
+        let add = |on: &str| serve(&ctx, &format!("show add {{\"app\":\"makepad-foo\",\"on\":\"{on}\",\"after\":[\"landed\",\"rc-x\"],\"by\":\"t\"}}"));
+        // a name no Cargo.toml has starts nothing (`devhub show 518`)
+        assert!(serve(&ctx, "show add {\"app\":\"518\",\"on\":\"mac\",\"by\":\"t\"}").unwrap_err().contains("no package `518`"));
         let r = add("mymac").unwrap();
         assert!(r.contains("\"device\":\"mac\"") && r.contains("\"state\":\"waiting\""), "{r}");
         assert!(add("nowhere").unwrap_err().contains("no device nowhere"));
@@ -749,13 +977,13 @@ mod tests {
         ctx.store.update(|d| {
             d.shows[1].state = "running".into();
             d.shows[1].pid = std::process::id();
-        });
+        }).unwrap_or_else(|e| { eprintln!("devhub state: {e}"); Default::default() });
         assert!(add("mac").unwrap_err().contains("--replace"));
         ctx.store.update(|d| {
             d.shows[1].state = "waiting".into();
             d.shows[1].pid = 0;
-        });
-        assert!(serve(&ctx, "show stop makepad-fab mac").unwrap().contains("stopped"));
+        }).unwrap_or_else(|e| { eprintln!("devhub state: {e}"); Default::default() });
+        assert!(serve(&ctx, "show stop makepad-foo mac").unwrap().contains("stopped"));
         assert_eq!(ctx.store.read(|d| d.shows[1].state.clone()), "cancelled");
         // what became of the recent ones stays listed (its outcome), not only the running ones
         let list = serve(&ctx, "show list").unwrap();
@@ -763,16 +991,71 @@ mod tests {
         ctx.store.update(|d| d.shows.iter_mut().for_each(|x| {
             x.ended_ms = 1;
             x.added_ms = 1;
-        }));
+        })).unwrap_or_else(|e| { eprintln!("devhub state: {e}"); Default::default() });
         assert_eq!(serve(&ctx, "show list").unwrap(), "[]");
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// A shown app's failure is said once, across a re-exec of the master between two looks (each
+    /// landing re-execs it): what its log was read to and what was said, of the log and of the
+    /// app's records, is in the show's record, not in the process. A panic of the morning was said
+    /// again at about 20 shows after (11-06).
+    #[test]
+    fn a_failure_is_said_once_across_a_master_re_exec() {
+        use std::io::Write as _;
+        let base = std::env::temp_dir().join(format!("devhub-show-reexec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let log = base.join("app.log");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&log, "starting\nthread 'main' panicked at src/a.rs:10:5:\nboom\n").unwrap();
+        let said: Arc<Mutex<Vec<String>>> = Default::default();
+        // a master on `home`: its state as the disk holds it
+        let master = |home: &std::path::Path| {
+            let said = said.clone();
+            let store = Store::open(home, "mac", Arc::new(move |r: Record| { if r.kind == "show_failed" { said.lock().unwrap().push(r.line.clone()); } 0 })).unwrap();
+            let leases = Arc::new(LeaseMaster::new("mac", home.to_path_buf(), Arc::new(|_: &str, _: &str, _: &str| Err("no nodes".to_string())), Arc::new(|_| {}), Arc::new(|| 1), None, true));
+            Arc::new(Ctx { store, leases, machine: "mymac".into(), monitor: crate::monitor::Monitor::start(&[]), repo: home.to_path_buf(), home: home.to_path_buf() })
+        };
+        let count = || said.lock().unwrap().len();
+        let first = base.join("first");
+        let ctx = master(&first);
+        ctx.store.update(|d| d.shows.push(Show { id: "V1".into(), app: "makepad-foo".into(), device: "mac".into(), state: "running".into(), pid: 4242, log: log.to_string_lossy().into(), launch_ms: 1, ..Default::default() })).unwrap();
+        let show = |ctx: &Ctx| ctx.store.read(|d| d.shows[0].clone());
+        let record = |seq: u64, clock: u64| Record { id: format!("mymac.4242.{seq}.{clock}"), at_ms: 1, machine: "mymac".into(), app: "makepad-foo".into(), pid: 4242, kind: "scripterr".into(), sev: Sev::Warn, line: "scripterr: x not found".into(), detail: format!("{{\"event\":\"scripterr\",\"seq\":{seq},\"pid\":4242,\"at_ms\":{clock},\"error\":\"x not found\"}}"), untrusted: false };
+        watch_log(&ctx, &show(&ctx));
+        on_record(&ctx, &record(1, 5120));
+        assert_eq!(count(), 2, "{:?}", said.lock().unwrap());
+        // (the record holds it: no process keeps it)
+        let x = show(&ctx);
+        assert_eq!((x.log_read, x.log_said.len(), x.events_said.as_slice()), (std::fs::metadata(&log).unwrap().len(), 1, &["mymac.4242.1.5120".to_string()][..]));
+        // the re-exec: a new process, with nothing but what the disk holds
+        drop(ctx);
+        let second = base.join("second");
+        std::fs::create_dir_all(&second).unwrap();
+        for f in ["state.json", "state.journal"] {
+            if first.join(f).exists() { std::fs::copy(first.join(f), second.join(f)).unwrap(); }
+        }
+        let ctx = master(&second);
+        watch_log(&ctx, &show(&ctx));
+        on_record(&ctx, &record(1, 5120));
+        assert_eq!(count(), 2, "nothing is said again: {:?}", said.lock().unwrap());
+        // the same kind of line again (numbers apart) stays quiet; a new kind and a run started
+        // again in place (its seq from 1 again, on a new clock) are said
+        std::fs::OpenOptions::new().append(true).open(&log).unwrap().write_all(b"thread 'main' panicked at src/a.rs:12:9:\nerror: a new kind\n").unwrap();
+        watch_log(&ctx, &show(&ctx));
+        on_record(&ctx, &record(1, 830));
+        assert_eq!(count(), 4, "{:?}", said.lock().unwrap());
+        assert!(said.lock().unwrap()[2].contains("error: a new kind"), "{:?}", said.lock().unwrap());
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn app_names_match_their_packages() {
-        assert!(super::same_app("fab", "makepad-fab"));
+        assert!(super::same_app("foo", "makepad-foo"));
         assert!(super::same_app("makepad-app-calculator", "makepad-app-calculator"));
         assert!(super::same_app("calculator", "makepad-app-calculator"));
-        assert!(!super::same_app("stage", "makepad-fab"));
+        assert!(!super::same_app("bar", "makepad-foo"));
     }
 }
+

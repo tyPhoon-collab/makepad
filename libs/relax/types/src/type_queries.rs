@@ -264,7 +264,7 @@ impl QueryCx {
         // (lead decision 52 R1); nothing reads the retired cache, so it is freed off the
         // edit's critical path. (rustc starts each incremental session with an empty cache.)
         if retired.len() > 4096 {
-            let _ = std::thread::Builder::new().name("run-solver-free".into()).spawn(move || drop(retired));
+            let _ = crate::run_threads::spawn("run-solver-free", move || drop(retired));
         }
     }
 
@@ -283,7 +283,7 @@ impl QueryCx {
         values += self.codegen_select.retire(&|_, _| false);
         let retired = std::mem::take(&mut self.solver);
         let entries = retired.cached_len();
-        let _ = std::thread::Builder::new().name("run-solver-free".into()).spawn(move || drop(retired));
+        let _ = crate::run_threads::spawn("run-solver-free", move || drop(retired));
         (values, entries)
     }
 
@@ -392,20 +392,12 @@ impl QueryCx {
 
     // Lead design rounds 47-48. Nightly resolve_bound_vars.rs:253-285,430-442
     // traverses whole owners. File-relative nodes require the entire edited file
-    // to change, including unchanged siblings; declarations keep their own input.
+    // to change, including unchanged siblings: an owner without a body too (a struct,
+    // an impl, a trait), whose lifetime uses are keyed by its file's nodes and positions,
+    // which an edit of any body in the file renumbers (an edited version is parsed whole).
     fn read_owner(&self, prog: &Program, owner: DefId) -> Result<(), QueryError> {
         self.read_def_declarations(prog, owner)?;
-        let def = prog.def(owner);
-        let pf = &prog.files[def.file as usize];
-        let has_body = match def.kind {
-            crate::program::DefKind::AnonConst | crate::program::DefKind::Closure => true,
-            _ => match pf.ast.item(def.item).kind {
-                crate::ast::ItemKind::Fn(sig, body, _) => body.is_some() || pf.ast.fn_sig(sig).lazy_body.is_some(),
-                crate::ast::ItemKind::Const(_, body) | crate::ast::ItemKind::Static(_, _, body) => body.is_some(),
-                _ => false,
-            },
-        };
-        if has_body { self.engine.input(FILE_BODIES, def.file)?; }
+        self.engine.input(FILE_BODIES, prog.def(owner).file)?;
         Ok(())
     }
 
@@ -589,24 +581,41 @@ impl Providers<'_> {
         let q = &self.tcx.queries;
         let (_, body) = q.typeck.get(&q.engine, def, &mut |def| {
             q.read_owner(self.prog, def)?;
-            let mark = crate::program::missing_mark();
-            let mut body = crate::typeck::check_fn(self.prog, self.tcx, def);
-            // run mode (no lints: `makepad run` / `test` / `live`): the unsafety and impl-soundness
-            // errors `makepad check` reports are the body's errors too, for the crates the borrow
-            // checker covers -- safe code may not dereference raw pointers or forge Send/Sync.
-            // (Errors, not a stub body: closures' layouts still read its tables.)
-            if body.errors.is_empty() && !crate::lint::enabled() && crate::borrowck::event::admit(self.prog, self.prog.def(def).krate) {
-                let mut errors: Vec<String> = crate::unsafety::run_crate_impl_errors(self.prog, self.tcx, self.prog.def(def).krate).to_vec();
-                errors.extend(crate::unsafety::run_body_errors(self.prog, self.tcx, &body));
-                for e in errors { body.errors.push(e); }
-            }
-            if !body.errors.is_empty() { body.deferred_misses = crate::program::missing_since(mark).into(); }
-            Ok((self.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), std::sync::Arc::new(body)))
+            test_typeck_panic(self.prog, def);
+            Ok((self.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), std::sync::Arc::new(self.check_body(def))))
         }, &|id| self.force(id))?;
         // the post-boot loader's misses travel with the cached failure (Body::deferred_misses)
         if !body.deferred_misses.is_empty() { crate::program::note_misses(&body.deferred_misses); }
         if crate::memstat::enabled() { note_typeck_read(def); }
         Ok(body)
+    }
+
+    /// typeck's value of `def` when the table holds it now; else the provider's work done here
+    /// without storing the body (makepad run's background check of the bodies no build asked
+    /// for: a whole program's bodies held at once would be gigabytes). The same body and errors
+    /// as `typeck`.
+    fn typeck_unstored(&self, def: DefId) -> std::sync::Arc<crate::typeck::Body> {
+        let q = &self.tcx.queries;
+        if let Some((_, body)) = q.typeck.peek(&q.engine, &def) { return body; }
+        std::sync::Arc::new(self.check_body(def))
+    }
+
+    /// The typeck provider's work for `def`.
+    fn check_body(&self, def: DefId) -> crate::typeck::Body {
+        BODIES_CHECKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mark = crate::program::missing_mark();
+        let mut body = crate::typeck::check_fn(self.prog, self.tcx, def);
+        // run mode (no lints: `makepad run` / `test` / `live`): the unsafety and impl-soundness
+        // errors `makepad check` reports are the body's errors too, for the crates the borrow
+        // checker covers -- safe code may not dereference raw pointers or forge Send/Sync.
+        // (Errors, not a stub body: closures' layouts still read its tables.)
+        if body.errors.is_empty() && !crate::lint::enabled() && crate::borrowck::event::admit(self.prog, self.prog.def(def).krate) {
+            let mut errors: Vec<String> = crate::unsafety::run_crate_impl_errors(self.prog, self.tcx, self.prog.def(def).krate).to_vec();
+            errors.extend(crate::unsafety::run_body_errors(self.prog, self.tcx, &body));
+            for e in errors { body.errors.push(e); }
+        }
+        if !body.errors.is_empty() { body.deferred_misses = crate::program::missing_since(mark).into(); }
+        body
     }
 
     fn const_eval_resolve(&self, key: ConstEvalKey) -> Result<EvalToValTreeResult, QueryError> {
@@ -617,12 +626,14 @@ impl Providers<'_> {
             let value = crate::const_eval::eval_to_valtree(self.tcx, self.prog, &key);
             // a failure the evaluator already reported (its own "evaluation panicked" ..) is reported
             // once; one it left unreported (an overflow found while lowering) gets the generic E0080
-            if let Err(ErrorHandled::Reported(error)) = &value {
-                if matches!(error, crate::const_eval::ValTreeCreationError::ErrorHandled(_)) && crate::infer::diagnostics::DiagCtxt::thread_emitted() == emitted {
+            if let Err(ErrorHandled::Reported(crate::const_eval::ValTreeCreationError::ErrorHandled(why))) = &value {
+                if crate::infer::diagnostics::DiagCtxt::thread_emitted() == emitted {
                     let d = self.prog.def(key.def);
+                    // (the evaluator's reason, never its Debug form)
+                    let what = if *why == "constant evaluation failed" { String::new() } else { format!(": {why}") };
                     self.tcx.dcx.report(crate::next_solver::fulfill::ObligationCause {
                         body_id: key.def, span: self.prog.files[d.file as usize].ast.item(d.item).lo,
-                    }, format!("E0080: constant evaluation failed: {error:?}"));
+                    }, format!("E0080: constant evaluation failed{what}"));
                 }
             }
             Ok(value)
@@ -725,10 +736,25 @@ impl Providers<'_> {
     }
 }
 
+/// Bodies type-checked so far (the typeck provider's runs, stored or not): makepad run's account
+/// of what its startup checked.
+pub static BODIES_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// rustc_middle ty/util.rs typeck_root_def_id (is_typeck_child): a closure or an inline const
+/// (`const { .. }`) is type-checked with the body that holds it, never on its own: an inline
+/// const's type is that body's, never fed, so its own typeck failed `anonymous const type`.
+pub fn typeck_root_def_id(prog: &Program, mut def: DefId) -> DefId {
+    while prog.def(def).kind == crate::program::DefKind::Closure
+        || matches!(prog.def_id_to_node_id.get(&def), Some((_, relax_front::def_collector::NodeId::InlineConst(_)))) {
+        def = prog.def(def).parent;
+    }
+    def
+}
+
 impl Tcx {
     /// rustc_hir_typeck/src/lib.rs:84-101: closures share their typeck root.
-    pub fn typeck(&self, prog: &Program, mut def: DefId) -> std::sync::Arc<crate::typeck::Body> {
-        while prog.def(def).kind == crate::program::DefKind::Closure { def = prog.def(def).parent; }
+    pub fn typeck(&self, prog: &Program, def: DefId) -> std::sync::Arc<crate::typeck::Body> {
+        let def = typeck_root_def_id(prog, def);
         match (Providers { tcx: self, prog }).typeck(def) {
             Ok(body) => body,
             // rustc_query_system cycle_error: E0391, the query's error value
@@ -742,6 +768,19 @@ impl Tcx {
             }
             Err(e) => panic!("typeck query: {e:?}"),
         }
+    }
+
+    /// `typeck` for a caller that wants only the verdict: the stored body when the query holds
+    /// one, else the check done without storing its body (Providers::typeck_unstored).
+    pub fn typeck_unstored(&self, prog: &Program, def: DefId) -> std::sync::Arc<crate::typeck::Body> {
+        let def = typeck_root_def_id(prog, def);
+        (Providers { tcx: self, prog }).typeck_unstored(def)
+    }
+
+    /// typeck's value of `def` when the query holds it now (nothing is checked).
+    pub fn typeck_peek(&self, prog: &Program, def: DefId) -> Option<std::sync::Arc<crate::typeck::Body>> {
+        let def = typeck_root_def_id(prog, def);
+        self.queries.typeck.peek(&self.queries.engine, &def).map(|(_, b)| b)
     }
 
     /// Nightly mir/interpret/queries.rs:58,90: retain the environment and full
@@ -781,8 +820,42 @@ impl Tcx {
         }
     }
 
+    /// rustc_middle/src/ty/util.rs:1337: no query in the simple cases (`needs_drop_components`);
+    /// a single component is the query's key, normalized with its regions erased.
     pub fn needs_drop(&self, prog: &Program, env: TypingEnv, ty: TyId) -> bool {
-        Providers { tcx: self, prog }.needs_drop(TypeKey { env, ty }).expect("needs_drop query")
+        let mut parts = (0usize, ty);
+        if self.needs_drop_components(ty, &mut parts).is_err() { return true; }
+        let query_ty = match parts { (0, _) => return false, (1, c) => c, _ => ty };
+        let query_ty = self.try_normalize_erasing_regions(prog, env, query_ty).unwrap_or_else(|_| self.tys.erase_regions(query_ty));
+        Providers { tcx: self, prog }.needs_drop(TypeKey { env, ty: query_ty }).expect("needs_drop query")
+    }
+
+    /// util.rs:1533 `needs_drop_components` as a count and the first component (`needs_drop` only
+    /// asks for none, one or more): Err = always requires drop.
+    fn needs_drop_components(&self, ty: TyId, out: &mut (usize, TyId)) -> Result<(), ()> {
+        let add = |n: usize, first: TyId, out: &mut (usize, TyId)| { if out.0 == 0 { out.1 = first; } out.0 += n; };
+        match *self.tys.kind(ty) {
+            TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) | TyKind::Never | TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::Char
+            | TyKind::Ptr(..) | TyKind::Ref(..) | TyKind::Str | TyKind::Foreign(_) => Ok(()),
+            TyKind::Dyn(..) | TyKind::Error => Err(()),
+            TyKind::Slice(e) => self.needs_drop_components(e, out),
+            TyKind::Array(e, len) => {
+                let mut elem = (0usize, e);
+                let res = self.needs_drop_components(e, &mut elem);
+                if res.is_ok() && elem.0 == 0 { return Ok(()); }
+                match len.try_to_target_usize(&self.tys) {
+                    // arrays of size zero don't need drop, even if their element type does
+                    Some(0) => Ok(()),
+                    Some(_) => { res?; add(elem.0, elem.1, out); Ok(()) }
+                    None => { add(1, ty, out); Ok(()) }
+                }
+            }
+            TyKind::Tuple(fields) => {
+                for &f in self.tys.list(fields) { self.needs_drop_components(f, out)?; }
+                Ok(())
+            }
+            _ => { add(1, ty, out); Ok(()) }
+        }
     }
 
     pub fn is_freeze(&self, prog: &Program, env: TypingEnv, ty: TyId) -> bool {
@@ -809,9 +882,19 @@ impl Tcx {
     /// rustc_middle/src/ty/normalize_erasing_regions.rs:140-149. `value` is
     /// one function binder's payload; nested binders keep their own regions.
     pub fn normalize_erasing_late_bound_regions(&self, prog: &Program, env: TypingEnv, value: TyId) -> TyId {
+        self.normalize_erasing_regions(prog, env, self.instantiate_fn_bound_regions_with_erased(value))
+    }
+
+    /// The fallible form, with the function's region binder instantiated first.
+    pub fn try_normalize_erasing_late_bound_regions(&self, prog: &Program, env: TypingEnv, value: TyId) -> Result<TyId, crate::next_solver::NoSolution> {
+        self.try_normalize_erasing_regions(prog, env, self.instantiate_fn_bound_regions_with_erased(value))
+    }
+
+    /// Erase one function region binder without normalizing its declared types.
+    pub(crate) fn instantiate_fn_bound_regions_with_erased(&self, value: TyId) -> TyId {
         let mut replacer = crate::types::fold::BoundVarReplacer::new(
             |_| crate::types::RegionId::ERASED, |_| panic!("bound type in a function region binder"));
-        self.normalize_erasing_regions(prog, env, replacer.instantiate(&self.tys, value))
+        replacer.instantiate(&self.tys, value)
     }
 
     /// normalize_erasing_regions.rs:95-120: erase before keying; alias-free types bypass
@@ -822,6 +905,22 @@ impl Tcx {
         Providers { tcx: self, prog }.try_normalize_generic_arg_after_erasing_regions(TypeKey { env, ty }).expect("normalize_erasing_regions query")
     }
 
+}
+
+/// MAKEPAD_RUN_TEST_TYPECK_PANIC=<fn name>[:gandalf]: `typeck`'s provider panics for that body, on
+/// the background checker's thread with `:gandalf`, else on every thread (compiler
+/// lazy_reload_tests: a panic in a background check stays in that check).
+fn test_typeck_panic(prog: &Program, def: DefId) {
+    static WANT: std::sync::OnceLock<Option<(String, bool)>> = std::sync::OnceLock::new();
+    let want = WANT.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_TEST_TYPECK_PANIC").ok().filter(|w| !w.is_empty()).map(|w| match w.strip_suffix(":gandalf") {
+        Some(name) => (name.to_string(), true),
+        None => (w, false),
+    })));
+    if let Some((name, only_gandalf)) = want {
+        if prog.name(def) == name.as_str() && (!*only_gandalf || std::thread::current().name() == Some("gandalf")) {
+            panic!("MAKEPAD_RUN_TEST_TYPECK_PANIC: forced panic type-checking `{name}`");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1261,4 +1360,11 @@ impl Tcx {
             providers.crate_inherent_impls_overlap_check(DefId(krate)).expect("inherent coherence query");
         }
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&TYPECK_READS, relax_session::sync::Mutex::new(None));
+    reset(&BODIES_CHECKED, std::sync::atomic::AtomicU64::new(0));
 }

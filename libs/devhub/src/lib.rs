@@ -20,11 +20,13 @@ macro_rules! print {
 }
 
 pub mod proto;
-pub mod conf;
 pub mod procinfo;
+pub mod heap;
+pub mod held;
 pub mod os;
 pub mod embed;
 pub mod inbox;
+pub mod hot;
 pub mod local;
 pub mod node;
 pub mod master;
@@ -32,15 +34,26 @@ pub mod cli;
 pub mod sync;
 pub mod cluster;
 pub mod trust;
-pub mod tray_glyph;
 pub mod glance;
 pub mod explorer;
 pub mod top;
 pub mod lease;
 pub mod land;
+pub mod private_check;
+pub mod ci_merge;
+pub mod git_exec;
+pub mod gitread;
 pub mod jitcache;
+mod jit_misses;
 pub mod state;
+pub mod testlog;
+#[cfg(test)]
+mod testenv;
 #[cfg(feature = "checkout")]
 pub mod monitor;
 #[cfg(feature = "checkout")]
 pub mod orch;
+#[cfg(feature = "checkout")]
+pub mod gateproof;
+#[cfg(feature = "checkout")]
+pub mod bucket;

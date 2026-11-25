@@ -6,7 +6,7 @@ use std::io::IsTerminal;
 
 /// The word a command line starts with, for every command `makepad` knows (help pages or not).
 pub const COMMANDS: &[&str] = &[
-    "run", "app", "fetch", "export", "pack-src", "inspect", "devhub", "observe", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition",
+    "run", "app", "fetch", "export", "pack-src", "inspect", "devhub", "observe", "ci", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition",
     "parse", "resolve", "file", "std-surface", "lex", "hub", "remote-relay", "remote", "help",
 ];
 
@@ -120,11 +120,12 @@ fn main_page(st: &Style) -> String {
     p.row("run <package>", "Run an app from this workspace");
     p.row("run <git-url> <package>", "Run an app straight from a git repository");
     p.row("run --src <store> <package>", "Run an app from a packed source archive (no checkout)");
-    p.row("app <id>", "Run an app the runner set up (its launch record; macOS: from its own .app)");
+    p.row("app [--home <dir>] <id>", "Run an app the runner set up (its launch record; macOS: from its own .app)");
     p.row("fetch <git-url>", "Fetch a repository into the local store");
     p.row("export <git-url> <folder>", "Write a repository's files (and the app's edits) into a folder");
     p.row("pack-src <out> <package>...", "Pack the sources a run of these packages reads into one store");
     p.row("inspect <app> <question>", "Ask a running app about itself (hangs, stacks, events)");
+    p.row("ci <status|run|seed>", "Committed CI proofs: local status and dirty units over the pool");
     p.row("devhub <stream|ls|inspect>", "Every JIT on the LAN, through the local devhub (also `observe`)");
     p.row("hub | remote-relay | remote", "Reach apps on other machines (see makepad help inspect)");
     p.row("check <package>", "Type- and borrow-check without running");
@@ -190,7 +191,7 @@ fn pack_src_page(st: &Style) -> String {
     let mut p = Page::new(st, 36);
     title(&mut p, "pack the sources of apps into one store");
     p.blank();
-    p.usage("makepad pack-src [--target <triple>] <out.store> <package> [flags] [<package> [flags]]...");
+    p.usage("makepad pack-src [--target <triple>] [--fonts <manifest>] <out.store> <package> [flags] [<package> [flags]]...");
     p.blank();
     p.text("Runs `makepad check` of each package cold, records every file the front end");
     p.text("reads (the crate graph and cfg of --target, build scripts included), adds the");
@@ -211,11 +212,13 @@ fn export_page(st: &Style) -> String {
     title(&mut p, "export a working tree");
     p.blank();
     p.usage("makepad export <git-url>[#ref] [--mount <dir>=<git-url>[#ref]]... [--cached] <folder>");
+    p.usage("makepad export --mounted <folder>");
     p.blank();
     p.text("Writes the repositories' files into <folder> (each mounted one at its");
     p.text("folder), then the files of $MAKEPAD_RUN_EDITS over them: the tree a run of");
     p.text("the same spec reads, for a native build. Unchanged files are not rewritten;");
-    p.text("files an earlier export wrote and this one does not are removed.");
+    p.text("files an earlier export wrote and this one does not are removed. --mounted");
+    p.text("writes out what this run's own virtual workspace has mounted.");
     p.out
 }
 
@@ -247,6 +250,7 @@ fn check_page(st: &Style) -> String {
     p.section("Options:");
     p.row("--json", "One JSON object per diagnostic, then a summary");
     p.row("--workspace", "Check every workspace crate the package reaches (platform, widgets, ...)");
+    p.row("--also=<pkg,..>", "Also check these packages' crates as this package's build compiles them (its features)");
     p.row("--serve", "Start (or use) the warm check server");
     p.row("--no-serve", "Never use the check server");
     p.row("--watch", "Re-check what each edit invalidates");
@@ -277,9 +281,15 @@ fn test_page(st: &Style) -> String {
     title(&mut p, "run tests");
     p.blank();
     p.usage("makepad test <file.rs> [filter]");
+    p.usage("makepad test <package> [--lib|--bins|--tests] [-- test arguments]");
     p.blank();
     p.text("Runs the crate's tests in-process; the optional filter is passed to the");
     p.text("test harness.");
+    p.usage("makepad test --live <package> [--lib | --test <name>] [-- <test args>]");
+    p.text("Keeps one target warm (default --lib); body edits rerun tests that entered the changed functions, including inlinees.");
+    p.text("Non-body edits, unknown reach or changed unattributed code rerun all; the verdict says why.");
+    p.text("Each run prints testverdict; makepad inspect <pid> watch on=testverdict follows its JSON verdicts.");
+    p.text("Hot-load failures restart the test process; only the replacement tests give a verdict.");
     p.out
 }
 
@@ -339,7 +349,7 @@ fn inspect_page(st: &Style) -> String {
     let mut p = Page::new(st, 34);
     title(&mut p, "ask a running app about itself");
     p.blank();
-    p.usage("makepad inspect <pid|app|all|list> <command> [k=v]...");
+    p.usage("makepad inspect <pid|list> <command> [k=v]...");
     p.blank();
     p.text("Every `makepad run` listens on a local socket. Answers are JSON lines,");
     p.text("pre-analysed and bounded, each starting with what was measured.");
@@ -350,12 +360,14 @@ fn inspect_page(st: &Style) -> String {
     p.row("threads | stacks | waits", "Threads, symbolised stacks, waits");
     p.row("panics | resume <id> panic", "Parked panics");
     p.row("help schema", "Tool definition for agents");
-    p.text("`all` covers every running app, also ones started later.");
+    p.text("At a terminal, or for the apps of your own lease, an app's name works in place of");
+    p.text("its pid, and `all` covers every such app, also ones started later. Anything else is");
+    p.text("refused and says which pid it would have reached: an agent names the pid.");
     p.section("Other machines:");
-    p.row("<host>:<app|pid> <command>", "Ask an app on a host of hosts.toml (via the hub)");
+    p.row("<host>:<pid> <command>", "Ask an app on a host of hosts.toml (via the hub)");
     p.row("<host>:list", "That host's running apps");
     p.row("<host>:session launch <app>", "Start a hidden session there (kill <pid> ends it, also after the hub restarted)");
-    p.row("<host>:session relaunch <pid>", "Restart its app domain, keeping the window and GPU device");
+    p.row("<host>:session relaunch <pid>", "Restart its app (a fresh process; an app that restarts itself keeps its state)");
     p.row("hosts", "Registry, link state and round trip");
     p.row("all:list", "Apps here and on every host");
     p.text("Hosts are added with `makepad remote add <name> --ssh user@host` or paired with");
@@ -383,6 +395,20 @@ fn observe_page(st: &Style) -> String {
     p.out
 }
 
+fn ci_page(st: &Style) -> String {
+    let mut p = Page::new(st, 40);
+    title(&mut p, "committed CI proofs for this checkout");
+    p.usage("makepad ci <status|run|seed|sweep|plan|stop>");
+    p.row("status [--json]", "Dirty apps and test crates, then the master's gate run and active sweep when reachable");
+    p.row("run", "Run dirty units over the master's pool; successful proofs return to this checkout");
+    p.row("seed", "Import the master's passing history as a proof hand-in to the landing train");
+    p.row("sweep [<work> <main>]", "Start the full sweep in the background alongside the gate");
+    p.row("plan [<work> <main>] [--sweep]", "Show planned shards, boxes and estimates");
+    p.row("stop [--sweep]", "Stop the gate, or the sweep with --sweep; running shards finish");
+    p.text("Each crate keeps its proofs in ci.toml. Commit returned proofs with your lane; on work the train commits them.");
+    p.out
+}
+
 /// The page for `makepad help [command]`; None for a word that is no command.
 fn page(st: &Style, cmd: Option<&str>) -> Option<String> {
     Some(match cmd {
@@ -393,6 +419,7 @@ fn page(st: &Style, cmd: Option<&str>) -> Option<String> {
         Some("pack-src") => pack_src_page(st),
         Some("inspect") => inspect_page(st),
         Some("devhub" | "observe") => observe_page(st),
+        Some("ci") => ci_page(st),
         Some("check") => check_page(st),
         Some("selftest") => selftest_page(st),
         Some("test") => test_page(st),

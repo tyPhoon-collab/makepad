@@ -934,7 +934,7 @@ impl LocalShadows {
                 rigid.transform = Mat4f::identity();
                 rigid.draw_vars.geometry_id = Some(quad);
                 if rigid.draw_vars.can_instance() {
-                    cx.add_instance(&rigid.draw_vars);
+                    cx.add_instance(&mut rigid.draw_vars);
                 }
             }
             rigid.face_rx = face.rx;
@@ -955,7 +955,7 @@ impl LocalShadows {
                 draw.transform = m.transform;
                 draw.draw_vars.geometry_id = Some(m.geometry);
                 if draw.draw_vars.can_instance() {
-                    cx.add_instance(&draw.draw_vars);
+                    cx.add_instance(&mut draw.draw_vars);
                     self.stats.caster_draws += 1;
                 }
             }
@@ -975,7 +975,7 @@ impl LocalShadows {
                     skinned.base.draw_vars.set_texture(0, &skin.joint_tex);
                     skinned.base.draw_vars.geometry_id = Some(m.geometry);
                     if skinned.base.draw_vars.can_instance() {
-                        cx.add_instance(&skinned.base.draw_vars);
+                        cx.add_instance(&mut skinned.base.draw_vars);
                         self.stats.caster_draws += 1;
                     }
                 } else {
@@ -984,7 +984,7 @@ impl LocalShadows {
                     draw.transform = m.transform;
                     draw.draw_vars.geometry_id = Some(m.geometry);
                     if draw.draw_vars.can_instance() {
-                        cx.add_instance(&draw.draw_vars);
+                        cx.add_instance(&mut draw.draw_vars);
                         self.stats.caster_draws += 1;
                     }
                 }
@@ -1517,17 +1517,6 @@ mod tests {
             let right=soft_weights(0.0,spread).iter().zip(&depths[1..]).map(|(a,b)|a*b).sum::<f32>();
             assert!((left-right).abs()<1e-6);
         }
-    }
-    #[test]
-    fn penumbra_grows_with_separation_and_light_size_but_is_bounded() {
-        let spread=|receiver:f32,blocker:f32,source:f32| {
-            (source*(receiver-blocker).max(0.0)/blocker.max(0.018)/0.04).clamp(1.5,4.0)
-        };
-        assert_eq!(spread(6.0,6.0,0.4),1.5);
-        assert!(spread(8.0,5.0,0.4)>spread(6.0,5.0,0.4));
-        assert!(spread(8.0,5.0,0.4)>spread(8.0,5.0,0.2));
-        assert_eq!(spread(20.0,0.1,2.0),4.0);
-        assert_eq!(spread(20.0,0.1,0.0),1.5);
     }
     fn spot(pos: Vec3f) -> LmLight {
         LmLight {

@@ -16,34 +16,55 @@ pub fn default_repo() -> PathBuf {
 }
 
 /// Runs `git <args>` in `cwd` (or with `git_dir` as the repository); stdout on success.
+#[track_caller]
 pub fn git(cwd: Option<&Path>, git_dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
-    let mut cmd = makepad_remote::group::command("git");
+    let mut cmd = crate::git_exec::command();
     cmd.arg("-c").arg("core.hooksPath=/dev/null").arg("-c").arg("advice.detachedHead=false");
     if let Some(g) = git_dir {
         cmd.arg("--git-dir").arg(g);
     }
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    if let Some(d) = cwd {
+    // git reads its working directory at start: never the hub's (proto::settle_cwd)
+    if let Some(d) = cwd.or(git_dir) {
         cmd.current_dir(d);
     }
     cmd.env("GIT_TERMINAL_PROMPT", "0").env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE");
-    let out = cmd.output().map_err(|e| format!("git: {e}"))?;
+    let out = cmd.output().map_err(|e| {
+        let err = format!("git: {e}");
+        crate::lease::caps::git_failed(&err);
+        err
+    })?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
         let err = String::from_utf8_lossy(&out.stderr);
         let err: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).take(6).collect();
-        Err(format!("git {}: {}", args.first().unwrap_or(&""), err.join(" | ")))
+        let err = format!("git {}: {}", args.first().unwrap_or(&""), err.join(" | "));
+        crate::lease::caps::git_failed(&err);
+        Err(err)
     }
 }
 
 /// Whether HEAD of the worktree at `dir` has commits no ref of its repository holds (a worktree's
 /// HEAD is not a ref, so this is "work only this checkout has").
 pub fn unique_commits(dir: &Path) -> bool {
-    let refs = git(Some(dir), None, &["for-each-ref", "--format=%(objectname)"]).unwrap_or_default();
-    let mut args = vec!["rev-list", "-n", "1", "HEAD", "--not"];
-    args.extend(refs.lines().map(str::trim).filter(|s| !s.is_empty()));
-    git(Some(dir), None, &args).map_or(true, |o| !o.trim().is_empty())
+    crate::gitread::head_unreferenced(dir)
+}
+
+/// Whether everything `rev` holds is in `work`: an ancestor of it, or content-equal (merging `rev` into
+/// `work` changes no file). The merge train leaves lane tips like "Merge work into rc-x" that are no
+/// ancestor of `work` though all their content landed.
+pub fn in_work(repo: &Path, rev: &str) -> bool {
+    if git(Some(repo), None, &["merge-base", "--is-ancestor", rev, "work"]).is_ok() {
+        return true;
+    }
+    let (Ok(m), Ok(w)) = (
+        git(Some(repo), None, &["merge-tree", "--write-tree", "work", rev]),
+        git(Some(repo), None, &["rev-parse", "work^{tree}"]),
+    ) else {
+        return false; // a conflicting merge exits nonzero: content not in work
+    };
+    m.lines().next().map(str::trim) == Some(w.trim())
 }
 
 /// Tracked changes or untracked files (ignored ones do not count), apart from `except`.
@@ -177,7 +198,7 @@ pub fn infos(repo: &Path) -> Result<Vec<Info>, String> {
     let under = |p: &Path| p.starts_with(&root) || std::fs::canonicalize(p).is_ok_and(|c| c.starts_with(&root));
     for e in list.into_iter().filter(|e| under(&e.path)) {
         let lane = e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let merged = !e.head.is_empty() && git(Some(repo), None, &["merge-base", "--is-ancestor", &e.head, "work"]).is_ok();
+        let merged = !e.head.is_empty() && in_work(repo, &e.head);
         let (mut ahead, mut behind) = (0, 0);
         if let Ok(c) = git(Some(repo), None, &["rev-list", "--left-right", "--count", &format!("{}...work", e.head)]) {
             let mut w = c.split_whitespace().map(|n| n.parse().unwrap_or(0));
@@ -215,12 +236,21 @@ pub fn create(repo: &Path, lane: &str, from: &str, commercial: bool) -> Result<P
     if path.exists() {
         return Err(format!("{} exists", path.display()));
     }
+    crate::ci_merge::install_merge_driver(repo, repo)?;
+    let scan = crate::private_check::scan_in(repo);
+    crate::private_check::install_message_check(repo, &scan)?;
+    if commercial {
+        crate::ci_merge::install_merge_driver(&repo.join("apps/commercial"), repo)?;
+        crate::private_check::install_message_check(&repo.join("apps/commercial"), &scan)?;
+    }
     std::fs::create_dir_all(root_of(repo)).map_err(|e| e.to_string())?;
     let p = path.to_string_lossy().into_owned();
     git(Some(repo), None, &["worktree", "add", "-q", "-b", &format!("rc-{lane}"), &p, from])?;
+    crate::ci_merge::install_merge_driver(&path, &path)?;
     if commercial {
         let src = repo.join("apps/commercial");
         git(Some(&src), None, &["worktree", "add", "-q", "--detach", &path.join("apps/commercial").to_string_lossy(), "main"])?;
+        crate::ci_merge::install_merge_driver(&path.join("apps/commercial"), &path)?;
     }
     Ok(path)
 }
@@ -374,6 +404,38 @@ mod tests {
         let mut locked = ok.clone();
         locked.entry.locked = true;
         assert!(decide(&locked).is_err());
+    }
+
+    /// A lane tip that is no ancestor of work but whose content landed counts as in work.
+    #[test]
+    fn in_work_compares_content() {
+        let base = std::env::temp_dir().join(format!("devhub-inwork-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let g = |args: &[&str]| git(Some(&base), None, args).unwrap();
+        let c = |m: &str| g(&["-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", m]);
+        g(&["init", "-q", "-b", "work"]);
+        std::fs::write(base.join("a.txt"), "a").unwrap();
+        g(&["add", "-A"]);
+        c("one");
+        g(&["branch", "same"]);
+        g(&["branch", "other"]);
+        g(&["checkout", "-q", "same"]);
+        std::fs::write(base.join("b.txt"), "b").unwrap();
+        g(&["add", "-A"]);
+        c("same b");
+        g(&["checkout", "-q", "other"]);
+        std::fs::write(base.join("c.txt"), "c").unwrap();
+        g(&["add", "-A"]);
+        c("other c");
+        g(&["checkout", "-q", "work"]);
+        std::fs::write(base.join("b.txt"), "b").unwrap(); // the same content, another commit
+        g(&["add", "-A"]);
+        c("work b");
+        assert!(in_work(&base, "same"));
+        assert!(!in_work(&base, "other"));
+        assert!(in_work(&base, "work"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A throwaway repo in a temp dir: never the user's checkout.

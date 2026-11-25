@@ -256,6 +256,23 @@ pub enum ScriptSource {
     /// A transient body the GC reclaimed (see [`ScriptVm::eval_transient`]):
     /// its slot is reused by the next module added.
     Free,
+    /// The earlier text of a module evaluated again with other text (a live
+    /// edit's reload pass): its body now runs the new text, and the fns made
+    /// from this one were moved here with it, so they keep their own code. No
+    /// lookup of the module finds it; the GC reclaims it (it is transient)
+    /// once no fn made from it is alive.
+    Retired(ScriptMod),
+}
+
+impl ScriptSource {
+    /// The module a body's text was written as, its current text or an
+    /// earlier one: what locations in the body name.
+    pub fn written(&self) -> Option<&ScriptMod> {
+        match self {
+            Self::Mod(m) | Self::Retired(m) => Some(m),
+            _ => None,
+        }
+    }
 }
 
 pub struct ScriptBody {
@@ -318,6 +335,31 @@ impl ScriptBody {
         match &self.shown {
             Some(file) => (file.clone(), (script_mod.line.saturating_sub(1), 0)),
             None => (script_mod.file.clone(), (script_mod.line, script_mod.column)),
+        }
+    }
+
+    /// This module body's parsed text as a body of its own
+    /// ([`ScriptSource::Retired`]), taken out before the body is parsed from
+    /// other text. Transient: its scope and `me` stay while a fn made from it
+    /// is alive, as no root.
+    fn retire_text(&mut self) -> ScriptBody {
+        let ScriptSource::Mod(script_mod) = std::mem::replace(&mut self.source, ScriptSource::Free) else {
+            unreachable!("only a module's text is retired")
+        };
+        ScriptBody {
+            source: ScriptSource::Retired(script_mod),
+            effective_code: std::mem::take(&mut self.effective_code),
+            tokenizer: std::mem::take(&mut self.tokenizer),
+            parser: std::mem::take(&mut self.parser),
+            scope: ScriptObjectRef::unrooted(self.scope.as_object()),
+            me: ScriptObjectRef::unrooted(self.me.as_object()),
+            end_scope: None,
+            checkpoint: None,
+            source_len: self.source_len,
+            content_hash: self.content_hash,
+            transient: true,
+            real_file: self.real_file.clone(),
+            shown: self.shown.clone(),
         }
     }
 }
@@ -634,7 +676,7 @@ pub struct ScriptFnToken {
 /// To Relax-compiled code it is an opaque handle: the crate drops, clones and
 /// reads it (relax_api.txt ops); an empty image ([`Self::is_empty`]) stands
 /// for "no fn" where a handle crosses by value.
-#[relax_api(handle, clone)]
+#[relax_api(handle, clone, debug)]
 #[repr(transparent)]
 pub struct ScriptFnImage(Option<Box<ScriptFnImageData>>);
 
@@ -770,7 +812,7 @@ pub struct ScriptErrorLoc {
 /// source location (zero-based line and column, like [`ScriptLoc`]) and
 /// its message apart, and the text the VM has always reported it as
 /// (`file:line:col: message (origin)`), which `Display` prints.
-#[relax_api(handle, clone)]
+#[relax_api(handle, clone, debug, display)]
 #[derive(Clone)]
 pub struct ScriptErrorRecord {
     pub loc: Option<ScriptErrorLoc>,
@@ -1075,9 +1117,9 @@ impl ScriptCode {
             let text: String = chars[start..end].iter().collect();
             // Where the `fn` keyword is written (its first character).
             let (row, col) = body.tokenizer.token_start_row_col(k as u32)?;
-            let loc = match &body.source {
-                ScriptSource::Mod(script_mod) => ScriptLoc { file: body.site_file(script_mod), line: row + script_mod.line as u32, col },
-                _ => ScriptLoc { file: "generated".into(), line: row, col },
+            let loc = match body.source.written() {
+                Some(script_mod) => ScriptLoc { file: body.site_file(script_mod), line: row + script_mod.line as u32, col },
+                None => ScriptLoc { file: "generated".into(), line: row, col },
             };
             file.push(&loc.file); at.line = loc.line; at.col = loc.col;
             output.push(&text);
@@ -1163,9 +1205,9 @@ impl ScriptCode {
             }
             let text: String = chars[start..end].iter().collect();
             let (row, col) = body.tokenizer.token_start_row_col(open as u32)?;
-            let loc = match &body.source {
-                ScriptSource::Mod(script_mod) => ScriptLoc { file: body.site_file(script_mod), line: row + script_mod.line as u32, col },
-                _ => ScriptLoc { file: "generated".into(), line: row, col },
+            let loc = match body.source.written() {
+                Some(script_mod) => ScriptLoc { file: body.site_file(script_mod), line: row + script_mod.line as u32, col },
+                None => ScriptLoc { file: "generated".into(), line: row, col },
             };
             Some((loc, text))
         })();
@@ -1187,9 +1229,9 @@ impl ScriptCode {
         let body = bodies.get(ip.body as usize)?;
         let tokens = &body.tokenizer.tokens;
         let (_, first, last, closure) = Self::fn_token_range(body, ip)?;
-        let (file, line0) = match &body.source {
-            ScriptSource::Mod(script_mod) => (body.site_file(script_mod), body.site_line0(script_mod)),
-            _ => ("generated".to_string(), 0),
+        let (file, line0) = match body.source.written() {
+            Some(script_mod) => (body.site_file(script_mod), body.site_line0(script_mod)),
+            None => ("generated".to_string(), 0),
         };
         let mut out = Vec::with_capacity(last + 1 - first);
         for i in first..=last {
@@ -1273,9 +1315,9 @@ impl ScriptCode {
         }
         let text: String = chars[start..end].iter().collect();
         let (row, col) = body.tokenizer.token_start_row_col(first as u32)?;
-        let (file, line0) = match &body.source {
-            ScriptSource::Mod(script_mod) => (body.site_file(script_mod), body.site_line0(script_mod)),
-            _ => ("generated".to_string(), 0),
+        let (file, line0) = match body.source.written() {
+            Some(script_mod) => (body.site_file(script_mod), body.site_line0(script_mod)),
+            None => ("generated".to_string(), 0),
         };
         let mut out = Vec::with_capacity(last + 1 - first);
         let mut strings = Vec::new();
@@ -1352,9 +1394,9 @@ impl ScriptCode {
                             // (The identifier's first character: a token's
                             // position may sit a character into it.)
                             let (row, col) = body.tokenizer.token_start_row_col(k as u32)?;
-                            return Some(match &body.source {
-                                ScriptSource::Mod(script_mod) => ScriptLoc { file: body.site_file(script_mod), line: row + script_mod.line as u32, col },
-                                _ => ScriptLoc { file: "generated".into(), line: row, col },
+                            return Some(match body.source.written() {
+                                Some(script_mod) => ScriptLoc { file: body.site_file(script_mod), line: row + script_mod.line as u32, col },
+                                None => ScriptLoc { file: "generated".into(), line: row, col },
                             });
                         }
                     }
@@ -1420,9 +1462,9 @@ impl ScriptCode {
             };
             k = prev;
         }
-        let values = match &body.source {
-            ScriptSource::Mod(script_mod) => &script_mod.values[..],
-            _ => &[],
+        let values = match body.source.written() {
+            Some(script_mod) => &script_mod.values[..],
+            None => &[],
         };
         let docs = &body.tokenizer.docs;
         let mut doc = docs.partition_point(|d| (d.next_token as usize) < k);
@@ -1471,9 +1513,9 @@ impl ScriptCode {
             let loc = self.ip_to_loc_plain(ip)?;
             let bodies = self.bodies.borrow();
             let body = bodies.get(ip.body as usize)?;
-            let base = match &body.source {
-                ScriptSource::Mod(script_mod) => script_mod.line as u32,
-                _ => 0,
+            let base = match body.source.written() {
+                Some(script_mod) => script_mod.line as u32,
+                None => 0,
             };
             body.code_text().lines().nth(loc.line.checked_sub(base)? as usize).map(str::to_string)
         })();
@@ -1483,9 +1525,9 @@ impl ScriptCode {
     pub(crate) fn ip_body_text_native(&self, ip: ScriptIp, out: &mut crate::vm_api::ScriptTextOut, at: &mut crate::vm_api::ScriptLineCol) -> bool {
         let bodies = self.bodies.borrow();
         let Some(body) = bodies.get(ip.body as usize) else { return false };
-        at.line = match &body.source {
-            ScriptSource::Mod(script_mod) => script_mod.line as u32,
-            _ => 0,
+        at.line = match body.source.written() {
+            Some(script_mod) => script_mod.line as u32,
+            None => 0,
         };
         out.push(body.code_text());
         true
@@ -1545,7 +1587,7 @@ impl ScriptCode {
 
                 if let Some(token_index) = nearest_token {
                     if let Some(rc) = body.tokenizer.token_index_to_row_col(token_index) {
-                        if let ScriptSource::Mod(script_mod) = &body.source {
+                        if let Some(script_mod) = body.source.written() {
                             return Some(ScriptLoc {
                                 file: match (&body.shown, body.real_file.is_empty()) {
                                     (Some(shown), _) => shown.clone(),
@@ -1665,7 +1707,7 @@ impl<'a> ScriptVm<'a> {
     #[inline(always)]
     pub fn with_instruction_limit<R>(
         &mut self,
-        instruction_limit: usize,
+        instruction_limit: u64,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         let (previous_remaining, applied) = self.instruction_limit_begin(instruction_limit);
@@ -1678,21 +1720,21 @@ impl<'a> ScriptVm<'a> {
     /// (the thread's previous remaining budget, the applied limit) for
     /// [`Self::instruction_limit_end`].
     #[inline(always)]
-    pub fn instruction_limit_begin(&mut self, instruction_limit: usize) -> (Option<usize>, usize) {
+    pub fn instruction_limit_begin(&mut self, instruction_limit: u64) -> (Option<u64>, u64) {
         let previous = self.bx.vm_stat(&mut ScriptCtlReq::new(STAT_LIMIT_REMAINING));
-        let previous_remaining = if previous == u64::MAX { None } else { Some(previous as usize) };
+        let previous_remaining = if previous == u64::MAX { None } else { Some(previous) };
         let applied = previous_remaining
             .map(|remaining| remaining.min(instruction_limit))
             .unwrap_or(instruction_limit);
-        self.bx.vm_ctl(&mut ScriptCtlReq::with(CTL_LIMIT_SET, applied as u64));
+        self.bx.vm_ctl(&mut ScriptCtlReq::with(CTL_LIMIT_SET, applied));
         (previous_remaining, applied)
     }
 
     /// The second half of [`Self::with_instruction_limit`].
     #[inline(always)]
-    pub fn instruction_limit_end(&mut self, previous_remaining: Option<usize>, applied: usize) {
-        let mut req = ScriptCtlReq::with(CTL_LIMIT_END, previous_remaining.map_or(u64::MAX, |n| n as u64));
-        req.b = applied as u64;
+    pub fn instruction_limit_end(&mut self, previous_remaining: Option<u64>, applied: u64) {
+        let mut req = ScriptCtlReq::with(CTL_LIMIT_END, previous_remaining.unwrap_or(u64::MAX));
+        req.b = applied;
         self.bx.vm_ctl(&mut req);
     }
 
@@ -1765,8 +1807,8 @@ impl<'a> ScriptVm<'a> {
 
     /// Instructions charged by the most recent `with_instruction_limit` call.
     #[inline(always)]
-    pub fn last_limit_consumed(&self) -> usize {
-        self.bx.vm_stat(&mut ScriptCtlReq::new(STAT_LAST_LIMIT_CONSUMED)) as usize
+    pub fn last_limit_consumed(&self) -> u64 {
+        self.bx.vm_stat(&mut ScriptCtlReq::new(STAT_LAST_LIMIT_CONSUMED))
     }
 
     #[inline(always)]
@@ -2357,6 +2399,7 @@ impl<'a> ScriptVm<'a> {
                     return value;
                 }
             }
+            // The interrupt is sampled here, every 1024 instructions of a limited run: one load.
             let instruction_limit_exceeded = if let Some(remaining) =
                 self.bx.threads.cur().instruction_limit_remaining.as_mut()
             {
@@ -2364,16 +2407,20 @@ impl<'a> ScriptVm<'a> {
                     true
                 } else {
                     *remaining -= 1;
-                    false
+                    *remaining & 1023 == 0 && self.bx.interrupt.is_set()
                 }
             } else {
                 false
             };
             if instruction_limit_exceeded {
-                let err = script_err_limit!(
-                    self.bx.threads.cur_ref().trap,
-                    "script instruction limit exceeded"
-                );
+                let err = if self.bx.interrupt.is_set() {
+                    script_err_limit!(self.bx.threads.cur_ref().trap, "script interrupted")
+                } else {
+                    script_err_limit!(
+                        self.bx.threads.cur_ref().trap,
+                        "script instruction limit exceeded"
+                    )
+                };
                 // drain_errors routes to the captured-error sink, the log, or
                 // the void depending on host configuration.
                 self.drain_errors();
@@ -2501,6 +2548,14 @@ impl<'a> ScriptVm<'a> {
         // Extract values from bodies before modifying thread state
         let (scope, me) = {
             let bodies = self.bx.code.bodies.borrow();
+            // Recovery bytecode is for parser tooling, never execution: a
+            // rejected loop body can otherwise become an infinite empty loop.
+            if bodies[body_id as usize].parser.had_error {
+                return ScriptValue::script_err_unexpected(ScriptIp {
+                    body: body_id,
+                    index: 0,
+                });
+            }
             (
                 bodies[body_id as usize].scope.obj,
                 bodies[body_id as usize].me.obj,
@@ -2944,41 +2999,55 @@ impl<'a> ScriptVm<'a> {
             shown: None,
         };
         let mut bodies = self.bx.code.bodies.borrow_mut();
-        for (i, body) in bodies.iter_mut().enumerate() {
-            if let ScriptSource::Mod(script_mod) = &body.source {
-                if let ScriptSource::Mod(new_mod) = &new_body.source {
-                    if script_mod.file == new_mod.file
-                        && script_mod.line == new_mod.line
-                        && script_mod.column == new_mod.column
-                    {
-                        let values_changed = script_mod.values != new_mod.values;
-                        body.source = new_body.source;
-                        body.scope = new_body.scope;
-                        body.me = new_body.me;
-                        body.transient = transient;
-                        body.real_file = String::new();
-                        body.shown = None;
-                        if body.effective_code != new_body.effective_code || values_changed {
-                            body.effective_code = new_body.effective_code;
-                            body.tokenizer = ScriptTokenizer::default();
-                            body.parser = ScriptParser::keeping_numbers(self.bx.keep_numbers);
-                            body.checkpoint = None;
-                            body.source_len = 0;
-                        }
-                        return i as u16;
-                    }
-                }
+        let ScriptSource::Mod(new_mod) = &new_body.source else { unreachable!() };
+        let same = bodies.iter().position(|body| {
+            matches!(&body.source, ScriptSource::Mod(m) if m.file == new_mod.file && m.line == new_mod.line && m.column == new_mod.column)
+        });
+        if let Some(i) = same {
+            let body = &mut bodies[i];
+            let ScriptSource::Mod(script_mod) = &body.source else { unreachable!() };
+            let values_changed = script_mod.values != new_mod.values;
+            let code_changed = body.effective_code != new_body.effective_code;
+            // Other text parses to other opcodes, and a fn made from the
+            // earlier text (one the reload pass does not make again, held by a
+            // type default or a host) is an index into them: it keeps its text,
+            // in a body of its own. (Other values alone leave every opcode
+            // where it was.)
+            let earlier = (code_changed && body.source_len > 0).then(|| body.retire_text());
+            body.source = new_body.source;
+            body.scope = new_body.scope;
+            body.me = new_body.me;
+            body.transient = transient;
+            body.real_file = String::new();
+            body.shown = None;
+            if code_changed || values_changed {
+                body.effective_code = new_body.effective_code;
+                body.tokenizer = ScriptTokenizer::default();
+                body.parser = ScriptParser::keeping_numbers(self.bx.keep_numbers);
+                body.checkpoint = None;
+                body.source_len = 0;
             }
+            if let Some(earlier) = earlier {
+                let to = Self::place_body(&mut bodies, &self.bx.code.free_bodies, earlier);
+                drop(bodies);
+                self.bx.move_code_of_body(i as u16, to);
+            }
+            return i as u16;
         }
-        if let Some(i) = self.bx.code.free_bodies.borrow_mut().pop() {
-            bodies[i as usize] = new_body;
+        Self::place_body(&mut bodies, &self.bx.code.free_bodies, new_body)
+    }
+
+    /// A slot for `body`: a reclaimed one, or a new one at the end.
+    fn place_body(bodies: &mut Vec<ScriptBody>, free: &RefCell<Vec<u16>>, body: ScriptBody) -> u16 {
+        if let Some(i) = free.borrow_mut().pop() {
+            bodies[i as usize] = body;
             return i;
         }
         let i = bodies.len();
         // A body id past the packing would alias another body's functions
         // (see `ScriptIp::BODY_BITS`): stop here rather than run the wrong code.
         assert!(i < ScriptIp::MAX_BODIES, "script body limit reached: {} bodies fit in ScriptIp", ScriptIp::MAX_BODIES);
-        bodies.push(new_body);
+        bodies.push(body);
         i as u16
     }
 
@@ -3264,7 +3333,7 @@ impl<'a> ScriptVm<'a> {
             // surface them to a captured-diagnostics sink here or a validating
             // host reports success for a script that failed to parse.
             // (A file's errors stay with its body: the same text evaluated again reports them again.)
-            let parse_errors = if body.shown.is_some() { body.parser.parse_errors.clone() } else { std::mem::take(&mut body.parser.parse_errors) };
+            let parse_errors = body.parser.parse_errors.clone();
             let parse_records: Vec<ScriptErrorRecord> = parse_errors.into_iter().enumerate()
                 .map(|(i, text)| ScriptErrorRecord::parse(text, body.parser.diagnostics.get(i), &body.parser.file)).collect();
             drop(bodies);
@@ -3401,12 +3470,9 @@ impl<'a> ScriptVm<'a> {
             body.checkpoint = Some(cp);
             body.content_hash = ScriptBody::content_hash_of(code, &existing_mod.values);
 
-            // A host that installed a captured-error sink is running a GAME
-            // eval and needs structural parse errors to FAIL it — the
-            // tolerant recovery otherwise runs something else entirely
-            // (`let loop` recovered into an infinite empty loop and burned
-            // the instruction budget). Live-typing paths install no sink and
-            // keep the log-only tolerance.
+            // Surface structural errors before run_root rejects the body.
+            // Incomplete but valid prefixes still use the parser's auto-close;
+            // recovery bytecode from an actual parse error is never executed.
             let from = errors_before.min(body.parser.parse_errors.len());
             let new_parse_errors: Vec<ScriptErrorRecord> = body.parser.parse_errors[from..].iter().enumerate()
                 .map(|(i, text)| ScriptErrorRecord::parse(text.clone(), body.parser.diagnostics.get(from + i), &body.parser.file)).collect();
@@ -3513,10 +3579,10 @@ pub struct ScriptVmBase {
     pub run_budget: Option<ScriptRunBudget>,
     /// Instructions charged by the most recent with_instruction_limit call
     /// (see ScriptVm::last_limit_consumed).
-    pub last_limit_consumed: usize,
+    pub last_limit_consumed: u64,
     /// The thread's remaining allowance at Return/Bail, stashed because
     /// handle_trap_on wipes instruction_limit_remaining to None on exit.
-    pub last_limit_exit_remaining: usize,
+    pub last_limit_exit_remaining: u64,
     /// Arithmetic on host objects (none by default): a host whose values
     /// are objects (animation descriptions, handles) can make `a + b` build
     /// a derived value. Only reached where an operand is an object, so no
@@ -3529,6 +3595,8 @@ pub struct ScriptVmBase {
     pub keep_numbers: bool,
     /// the allocation budgets with_heap_allocation_limit put aside (CTL_ALLOC_BEGIN / CTL_ALLOC_END)
     pub(crate) alloc_budgets: Vec<Option<ScriptAllocationBudget>>,
+    /// The cross-thread stop runs under an instruction limit sample ([`Self::interrupt_handle`]).
+    pub(crate) interrupt: crate::interrupt::ScriptInterrupt,
 }
 
 impl Drop for ScriptVmBase {
@@ -3550,6 +3618,9 @@ impl ScriptVmBase {
     pub fn select_thread(&mut self, id: ScriptThreadId) { self.threads.set_current_thread_id(id); }
     #[inline(always)]
     pub fn gc_if_needed(&mut self) { self.vm_ctl(&mut ScriptCtlReq::new(CTL_GC_IF_NEEDED)); }
+    /// A handle another thread uses to stop this VM's runs ([`crate::interrupt`]).
+    #[relax_api]
+    pub fn interrupt_handle(&self) -> crate::interrupt::ScriptInterrupt { self.interrupt.clone() }
     #[inline(always)]
     pub fn body_count(&self) -> usize { self.vm_stat(&mut ScriptCtlReq::new(STAT_BODY_COUNT)) as usize }
     #[relax_api]
@@ -3603,6 +3674,7 @@ impl ScriptVmBase {
             let_hook: None,
             keep_numbers: false,
             alloc_budgets: Vec::new(),
+            interrupt: Default::default(),
         }
     }
 
@@ -3654,6 +3726,7 @@ impl ScriptVmBase {
             let_hook: None,
             keep_numbers: false,
             alloc_budgets: Vec::new(),
+            interrupt: Default::default(),
         }
     }
 }
@@ -3661,6 +3734,44 @@ impl ScriptVmBase {
 
 // moved from ScriptVm: they use nothing but the base
 impl ScriptVmBase {
+    /// Move what runs the code of body `from` to the same opcodes in body
+    /// `to` (its earlier text, see [`ScriptBody::retire_text`]): every
+    /// script fn defined in it and every thread position or return in it (a
+    /// native call can evaluate the module again while it runs). Where an
+    /// object was made stays `from`: a live literal there is still found by
+    /// its site in the module.
+    pub(crate) fn move_code_of_body(&mut self, from: u16, to: u16) {
+        let moved = |ip: ScriptIp| ScriptIp { body: to, index: ip.index };
+        for i in 1..self.heap.objects.len() {
+            let object = self.heap.objects.get_at_mut(i);
+            if !object.tag.is_alloced() {
+                continue;
+            }
+            if let Some(ip) = object.tag.fn_script_ip() {
+                if ip.body == from {
+                    object.tag.set_fn(ScriptFnPtr::Script(moved(ip)));
+                }
+            }
+        }
+        for t in 0..self.threads.len() {
+            let Some(thread) = self.threads.get_mut(t) else { continue };
+            if !thread.trap.ip.is_unknown() && thread.trap.ip.body == from {
+                thread.trap.ip = moved(thread.trap.ip);
+            }
+            for call in thread.calls.iter_mut() {
+                if let Some(ip) = call.return_ip.filter(|ip| ip.body == from) {
+                    call.return_ip = Some(moved(ip));
+                }
+            }
+        }
+        let (scope, me) = {
+            let bodies = self.code.bodies.borrow();
+            (bodies[to as usize].scope.as_object(), bodies[to as usize].me.as_object())
+        };
+        self.heap.ref_object_chain(scope);
+        self.heap.ref_object_chain(me);
+    }
+
     /// Name `body`'s file in its messages and count its first line from
     /// `ScriptMod::line` (see [`ScriptBody::shown`]).
     pub(crate) fn set_body_shown(&mut self, body: u16, file: &str) {
@@ -3675,8 +3786,7 @@ impl ScriptVmBase {
         let scope = self.code.bodies.borrow()[body as usize].scope.obj;
         for (key, value) in self.object_entries(from) {
             let Some(id) = key.as_id() else { continue };
-            let mut head = [0u8; 2];
-            if LiveId::lut_name_copy(id, &mut head) == 2 && head == *b"__" {
+            if self.heap.is_private_name(id) {
                 continue;
             }
             self.heap.set_value_def(scope, key, value);
@@ -3718,8 +3828,7 @@ impl ScriptVmBase {
         let exports = self.heap.new_object();
         for (key, value) in entries {
             let Some(id) = key.as_id() else { continue };
-            let mut head = [0u8; 2];
-            if id == id!(mod) || (LiveId::lut_name_copy(id, &mut head) == 2 && head == *b"__") {
+            if id == id!(mod) || self.heap.is_private_name(id) {
                 continue;
             }
             if self.injected_globals.get(&id) == Some(&value) {

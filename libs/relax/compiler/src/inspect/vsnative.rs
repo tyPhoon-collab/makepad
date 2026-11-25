@@ -14,7 +14,7 @@
 use super::{Out, Req};
 
 pub fn cmd_vsnative(req: &Req, out: &mut Out) {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     if let Some(f) = req.get("file") {
         return stacks::run_file(req, out, f);
     }
@@ -217,7 +217,7 @@ mod imp {
         let stop_at = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
         let spawned = {
             let _k = crate::zone_alloc::kept();
-            std::thread::Builder::new().name("run-inspect-vsnative".into()).spawn(move || {
+            crate::run_threads::spawn("run-inspect-vsnative", move || {
                 crate::inspect::heap::exclude_this_thread();
                 let mut v = Vec::new();
                 while std::time::Instant::now() < stop_at {
@@ -362,7 +362,7 @@ mod imp {
 /// and keyed alike (`Type::fn` without generics), so self and inclusive time per fn compare 1:1 --
 /// the attribution table of a JIT-vs-native gap. `roots=` keeps the samples under those fns (the
 /// part of a frame a meter times) and cuts their stacks at the root.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 mod stacks {
     use super::{Out, Req};
     use crate::inspect::short;
@@ -702,7 +702,7 @@ mod stacks {
         let ids: Vec<u64> = tids.iter().map(|t| t.0).collect();
         let spawned = {
             let _k = crate::zone_alloc::kept();
-            std::thread::Builder::new().name("run-inspect-vsnative".into()).spawn(move || {
+            crate::run_threads::spawn("run-inspect-vsnative", move || {
                 crate::inspect::heap::exclude_this_thread();
                 let r = crate::inspect::prof::collect_foreign(&ids, secs, hz, ev, &cfi, &|| false);
                 let _ = tx.send((r, cfi));

@@ -4,10 +4,10 @@
 //! the resolved paths, method calls, field reads, patterns, types it mentions); the signatures'
 //! and fields' references are read from the syntax (`TypeWalker`). `finish` then runs rustc's
 //! worklist: seeds are `main`, the effectively public items (`#[allow(dead_code)]` items,
-//! `#[no_mangle]` / `#[used]` / lang items, `const _`), and whatever a live item mentions is
-//! live; trait impls and their items are live when the trait (item) and the implementing type
-//! are. What stays dead is reported per module as rustc's `check_mod_deathness` does, grouped
-//! by parent and lint level.
+//! `#[no_mangle]` / `#[used]` / lang items, `const _`, a test build's `#[test]` fns), and
+//! whatever a live item mentions is live; trait impls and their items are live when the trait
+//! (item) and the implementing type are. What stays dead is reported per module as rustc's
+//! `check_mod_deathness` does, grouped by parent and lint level.
 //!
 //! Check-only (reports through the lint sink); `makepad run` never calls this.
 
@@ -36,6 +36,7 @@ enum Ref {
 }
 
 /// What one body owner references, and the diagnostics it emits when it is live.
+#[derive(Default)]
 struct BodyInfo {
     refs: Vec<Ref>,
     /// (position, message, attributes in scope): `useless assignment ... to itself`
@@ -389,33 +390,64 @@ fn fields(w: &mut TypeWalker, ast: &Ast, l: List<FieldDef>, pub_only: bool) {
 
 // ================================================================ body references
 
+/// A body that failed its type check: the traits of the methods it did resolve are used (rustc's
+/// method probe records a used trait import as each call resolves, an error later in the body
+/// or not), and with a method error (E0599: no item `name` found) so is every trait in scope that
+/// has an item of that name (report_method_error marks the call's in-scope traits used, which the
+/// resolver gathered by the name: the error is very possibly why the trait was not used). Its
+/// other references are not collected: with an error, no dead code is reported.
+pub fn note_failed_body(prog: &Program, tcx: &Tcx, body: &Body) {
+    if !lint::enabled() { return; }
+    let d = prog.def(body.def);
+    for m in body.methods.values() { crate::lint_imports::note_method(prog, tcx, d.krate, m.def); }
+    for r in body.res.values() {
+        if let Res::Def(x) = r { crate::lint_imports::note_method(prog, tcx, d.krate, *x); }
+    }
+    for e in body.errors.iter() {
+        let Some((_, rest)) = e.split_once(": E0599: ") else { continue };
+        let Some(name) = rest.split_once("named `").and_then(|(_, n)| n.split_once('`')).map(|(n, _)| n) else { continue };
+        crate::lint_imports::note_scope_traits(prog, d.krate, d.scope, name);
+    }
+}
+
 pub fn collect_body(prog: &Program, tcx: &Tcx, body: &Body) {
     if !lint::enabled() { return; }
     let d = prog.def(body.def);
     let ast = &prog.files[body.file as usize].ast;
     let mut b = BodyRefs { prog, tcx, body, ast, tw: TypeWalker::new(prog, body.def), in_pat: false, ignore: Vec::new(), out: Vec::new(), stack: Vec::new(), notes: Vec::new() };
     b.tw.module = d.scope;
-    match ast.item(d.item).kind {
-        ItemKind::Fn(s, _, _) => {
-            let Ok(Some(block)) = prog.fn_body(body.file, d.item) else { return };
-            for p in ast.list(ast.fn_sig(s).params) {
-                b.enter_attrs(p.attrs);
-                b.pat(p.pat);
-                b.leave_attrs(p.attrs);
+    // rustc dead.rs visit_nested_body: an anonymous constant is walked with its own typeck results,
+    // and what it uses, the item around it uses (`d.item` is that item's, not the constant's)
+    let holder = if d.kind == DefKind::AnonConst {
+        let Some(e) = crate::const_eval::const_body(prog, body.def) else { return };
+        b.expr(e);
+        crate::borrowck::body::root_owner(prog, body.def)
+    } else {
+        match ast.item(d.item).kind {
+            ItemKind::Fn(s, _, _) => {
+                let Ok(Some(block)) = prog.fn_body(body.file, d.item) else { return };
+                for p in ast.list(ast.fn_sig(s).params) {
+                    b.enter_attrs(p.attrs);
+                    b.pat(p.pat);
+                    b.leave_attrs(p.attrs);
+                }
+                b.block(block);
             }
-            b.block(block);
+            ItemKind::Const(..) | ItemKind::Static(..) => {
+                let Ok(Some(e)) = prog.const_body(body.file, d.item) else { return };
+                b.expr(e);
+            }
+            _ => return,
         }
-        ItemKind::Const(..) | ItemKind::Static(..) => {
-            let Ok(Some(e)) = prog.const_body(body.file, d.item) else { return };
-            b.expr(e);
-        }
-        _ => return,
-    }
+        body.def
+    };
     let mut out = std::mem::take(&mut b.out);
     out.append(&mut b.tw.out);
+    let mut notes = std::mem::take(&mut b.notes);
     let mut g = BODY_REFS.lock().unwrap_or_else(|e| e.into_inner());
-    let notes = std::mem::take(&mut b.notes);
-    g.get_or_insert_with(HashMap::new).insert(body.def, BodyInfo { refs: out, notes });
+    let info = g.get_or_insert_with(HashMap::new).entry(holder).or_default();
+    info.refs.append(&mut out);
+    info.notes.append(&mut notes);
 }
 
 struct BodyRefs<'a> {
@@ -507,6 +539,7 @@ impl<'a> BodyRefs<'a> {
         // a field of with this index and name
         let name = match self.ast.expr(e).kind {
             ExprKind::Field(_, n) => Some(self.prog.files[self.body.file as usize].text(n).to_string()),
+            // a tuple field: the body's uses of that index (typeck records them as check_field does)
             _ => None,
         };
         for &(adt, fi) in self.body.field_uses.iter() {
@@ -584,7 +617,7 @@ impl<'a> BodyRefs<'a> {
         match self.body.res.get(&e.0) {
             Some(Res::Def(d)) => {
                 let d = *d;
-                crate::lint_imports::note_method(self.prog, self.tcx, d);
+                crate::lint_imports::note_method(self.prog, self.tcx, self.prog.def(self.body.def).krate, d);
                 self.handle_res(d);
                 // a trait impl's item stands for the trait's
                 if let Some(t) = self.trait_item_of(d) { self.use_def(t); }
@@ -690,7 +723,7 @@ impl<'a> Visitor<'a> for BodyRefs<'a> {
                 self.tw.generic_args(r.turbofish);
                 if let Some(m) = self.body.methods.get(&e.0) {
                     let d = m.def;
-                    crate::lint_imports::note_method(self.prog, self.tcx, d);
+                    crate::lint_imports::note_method(self.prog, self.tcx, self.prog.def(self.body.def).krate, d);
                     self.use_def(d);
                     if let Some(t) = self.trait_item_of(d) { self.use_def(t); }
                 }
@@ -780,19 +813,24 @@ fn use_leaves(ast: &Ast, t: &UseTree, prefix: &mut Vec<PathSeg>, out: &mut Vec<(
 }
 
 impl Reach {
-    fn compute(prog: &Program, tcx: &Tcx, own: &[bool]) -> Reach {
+    fn compute(prog: &Program, tcx: &Tcx, c: &CrateItems) -> Reach {
+        let own = &c.own[..];
         let mut r = Reach { own: own.to_vec(), defs: HashSet::new(), named: HashSet::new(), fields: HashSet::new() };
         let mut done: HashSet<u32> = HashSet::new();
-        for (k, c) in prog.crates.iter().enumerate() {
-            if own.get(k).copied().unwrap_or(false) { r.module(prog, c.root_mod, &mut done); }
-        }
-        r.impls(prog, tcx, own);
+        r.module(prog, prog.crates[c.krate as usize].root_mod, &mut done);
+        // the crate's impls; one that is reached stays reached (`impls` keeps the others)
+        let mut impls: Vec<DefId> = c.defs.iter().copied().filter(|&d| prog.def(d).kind == DefKind::Impl).collect();
+        r.impls(prog, tcx, &mut impls);
         r.named = r.defs.clone();
-        // the types a reachable item mentions in its interface are reachable too
+        // the types a reachable item mentions in its interface are reachable too; each item's
+        // interface is read once: what it names that is not reached yet is reached by this round
         let mut done2: HashSet<u32> = HashSet::new();
+        let mut scanned: HashSet<DefId> = HashSet::new();
         loop {
             let mut found: Vec<DefId> = Vec::new();
-            for &d in r.defs.iter() {
+            let fresh: Vec<DefId> = r.defs.iter().copied().filter(|d| !scanned.contains(d)).collect();
+            for d in fresh {
+                scanned.insert(d);
                 let k = prog.def(d).kind;
                 if !matches!(k, DefKind::Fn | DefKind::AssocFn | DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::Trait | DefKind::TypeAlias | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::AssocTy | DefKind::Impl | DefKind::ForeignFn | DefKind::ForeignStatic) { continue; }
                 for u in item_refs_in(prog, d, true) {
@@ -805,40 +843,43 @@ impl Reach {
             if found.is_empty() { break; }
             for t in found { let td = prog.def(t); r.mark_item(prog, td.file, td.item, t, &mut done2); }
             // the impls of the types just reached expose their items too
-            r.impls(prog, tcx, own);
+            r.impls(prog, tcx, &mut impls);
         }
         r
     }
 
     /// The `pub` items of impls of reachable types, and every item of a trait impl whose trait
-    /// and type are reachable.
-    fn impls(&mut self, prog: &Program, tcx: &Tcx, own: &[bool]) {
-        let r = self;
-        for i in 0..prog.defs.len() {
-            let def = prog.defs[i];
-            if def.kind != DefKind::Impl || !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
-            let d = DefId(i as u32);
+    /// and type are reachable. `impls`: the checked crates' impls not reached yet; the reached
+    /// ones leave it (their items are in `defs` for good).
+    fn impls(&mut self, prog: &Program, tcx: &Tcx, impls: &mut Vec<DefId>) {
+        let own = &self.own;
+        let defs = &mut self.defs;
+        let local = |k: DefId| own.get(prog.def(k).krate as usize).copied().unwrap_or(false);
+        impls.retain(|&d| {
+            let def = *prog.def(d);
             let ast = &prog.files[def.file as usize].ast;
-            let ItemKind::Impl(row) = ast.item(def.item).kind else { continue };
+            let ItemKind::Impl(row) = ast.item(def.item).kind else { return false };
             let imp = *ast.row(row);
             let self_reach = match tcx.impl_self.get(&d).map(|t| *tcx.tys.kind(*t)) {
-                Some(TyKind::Adt(a, ..)) => !own.get(prog.def(a).krate as usize).copied().unwrap_or(false) || r.defs.contains(&a),
+                Some(TyKind::Adt(a, ..)) => !local(a) || defs.contains(&a),
                 Some(_) => true,
-                None => false,
+                // (no self type: never reached)
+                None => return false,
             };
-            if !self_reach { continue; }
+            if !self_reach { return true; }
             let trait_reach = match imp.trait_ {
                 None => None,
-                Some(_) => Some(tcx.impl_trait.get(&d).map_or(true, |t| !own.get(prog.def(*t).krate as usize).copied().unwrap_or(false) || r.defs.contains(t))),
+                Some(_) => Some(tcx.impl_trait.get(&d).map_or(true, |&t| !local(t) || defs.contains(&t))),
             };
-            if trait_reach == Some(false) { continue; }
-            if trait_reach.is_some() { r.defs.insert(d); }
+            if trait_reach == Some(false) { return true; }
+            if trait_reach.is_some() { defs.insert(d); }
             for &it in ast.list(imp.items) {
                 if let Some(&cd) = prog.item_defs.get(&(def.file, it.0)) {
-                    if trait_reach.is_some() || matches!(ast.item(it).vis, Vis::Pub) { r.defs.insert(cd); }
+                    if trait_reach.is_some() || matches!(ast.item(it).vis, Vis::Pub) { defs.insert(cd); }
                 }
             }
-        }
+            false
+        });
     }
 
     fn mark_item(&mut self, prog: &Program, file: u32, it: ItemId, d: DefId, done: &mut HashSet<u32>) {
@@ -958,15 +999,17 @@ struct Dead<'a> {
     prog: &'a Program,
     tcx: &'a Tcx,
     own: &'a [bool],
-    refs: HashMap<DefId, BodyInfo>,
+    refs: &'a HashMap<DefId, BodyInfo>,
     live: HashSet<DefId>,
+    /// the definitions made live since `mark_with_unsolved` last looked (the unsolved items they wake)
+    live_log: Vec<DefId>,
     live_fields: HashSet<FieldKey>,
     worklist: Vec<Work>,
     scanned: HashSet<(DefId, bool)>,
     propagated: bool,
     /// ADTs with an ignored derived impl (Clone, Debug): the note
     ignored_derived: HashMap<DefId, Vec<String>>,
-    children: HashMap<DefId, Vec<DefId>>,
+    children: &'a HashMap<DefId, Vec<DefId>>,
 }
 
 impl<'a> Dead<'a> {
@@ -985,7 +1028,12 @@ impl<'a> Dead<'a> {
                 let n = lint::attr_path(self.prog, def.file, a);
                 n == b"no_mangle" || n == b"export_name" || n == b"used"
             });
-        if used_like || lint::has_attr(self.prog, def.file, attrs, "lang") { Some(false) } else { None }
+        // rustc_builtin_macros global_allocator.rs: the expansion's allocator shims read the static
+        let allocator = def.kind == DefKind::Static && lint::has_attr(self.prog, def.file, attrs, "global_allocator");
+        // rustc_builtin_macros test_harness.rs: a test build's generated `main` names every `#[test]`
+        // fn (outside a test build the front end has removed them)
+        let test = def.kind == DefKind::Fn && lint::has_attr(self.prog, def.file, attrs, "test");
+        if used_like || allocator || test || lint::has_attr(self.prog, def.file, attrs, "lang") { Some(false) } else { None }
     }
 
     fn own_allow(&self, d: DefId) -> bool {
@@ -996,7 +1044,7 @@ impl<'a> Dead<'a> {
         if !self.local(d) { return; }
         let own = self.own_allow(d);
         if should_explore(self.prog.def(d).kind) { self.worklist.push(Work { id: d, propagated: self.propagated, own }); }
-        if !own { self.live.insert(d); }
+        if !own && self.live.insert(d) { self.live_log.push(d); }
     }
 
     fn apply(&mut self, refs: &[Ref]) {
@@ -1019,7 +1067,7 @@ impl<'a> Dead<'a> {
     fn explore(&mut self, w: Work) {
         let mut id = w.id;
         self.propagated = w.propagated;
-        if !w.own { self.live.insert(id); }
+        if !w.own && self.live.insert(id) { self.live_log.push(id); }
         if !self.scanned.insert((id, w.propagated)) { return; }
         let def = *self.prog.def(id);
         let ast = &self.prog.files[def.file as usize].ast;
@@ -1102,60 +1150,201 @@ impl<'a> Dead<'a> {
         })
     }
 
-    /// `check_impl_or_impl_item_live`
-    fn impl_live(&self, d: DefId) -> bool {
+    /// What `impl_live` waits for: the local trait (an impl) or trait item (an impl's item), and
+    /// the local type of the impl.
+    fn impl_keys(&self, d: DefId) -> [Option<DefId>; 2] {
         let def = self.prog.def(d);
         let (impl_block, trait_def) = if def.kind == DefKind::Impl {
             (d, self.tcx.impl_trait.get(&d).copied())
         } else {
             (def.parent, self.trait_item_of(d))
         };
-        if let Some(t) = trait_def {
-            if self.local(t) && !self.live.contains(&t) { return false; }
-        }
-        if let Some(TyKind::Adt(a, ..)) = self.tcx.impl_self.get(&impl_block).map(|t| *self.tcx.tys.kind(*t)) {
-            if self.local(a) && !self.live.contains(&a) { return false; }
-        }
-        true
+        let adt = match self.tcx.impl_self.get(&impl_block).map(|t| *self.tcx.tys.kind(*t)) {
+            Some(TyKind::Adt(a, ..)) => Some(a),
+            _ => None,
+        };
+        [trait_def.filter(|&t| self.local(t)), adt.filter(|&a| self.local(a))]
     }
 
+    /// `check_impl_or_impl_item_live`
+    fn impl_live(&self, d: DefId) -> bool {
+        self.impl_keys(d).iter().flatten().all(|k| self.live.contains(k))
+    }
+
+    /// rustc dead.rs `solve_rest_impl_items`: an unsolved impl (item) is explored once what it
+    /// waits for is live. Each is looked at once, then again only when one of its keys became
+    /// live (rescanning every unsolved item after each round was quadratic over a workspace).
     fn mark_with_unsolved(&mut self, unsolved: &mut Vec<DefId>) {
         self.mark_live_symbols();
+        let mut solved = vec![false; unsolved.len()];
+        let mut waits: HashMap<DefId, Vec<u32>> = HashMap::new();
         let mut check: Vec<DefId> = Vec::new();
-        let mut i = 0;
-        while i < unsolved.len() {
-            if self.impl_live(unsolved[i]) { check.push(unsolved.swap_remove(i)); } else { i += 1; }
+        for (i, &d) in unsolved.iter().enumerate() {
+            let keys = self.impl_keys(d);
+            if keys.iter().flatten().all(|k| self.live.contains(k)) {
+                solved[i] = true;
+                check.push(d);
+            } else {
+                for k in keys.into_iter().flatten() { waits.entry(k).or_default().push(i as u32); }
+            }
         }
+        self.live_log.clear();
         while !check.is_empty() {
             for d in check.drain(..) { self.worklist.push(Work { id: d, propagated: false, own: false }); }
             self.mark_live_symbols();
-            let mut i = 0;
-            while i < unsolved.len() {
-                if self.impl_live(unsolved[i]) { check.push(unsolved.swap_remove(i)); } else { i += 1; }
+            for k in std::mem::take(&mut self.live_log) {
+                let Some(ws) = waits.remove(&k) else { continue };
+                for i in ws {
+                    let i = i as usize;
+                    if !solved[i] && self.impl_live(unsolved[i]) {
+                        solved[i] = true;
+                        check.push(unsolved[i]);
+                    }
+                }
             }
+        }
+        let mut i = 0;
+        unsolved.retain(|_| { let keep = !solved[i]; i += 1; keep });
+    }
+}
+
+/// MAKEPAD_RUN_CHECK_TIMES: a pass's parts of 50 ms or more, summed over the crates
+pub(crate) struct PartTimes {
+    pass: &'static str,
+    on: bool,
+    t: std::time::Instant,
+    parts: Vec<(&'static str, std::time::Duration)>,
+}
+impl PartTimes {
+    pub(crate) fn new(pass: &'static str) -> Self {
+        PartTimes { pass, on: std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some(), t: std::time::Instant::now(), parts: Vec::new() }
+    }
+    pub(crate) fn mark(&mut self, part: &'static str) {
+        if !self.on { return; }
+        let dt = self.t.elapsed();
+        match self.parts.iter_mut().find(|p| p.0 == part) {
+            Some(p) => p.1 += dt,
+            None => self.parts.push((part, dt)),
+        }
+        self.t = std::time::Instant::now();
+    }
+    /// `other`'s parts summed into these (a worker's).
+    pub(crate) fn add(&mut self, other: PartTimes) {
+        for (part, dt) in other.parts {
+            match self.parts.iter_mut().find(|p| p.0 == part) {
+                Some(p) => p.1 += dt,
+                None => self.parts.push((part, dt)),
+            }
+        }
+    }
+    pub(crate) fn report(&self, crates: usize) {
+        for &(part, dt) in &self.parts {
+            if dt.as_millis() >= 50 { eprintln!("makepad check: {} {} {:.2} s ({} crates)", self.pass, part, dt.as_secs_f64(), crates); }
         }
     }
 }
 
-/// The checked crates are done: run the analysis and report.
-pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32) {
+/// One checked crate, as its passes see it: rustc runs dead-code, reachability and the unused
+/// imports on each crate it compiles, so a crate's verdict depends on its own code and its
+/// dependencies, never on which other crates the check has.
+pub struct CrateItems<'p> {
+    pub krate: u32,
+    /// only `krate` is set: what the passes call local
+    pub own: Vec<bool>,
+    /// its definitions, modules and imports, in program order
+    pub defs: Vec<DefId>,
+    pub mods: Vec<u32>,
+    pub imports: Vec<&'p crate::program::Import>,
+    /// its imports that never bind and are reported (E0432, E0603): rustc counts them used
+    pub unresolved: Vec<&'p crate::program::Import>,
+}
+
+/// The checked crates are done: run the analysis and report, one crate at a time. `late`: the
+/// required analyses passed, so rustc's misc_checking_3 runs (dead code and the late lints);
+/// without it only the unused imports are reported (rustc's resolver and check_unused_traits
+/// report them before the analyses can fail). `erroneous`: the imports (by index) the check
+/// reported an error of that never bind in rustc, besides the ones still open.
+pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32, late: bool, erroneous: &[usize]) {
     if !lint::enabled() { return; }
+    let mut pt = PartTimes::new("lint_dead::finish");
     let refs = BODY_REFS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut traits = crate::lint_imports::take_method_traits();
+    let n = prog.crates.len();
+    let is_own = |k: u32| own.get(k as usize).copied().unwrap_or(false);
+    let mut crates: Vec<CrateItems> = (0..n as u32).filter(|&k| is_own(k)).map(|k| {
+        let mut own = vec![false; n];
+        own[k as usize] = true;
+        CrateItems { krate: k, own, defs: Vec::new(), mods: Vec::new(), imports: Vec::new(), unresolved: Vec::new() }
+    }).collect();
+    let mut slot = vec![usize::MAX; n];
+    for (i, c) in crates.iter().enumerate() { slot[c.krate as usize] = i; }
     let mut children: HashMap<DefId, Vec<DefId>> = HashMap::new();
     for i in 0..prog.defs.len() {
-        let p = prog.defs[i].parent;
-        if p != NO_DEF { children.entry(p).or_default().push(DefId(i as u32)); }
+        let def = &prog.defs[i];
+        if def.parent != NO_DEF { children.entry(def.parent).or_default().push(DefId(i as u32)); }
+        if is_own(def.krate) { crates[slot[def.krate as usize]].defs.push(DefId(i as u32)); }
     }
-    let reach = Reach::compute(prog, tcx, own);
-    let mut s = Dead { prog, tcx, own, refs, live: HashSet::new(), live_fields: HashSet::new(), worklist: Vec::new(), scanned: HashSet::new(), propagated: false, ignored_derived: HashMap::new(), children };
+    for (m, md) in prog.mods.iter().enumerate() {
+        if is_own(md.krate) { crates[slot[md.krate as usize]].mods.push(m as u32); }
+    }
+    let open: HashSet<usize> = prog.open_reportable_imports(0).into_iter().chain(erroneous.iter().copied()).collect();
+    for (i, im) in prog.imports_iter().enumerate() {
+        let k = prog.mods[im.module as usize].krate;
+        if !is_own(k) { continue; }
+        let c = &mut crates[slot[k as usize]];
+        c.imports.push(im);
+        if open.contains(&i) { c.unresolved.push(im); }
+    }
+    pt.mark("children");
+    // the crates on the pool, the biggest first
+    let traits: Vec<HashSet<DefId>> = crates.iter().map(|c| traits.remove(&c.krate).unwrap_or_default()).collect();
+    let mut order: Vec<usize> = (0..crates.len()).collect();
+    order.sort_by_key(|&i| (std::cmp::Reverse(crates[i].defs.len()), i));
+    let parts = crate::lint::par_each(&order, |&i| {
+        let mut pt = PartTimes::new("lint_dead::finish");
+        finish_crate(&CrateCx { prog, tcx, c: &crates[i], root, refs: &refs, children: &children }, &traits[i], late, &mut pt);
+        pt
+    });
+    for p in parts { pt.add(p); }
+    pt.report(crates.len());
+}
+
+/// The shared read-only context for one checked crate's lints.
+struct CrateCx<'a> {
+    prog: &'a Program,
+    tcx: &'a Tcx,
+    c: &'a CrateItems<'a>,
+    root: u32,
+    refs: &'a HashMap<DefId, BodyInfo>,
+    children: &'a HashMap<DefId, Vec<DefId>>,
+}
+
+/// One checked crate's dead code and reachability lints (`late`), and its unused imports.
+fn finish_crate(cx: &CrateCx<'_>, traits: &HashSet<DefId>, late: bool, pt: &mut PartTimes) {
+    let CrateCx { prog, tcx, c, .. } = *cx;
+    let reach = Reach::compute(prog, tcx, c);
+    pt.mark("Reach::compute");
+    if late { late_lints(cx, &reach, pt); }
+    crate::lint_imports::check(prog, tcx, c, &reach, traits);
+    pt.mark("lint_imports::check");
+}
+
+/// misc_checking_3 of one checked crate: dead code, then the late lints of its items.
+fn late_lints(cx: &CrateCx<'_>, reach: &Reach, pt: &mut PartTimes) {
+    let CrateCx { prog, tcx, c, root, refs, children } = *cx;
+    let own = &c.own[..];
+    let mut s = Dead { prog, tcx, own, refs, live: HashSet::new(), live_log: Vec::new(), live_fields: HashSet::new(), worklist: Vec::new(), scanned: HashSet::new(), propagated: false, ignored_derived: HashMap::new(), children };
     // seeds
-    let executable = is_executable(prog, root);
     let mut deferred: Vec<Work> = Vec::new();
     let mut unsolved: Vec<DefId> = Vec::new();
+    // rustc_passes dead.rs create_and_seed_worklist: a binary's `main` is live. Cargo checks each
+    // target as a crate of its own, so every binary of the check seeds its entry: a package's
+    // `src/bin/*.rs` and `[[bin]]` targets beside the one the check is rooted at.
+    let main = prog.syms.intern_late("main");
+    let ci = &prog.crates[c.krate as usize];
+    let executable = if c.krate == root { is_executable(prog, root) } else { ci.is_bin && !ci.harness && is_executable(prog, c.krate) };
     if executable {
-        let rm = prog.crates[root as usize].root_mod;
-        let main = prog.syms.intern_late("main");
-        if let Some(m) = prog.lookup_in_container(prog.mods[rm as usize].def, main, false) {
+        if let Some(m) = prog.lookup_in_container(prog.mods[ci.root_mod as usize].def, main, false) {
             if prog.def(m).kind == DefKind::Fn { s.worklist.push(Work { id: m, propagated: false, own: false }); }
         }
     }
@@ -1164,7 +1353,7 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32) {
     }
     let item_kinds = |k: DefKind| matches!(k, DefKind::Mod | DefKind::Fn | DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::Const | DefKind::Static | DefKind::Trait | DefKind::Impl
         | DefKind::TypeAlias | DefKind::AssocFn | DefKind::AssocConst | DefKind::AssocTy | DefKind::ForeignFn | DefKind::ForeignStatic | DefKind::ForeignTy);
-    let all: Vec<DefId> = (0..prog.defs.len()).map(|i| DefId(i as u32)).filter(|&d| s.local(d) && item_kinds(prog.def(d).kind)).collect();
+    let all: Vec<DefId> = c.defs.iter().copied().filter(|&d| item_kinds(prog.def(d).kind)).collect();
     for &d in &all {
         let def = prog.def(d);
         if def.kind == DefKind::Mod && def.parent == NO_DEF { continue; }
@@ -1212,22 +1401,30 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32) {
             _ => {}
         }
     }
+    pt.mark("seeds");
     s.mark_with_unsolved(&mut unsolved);
+    pt.mark("mark 1");
     let pre_live = s.live.clone();
     let pre_derived = s.ignored_derived.clone();
     s.worklist.extend(deferred);
     s.mark_with_unsolved(&mut unsolved);
+    pt.mark("mark 2");
     let _ = pre_derived;
     // report
-    let rep = Reporter { s: &s, reach: &reach };
+    let rep = Reporter { s: &s, reach };
     if executable { rep.run(&DEAD_CODE_PUB_IN_BINARY, &pre_live, true, &all); }
     rep.run(&DEAD_CODE, &s.live, false, &all);
-    crate::lint_late::missing_copy_implementations(prog, tcx, own, &reach);
-    crate::lint_late::variant_size_differences(prog, tcx, own);
-    crate::lint_late::async_fn_in_trait(prog, own, &reach);
-    crate::lint_late::repr_transparent_fields(prog, tcx, own);
-    unnameable_types(prog, own, &reach);
-    crate::lint_imports::check(prog, tcx, own, &reach);
+    pt.mark("report");
+    crate::lint_late::missing_copy_implementations(prog, tcx, &c.defs, reach);
+    pt.mark("missing_copy_implementations");
+    crate::lint_late::variant_size_differences(prog, tcx, &c.defs);
+    pt.mark("variant_size_differences");
+    crate::lint_late::async_fn_in_trait(prog, &c.defs, reach);
+    pt.mark("async_fn_in_trait");
+    crate::lint_late::repr_transparent_fields(prog, tcx, &c.defs);
+    pt.mark("repr_transparent_fields");
+    unnameable_types(prog, own, reach);
+    pt.mark("unnameable_types");
 }
 
 fn is_executable(prog: &Program, root: u32) -> bool {
@@ -1497,4 +1694,11 @@ fn unnameable_types(prog: &Program, own: &[bool], reach: &Reach) {
         let name = pf.text(item.name);
         lint::emit(prog, d, &UNNAMEABLE_TYPES, def.file, item.lo, &format!("{} `{}` is reachable but cannot be named", kind, name));
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&BINDING_SITES, Mutex::new(None));
+    reset(&BODY_REFS, Mutex::new(None));
 }

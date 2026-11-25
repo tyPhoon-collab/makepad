@@ -78,7 +78,7 @@ pub fn create_texture(device: ObjcId, t: &TextureObj, gen: u32, label: &str) -> 
     } else {
         MTLTextureType::D2
     };
-    let mut usage_bits = 0u64;
+    let mut usage_bits = if t.usage & usage::STORAGE != 0 { MTLTextureUsage::ShaderWrite as u64 } else { 0u64 };
     if render {
         usage_bits |= MTLTextureUsage::RenderTarget as u64;
         // a colour target is always readable (blits, later passes); depth only when sampled
@@ -230,7 +230,7 @@ unsafe impl Send for Buf {}
 
 impl Buf {
     pub fn new(device: ObjcId, gen: u32, size: u64) -> Option<Buf> {
-        let alloc = size.max(16);
+        let alloc = size.max(16).checked_add(3)? / 4 * 4;
         let buffer = RcObjcId::from_owned(NonNull::new(unsafe { msg_send![device, newBufferWithLength: alloc options: MTLResourceOptions::StorageModeShared] })?);
         let contents: *mut u8 = unsafe { msg_send![buffer.as_id(), contents] };
         if contents.is_null() {
@@ -249,9 +249,13 @@ pub fn writable_in_place(b: &Buf, completed: u64) -> bool {
     b.last_bound <= completed
 }
 
-pub fn fill(b: &mut Buf, off: u64, data: &[u8]) {
-    // SAFETY: the caller checked off + len <= size <= the allocation
+pub fn fill(b: &mut Buf, off: u64, data: &[u8]) -> Result<(), String> {
+    if off.checked_add(data.len() as u64).is_none_or(|end| end > b.size) {
+        return Err(format!("Metal buffer upload offset={off} bytes={} exceeds mapped buffer size={}", data.len(), b.size));
+    }
+    // SAFETY: the checked range is inside this allocation.
     unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), b.contents.add(off as usize), data.len()) };
+    Ok(())
 }
 
 /// A fresh buffer holding the old one's bytes, for a write that cannot go in place.

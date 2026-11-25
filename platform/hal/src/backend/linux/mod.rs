@@ -12,8 +12,15 @@ mod x11;
 pub mod direct;
 pub(crate) mod wm;
 
+/// (`backend::end_run`)
+pub(crate) fn end_run() {
+    direct::end_run();
+    wm::end_run();
+}
+
 use super::exec::OsCmd;
 use super::log_enabled;
+use super::shell;
 use super::vulkan::surface::{NativeSurface, SurfaceState, VkSurfaceSource};
 use crate::{buffers::EventQueue, session::World, types::*, Id};
 use makepad_vulkan::vk;
@@ -573,13 +580,27 @@ fn connect(shared: &'static Shared) -> Result<Box<dyn Shell>, String> {
     let display = std::env::var_os("DISPLAY").filter(|s| !s.is_empty());
     let (backend, reason) = wm_socket::choose(forced, window_manager, wayland_display.is_some() || wayland_socket.is_some(),
         || wm_socket::discovered(makepad_studio_protocol::WIRE).clone());
-    if log_enabled() || matches!(backend, Backend::Wm | Backend::Direct) {
+    {
+        let path = matches!(backend, Backend::Wm | Backend::Incompatible)
+            .then(wm_socket::discovery_path).flatten().map(|p| p.to_string_lossy().into_owned());
+        let mut s = shell::snapshot();
+        let name = match backend {
+            Backend::Wm => "wm", Backend::Incompatible => "incompatible", Backend::Direct => "direct",
+            Backend::Wayland => "wayland", Backend::X11 => "x11",
+        };
+        *s = shell::Snapshot::new(name, reason.clone());
+        s.wm_socket = path;
+        s.app_frame_shown = (backend == Backend::Wm).then_some(false);
+        if backend == Backend::Incompatible { s.refused = Some(reason.clone()); }
+    }
+    if log_enabled() || matches!(backend, Backend::Wm | Backend::Incompatible | Backend::Direct) {
         eprintln!("[hal-linux] backend={backend:?} reason={reason}; WAYLAND_DISPLAY={wayland_display:?} WAYLAND_SOCKET={wayland_socket:?} DISPLAY={display:?}; XDG_RUNTIME_DIR={:?}",
             std::env::var_os("XDG_RUNTIME_DIR"));
     }
     match backend {
         Backend::Direct => direct::App::connect(shared).map(|app| Box::new(app) as Box<dyn Shell>),
         Backend::Wm => wm::App::connect(shared).map(|app| Box::new(app) as Box<dyn Shell>),
+        Backend::Incompatible => Err(format!("a makepad WM is running but cannot host this process: {reason}; not falling back to Wayland or X11")),
         Backend::Wayland => match wayland::App::connect(shared) {
             Ok(app) => Ok(Box::new(app)),
             Err(e) => {
@@ -588,11 +609,18 @@ fn connect(shared: &'static Shared) -> Result<Box<dyn Shell>, String> {
                         if forced.is_some() { "Wayland explicitly selected" } else { "DISPLAY unset/empty" }));
                 }
                 eprintln!("[hal-linux] Wayland connection failed: {e}; backend=x11 fallback because DISPLAY is set");
+                {
+                    let mut s = shell::snapshot();
+                    s.backend = "x11";
+                    s.reason = format!("{reason}; Wayland connection failed: {e}; DISPLAY is set");
+                }
                 x11::App::connect(shared)
                     .map(|app| Box::new(app) as Box<dyn Shell>)
                     .map_err(|x| format!("Wayland failed: {e}; X11 fallback failed: {x}"))
             }
         },
+        // no X server to fall back to: say why no WM hosted this process, never a bare XOpenDisplay error
+        Backend::X11 if display.is_none() => Err(format!("no window system for this process: {reason}")),
         Backend::X11 => x11::App::connect(shared).map(|app| Box::new(app) as Box<dyn Shell>),
     }
 }
@@ -629,6 +657,7 @@ pub fn run_main_loop() {
     let mut app = match result {
         Ok(app) => app,
         Err(e) => {
+            shell::snapshot().refused = Some(e.clone());
             eprintln!("[hal-linux] shell startup failed: {e}");
             return;
         }

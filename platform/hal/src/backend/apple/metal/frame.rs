@@ -7,7 +7,7 @@ use super::device::{Done, Loc};
 use super::pipeline::Select;
 use super::resources::*;
 use super::timing::*;
-use super::{window_row, Metal};
+use super::{window_row, LayerSize, Metal};
 use crate::buffers::{id_at, read_ids, read_pairs, CmdView};
 use crate::ledger::Kind;
 use crate::session::{LentRef, Session, TextureObj, HOST};
@@ -27,11 +27,11 @@ const ENCODE_SLICE: Duration = Duration::from_millis(2);
 /// An encoder the GPU profiler times: its group in the batch's samples, or (a split pass) the
 /// encoders of its shader runs in samples of their own.
 pub(super) struct ProfPass {
-    key: FrameKey,
-    pass: u16,
-    kind: u8,
-    sample: Option<usize>,
-    split: Option<SplitTimes>,
+    pub(super) key: FrameKey,
+    pub(super) pass: u16,
+    pub(super) kind: u8,
+    pub(super) sample: Option<usize>,
+    pub(super) split: Option<SplitTimes>,
 }
 
 pub(super) struct SplitTimes {
@@ -140,7 +140,7 @@ pub struct Batch {
     pub buffer: RcObjcId,
     pub seq: u64,
     opened: Instant,
-    samples: Option<Arc<PassSamples>>,
+    pub(super) samples: Option<Arc<PassSamples>>,
     tickets: Vec<Ticket>,
     passes: Vec<(String, Vec<String>)>,
     native_frames: Vec<super::super::media::layers::Frame>,
@@ -219,7 +219,7 @@ fn load_action(load: u8) -> MTLLoadAction {
 
 /// The storage of a texture a pass uses. A transient target whose storage was given back is made
 /// again (the app was told and produces its content).
-fn texture_obj(tex: &mut FastMap<(u32, u32), Tex>, device: ObjcId, s: &mut Session, id: Id, seq: u64) -> Option<ObjcId> {
+pub(super) fn texture_obj(tex: &mut FastMap<(u32, u32), Tex>, device: ObjcId, s: &mut Session, id: Id, seq: u64) -> Option<ObjcId> {
     let sid = s.id;
     if let Some(t) = tex.get_mut(&(sid, id.index)).filter(|t| t.gen == id.gen) {
         t.last_bound = seq;
@@ -441,7 +441,7 @@ impl Metal {
         let ids: Vec<_> = self.restores.keys().copied().collect();
         for id in ids {
             let base = self.restores.remove(&id).expect("pending window restore");
-            let native = self.native_windows.composition((HOST, id), s.dpi);
+            let native = self.native_windows.composition((HOST, id), s.window_dpi(id));
             self.native_sync = native.is_some();
             if let Some(dst) = self.window_target(s, HOST, id, base.w, base.h, now) {
                 self.copy_layer(base.tex.obj.as_id(), dst, [0, 0, base.w, base.h]);
@@ -459,7 +459,8 @@ impl Metal {
     }
 
     /// Every physical host window accounts for all of its layers, including the
-    /// pristine app image and a pending restore. App aliases do not own these bytes.
+    /// pristine app image, a pending restore and a badge layer's composed image. App
+    /// aliases do not own these bytes.
     pub(super) fn account_host_layers(&self, world: &mut crate::session::World) {
         let now = world.now();
         let Some(s) = world.session_mut(HOST) else { return };
@@ -469,23 +470,32 @@ impl Metal {
             let layers = final_image.into_iter()
                 .chain(overlay.and_then(|o| o.base.as_ref()))
                 .chain(overlay.and_then(|o| o.image.as_ref()))
-                .chain(self.restores.get(&id));
+                .chain(self.restores.get(&id))
+                .chain(self.badged.get(&id.index).and_then(Option::as_ref));
             let mut size = None;
             let mut bytes = 0;
+            let mut layers_count = 0;
             for layer in layers {
                 size = Some((layer.w, layer.h));
                 bytes += allocated_size(layer.tex.obj.as_id());
+                layers_count += 1;
             }
-            if let Some((gen, w, h)) = self.layer_sizes.get(&(HOST, id.index)) {
-                if *gen == id.gen { bytes += *w as u64 * *h as u64 * 4 * 3; size = Some((*w, *h)); }
+            let mut objects = layers_count;
+            if let Some(l) = self.layer_sizes.get(&(HOST, id.index)).filter(|l| l.gen == id.gen) {
+                bytes += l.drawables * l.drawable_bytes;
+                objects += l.drawables;
+                size = Some((l.w, l.h));
             }
             if let Some((w, h)) = size {
                 if let Some(row) = s.ledger.get_mut(Kind::Window, id.index).filter(|row| row.gen == id.gen) {
                     row.bytes = bytes;
+                    row.objects = objects;
                     row.width = w;
                     row.height = h;
                 } else {
-                    s.ledger.add(window_row(id.index, id.gen, bytes, w, h, now, s.frame));
+                    let mut row = window_row(id.index, id.gen, bytes, w, h, now, s.frame);
+                    row.objects = objects;
+                    s.ledger.add(row);
                 }
             }
         }
@@ -539,7 +549,7 @@ impl Metal {
                 self.copy_layer(base.tex.obj.as_id(), dst, [0, 0, w.min(base.w), h.min(base.h)]);
             }
             if let Some(image) = overlay.image.as_ref().filter(|_| overlay.ready) {
-                let dpi = s.dpi;
+                let dpi = s.window_dpi(window);
                 let x = (overlay.rect[0] * dpi).floor().max(0.0) as u32;
                 let y = (overlay.rect[1] * dpi).floor().max(0.0) as u32;
                 let right = ((overlay.rect[0] + overlay.rect[2]) * dpi).ceil().max(0.0) as u32;
@@ -779,11 +789,18 @@ impl Metal {
         if !self.native_sync {
             unsafe { let () = msg_send![cb, presentDrawable: drawable.as_id()]; }
         }
-        // the ledger's row of the window: three drawables of this size
-        let now_size = (window.gen, w, h);
-        if self.layer_sizes.insert((owner, physical.index), now_size) != Some(now_size) {
+        // the ledger's row of the physical window (`account_host_layers`): the layer's drawables,
+        // each the size Metal gives its texture, whichever session presents (an app drawing a
+        // lent window presents its host's layer)
+        let known = self.layer_sizes.get(&(owner, physical.index)).filter(|l| (l.gen, l.w, l.h) == (physical.gen, w, h)).is_some();
+        if !known {
+            let drawables: u64 = unsafe { msg_send![layer_id, maximumDrawableCount] };
+            let now_size = LayerSize { gen: physical.gen, w, h, drawables, drawable_bytes: allocated_size(texture) };
+            self.layer_sizes.insert((owner, physical.index), now_size);
             if owner == s.id {
-                s.ledger.add(window_row(window.index, window.gen, w as u64 * h as u64 * 4 * 3, w, h, now, s.frame));
+                let mut row = window_row(physical.index, physical.gen, drawables * now_size.drawable_bytes, w, h, now, s.frame);
+                row.objects = drawables;
+                s.ledger.add(row);
             }
         }
         if self.composing {
@@ -903,6 +920,7 @@ impl Metal {
             s.stats.bad_args += 1;
             return None;
         };
+        if !self.compute_ready(sid, &view.passes[passes.clone()], view) { return None; }
         let frame = p.frame;
         s.frame = frame;
         s.font_frames.submitted(frame);
@@ -916,12 +934,18 @@ impl Metal {
         // The batch's command buffer, or a new one when this frame must be timed alone (no
         // counter sampling), the buffer's samples are full, or it has been encoding for a while.
         let clock = self.dev.pass_clock();
-        let wanted = passes.len();
+        let wanted = view.passes[passes.clone()].iter().map(|p| {
+            if p.kind == crate::types::pass_kind::COMPUTE { crate::compute::records::<Dispatch>(view.arena, p.dispatches).map_or(0, |d| d.len()) }
+            else { 1 }
+        }).sum();
         let full = self.batch.as_ref().and_then(|b| b.samples.as_ref()).is_some_and(|x| x.full() || x.reserve_room() < wanted);
         let slow = self.batch.as_ref().is_some_and(|b| b.opened.elapsed() >= ENCODE_SLICE);
         if clock.is_none() || full || slow {
             self.commit_batch();
         }
+        // nextDrawable may block. Earlier independent compute and readback
+        // blits must already be committed before a window frame acquires it.
+        if kind & !target::FLAGS == target::WINDOW { self.commit_batch(); }
         let (cb, seq) = self.ensure_batch();
         if let Some(clock) = &clock {
             let batch = self.batch.as_mut().expect("batch");
@@ -972,7 +996,7 @@ impl Metal {
         let mut native = None;
         if native_frame {
             self.native_windows.discard_pending(sid, target);
-            if let Some(pass) = view.passes[passes.clone()].iter().find(|p| p.color.iter().all(|id| id.is_none())) {
+            if let Some(pass) = view.passes[passes.clone()].iter().find(|p| p.kind == crate::types::pass_kind::DRAW && p.color.iter().all(|id| id.is_none())) {
                 let placement = self.media.native_frame(s, target, pass.dpi, records, view);
                 native = self.native_windows.prepare(s, target, (owner, physical), self.dev.device, pass, records, view, placement, fallback);
                 if native.is_none() {
@@ -989,11 +1013,29 @@ impl Metal {
             }
         }
         if native.is_none() && is_window && !pick && !replay {
-            native = self.native_windows.composition((owner, physical), s.dpi);
+            native = self.native_windows.composition((owner, physical), s.window_dpi(target));
         }
         self.native_sync = native.is_some();
         let sync_frame = self.native_sync;
         for pass in &view.passes[passes] {
+            if pass.kind == crate::types::pass_kind::COMPUTE {
+                let pending = self.pending_draws;
+                match self.encode_compute(s, pass, view, cb, seq) {
+                    Ok(index) => {
+                        indices.extend(index);
+                        s.stats.passes += 1;
+                        // the pass's kernels in order (a run of one kernel once), for the hang
+                        // watchdog's diagnostic
+                        let mut kernels: Vec<String> = crate::compute::records::<Dispatch>(view.arena, pass.dispatches).unwrap_or_default().iter()
+                            .map(|d| s.pipelines.get(s.id, d.pipeline).ok().and_then(|p| s.string(p.val.desc.name)).unwrap_or("?").to_string()).collect();
+                        kernels.dedup();
+                        if let Some(b) = self.batch.as_mut() { b.passes.push((s.string(pass.name).unwrap_or("compute").to_string(), kernels)); }
+                    }
+                    Err(e) => { eprintln!("[hal-metal] {e}"); s.bad(); }
+                }
+                partial |= self.pending_draws != pending;
+                continue;
+            }
             let Some(dr) = slice(pass.draws, view.draws.len()) else {
                 s.stats.bad_args += 1;
                 continue;
@@ -1052,7 +1094,7 @@ impl Metal {
             // A retained window image must contain all Makepad segments, including transparent
             // draws above native content. Upper layers are framebuffer-only: replay the existing
             // draws into `win` rather than reading their drawables. Native pixels are unavailable.
-            if let Some(pass) = view.passes[slice(p.passes, view.passes.len())?].iter().find(|p| p.color.iter().all(|id| id.is_none())) {
+            if let Some(pass) = view.passes[slice(p.passes, view.passes.len())?].iter().find(|p| p.kind == crate::types::pass_kind::DRAW && p.color.iter().all(|id| id.is_none())) {
                 let w = pass.viewport[2].max(1.0) as u32;
                 let h = pass.viewport[3].max(1.0) as u32;
                 if let (Some(texture), Some(drawable)) = (self.offscreen_target(s, sid, target, w, h, now), self.frame_drawable.as_ref().and_then(|f| f.drawable.clone())) {
@@ -1397,7 +1439,12 @@ impl Metal {
                 }
             }
             if depth.is_some() {
-                let state = if d.flags & Draw::DEPTH_WRITE != 0 { self.dev.depth_write.as_id() } else { self.dev.depth_no_write.as_id() };
+                let state = match (d.flags & Draw::DEPTH_GREATER != 0, d.flags & Draw::DEPTH_WRITE != 0) {
+                    (false, true) => self.dev.depth_write.as_id(),
+                    (false, false) => self.dev.depth_no_write.as_id(),
+                    (true, true) => self.dev.depth_greater_write.as_id(),
+                    (true, false) => self.dev.depth_greater_no_write.as_id(),
+                };
                 if enc.depth_state != state {
                     enc.depth_state = state;
                     unsafe {
@@ -1476,6 +1523,19 @@ impl Metal {
                 };
                 enc.buffer(buffer.unwrap_or(nil), 0, index);
             }
+
+            if crate::compute::validate_draw(s, d, view.arena, &pipe.storage).is_err() { s.bad(); continue; }
+            if d.storage_buffers.len as usize != pipe.storage.len() { s.bad(); continue; }
+            let mut storage_valid = true;
+            for (i, binding) in pipe.storage.iter().enumerate() {
+                let id = id_at(view.arena, d.storage_buffers, i);
+                if let Some(buffer) = self.buf.get_mut(&(sid, id.index)).filter(|b| b.gen == id.gen) {
+                    buffer.last_bound = seq;
+                    enc.buffer(buffer.buffer.as_id(), 0, binding.index as u64);
+                    s.ledger.touch(Kind::Buffer, id.index, id.gen, frame, now);
+                } else { storage_valid = false; break; }
+            }
+            if !storage_valid { s.bad(); continue; }
 
             // textures: what the shader samples, then (a pick) the id twins of those
             let ntex = slot(pipeline_binding::TEXTURES).unwrap_or(0) as usize;

@@ -39,6 +39,7 @@ pub fn in_eval() -> bool {
 
 /// std::relax::probe::__eval's answer: tag 0 the type, 1 the value.
 pub extern "C" fn relax_probe_result(tag: u32, t: *const u8, n: usize) {
+    let _kept = crate::zone_alloc::kept();
     let s = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(t, n) }).into_owned();
     let _ = RESULT.try_with(|r| {
         let mut r = r.borrow_mut();
@@ -315,7 +316,7 @@ fn describe_addr(u: &Unit, a: u64) -> (String, Option<(u64, u64)>) {
     if let Some(id) = u.find_fn(a) {
         return (format!("code of {}", u.fns[id as usize].name), None);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         extern "C" {
             fn malloc_size(p: *const u8) -> usize;
@@ -501,7 +502,9 @@ pub fn cmd_locals(req: &Req, out: &mut Out) {
         }
     } else if let Some(sel) = req.get("thread") {
         let want = super::pick_threads(sel);
-        let list = super::threads::list();
+        // `main` / `owner` pick by handle: the OS list knows tids only until handles are named
+        let mut list = super::threads::list();
+        super::name_handles(&mut list);
         let Some(t) = list.iter().find(|t| want(t)) else { return out.err(&format!("no thread {}", sel)) };
         if t.os_id == super::threads::self_os_id() {
             return out.err("that is the inspect thread");

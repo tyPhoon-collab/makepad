@@ -502,6 +502,20 @@ impl ScriptVm<'_> {
         self.heap().resolve_fields(value, apply.is_eval(), fields, out)
     }
 
+    /// A live edit keeps runtime state when the old and new templates resolve the same value,
+    /// including a field set nowhere in either template.
+    #[doc(hidden)]
+    #[relax_api]
+    #[inline(never)]
+    pub fn script_derive_unchanged(&mut self, apply: &Apply, old: ScriptValue, key: LiveId, slot: ScriptValue) -> bool {
+        if !apply.is_live_edit_reload() || !old.is_object() {
+            return false;
+        }
+        let mut old_value = [ScriptValue::NOT_FOUND];
+        self.heap().resolve_fields(old, false, &[(key, 0)], &mut old_value);
+        self.heap().deep_eq(old_value[0], slot)
+    }
+
     /// One resolved field of `script_apply`: apply `slot` to the field; a field set nowhere gets,
     /// on a reload, the type's registered default (`script_reload_default`), else stays untouched.
     #[doc(hidden)]
@@ -746,6 +760,10 @@ impl ScriptVm<'_> {
 #[relax_api]
 pub fn script_pod_inner(vm: &mut ScriptVm, type_id: ScriptTypeId, type_name: &str) -> Option<ScriptPodType> {
     use crate::pod::*;
+    // one pod type per Rust type (`ScriptHeap::rust_pod_types`)
+    if let Some(pt) = vm.bx.heap.rust_pod_types.get(&type_id).copied() {
+        return Some(pt);
+    }
     use makepad_math::{
         F16x2, F16x4, I16x2, Mat4f, Quat, SNorm16x2, SNorm8x4, U16x2, UNorm16x2, UNorm8x4,
         Vec2f, Vec3f, Vec4f,
@@ -916,6 +934,8 @@ pub fn script_pod_inner(vm: &mut ScriptVm, type_id: ScriptTypeId, type_name: &st
     let pt = vm.bx.heap.new_pod_type(pod_obj, None, pod_ty, NIL);
     vm.bx.heap.set_object_pod_type(pod_obj, pt);
     vm.bx.heap.freeze(pod_obj);
+    vm.bx.heap.set_static(pod_obj.into());
+    vm.bx.heap.rust_pod_types.insert(type_id, pt);
 
     Some(pt)
 }

@@ -124,12 +124,25 @@ impl<'a> Writer<'a> {
         self.secs.push((id, std::mem::size_of::<T>() as u32, vec![Chunk::Mapped(bytes)], v.len() as u64));
     }
 
-    /// One array with a mapped prefix and newly generated tail, in the same section.
-    pub fn add_mapped_prefix<T: Pod>(&mut self, id: u32, mapped: &'static [T], tail: &[T]) {
+    /// One array with a mapped prefix and a newly generated tail (its elements' bytes, taken as
+    /// they are), in the same section.
+    pub fn add_mapped_prefix<T: Pod>(&mut self, id: u32, mapped: &'static [T], tail: Vec<u8>) {
+        debug_assert!(tail.len() % std::mem::size_of::<T>() == 0);
         let mapped_bytes = unsafe { std::slice::from_raw_parts(mapped.as_ptr() as *const u8, std::mem::size_of_val(mapped)) };
-        let tail_bytes = unsafe { std::slice::from_raw_parts(tail.as_ptr() as *const u8, std::mem::size_of_val(tail)) };
-        self.secs.push((id, std::mem::size_of::<T>() as u32,
-            vec![Chunk::Mapped(mapped_bytes), Chunk::Owned(tail_bytes.to_vec())], (mapped.len() + tail.len()) as u64));
+        let n = mapped.len() + tail.len() / std::mem::size_of::<T>();
+        self.secs.push((id, std::mem::size_of::<T>() as u32, vec![Chunk::Mapped(mapped_bytes), Chunk::Owned(tail)], n as u64));
+    }
+
+    /// One array from a mapped prefix and borrowed runs, in the same section: the bytes of
+    /// `add_mapped_prefix(id, mapped, &runs.concat())` without the concatenated copy.
+    pub fn add_parts<T: Pod>(&mut self, id: u32, mapped: &'static [T], runs: Vec<&'a [T]>) {
+        fn bytes<T: Pod>(v: &[T]) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+        }
+        let n = mapped.len() + runs.iter().map(|r| r.len()).sum::<usize>();
+        let mut chunks = vec![Chunk::Mapped(bytes(mapped))];
+        chunks.extend(runs.into_iter().map(|r| Chunk::Borrowed(bytes(r))));
+        self.secs.push((id, std::mem::size_of::<T>() as u32, chunks, n as u64));
     }
 
     /// Small generated sections whose temporary backing array does not outlive the writer.
@@ -163,21 +176,45 @@ impl<'a> Writer<'a> {
     }
 
     /// Freeze borrowed arrays while keeping generated sections and nested images intact.
-    pub fn into_owned(self) -> Writer<'static> {
-        Writer { secs: self.secs.into_iter().map(|(id, es, chunks, n)| {
-            let chunks = chunks.into_iter().map(|chunk| match chunk {
-                Chunk::Borrowed(b) => Chunk::Owned(b.to_vec()),
-                Chunk::Mapped(b) => Chunk::Mapped(b),
-                Chunk::Owned(b) => Chunk::Owned(b),
-                Chunk::Shared(b) => Chunk::Shared(b),
-                Chunk::Image(image) => {
-                    // Shared builders are legal too; only that case needs an owned copy.
-                    let image = std::sync::Arc::try_unwrap(image).unwrap_or_else(|image| (*image).clone());
-                    Chunk::Image(std::sync::Arc::new(image.into_owned()))
-                }
-            }).collect();
-            (id, es, chunks, n)
-        }).collect() }
+    /// `stop` is asked before each OWN_STEP bytes copied: yes drops the copy and None comes back
+    /// (a background encode under the owner thread yields to a waiting request: copying a large
+    /// program's arrays in one go held it 48 ms).
+    pub fn into_owned(self, stop: &dyn Fn() -> bool) -> Option<Writer<'static>> {
+        const OWN_STEP: usize = 4 << 20;
+        let mut secs = Vec::with_capacity(self.secs.len());
+        for (id, es, chunks, n) in self.secs {
+            let mut owned = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                owned.push(match chunk {
+                    Chunk::Borrowed(b) => {
+                        let mut v = Vec::with_capacity(b.len());
+                        for piece in b.chunks(OWN_STEP) {
+                            if stop() { return None; }
+                            v.extend_from_slice(piece);
+                        }
+                        Chunk::Owned(v)
+                    }
+                    Chunk::Mapped(b) => Chunk::Mapped(b),
+                    Chunk::Owned(b) => Chunk::Owned(b),
+                    Chunk::Shared(b) => Chunk::Shared(b),
+                    Chunk::Image(image) => {
+                        // Shared builders are legal too; only that case needs an owned copy.
+                        let image = std::sync::Arc::try_unwrap(image).unwrap_or_else(|image| (*image).clone());
+                        Chunk::Image(std::sync::Arc::new(image.into_owned(stop)?))
+                    }
+                });
+            }
+            secs.push((id, es, owned, n));
+        }
+        Some(Writer { secs })
+    }
+
+    /// The bytes the writer holds itself (generated sections, frozen copies), nested images'
+    /// included: what it adds to the process beyond the arrays it borrows or maps.
+    pub fn owned_len(&self) -> usize {
+        self.secs.iter().flat_map(|(_, _, b, _)| b).map(|c| match c {
+            Chunk::Owned(b) => b.len(), Chunk::Image(image) => image.owned_len(), _ => 0,
+        }).sum()
     }
 
     pub fn len(&self) -> usize {

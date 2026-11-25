@@ -18,64 +18,109 @@ use current source for API signatures and working examples.
 
 ## Current agent workflow
 
-- Opus 5.5 does all work that takes judgement: implementation lanes, reviews
-  of every lane's diff, research and design.
+- Opus 5.5 decides who gets each task. It keeps design, research, hard
+  diagnosis and reviews of every lane's diff, and gives well-specified
+  implementation, tests, runs and cleanups to Codex.
 - Grok handles only hyper-mechanical work (bulk renames, repetitive edits,
   transcription, log sweeps) under precise briefs.
-- Codex, Sol and Fable are not used for now.
+- Codex works under precise briefs: `codex exec -s workspace-write -C <worktree> -m <model> "<brief>" < /dev/null`, from the normal user environment (its real HOME; a changed HOME or CODEX_HOME fails with 401, an open stdin hangs it). Sol and Fable are not used for now.
+- An agent does the task it was given itself. It never starts another agent
+  CLI (claude, codex, grok) as a subprocess. If a task is too hard or the
+  brief is not enough, it stops and ends with `HAND BACK: <reason>` plus what
+  it found and changed; the Opus lead then takes the task over.
 - Resume a finished lane with its context for follow-ups instead of starting
-  a fresh one that repays the same input. Idle without polling while waiting.
-- This is the user's current workflow (2026-09-27) and supersedes older role
-  assignments in local skills or memories (including the 2026-09-16 one).
+  a fresh one that repays the same input.
+- This is the user's current workflow (2026-11-03) and supersedes older role
+  assignments in local skills or memories.
+
+## Token cost of a turn
+
+Every tool round re-reads your whole context, on average about 25 times what its result
+costs, so the number of rounds is the cost. Measured over 36 h of lanes: 95% of messages
+carried a single tool call, 59% of rounds were code reads, and waiting for or checking on
+runs took 17% of the cost.
+
+- Batch what you can already name: several Reads or searches in one message, or one command
+  that prints them all. Go one at a time only when the next call depends on the last result.
+- Never poll: no `until grep` or `sleep` loops, no repeated `tail` of a log or task output, no
+  repeated `job list`. Start a script of your own with the Bash tool's `run_in_background`; it
+  wakes you when it exits.
+- Wait for a run with `devhub job submit`, then `devhub job wait <id>` in the background: no
+  filter, no buffer, no expiry. A plan of several jobs goes in one `job submit --batch <file>`.
+- A Monitor on a log must end in a stage that flushes: `grep --line-buffered` does; `cut`,
+  `head` and `sed` hold the matches back, so it stays silent.
+- A finished job: `devhub job result <id> [--tail]` gives exit, error lines and log tail; the
+  whole log is `~/.makepad/devhub/jobs/<id>.log`.
+- `devhub <cmd> --help` prints that command's entry; don't read or grep the whole help.
 
 ## Sending your changes to Makepad
 
-People who installed Makepad apps with the Makepad Builder change them with
-their own coding agent. When the person asks you to "send what I changed",
-"share my changes with Makepad" or similar, write a change report and send
-it only with their approval. The format, limits and anonymisation rules are
-in [Change reports](docs/agents/change-report.md); the steps:
+People who run Makepad apps with the Makepad Runner change them with their
+own coding agent. When the person asks you to "send what I changed", "share
+my changes with Makepad" or similar, write a change report. The format, limits
+and anonymisation rules are in
+[Change reports](docs/agents/change-report.md); the steps:
 
-1. Find the installation. This checkout is `builder/sources/<release>/makepad`
-   inside it (app repositories at `makepad/apps/<name>`); the installation
-   folder holds `makepad-builder.exe` (Windows) or `makepad-builder.sh`
-   (macOS, Linux). `builder/installed/<app>.json` names the app (`"id"`) and
-   the release its source came from (`"release"`, `"repositories"`). Below,
-   `BUILDER` is `<installation>\makepad-builder.exe` or
-   `<installation>/makepad-builder.sh`.
-2. Collect the changes: `BUILDER changes <app>` prints the diff of the app's
-   source against that release (`--files` lists the files). Edits saved by
-   an earlier update are in `builder/changes/<app>-<date>.diff`. With git
-   available, `git status` and `git diff HEAD` in each repository give the
-   same. Skip build output and anything unrelated to the app.
-3. Write the list as concepts, not code: per change a one-line title, a
+1. Collect the changes. In a Runner installation an app's edits are the files
+   in `runner/edits/<app>/` of its folder, and `runner/releases.tsv` names the
+   release its source came from. With git available, `git status` and
+   `git diff HEAD` in each repository give the same. Skip build output and
+   anything unrelated to the app.
+2. Write the list as concepts, not code: per change a one-line title, a
    kind (fix, feature, tweak, ui, performance, refactor, docs, other), what
    is different for someone using the app and why, and the screens or
    components it touches. Add a tiny snippet only when a change cannot be
    told without it.
-4. Anonymise everything that will be sent: replace names and usernames,
+3. Anonymise everything that will be sent: replace names and usernames,
    email addresses, host names and private IP addresses, absolute and home
    folder paths (use repo-relative paths), keys, tokens and passwords,
    private service URLs and personal data in strings or comments with
    `[name]`, `[email]`, `[host]`, `[path]`, `[secret]`, `[private-url]` or
    `[personal]`, and count what you took out, by kind.
-5. Show the person the list and what was taken out, ask whether to include
-   a trimmed diff (default: no) and whether Makepad may reply by email, and
-   wait for their explicit approval or edits. Never send without it.
-6. Write `builder/changes/<app>-report/` with `report.json` (schema:
+4. Show the person the list and what was taken out, ask whether to include
+   a trimmed diff (default: no), and wait for their explicit approval or edits.
+5. Write `<app>-report/`, outside the app's source, with `report.json` (schema:
    `docs/agents/change-report.schema.json`), `REPORT.md` (the same list for
-   people) and, only when they opted in, `changes.diff`. `BUILDER
-   send-changes <app>` checks it (schema, 256 KB limit, the anonymisation
-   scan) and prints what would be sent; fix what it reports.
-7. Send it: `BUILDER send-changes <app> --yes`, adding `--with-email` only
-   when the person wants a reply (the Builder adds the address it is logged
-   in with; you never need it). Or leave the report for them to read and
-   send in the Builder (`e` on the app's row). Without the Builder, POST the
-   zip: `curl -sS -X POST -H 'X-Makepad-Feedback: 1' -H 'Content-Type:
-   application/zip' --data-binary @report.zip
-   https://makepad.nl/api/feedback/changes`.
-8. Tell the person the report id the Builder (or the server's
-   `{"ok":true,"id":N}`) returned.
+   people) and, only when they opted in, `changes.diff`.
+6. Nothing can send it yet: makepad.nl has no route for reports. Tell the
+   person and leave the report with them.
+
+## Lanes go through devhub
+
+- Create every lane with `makepad devhub lane new <name>` (add `--no-commercial`
+  for a makepad-only lane). It makes the worktrees in both repos, the branches
+  and the devhub record, so builds, leases, landing and cleanup work. Never
+  create lane worktrees with plain `git worktree add`; if one exists already,
+  register it with `makepad devhub lane adopt` before building.
+- Build, test and land through devhub (`devhub run`, leases, `devhub land`), not
+  ad-hoc scripts on nodes.
+- Iterate and check under the JIT, never by native rebuilds:
+  - UI: `makepad devhub live start <app> --visible`, then after each save
+    `makepad devhub live look <id>` (patched, a frame, a PNG in `local/screencap/<lane>/`).
+  - Tests: `makepad devhub test <lane> <pkg> [--lib|--test T] --live [-- filter]`; the
+    pre-land check is the same without `--live`.
+  - devhub refuses a lane's native cargo build/run/test. It runs only for the JIT's own
+    crates, an open JIT miss, a platform without a JIT, a test devhub's measured routing
+    sends to cargo, or `--native "<reason>"` (native-vs-JIT baselines, timed perf series).
+  A `JIT error, not your change` answer is not the lane's bug: carry on.
+- Pass `--cost small|medium|large` or `--est-min N` to run/job/lease so small jobs
+  go to the hot boxes; devhub corrects bad guesses from measured times.
+- Apps run and are checked on Linux nodes (screen and live leases, grabs, app tests,
+  benchmarks and JIT cold starts included). Add `--needs os=macos` only for
+  macOS/Metal-specific work and macOS-specific timings: nothing else lands on a Mac, and a
+  lease naming a Mac without it is refused. The Macs are scarce: one batched bench lease
+  per lane, all its cases in one run. A macOS timed lease runs on the bench Mac, or on another
+  Mac while the bench Mac runs timed work; its release line names the box. A series compared
+  across leases names its box (`--node`).
+- The merge bot keeps each lane merged with the tip, in the lane's own worktree. It waits
+  while a job or live job runs there, and while a `timed` lease of the lane is queued, live,
+  or ended in the last 15 minutes. A timed or bench series with longer gaps between runs, or
+  any other pinned binary you compare against, needs `makepad devhub hold <branch> "why"` before
+  the first run and `devhub unhold <branch>` after the last.
+- A master restart (self-update) keeps every lease and queued request, and leases in setup or
+  cleanup; it happens at most every 10 minutes, within 5 minutes of a devhub landing even while
+  landings keep coming (a wait says `stalled: <why>` in the update events). Holders just keep
+  beating; `devhub master restart` forces one.
 
 ## Clean up after work
 
@@ -122,10 +167,11 @@ it used (this one and any build or bench node):
 ## Commit content and Studio iteration history
 
 - NEVER create or publish additional public branches in `makepad/makepad`.
-  Use only the established `local` → `work` → `main` workflow. `local` remains
-  private and must never be pushed. Feature, test, release, packaging, and
-  distribution work do not authorize another public branch; using a separate
-  checkout or worktree does not change this rule.
+  Use only the established `local` → `work` → `main` workflow, plus `release`:
+  the branch Runner reads, which only ever moves to the already-pushed `work`
+  tip. `local` remains private and must never be pushed. Feature, test,
+  packaging, and distribution work do not authorize another public branch;
+  using a separate checkout or worktree does not change this rule.
 - Keep AI-generated Markdown, plans, reports, scratch helpers, logs, recordings,
   captures, build output, and other temporary artifacts out of commits. Existing
   instruction files such as `AGENTS.md` are the Markdown exception. Preserve
@@ -139,9 +185,29 @@ it used (this one and any build or bench node):
   `git diff --stat` before every commit and stop on paths you did not write;
   a chain that carries such content is rewritten before it is pushed, never
   fixed with a follow-up delete.
+- NEVER put machine or host names, node numbers, LAN addresses, user names,
+  home paths or hardware inventory in tracked files, test names, fixtures or
+  commit messages. Write "a Linux node", "the Mac", "an M-series Metal GPU",
+  "a 24 GB GPU" or 192.0.2.x, and repo-relative paths; machine names belong
+  only in `local/`. The git hooks (`tools/private_check/hooks`, installed in
+  the common git dir) and `devhub land` enforce this with
+  `tools/private_check/scan.sh`; never use `--no-verify`. A real exception is
+  one reasoned line in `tools/private_check/allow`, reviewed before it lands.
 - Run the existing repository tests for validation. Do not add generated test
   files, inline test code, or test scaffolding unless the user explicitly requests
-  that change. Preserve existing tests; do not remove or weaken them to pass.
+  that change. Never weaken a test to make it pass. Every test in the repo must
+  be useful and pass: fix it, or delete it if it only restates the
+  implementation, duplicates another, pins timings or unchecked golden output,
+  or needs external tools (Node.js, clang, network, credentials, model
+  downloads). No `#[ignore]`d or never-run tests.
+- Tests are as fast as is meaningfully useful: the smallest input that proves
+  the property; unit tests well under 1 s, scenario/app tests a few seconds;
+  no multi-minute tests; slow product code is a perf bug, not a reason for a
+  slow test. Every test runs thousands of times (every lane, every land, CI),
+  so each one must be worth its cost: delete redundant or implementation-pinning
+  tests; keep the ones that guard real behaviour or past bugs. Prefer one test
+  that sets up once and checks several properties (each assertion saying which
+  property broke) over several tests that rebuild the same setup.
 - The source hierarchy is `local` → `work` → `main`: `local` records every
   build iteration, `work` carries day-to-day landings, and `main` holds validated
   milestones, one squashed commit per logical block, and incoming external PRs.
@@ -156,8 +222,8 @@ it used (this one and any build or bench node):
   changes without discarding unrelated work.
 - For Studio-managed flow builds, use this order: platform build checks,
   rustfmt on changed Rust, repeat checks if formatting changed the source,
-  commit the exact eligible source to `local`, release binary build, existing
-  native tests, then launch. Record the checkpoint hash with the binary and
+  commit the exact eligible source to `local`, release binary build, its tests
+  under the JIT (`devhub test`), then launch. Record the checkpoint hash with the binary and
   its evidence. Reuse bounded worktrees; never create one per build.
 - Agents may code, check, and build the next revision while its previous app
   is running. When the replacement is ready, gracefully close and restart
@@ -167,8 +233,8 @@ it used (this one and any build or bench node):
   is not a reason to defer a build, ask for permission, or require the user
   to close it.
 - A validated revision requires `cargo check` for its supported platforms with
-  zero warnings/errors, the existing native tests on the current host, and a
-  release build/runtime check when applicable. Use the repository's actual
+  zero warnings/errors, its tests under the JIT (`devhub test`), and a runtime
+  check under the JIT (`devhub live start` + `live look`) when applicable. Use the repository's actual
   package/target support matrix. Missing SDKs, runners, or required tests are
   blocked coverage, not passes. Do not suppress warnings to obtain a green gate.
 - Validate the exact resulting source for each feature/milestone promotion so
@@ -186,9 +252,9 @@ it used (this one and any build or bench node):
 
 - Use release builds for runtime validation, profiling, benchmarks, and
   timing checks unless the user explicitly requests debug.
-- Build with `cargo build --release -p <package>` from the package's owning
-  workspace, then launch the resulting standalone executable from this
-  checkout. Check the target directory and resource working directory;
+- Native builds (`cargo build --release -p <package>` from the package's owning
+  workspace, then the standalone executable) only where the JIT-first rule above
+  allows them. Check the target directory and resource working directory;
   some apps have their own workspace.
 - Build profiles live in the root `Cargo.toml`: dev keeps line tables only,
   release is incremental without LTO. cargo-makepad's packaging commands
@@ -207,12 +273,17 @@ it used (this one and any build or bench node):
   muted Stage (H.264-only sites such as X via the media file behind the page)
   and writes the clip, provenance and frames. See
   `apps/commercial/stage/WEB-GRABS.md`.
-- The parallel rustc frontend is a local opt-in, never for CI or shipped
-  builds. It needs `RUSTC_BOOTSTRAP` on stable and roughly halves a clean
-  dev build. Put it in the user config, `~/.cargo/config.toml`, so every
-  build on the machine gets the same flags (a flag difference rebuilds
-  every crate); do not set it per shell with `RUSTFLAGS`:
-  `[env]` `RUSTC_BOOTSTRAP = "1"` and `[build]` `rustflags = ["-Zthreads=8"]`.
+- Every host build in the workspace uses the parallel rustc frontend:
+  hand builds, devhub, CI and the land gate alike. The repo's
+  `.cargo/config.toml` gives each host target `-Z threads=8` and
+  `-Z allow-features=`, and sets `RUSTC_BOOTSTRAP = "1"` in `[env]` so that
+  stable rustc takes them. The empty allow list keeps the bootstrap from
+  letting a `#![feature]` through, so stable's guarantee still holds. Do not
+  add these flags in `~/.cargo/config.toml` or override them per shell with
+  `RUSTFLAGS`: a different flag set builds a second copy of every crate.
+  Cross targets get `-Z allow-features=` too (`[build] rustflags`); a build
+  that sets `RUSTFLAGS` for one adds it, except a nightly `-Z build-std`
+  build, which needs std's features.
 - Use the WM’s Cargo launch path for its hosted apps: `cargo run --release`
   builds each app on demand, and the WM shows compilation while it starts.
   Do not collect prebuilt app binaries for a WM session.
@@ -245,8 +316,8 @@ it used (this one and any build or bench node):
 - Apps that embed the AI chat build only its CLI/MCP/cloud backends. The
   local model runtimes (Qwen on Metal/CUDA, the metallib and kernel builds)
   come in through the app's own `localai` cargo feature
-  (`cargo build --release -p <app> --features localai`, or in a Builder
-  catalog entry's `features`). It is on by default only where the app's own
+  (`cargo build --release -p <app> --features localai`, or in an entry's
+  `features` in `libs/app_registry/runner_apps.json`). It is on by default only where the app's own
   job runs local models: `apps/ai-hub`, route and files.
 
 ## App ownership, focus, and screenshots

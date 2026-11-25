@@ -37,10 +37,19 @@ struct Record {
     depth: usize,
     owner: NodeId,
     part_key: u64,
+    /// A part drawn as an area of its own (a list's row): its bounds, and whether it is
+    /// offscreen, are that area's once the frame's turtles finish, as a widget's are. Empty:
+    /// the part carries its own.
+    drawn: Area,
     label_for: NodeId,
     generated_labels: Vec<NodeId>,
+    /// The node's name is its tip's text (a nameless control in a tooltip).
+    named_by_tip: bool,
     parts: HashMap<u64, NodeId>,
     drawn_parts: Vec<NodeId>,
+    /// Where the node's area stood when its text geometry (absolute line boxes and glyph
+    /// positions) was measured; see [`CxA11y::set_text_origin`].
+    text_at: Option<[f32; 2]>,
 }
 #[derive(Default)]
 struct WindowTree {
@@ -52,6 +61,8 @@ struct WindowTree {
     full: bool,
     ids: Vec<NodeId>,
     walk: Vec<(NodeId, NodeId, usize)>,
+    /// (control, tip) pairs the frame's tips may name (scratch, reused).
+    tipped: Vec<(NodeId, NodeId)>,
     update: TreeUpdate,
     bytes: Vec<u8>,
 }
@@ -75,6 +86,17 @@ pub struct CxA11y {
     announcements: Vec<Notification>,
     pending: Option<(u64, ActionResult)>,
     requested_focus: NodeId,
+    /// Nodes whose path the widget layer could not name while they drew (`path_unknown`).
+    paths_unknown: Vec<(WindowKey, NodeId)>,
+}
+
+/// Names a widget node's path (`Node::path`) after the frame drew, for nodes whose path the
+/// widget layer could not name during the draw: `(cx, widget uid, its window's root uid)`.
+static PATH_RESOLVER: std::sync::OnceLock<fn(&Cx, u64, u64) -> Option<String>> = std::sync::OnceLock::new();
+
+/// The widget layer's path resolver (`PATH_RESOLVER`); the first one set stays.
+pub fn set_path_resolver(resolve: fn(&Cx, u64, u64) -> Option<String>) {
+    let _ = PATH_RESOLVER.set(resolve);
 }
 
 impl CxA11y {
@@ -156,6 +178,7 @@ impl CxA11y {
         if rec.seen != frame {
             rec.drawn_children.clear();
             rec.drawn_parts.clear();
+            rec.text_at = None;
         }
         rec.seen = frame;
         rec.parent = parent;
@@ -211,6 +234,17 @@ impl CxA11y {
         self.stack.push(Frame { id, window, list });
         token
     }
+    /// Where the node's area stands as its semantics measure its text. A widget's semantics run
+    /// right after it draws, before the parents around it align their children, so its line
+    /// boxes and glyph positions (absolute, unlike its bounds, which come from its area once
+    /// every turtle has finished) would keep the place it was drawn at; `finish_frame` moves
+    /// them as far as the area has moved since.
+    pub fn set_text_origin(&mut self, token: u32, at: [f32; 2]) {
+        let f = self.stack[token as usize];
+        if let Some(rec) = f.window.and_then(|w| self.windows.get_mut(&w)).and_then(|t| t.records.get_mut(&f.id)) {
+            rec.text_at = Some(at);
+        }
+    }
     /// Reuse the previous draw's strings and vectors. Semantics implementations overwrite the
     /// fields they own and compare strings before copying; class/path are computed only once.
     pub fn take_node(&mut self, token: u32) -> Node {
@@ -218,7 +252,14 @@ impl CxA11y {
         f.window
             .and_then(|w| self.windows.get_mut(&w))
             .and_then(|w| w.records.get_mut(&f.id))
-            .map(|r| std::mem::take(&mut r.next))
+            .map(|r| {
+                let mut node = std::mem::take(&mut r.next);
+                // The widget names its node itself; a tip's name is given again after the frame.
+                if r.named_by_tip {
+                    node.name.clear();
+                }
+                node
+            })
             .unwrap_or_default()
     }
     pub fn end_node(&mut self, token: u32, mut node: Node, area: Area) {
@@ -248,7 +289,8 @@ impl CxA11y {
     /// Insert a non-widget child. Keys are stable application item identities, not draw indices.
     /// Overflow of the wire's 16-bit part field uses a fresh widget id from the same allocator;
     /// dispatch always resolves the owner, so large virtual collections do not truncate or collide.
-    pub fn set_part(&mut self, token: u32, key: u64, parent_key: Option<u64>, mut node: Node, alloc: impl FnOnce() -> u64) {
+    /// `drawn`: the area the part drew as, when it drew as one of its own (see [`Record::drawn`]).
+    pub fn set_part(&mut self, token: u32, key: u64, parent_key: Option<u64>, mut node: Node, drawn: Area, alloc: impl FnOnce() -> u64) {
         let f = self.stack[token as usize];
         let Some(w) = f.window else { return };
         let tree = self.windows.get_mut(&w).unwrap();
@@ -285,7 +327,27 @@ impl CxA11y {
         let rec = tree.records.get_mut(&id).unwrap();
         rec.owner = f.id;
         rec.part_key = key;
+        rec.drawn = drawn;
         rec.next = node;
+    }
+    /// The path of the node being built could not be named yet: it is asked again once the
+    /// frame has drawn (`set_path_resolver`), and after every later frame until it is named.
+    pub fn path_unknown(&mut self, token: u32) {
+        let f = self.stack[token as usize];
+        if let Some(w) = f.window {
+            if !self.paths_unknown.contains(&(w, f.id)) {
+                self.paths_unknown.push((w, f.id));
+            }
+        }
+    }
+    /// Whether the node being built still waits for its path (`path_unknown`): its widget names
+    /// it again when it draws.
+    pub fn path_pending(&self, token: u32) -> bool {
+        if self.paths_unknown.is_empty() {
+            return false;
+        }
+        let f = self.stack[token as usize];
+        f.window.is_some_and(|w| self.paths_unknown.contains(&(w, f.id)))
     }
     pub fn is_current_node(&self, uid: u64) -> bool { self.stack.last().is_some_and(|f| f.id == NodeId::widget(uid)) }
     pub fn set_label_for(&mut self, token: u32, target: u64) {
@@ -342,11 +404,13 @@ impl CxA11y {
 
     /// `list_redraw` excludes freed lists, including pool slots awaiting reuse. `bounds` runs
     /// after all turtles finish, also updating cached nodes when their view transform moves.
+    /// `origin` is an area's unclipped top-left then, which a node's text follows.
     pub fn finish_frame(
         &mut self,
         focus: Area,
         mut list_redraw: impl FnMut(DrawListId) -> Option<u64>,
         mut bounds: impl FnMut(Area) -> Option<makepad_a11y::Rect>,
+        mut origin: impl FnMut(Area) -> Option<[f32; 2]>,
         mut emit: impl FnMut(WindowId, Vec<u8>),
     ) {
         if !self.on {
@@ -361,14 +425,27 @@ impl CxA11y {
                 rec.alive = rec.seen == self.frame || redraw.is_some_and(|r| r == rec.redraw);
                 if rec.seen != self.frame && rec.annotated != self.frame {
                     reuse_node(&mut rec.next, &rec.node);
+                    // A name a tip gave is given again below, from the tip as it is now.
+                    if rec.named_by_tip {
+                        rec.next.name.clear();
+                    }
                 }
+                rec.named_by_tip = false;
                 if rec.alive {
                     if !rec.owner.is_none() {
-                        // Parts carry their own bounds, but focus belongs to the owner's real Area.
-                    } else if let Some(b) = bounds(rec.area) {
-                        rec.next.bounds = b;
-                    } else if !rec.area.is_empty() {
-                        rec.next.bounds = Default::default();
+                        // Parts carry their own bounds, but focus belongs to the owner's real
+                        // Area; one drawn as an area of its own stands where that area shows.
+                        if !rec.drawn.is_empty() {
+                            shown_at(&mut rec.next, bounds(rec.drawn));
+                        }
+                    } else {
+                        if !rec.area.is_empty() {
+                            shown_at(&mut rec.next, bounds(rec.area));
+                        }
+                        if let (Some(at), Some(now)) = (rec.text_at, origin(rec.area)) {
+                            follow_origin(&mut rec.next, [now[0] - at[0], now[1] - at[1]]);
+                            rec.text_at = Some(now);
+                        }
                     }
                     if let Some(r) = redraw {
                         rec.redraw = r;
@@ -443,6 +520,24 @@ impl CxA11y {
                 if let Some(field) = tree.records.get_mut(&target).filter(|r| r.reachable) {
                     if !field.next.relations.labelled_by.contains(id) { field.next.relations.labelled_by.push(*id); field.generated_labels.push(*id); }
                 }
+            }
+            // A control with no name of its own inside a tip is named by the tip's text (a
+            // tooltip is a name's last resort, as an HTML `title` is): what a pointer reads on
+            // hover is what a screen reader hears, from one source.
+            tree.tipped.clear();
+            for id in &tree.ids {
+                let Some(tip) = tree.records.get(id).filter(|r| r.reachable && r.next.role == Role::Tooltip && !r.next.description.is_empty()) else { continue };
+                tree.tipped.extend(tip.next.children.iter().map(|child| (*child, *id)));
+            }
+            for &(child, tip) in &tree.tipped {
+                if !tree.records.get(&child).is_some_and(|r| r.next.name.is_empty() && r.next.role.is_interactive()) {
+                    continue;
+                }
+                let text = std::mem::take(&mut tree.records.get_mut(&tip).unwrap().next.description);
+                let rec = tree.records.get_mut(&child).unwrap();
+                set_string(&mut rec.next.name, &text);
+                rec.named_by_tip = true;
+                tree.records.get_mut(&tip).unwrap().next.description = text;
             }
             let next_focus = if tree.records.get(&self.requested_focus).is_some_and(|r| r.reachable && r.area == focus && emits(&r.next)) {
                 self.requested_focus
@@ -552,6 +647,23 @@ fn ancestor(tree: &WindowTree, candidate: NodeId, mut child: NodeId) -> bool {
         child = rec.parent;
     }
     false
+}
+
+/// A node's text geometry moved with its area (a parent aligned it after its semantics ran).
+fn follow_origin(node: &mut Node, [dx, dy]: [f32; 2]) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    if let Some(text) = node.text.as_mut() {
+        for line in &mut text.lines {
+            line.rect.x += dx;
+            line.rect.y += dy;
+            line.baseline += dy;
+        }
+        for x in &mut text.glyph_x {
+            *x += dx;
+        }
+    }
 }
 
 // Derived Node::clone_from would replace every String. Cached records copy into their
@@ -673,6 +785,26 @@ impl Cx {
         if !self.a11y.on {
             return;
         }
+        if !self.a11y.paths_unknown.is_empty() {
+            // Kept until named: the graph may read a widget made mid-draw only after a later
+            // frame. A node whose window or record went is dropped.
+            let mut unknown = std::mem::take(&mut self.a11y.paths_unknown);
+            if let Some(resolve) = PATH_RESOLVER.get() {
+                unknown.retain(|(w, id)| {
+                    let Some(root) = self.a11y.windows.get(w).filter(|t| t.records.contains_key(id)).map(|t| t.root.uid()) else {
+                        return false;
+                    };
+                    let Some(path) = resolve(self, id.uid(), root) else { return true };
+                    if let Some(rec) = self.a11y.windows.get_mut(w).and_then(|t| t.records.get_mut(id)) {
+                        rec.next.path = path;
+                    }
+                    false
+                });
+            } else {
+                unknown.clear();
+            }
+            self.a11y.paths_unknown = unknown;
+        }
         let mut a11y = std::mem::take(&mut self.a11y);
         let mut ops = std::mem::take(&mut self.platform_ops);
         a11y.finish_frame(
@@ -684,12 +816,24 @@ impl Cx {
                     .map(|l| l.redraw_id)
             },
             |area| snapshot_rect(&area, self).map(semantic_rect),
+            |area| area.is_valid(self).then(|| {
+                let pos = area.rect(self).pos;
+                [pos.x as f32, pos.y as f32]
+            }),
             |window, bytes| ops.push_back(CxOsOp::A11yUpdate { window, bytes }),
         );
         self.platform_ops = ops;
         self.a11y = a11y;
     }
 }
+/// A drawn node's bounds: its area clipped by every clip it drew under, on every side. None:
+/// nothing of it is inside them (a row a list scrolled past an edge, a panel a scroll view
+/// moved away), so it is offscreen, with no bounds.
+fn shown_at(node: &mut Node, shown: Option<makepad_a11y::Rect>) {
+    node.states.set(States::OFFSCREEN, shown.is_none());
+    node.bounds = shown.unwrap_or_default();
+}
+
 pub fn semantic_rect(rect: crate::makepad_math::Rect) -> makepad_a11y::Rect {
     makepad_a11y::Rect {
         x: rect.pos.x as f32,
@@ -877,10 +1021,20 @@ mod tests {
         focus: Area,
         redraw: impl FnMut(DrawListId) -> Option<u64>,
     ) -> Vec<TreeUpdate> {
+        finish_shown(b, focus, redraw, |_| None)
+    }
+    /// [`finish`] with the areas' on-screen bounds (`None`: nothing of it on screen).
+    fn finish_shown(
+        b: &mut CxA11y,
+        focus: Area,
+        redraw: impl FnMut(DrawListId) -> Option<u64>,
+        bounds: impl FnMut(Area) -> Option<makepad_a11y::Rect>,
+    ) -> Vec<TreeUpdate> {
         let mut messages = Vec::new();
         b.finish_frame(
             focus,
             redraw,
+            bounds,
             |_| None,
             |w, bytes| messages.push((w, bytes)),
         );
@@ -897,6 +1051,75 @@ mod tests {
         let mut b = CxA11y::default();
         assert!(b.set_consumers(4));
         b
+    }
+
+    /// A node drawn with nothing of it on screen (clipped away, a row scrolled past a list's
+    /// edge) is offscreen, with no bounds; scrolled back, it is on screen where it stands. So is
+    /// a part drawn as an area of its own (a list's row that is no widget), where its area
+    /// shows when the frame finishes; a part drawn as none keeps the bounds it carries.
+    #[test]
+    fn a_node_clipped_out_of_view_is_offscreen_until_it_shows() {
+        let mut pool = CxDrawListPool::default();
+        let list = pool.alloc();
+        let area = |rect_id| Area::Rect(RectArea { draw_list_id: list.id(), rect_id, redraw_id: 1 });
+        let (row, part_row) = (area(0), area(1));
+        let carried = makepad_a11y::Rect { x: 0.0, y: 90.0, w: 100.0, h: 20.0 };
+        let mut b = active();
+        let mut tree = makepad_a11y::mirror::Tree::default();
+        let frame = |b: &mut CxA11y, tree: &mut makepad_a11y::mirror::Tree, shown: Option<makepad_a11y::Rect>| {
+            b.begin_frame();
+            let r = root(b, WindowId(0, 1), 1, list.id());
+            let t = b.begin_node(2, Some(list.id()));
+            b.end_node(t, node(Role::ListItem, "Row"), row);
+            let owner = b.begin_node(3, Some(list.id()));
+            b.set_part(owner, 7, None, node(Role::ListItem, "Part row"), part_row, || unreachable!("a part id"));
+            b.set_part(owner, 8, None, Node { bounds: carried, ..node(Role::ListItem, "Own bounds") }, Area::Empty, || unreachable!("a part id"));
+            b.end_node(owner, node(Role::List, "List"), Area::Empty);
+            end_root(b, r);
+            b.finish_frame(Area::Empty, |_| Some(1), |a| if a == row || a == part_row { shown } else { None }, |_| None, |_, bytes| {
+                tree.apply(makepad_a11y::wire::decode_update(&bytes).unwrap());
+            });
+            let get = |id| tree.node(id).cloned().expect("drawn");
+            (get(NodeId::widget(2)), get(NodeId::part(3, 1)), get(NodeId::part(3, 2)))
+        };
+        let (row, part, own) = frame(&mut b, &mut tree, None);
+        assert!(row.states.contains(States::OFFSCREEN) && row.bounds.is_empty(), "clipped away: offscreen, no bounds");
+        assert!(part.states.contains(States::OFFSCREEN) && part.bounds.is_empty(), "a part's row clipped away too");
+        assert!(!own.states.contains(States::OFFSCREEN) && own.bounds == carried, "a part with no area of its own keeps its bounds");
+        let on = makepad_a11y::Rect { x: 0.0, y: 40.0, w: 100.0, h: 20.0 };
+        let (row, part, own) = frame(&mut b, &mut tree, Some(on));
+        assert!(!row.states.contains(States::OFFSCREEN), "scrolled back into view: on screen");
+        assert_eq!(row.bounds, on);
+        assert!(!part.states.contains(States::OFFSCREEN) && part.bounds == on, "the part's row where its area shows");
+        assert_eq!(own.bounds, carried);
+    }
+
+    #[test]
+    fn text_follows_an_alignment_that_moves_its_node_after_its_semantics() {
+        let mut pool = CxDrawListPool::default();
+        let list = pool.alloc();
+        let mut b = active();
+        b.begin_frame();
+        let r = root(&mut b, WindowId(0, 1), 1, list.id());
+        let t = b.begin_node(2, Some(list.id()));
+        // the field drew at y 66 and measured its line there; the row it sits in then centred it
+        // 9 lower and the list moved it 2 right
+        let mut field = node(Role::TextField, "Search");
+        field.text = Some(TextInfo {
+            content: "ab".into(),
+            lines: vec![makepad_a11y::LineBox { start: 0, rect: makepad_a11y::Rect { x: 104.0, y: 68.5, w: 12.0, h: 13.0 }, baseline: 78.5 }],
+            glyph_x: vec![104.0, 110.0, 116.0],
+            ..Default::default()
+        });
+        b.set_text_origin(t, [104.0, 66.0]);
+        b.end_node(t, field, Area::Empty);
+        end_root(&mut b, r);
+        let mut messages = Vec::new();
+        b.finish_frame(Area::Empty, |_| Some(1), |_| None, |_| Some([106.0, 75.0]), |w, bytes| messages.push((w, bytes)));
+        let update = makepad_a11y::wire::decode_update(&messages[0].1).unwrap();
+        let text = update.nodes.iter().find(|n| n.id == NodeId::widget(2)).and_then(|n| n.text.clone()).expect("the field's text");
+        let line = text.lines[0];
+        assert_eq!((line.rect.x, line.rect.y, line.baseline, text.glyph_x), (106.0, 77.5, 87.5, vec![106.0, 112.0, 118.0]), "the line box and glyphs are where the field was put, not where it drew");
     }
 
     #[test]
@@ -924,7 +1147,7 @@ mod tests {
                     role: Role::TabPanel,
                     name: "Panel".into(),
                     ..Default::default()
-                }, || unreachable!("existing widget"));
+                }, Area::Empty, || unreachable!("existing widget"));
             }
             end_root(&mut builder, root);
             for update in finish(&mut builder, Area::Empty, |list| {
@@ -938,6 +1161,40 @@ mod tests {
             assert_eq!(tree.node(panel).unwrap().children, [NodeId::widget(panel.uid() + 1)]);
             assert_eq!(tree.nodes.len(), 3);
         }
+    }
+
+    /// An icon button wrapped in a tip has no name of its own: the tip's text names it, and a
+    /// control with a name keeps it. A frame that redraws nothing keeps the tip's name; a new
+    /// tip text renames the control.
+    #[test]
+    fn a_nameless_control_in_a_tip_is_named_by_the_tip() {
+        let mut pool = CxDrawListPool::default();
+        let main = pool.alloc();
+        let content = pool.alloc();
+        let mut builder = active();
+        let mut tree = Tree::new();
+        let frame = |builder: &mut CxA11y, tree: &mut Tree, frame: u64, tip: Option<&str>, content_redraw: u64| {
+            builder.begin_frame();
+            let root = root(builder, WindowId(0, 1), 1, main.id());
+            if let Some(text) = tip {
+                for (tip, control, name) in [(2, 3, ""), (4, 5, "Open")] {
+                    let t = builder.begin_node(tip, Some(content.id()));
+                    let c = builder.begin_node(control, Some(content.id()));
+                    builder.end_node(c, node(Role::Button, name), Area::Empty);
+                    builder.end_node(t, Node { role: Role::Tooltip, description: text.into(), ..Default::default() }, Area::Empty);
+                }
+            }
+            end_root(builder, root);
+            for update in finish(builder, Area::Empty, |list| Some(if list == main.id() { frame } else { content_redraw })) {
+                tree.apply(update);
+            }
+            let name = |uid| tree.node(NodeId::widget(uid)).expect("drawn").name.clone();
+            (name(3), name(5))
+        };
+        let named = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(frame(&mut builder, &mut tree, 1, Some("Fit the whole map"), 1), named("Fit the whole map", "Open"));
+        assert_eq!(frame(&mut builder, &mut tree, 2, None, 1), named("Fit the whole map", "Open"), "cached: the tip's name stays");
+        assert_eq!(frame(&mut builder, &mut tree, 3, Some("Home"), 2), named("Home", "Open"), "a new tip text renames it");
     }
 
     #[test]
@@ -964,7 +1221,7 @@ mod tests {
             role: Role::Menu,
             states: States::HIDDEN,
             ..Default::default()
-        }, || unreachable!("an existing widget needs no part id"));
+        }, Area::Empty, || unreachable!("an existing widget needs no part id"));
         end_root(&mut builder, root);
         tree.apply(finish(&mut builder, Area::Empty, |list| {
             Some(if list == main.id() { 2 } else { 1 })
@@ -1193,9 +1450,11 @@ mod tests {
             if i == 1 {
                 b.announce("Saved", Live::Assertive);
             }
-            let u = finish(&mut b, if i == 0 { Area::Empty } else { area }, |_| {
+            // the field on screen where it drew
+            let drawn = makepad_a11y::Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
+            let u = finish_shown(&mut b, if i == 0 { Area::Empty } else { area }, |_| {
                 Some(i as u64 + 1)
-            })
+            }, |a| (a == area).then_some(drawn))
             .pop()
             .unwrap();
             if i == 1 {
@@ -1247,6 +1506,7 @@ mod tests {
                     h: 10.0,
                 })
             },
+            |_| None,
             |_, bytes| updates.push(makepad_a11y::wire::decode_update(&bytes).unwrap()),
         );
         assert_eq!(
@@ -1376,6 +1636,7 @@ mod tests {
                 Area::Empty,
                 |_| panic!("list lookup while off"),
                 |_| panic!("bounds lookup while off"),
+                |_| panic!("origin lookup while off"),
                 |_, _| panic!("update while off"),
             );
         }
@@ -1442,6 +1703,7 @@ mod allocation_tests {
                     Area::Empty,
                     |_| unreachable!(),
                     |_| unreachable!(),
+                    |_| unreachable!(),
                     |_, _| unreachable!(),
                 );
             }
@@ -1461,6 +1723,16 @@ mod allocation_tests {
             node.role = Role::Button;
             set_string(&mut node.name, "Save");
             builder.end_node(child, node, Area::Empty);
+            // an icon button its tip names
+            let tip = builder.begin_node(3, Some(list.id()));
+            let icon = builder.begin_node(4, Some(list.id()));
+            let mut node = builder.take_node(icon);
+            node.role = Role::Button;
+            builder.end_node(icon, node, Area::Empty);
+            let mut node = builder.take_node(tip);
+            node.role = Role::Tooltip;
+            set_string(&mut node.description, "Fit the whole map");
+            builder.end_node(tip, node, Area::Empty);
             let mut node = builder.take_node(token);
             node.role = Role::Window;
             set_string(&mut node.name, "Test");
@@ -1471,6 +1743,7 @@ mod allocation_tests {
             builder.finish_frame(
                 Area::Empty,
                 |_| Some(1),
+                |_| None,
                 |_| None,
                 |w, bytes| payload = Some((w, bytes)),
             );
@@ -1490,7 +1763,7 @@ mod allocation_tests {
         let cached = measured(|| {
             for _ in 0..1_000 {
                 builder.begin_frame();
-                builder.finish_frame(Area::Empty, |_| Some(1), |_| None, |_, _| unreachable!());
+                builder.finish_frame(Area::Empty, |_| Some(1), |_| None, |_| None, |_, _| unreachable!());
             }
         });
         assert_eq!(cached, 0);

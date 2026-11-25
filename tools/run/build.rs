@@ -22,6 +22,7 @@ const PROVIDED: &[&str] = &[
     "makepad-script-compute",
     "makepad-shader",
     "makepad-tween-script",
+    "makepad-cpu-budget",
     "makepad-script-audio-aot",
     "makepad-hal",
 ];
@@ -32,11 +33,12 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
             println!("cargo:rustc-link-arg-bins=/STACK:8388608");
-        } else if std::env::var("CARGO_ENCODED_RUSTFLAGS").is_ok_and(|f| f.contains("linker-flavor=ld.lld")) {
-            // Rust's LLD called directly in MinGW mode (the Makepad Builder's GNU toolchain)
-            println!("cargo:rustc-link-arg-bins=--stack=8388608");
         } else {
             println!("cargo:rustc-link-arg-bins=-Wl,--stack,8388608");
+            // the #[relax_api] entries (makepad-relax-api) are reached only through the table's
+            // bounds, and `#[used]` is no GC root on COFF outside MSVC: GNU ld's gc would drop
+            // every object's entries that nothing else references
+            println!("cargo:rustc-link-arg-bins=-Wl,--no-gc-sections");
         }
     }
     // ELF: the #[relax_api] entries (makepad-relax-api) sit in the `relax_api` section, reached
@@ -64,8 +66,9 @@ fn main() {
         for i in g.closure(root) {
             let p = &g.pkgs[i];
             if p.dir.contains("/.cargo/registry/") || p.dir.contains("/.cargo/git/") { continue; }
-            // Directory watches catch additions, including an initially absent build.rs.
-            println!("cargo:rerun-if-changed={}", p.dir);
+            // Source-directory watches catch additions without watching unrelated root files.
+            let src = PathBuf::from(&p.dir).join("src");
+            if src.is_dir() { println!("cargo:rerun-if-changed={}", src.display()); }
             let key = format!("{}@{}", p.name.replace('-', "_"), p.version);
             for ((package, path), _) in &manifest {
                 if (package == &key || package == &format!("host:{key}")) && !path.starts_with('\0') {

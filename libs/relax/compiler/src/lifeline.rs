@@ -66,7 +66,21 @@ thread_local! {
     static INDEX: Cell<usize> = const { Cell::new(usize::MAX) };
     /// the last panic's position on this thread ("file.rs:line"), written by the panic hook with
     /// no allocation (it may run on any thread at any time)
-    static PANIC_AT: Cell<([u8; 62], u8, u32)> = const { Cell::new(([0; 62], 0, 0)) };
+    static PANIC_AT: Cell<PanicAt> = const { Cell::new(NO_PANIC_AT) };
+}
+
+/// A recorded panic position: (the path's tail, its length, the line).
+pub type PanicAt = ([u8; 62], u8, u32);
+pub const NO_PANIC_AT: PanicAt = ([0; 62], 0, 0);
+
+/// This thread's recorded panic position as it is stored (the owner hands it to a requester).
+pub fn panic_at_raw() -> PanicAt {
+    PANIC_AT.try_with(|c| c.get()).unwrap_or(NO_PANIC_AT)
+}
+
+/// Takes over a position recorded on another thread (a request's panic on the owner, resumed here).
+pub fn set_panic_at_raw(at: PanicAt) {
+    let _ = PANIC_AT.try_with(|c| c.set(at));
 }
 
 /// Records where a panic happened on this thread (the panic hook; no allocation, no lock).
@@ -163,6 +177,12 @@ pub fn run(name: &str, policy: OnPanic, mut body: impl FnMut()) {
             set_state(i, EXITED);
             std::panic::resume_unwind(p);
         }
+        // work that gave way (preempted, the owner busy) and unwound this far: the thread goes on,
+        // nothing went wrong, and it uses up none of its restarts
+        if crate::jit::panic_payload(&*p).1 {
+            crate::inspect::flightrec::event("thread.bail", name, restarts as u64, policy as u64);
+            continue;
+        }
         restarts += 1;
         let line = crate::zone_alloc::kept_with(|| panic_line(&*p));
         {
@@ -198,12 +218,12 @@ pub fn run(name: &str, policy: OnPanic, mut body: impl FnMut()) {
 /// Spawns the long-lived JIT thread `name` running `body` under `run`. A failed spawn is said
 /// (false), never ignored.
 pub fn spawn(name: String, policy: OnPanic, stack: Option<usize>, body: impl FnMut() + Send + 'static) -> bool {
-    let mut b = std::thread::Builder::new().name(name.clone());
-    if let Some(s) = stack {
-        b = b.stack_size(s);
-    }
     let n2 = crate::zone_alloc::kept_with(|| name.clone());
-    match b.spawn(move || run(&n2, policy, body)) {
+    let started = match stack {
+        Some(s) => crate::run_threads::spawn_sized(&name, s, move || run(&n2, policy, body)),
+        None => crate::run_threads::spawn(&name, move || run(&n2, policy, body)),
+    };
+    match started {
         Ok(_) => true,
         Err(e) => {
             eprintln!("makepad-run: cannot start JIT thread `{}`: {}", name, e);

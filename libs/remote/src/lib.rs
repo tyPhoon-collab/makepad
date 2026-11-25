@@ -37,6 +37,7 @@ macro_rules! print {
 pub mod app;
 pub mod carrier;
 pub mod cmd;
+pub mod params;
 pub mod conn;
 pub mod discovery;
 pub mod endpoint;
@@ -45,8 +46,10 @@ pub mod frames;
 pub mod group;
 pub mod procs;
 pub mod hello;
+pub mod jit;
 pub mod hosts;
 pub mod hub;
+pub mod hot;
 pub mod lines;
 pub mod pair;
 pub mod program;

@@ -147,9 +147,9 @@
 //!   double-sided occluder set; BakerBoy itself renders the material's
 //!   ShadowCaster pass, which for these twins yields the same surfaces.
 
-use crate::ao_atlas::{project, Chart, GUTTER, TEXEL_SUBSAMPLES, TEXEL_SUB_OFFSETS};
+use crate::ao_atlas::{Chart, TEXEL_SUBSAMPLES, TEXEL_SUB_OFFSETS};
 use makepad_draw::makepad_math::Vec3f;
-use makepad_draw::makepad_platform::thread::{Lane, TaskPool};
+use makepad_draw::makepad_platform::thread::{TaskPool};
 
 /// Everything `BakerBoyConfig` carries that this port honours, plus the two
 /// knobs the task parameterises (direction count, depth resolution).
@@ -630,7 +630,7 @@ fn collect_texel_points(
         let mut nrm_acc = vec![Vec3f { x: 0.0, y: 0.0, z: 0.0 }; texels];
         let mut cnt = vec![0.0f32; texels];
 
-        for &t in &c.tris {
+        for (chart_tri, &t) in c.tris.iter().enumerate() {
             let (ia, ib, ic) = (
                 indices[t * 3] as usize,
                 indices[t * 3 + 1] as usize,
@@ -641,16 +641,7 @@ fn collect_texel_points(
             let nb = normals.get(ib).copied().unwrap_or(fallback);
             let nc = normals.get(ic).copied().unwrap_or(fallback);
 
-            let to_tex = |p: Vec3f| {
-                let (pu, pv) = project(p, c.axis);
-                (
-                    GUTTER as f32 + (pu - c.u0) * c.scale,
-                    GUTTER as f32 + (pv - c.v0) * c.scale,
-                )
-            };
-            let (ax, ay) = to_tex(pa);
-            let (bx, by) = to_tex(pb);
-            let (cx2, cy2) = to_tex(pc);
+            let [[ax, ay], [bx, by], [cx2, cy2]] = c.tex[chart_tri];
 
             let area = (bx - ax) * (cy2 - ay) - (by - ay) * (cx2 - ax);
             if area.abs() < 1.0e-9 {
@@ -749,7 +740,7 @@ pub(crate) fn bake_all_charts(
     // partial sums reduced in worker order, so the float addition order — and
     // with it the bake — is reproducible.
     let threads = pool
-        .map_or(1, |pool| pool.heavy_workers().saturating_add(1))
+        .map_or(1, |pool| pool.worker_count().saturating_add(1))
         .min(params.sample_count.max(1));
     let res = params.depth_res;
     let point_count = points.len();
@@ -775,7 +766,7 @@ pub(crate) fn bake_all_charts(
         let _ = tx.send((worker, occ));
     };
     match pool {
-        Some(pool) => pool.fan_out(Lane::Heavy, threads, work),
+        Some(pool) => pool.fan_out(threads, work),
         None => (0..threads).for_each(work),
     }
     drop(tx);

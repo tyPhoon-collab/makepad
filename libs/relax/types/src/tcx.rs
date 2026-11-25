@@ -130,6 +130,12 @@ pub struct AdtT {
     /// Live sessions (M10): (added field, dead base slot) for a retyped scalar field -- running
     /// values get the old value converted (`as`, lossless widening) instead of the default.
     pub ext_conv: Vec<(u32, u32)>,
+    /// Live sessions (M10): per variant, the tag value its running values hold in the enum's
+    /// Direct-tagged layout, once a live edit inserted a variant before others or changed a
+    /// discriminant (a variant keeps its tag by name; an added one takes a new one). The
+    /// discriminants are the new text's (`discriminant_for_variant`); reading one decodes the tag.
+    /// Empty: each tag is the discriminant.
+    pub live_tags: Vec<u128>,
 }
 
 /// rustc_middle/src/ty/adt.rs:33,340. Identity flags come only from collected attributes.
@@ -234,6 +240,8 @@ pub struct Tcx {
     pub nominal_region_contracts: ImageMap<DefId, outlives::RegionContract>,
     pub impl_self: ImageMap<DefId, TyId>,
     pub impl_trait: ImageMap<DefId, DefId>,
+    /// Hot reload: impls uncollect_impls took out of the impl tables that no collection has recorded again (a refused or rolled-back version's: their defs stay loaded for code that names them, but they are no impls of the program).
+    pub refused_impls: crate::fxhash::HashSet<DefId>,
     pub inherent: ImageMap<TyKey, Vec<DefId>>,
     pub trait_impls: ImageMap<(TyKey, DefId), Vec<DefId>>,
     /// All impls of a trait, shared by candidate assembly and coherence.
@@ -272,8 +280,9 @@ pub struct Tcx {
     /// poll function is lowered (coroutine_transform)
     pub coro_frames: crate::conc::MemoMap<TyId, (u32, u32)>,
     /// a coroutine type's state shape (M5): a hash of its suspension points' saved slots and
-    /// values (offset, size), its size and alignment -- a body edit whose new poll code has the
-    /// same shape and the same code up to its last await may resume suspended values (reload.rs)
+    /// values (offset, size; in a live session their types too), its size and alignment -- a
+    /// body edit whose new poll code has the same shape and the same code up to its last await
+    /// may resume suspended values (reload.rs)
     pub coro_shapes: crate::conc::MemoMap<TyId, u64>,
     /// a coroutine poll slot's coroutine type (set when it is lowered)
     pub coro_slot_ty: crate::conc::MemoMap<u32, TyId>,
@@ -426,6 +435,7 @@ impl Tcx {
             contracts_waiting: Default::default(),
             impl_self: Default::default(),
             impl_trait: Default::default(),
+            refused_impls: Default::default(),
             inherent: Default::default(),
             trait_impls: Default::default(),
             trait_impls_of: Default::default(),
@@ -484,7 +494,6 @@ impl Tcx {
     }
 
     pub fn orphan_errors_of(&self, prog: &Program, crates: Option<&[u32]>) -> Vec<(DefId, u32, String)> {
-        let typing_env = TypingEnv::fully_monomorphized(prog);
         let mut errors = Vec::new();
         for im in &prog.impls {
             let krate = prog.def(im.def).krate;
@@ -502,7 +511,14 @@ impl Tcx {
                 continue;
             }
             // (a projection self type is checked as what it normalizes to)
-            let st = if self.tys.has_assoc(st) { self.try_normalize_erasing_regions(prog, typing_env, st).unwrap_or(st) } else { st };
+            let st = if self.tys.has_assoc(st) {
+                // This is still an identity-generic impl, not codegen. Its const
+                // parameters obtain their types from the impl's environment.
+                // The orphan verdict below separately uses fresh inference
+                // arguments and the empty environment required by orphanck.
+                let typing_env = TypingEnv { limit: RecursionLimit::for_item(prog, im.def), param_env: self.param_env_id(prog, im.def), mode: TypingMode::non_body_analysis() };
+                self.try_normalize_erasing_regions(prog, typing_env, st).unwrap_or(st)
+            } else { st };
             let item = prog.files[im.file as usize].ast.item(im.item);
             let pos = item.lo;
             let is_trait_impl = prog.files[im.file as usize].ast.as_impl(&item.kind).is_some_and(|i| i.trait_.is_some());
@@ -849,6 +865,7 @@ impl Tcx {
             self.err_sink.get_mut().unwrap_or_else(|e| e.into_inner()).extend(h.errors);
             let st = h.self_ty;
             self.impl_self.insert(im.def, st);
+            self.refused_impls.remove(&im.def);
             let key = ty_key(&self.tys, st);
             match h.trait_ {
                 None => {
@@ -1042,6 +1059,7 @@ impl Tcx {
             self.err_sink.get_mut().unwrap_or_else(|e| e.into_inner()).extend(h.errors);
             let st = h.self_ty;
             self.impl_self.insert(d, st);
+            self.refused_impls.remove(&d);
             let key = ty_key(&self.tys, st);
             match h.trait_ {
                 None => self.inherent.entry(key).or_default().push(d),
@@ -1100,6 +1118,21 @@ impl Tcx {
         } else {
             self.collect_adt_destructors(prog);
         }
+        // an added trait's supertraits, as `collect` records every trait's
+        for &d in defs {
+            if prog.def(d).kind == DefKind::Trait {
+                let mut all = Vec::new();
+                let mut todo = vec![d];
+                while let Some(x) = todo.pop() {
+                    if !all.contains(&x) {
+                        all.push(x);
+                        todo.extend(self.trait_supers(prog, x));
+                    }
+                }
+                self.trait_closure.insert(d, all);
+            }
+        }
+        self.flush_errs();
         self.errors[n0..].to_vec()
     }
 
@@ -1156,11 +1189,6 @@ impl Tcx {
         for &d in defs {
             let errors = self.signature_errors(prog, d).to_vec();
             self.errors.extend(errors);
-            if prog.def(d).kind == DefKind::Trait {
-                let mut all = Vec::new(); let mut todo = vec![d];
-                while let Some(x) = todo.pop() { if !all.contains(&x) { all.push(x); todo.extend(self.trait_supers(prog, x)); } }
-                self.trait_closure.insert(d, all);
-            }
         }
         self.flush_errs();
         self.publish_collected();
@@ -1172,6 +1200,7 @@ impl Tcx {
         if impls.is_empty() {
             return;
         }
+        self.refused_impls.extend(impls.iter().copied());
         // a set: every impl list of the program is filtered against them (a slice scan per
         // entry was 2% of a `makepad check makepad-scope`)
         let impls: crate::fxhash::HashSet<DefId> = impls.iter().copied().collect();
@@ -1430,33 +1459,38 @@ impl Tcx {
         self.variances.take();
         self.err_sink.get_mut().unwrap_or_else(|e| e.into_inner()).extend(p.errors);
         if let Some(adt) = p.adt {
-            // a tuple constructor is a fn item (rustc: its own FnDef type with the ADT's args):
-            // its signature, fields to the ADT
-            if !adt.is_union {
-                let n = adt.n_generics;
-                let pargs = adt.generic_indices.identity_types_consts(&self.tys);
-                let ret = self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&pargs), adt.region_params));
-                for v in adt.variants.iter().filter(|v| v.shape == 1) {
-                    self.ctor_sigs.insert(v.def, FnSigT {
-                        region_contract: adt.region_contract.clone(),
-                        generic_indices: adt.generic_indices.clone(),
-                        bound_regions: 0,
-                        params: v.fields.iter().map(|f| f.ty).collect(),
-                        ret,
-                        self_kind: 0,
-                        n_generics: n,
-                        n_parent_generics: if adt.is_enum { n } else { 0 },
-                        is_const: false,
-                        rustc_promotable: false,
-                        rustc_intrinsic: false,
-                        header: FnHeader::RUST,
-                        track_caller: false,
-                        target_features: Vec::new(),
-                        safe_target_features: false,
-                    });
-                }
-            }
+            self.insert_ctor_sigs(d, &adt);
             self.adts.insert(d, adt);
+        }
+    }
+
+    /// A tuple constructor is a fn item (rustc: its own FnDef type with the ADT's args): the
+    /// signatures of ADT `d`'s, fields to the ADT. Also for the variants a live edit adds (M10).
+    pub fn insert_ctor_sigs(&mut self, d: DefId, adt: &AdtT) {
+        if adt.is_union {
+            return;
+        }
+        let n = adt.n_generics;
+        let pargs = adt.generic_indices.identity_types_consts(&self.tys);
+        let ret = self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&pargs), adt.region_params));
+        for v in adt.variants.iter().filter(|v| v.shape == 1) {
+            self.ctor_sigs.insert(v.def, FnSigT {
+                region_contract: adt.region_contract.clone(),
+                generic_indices: adt.generic_indices.clone(),
+                bound_regions: 0,
+                params: v.fields.iter().map(|f| f.ty).collect(),
+                ret,
+                self_kind: 0,
+                n_generics: n,
+                n_parent_generics: if adt.is_enum { n } else { 0 },
+                is_const: false,
+                rustc_promotable: false,
+                rustc_intrinsic: false,
+                header: FnHeader::RUST,
+                track_caller: false,
+                target_features: Vec::new(),
+                safe_target_features: false,
+            });
         }
     }
 
@@ -1505,7 +1539,7 @@ impl Tcx {
             };
             flags.insert(identity);
         }
-        let mut adt = AdtT { region_contract: self.region_contract(cx, prog, d, &env), generic_indices: crate::types::variance::GenericIndices::from_env(&env), flags, region_params: env.regions.identity_args(&self.tys), is_enum: false, is_union: false, n_generics, variants: Vec::new(), repr_c, repr_int, repr_align, repr_packed, valid_start, valid_end, no_niche, param_maybe_unsized, ext_from: u32::MAX, ext_conv: Vec::new() };
+        let mut adt = AdtT { region_contract: self.region_contract(cx, prog, d, &env), generic_indices: crate::types::variance::GenericIndices::from_env(&env), flags, region_params: env.regions.identity_args(&self.tys), is_enum: false, is_union: false, n_generics, variants: Vec::new(), repr_c, repr_int, repr_align, repr_packed, valid_start, valid_end, no_niche, param_maybe_unsized, ext_from: u32::MAX, ext_conv: Vec::new(), live_tags: Vec::new() };
         match &it.kind {
             ItemKind::Struct(r) => {
                 let (shape, fields) = self.lower_fields(cx, prog, file, module, &env, &ast.row(*r).data);
@@ -1708,12 +1742,6 @@ impl Tcx {
                 }
             }
         }
-        // rustc_hir_analysis check_main_fn_ty: the crate's `main` takes no generic parameters
-        if def.kind == DefKind::Fn && prog.name(did) == "main" && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did)
-            && def.parent == prog.mods[prog.crates[def.krate as usize].root_mod as usize].def
-            && !self.generic_indices_of(prog, did).types_consts.is_empty() {
-            errors.push(prog.record_error(def.file, prog.files[def.file as usize].ast.item(def.item).lo, "signature", "E0131: `main` function is not allowed to have generic parameters".into()));
-        }
         if def.kind == DefKind::AssocFn && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             // rustc_ast_passes ast_validation check_trait_fn_not_const (E0379)
             let ast = &prog.files[def.file as usize].ast;
@@ -1773,11 +1801,18 @@ impl Tcx {
         let env = self.item_env(prog, d);
         let state = EvalState::new();
         state.errors.replace(Some(Vec::new()));
+        state.declaration_check.set(true);
         let cx = EvalCx::new(prog, self, TypingEnv::fully_monomorphized(prog), &state);
         let mut param_wf = Vec::new();
-        for param in ast.list(generics.params) {
+        let params = ast.list(generics.params).iter().filter(|p| !matches!(p.kind, GenericParamKind::Lifetime(_)));
+        for (i, param) in params.enumerate() {
             match param.kind {
-                GenericParamKind::Type(_, Some(ty)) => { self.lower_ty(&cx, prog, def.file, def.scope, &env, ty); }
+                // the default's lowering starts at this parameter, as fill_type_defaults does
+                GenericParamKind::Type(_, Some(ty)) => {
+                    state.lowering.borrow_mut().push(Lowering::Default(d, i));
+                    self.lower_ty(&cx, prog, def.file, def.scope, &env, ty);
+                    state.lowering.borrow_mut().pop();
+                }
                 GenericParamKind::Const(ty, default) => {
                     let ty = self.lower_ty(&cx, prog, def.file, def.scope, &env, ty);
                     if let Some(value) = default { self.lower_const_arg(prog, def.file, &env, value, ty); }
@@ -1791,11 +1826,7 @@ impl Tcx {
         // a type alias's right-hand side is lowered where it is written (rustc type_of of the alias),
         // used or not
         if def.kind == DefKind::TypeAlias {
-            if let Some(TypeAliasItem { ty: Some(t), .. }) = ast.as_alias(&ast.item(def.item).kind) {
-                let mut env = self.item_env(prog, d);
-                env.regions.enabled = true;
-                self.lower_ty(&cx, prog, def.file, self.item_module(prog, d), &env, *t);
-            }
+            self.alias_ty(&cx, prog, d);
         }
         // the types the where clauses bound name existing types (rustc resolves them whether or
         // not the item is used: late resolution of the generics' predicates)
@@ -2151,7 +2182,11 @@ impl Tcx {
                 errors.push((attr_pos, format!("the target features {} must all be either enabled or disabled together", features.join(", "))));
             }
         }
-        for (pos, message) in errors { self.err(cx, prog, file, pos, message); }
+        // (rustc words these without a code, except the E0658 feature gates)
+        for (pos, message) in errors {
+            let coded = message.len() > 5 && message.starts_with('E') && message[1..5].bytes().all(|b| b.is_ascii_digit());
+            self.err(cx, prog, file, pos, if coded { message } else { format!("{}{}", relax_front::diagnostics::UNCODED_PREFIX, message) });
+        }
         out
     }
 
@@ -2463,8 +2498,9 @@ impl Tcx {
         if expected_ty == self.tys.error { return self.tys.intern_const(ConstKind::Error); }
         // hir_ty_lowering/mod.rs:3083-3118 try_lower_anon_const_lit: a (negated) integer literal
         // whose kind matches the type (ty/consts/lit.rs:50-55 const_lit_matches_ty) is lowered
-        // directly by lit_to_const, truncated to the type (thir/constant.rs:21-33,75-94; rustc's
-        // deny-by-default overflowing_literals lint has no Relax counterpart). Anything else is
+        // directly by lit_to_const, truncated to the type (thir/constant.rs:21-33,75-94; the
+        // deny-by-default overflowing_literals lint runs on the anon const's own typeck: check.rs
+        // body_anon_consts, signature_anon_consts). Anything else is
         // the anon const, whose typeck reports the mismatch (`Foo<3u16>` for a u8 parameter).
         let (literal, neg) = match pf.ast.expr(unwrapped).kind {
             ast::ExprKind::Unary(ast::UnOp::Neg, inner) if matches!(pf.ast.expr(inner).kind, ast::ExprKind::Lit(ast::LitKind::Int)) => (Some(inner), true),
@@ -3093,12 +3129,13 @@ impl Tcx {
         env.regions.enabled = regions.is_some();
         let module = self.item_module(prog, d);
         for i in args.len()..params.len() {
-            if cx.state.default_inprog.borrow().contains(&(d, i)) {
-                self.err(cx, prog, def.file, params[i].name.lo, format!("E0391: cycle detected when computing the default of generic parameter `{}`", prog.def_path(d)));
+            let key = Lowering::Default(d, i);
+            if cx.state.lowering.borrow().contains(&key) {
+                self.lowering_cycle(cx, prog, key);
                 args.push(self.tys.error);
                 continue;
             }
-            cx.state.default_inprog.borrow_mut().push((d, i));
+            cx.state.lowering.borrow_mut().push(key);
             let t = match &params[i].kind {
                 GenericParamKind::Type(_, Some(dt)) => {
                     let lt = self.lower_ty(cx, prog, def.file, module, &env, *dt);
@@ -3113,7 +3150,7 @@ impl Tcx {
                 }
                 _ => { missing = true; self.tys.error }
             };
-            cx.state.default_inprog.borrow_mut().pop();
+            cx.state.lowering.borrow_mut().pop();
             args.push(t);
         }
         missing
@@ -3193,23 +3230,69 @@ impl Tcx {
     }
 
     pub fn alias_ty(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, d: DefId) -> TyId {
-        if let Some(t) = self.alias_tys.get(&(cx.typing_env, d)) {
-            return t;
+        let memo = !cx.state.declaration_check.get();
+        if memo {
+            if let Some(t) = self.alias_tys.get(&(cx.typing_env, d)) {
+                return t;
+            }
         }
-        let ik = (cx.typing_env, d);
-        if cx.state.alias_inprog.borrow().contains(&ik) {
+        let key = Lowering::Alias(cx.typing_env, d);
+        if cx.state.lowering.borrow().contains(&key) {
+            self.lowering_cycle(cx, prog, key);
             return self.tys.error;
         }
-        cx.state.alias_inprog.borrow_mut().insert(ik.clone());
+        cx.state.lowering.borrow_mut().push(key);
         let read0 = cx.state.impl_read.replace(false);
         let t = self.lower_alias_rhs(cx, prog, d);
-        cx.state.alias_inprog.borrow_mut().remove(&ik);
+        cx.state.lowering.borrow_mut().pop();
         let read = cx.state.impl_read.get();
         cx.state.impl_read.set(read0 || read);
-        if !(read && cx.state.par_impls.get()) {
+        if memo && !(read && cx.state.par_impls.get()) {
             self.alias_tys.insert((cx.typing_env, d), t);
         }
         t
+    }
+
+    /// The lowering met `key` again: the cycle is the stack from `key`'s entry on. rustc reports
+    /// a query cycle where its query system finds it, and in a parallel check that depends on
+    /// which evaluation gets there first (alias_tys keeps the first expansion, and an expansion
+    /// read from it shows no cycle). Here one member answers for the cycle: its first generic
+    /// parameter default, else its first type alias. The check of that declaration starts its
+    /// lowering at that member, with no memoized expansions, and reports the cycle. Every
+    /// other evaluation only cuts the cycle (the error type). So the cycle is reported once, and
+    /// the same way in every run.
+    fn lowering_cycle(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, key: Lowering) {
+        if !cx.state.declaration_check.get() { return; }
+        let speaker = {
+            let stack = cx.state.lowering.borrow();
+            let Some(p) = stack.iter().position(|k| *k == key) else { return };
+            let cycle = &stack[p..];
+            let first = cycle.iter().filter_map(|k| match *k { Lowering::Default(d, i) => Some((d.0, i)), Lowering::Alias(..) => None }).min()
+                .map(|(d, i)| Lowering::Default(DefId(d), i))
+                .or_else(|| cycle.iter().filter_map(|k| match *k { Lowering::Alias(_, d) => Some(d.0), Lowering::Default(..) => None }).min()
+                    .and_then(|d| cycle.iter().copied().find(|k| matches!(*k, Lowering::Alias(_, a) if a.0 == d))));
+            if stack.first() != first.as_ref() { return; }
+            first
+        };
+        match speaker {
+            Some(Lowering::Default(d, i)) => {
+                let def = prog.def(d);
+                let ast = &prog.files[def.file as usize].ast;
+                let Some(g) = ast.kind_generics(&ast.item(def.item).kind) else { return };
+                let Some(param) = ast.list(g.params).iter().filter(|p| !matches!(p.kind, GenericParamKind::Lifetime(_))).nth(i) else { return };
+                self.err(cx, prog, def.file, param.name.lo, format!("E0391: cycle detected when computing the default of generic parameter `{}`", prog.def_path(d)));
+            }
+            Some(Lowering::Alias(_, d)) => {
+                let def = prog.def(d);
+                let ast = &prog.files[def.file as usize].ast;
+                let pos = match ast.as_alias(&ast.item(def.item).kind) {
+                    Some(TypeAliasItem { ty: Some(t), .. }) => crate::lint_late::ast_ty_pos(ast, *t),
+                    _ => None,
+                };
+                self.err(cx, prog, def.file, pos.unwrap_or(ast.item(def.item).name.lo), format!("E0391: cycle detected when expanding type alias `{}`", prog.def_path(d)));
+            }
+            None => {}
+        }
     }
 
     /// The (type/const, lifetime) parameters a path's last segment can name for the type-like item
@@ -4246,9 +4329,13 @@ pub struct EvalState {
     /// const_eval::fold_without_execution: named constants fold without the query cache
     pub(crate) fold_only: std::cell::Cell<bool>,
     pub(crate) const_generic_frame: std::cell::RefCell<Option<(GenEnv, Vec<TyId>)>>,
-    alias_inprog: std::cell::RefCell<crate::fxhash::HashSet<(TypingEnv, DefId)>>,
-    /// generic parameter defaults being lowered: (item, parameter position)
-    default_inprog: std::cell::RefCell<Vec<(DefId, usize)>>,
+    /// the declarations this evaluation is lowering, outermost first: one met again is a query
+    /// cycle (rustc_query_system cycle_error, E0391; see Tcx::lowering_cycle)
+    lowering: std::cell::RefCell<Vec<Lowering>>,
+    /// a declaration's own check (check_item_type_defaults): type aliases are expanded here, not
+    /// read from alias_tys, so the check meets every cycle through its declaration even when
+    /// another evaluation's memoized expansion would hide it
+    declaration_check: std::cell::Cell<bool>,
     pub tc_depth: std::cell::Cell<u32>,
 }
 
@@ -4256,6 +4343,15 @@ impl EvalState {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+/// A declaration being lowered (EvalState::lowering).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lowering {
+    /// a type alias's right-hand side (rustc type_of of the alias)
+    Alias(TypingEnv, DefId),
+    /// the default of a generic parameter: (item, position among its type and const parameters)
+    Default(DefId, usize),
 }
 
 impl<'p> EvalCx<'p> {
@@ -4376,4 +4472,9 @@ fn ty_mentions_self(ast: &ast::Ast, t: ast::TyId) -> bool {
         ast::Ty::Tuple(l) => ast.list(*l).iter().any(|&i| ty_mentions_self(ast, i)),
         _ => false,
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    resolve_bound_vars::reset_statics();
 }

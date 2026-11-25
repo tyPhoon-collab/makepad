@@ -18,6 +18,7 @@ pub(crate) mod gl_interop;
 mod hosted;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
+pub(crate) mod loop_watch;
 mod media;
 mod ops;
 mod query;
@@ -56,17 +57,26 @@ fn wake_sessions() -> std::sync::MutexGuard<'static, Vec<u32>> {
     WAKE_SESSIONS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The session's loop is one this code's signals wake.
+/// The session's loop is one this code's signals wake, and so do makepad inspect's queries for
+/// its VMs (`serve_idle` answers them at the woken turn).
 pub(crate) fn register_wake_session(session: u32) {
     let mut sessions = wake_sessions();
     if !sessions.contains(&session) {
         sessions.push(session);
     }
+    crate::makepad_script::inspect_query::add_idle_waker(wake_session_for_inspect, session);
 }
 
 /// The session's loop has ended.
 pub(crate) fn unregister_wake_session(session: u32) {
     wake_sessions().retain(|s| *s != session);
+    crate::makepad_script::inspect_query::remove_idle_waker(wake_session_for_inspect, session);
+}
+
+/// An inspect query's wake, from the asking thread: the HAL's, which reads no statics of this
+/// code (a domain's statics are its own under relax, and the asking thread is in another).
+extern "C" fn wake_session_for_inspect(session: u32) {
+    makepad_hal::hal_wake_session(session);
 }
 
 /// Any thread (signals, actions, audio and network threads) wakes the loops blocked in
@@ -151,6 +161,10 @@ pub struct HalClient {
     pub(crate) ime_height: f64,
     /// a window announced a frame (`FrameReady`)
     pub(crate) beat: bool,
+    /// the flip (HAL ns, 0: unknown) the last `FrameReady` aims at, until a beat takes it
+    pub(crate) ready_flip: Option<u64>,
+    /// `MAKEPAD_TRACE=frames`: what woke each beat, the next-frame and present gaps
+    pub(crate) frame_trace: crate::frame_trace::FrameTrace,
     /// A window close is on its way (asked of the window system, or accepted and sent):
     /// since when. Until the HAL answers, the loop sends at once and draws nothing, so a close
     /// never waits behind a slow frame. Bounded by `CLOSE_WAIT` should no answer come.
@@ -166,6 +180,8 @@ pub struct HalClient {
     pub(crate) beat_phases: [[u64; 2]; 6],
     /// the HAL said the GPU device is lost and has not reset it yet: no frames are built
     pub(crate) device_lost: bool,
+    /// device replacements so far: GPU contents made on an older generation are gone
+    pub(crate) device_generation: u64,
     /// another thread woke the loop (`Wake`)
     pub(crate) wake: bool,
     /// the window that has the keyboard focus, for the ops that name no window
@@ -200,6 +216,7 @@ pub struct HalClient {
     /// the least event payload room the session needs (camera frames and readbacks are large)
     pub(crate) event_arena_min: usize,
     pub(crate) readbacks: readback::Readbacks,
+    pub(crate) compute: crate::gpu_compute::ComputeState,
     /// font service answers the text stack has not taken yet
     pub(crate) font_events: Vec<HalFontEvent>,
     pub(crate) glyph_wait: fonts::GlyphWait,
@@ -210,7 +227,7 @@ pub struct HalClient {
     pub(crate) safe_area: crate::event::SafeAreaInsets,
     /// APK font files already mapped (see `Cx::get_resource_font_asset_bytes_by_path`)
     #[cfg(target_os = "android")]
-    pub(crate) mapped_font_assets: std::cell::RefCell<HashMap<String, Option<crate::shared_bytes::SharedBytes>>>,
+    pub(crate) mapped_font_assets: std::cell::RefCell<HashMap<String, Option<crate::shared_bytes::HostBuf>>>,
 }
 
 impl Default for HalClient {
@@ -240,12 +257,15 @@ impl Default for HalClient {
             ime_visible: false,
             ime_height: 0.0,
             beat: false,
+            ready_flip: None,
+            frame_trace: crate::frame_trace::FrameTrace::new(),
             close_pending: None,
             xr_beat: false,
             profile_beat: 0,
             profile_input_ns: 0,
             beat_phases: [[0; 2]; 6],
             device_lost: false,
+            device_generation: 0,
             wake: false,
             focused: None,
             frames_done: 0,
@@ -266,6 +286,7 @@ impl Default for HalClient {
             software_videos: HashMap::new(),
             native_videos: HashMap::new(),
             readbacks: Default::default(),
+            compute: Default::default(),
             event_arena_min: 0,
             font_events: Vec::new(),
             glyph_wait: Default::default(),
@@ -552,8 +573,14 @@ impl Cx {
 impl Cx {
     /// A shader can draw once the HAL said its pipeline is ready; a caller with a fallback asks
     /// this and keeps drawing the fallback until then.
+    /// Asking counts: a pipeline asked for while it compiles is one the frame would draw (a frame
+    /// that waits waits for it, and it goes ahead in the HAL's compile queue).
     pub fn is_draw_shader_window_ready(&self, shader_id: crate::draw_shader::DrawShaderId) -> bool {
-        self.draw_shaders.shaders[shader_id.index].pipeline_id.is_some_and(|pipe| self.hal.frames.pipeline_is_ready(pipe))
+        self.draw_shaders.shaders[shader_id.index].pipeline_id.is_some_and(|pipe| {
+            let ready = self.hal.frames.pipeline_is_ready(pipe);
+            if !ready { self.hal.frames.probed_unready(pipe); }
+            ready
+        })
     }
 
     pub(crate) fn poll_texture_lifetimes(&mut self) {
@@ -585,7 +612,7 @@ pub(crate) fn read_asset(path: &str) -> Option<Vec<u8>> {
 /// Maps a stored APK asset without a heap copy; compressed or missing assets return None. The
 /// mapping is named `apk:<asset>` so the HAL's font service maps the same asset by that name.
 #[cfg(target_os = "android")]
-pub(crate) fn map_asset(path: &str) -> Option<crate::shared_bytes::SharedBytes> {
+pub(crate) fn map_asset(path: &str) -> Option<crate::shared_bytes::HostBuf> {
     use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
     let mut range = [0i64; 2];
     let mut name = path.to_string();
@@ -598,5 +625,5 @@ pub(crate) fn map_asset(path: &str) -> Option<crate::shared_bytes::SharedBytes> 
         return None;
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
-    crate::shared_bytes::SharedBytes::map_fd_range_named(fd.as_raw_fd(), u64::try_from(range[0]).ok()?, usize::try_from(range[1]).ok()?, &format!("{}{name}", makepad_hal::APK_ASSET_PREFIX)).ok()
+    crate::shared_bytes::HostBuf::map_fd_range_named(fd.as_raw_fd(), u64::try_from(range[0]).ok()?, usize::try_from(range[1]).ok()?, &format!("{}{name}", makepad_hal::APK_ASSET_PREFIX)).ok()
 }

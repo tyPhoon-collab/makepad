@@ -49,7 +49,7 @@ enum DrawState {
     DrawBody,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub enum FoldHeaderAction {
     Opening,
     Closing,
@@ -69,7 +69,7 @@ pub struct FoldHeader {
     #[rust]
     rect_size: f64,
     /// Set by the header step when the body is drawn unconstrained (fully
-    /// open or first draw) — the only draw whose used height is the truth.
+    /// open or first draw), so its measured height may shrink the remembered size.
     #[rust]
     measure_body: bool,
     /// The fold's full outer rect (header + body), captured when the outer
@@ -242,17 +242,21 @@ impl Widget for FoldHeader {
         if let Some(DrawState::DrawBody) = self.draw_state.get() {
             let walk = self.body.walk(cx);
             self.body.draw_walk(cx, scope, walk)?;
-            // Remember the content height ONLY from an unconstrained draw. A
-            // folded or animating body is drawn into a shorter turtle, and
-            // measuring it there would shrink the remembered size: a Fill body
-            // collapses to its Fit children while closed, and re-opening then
-            // gave the body that collapsed height (the chat text box never
-            // came back).
+            // An unconstrained draw sets the remembered height. A folded or
+            // animating draw may only grow it: a Fit body lays out at its full
+            // height in the shorter turtle too, so rows a panel makes when the
+            // fold opens set the animation's target on its first frame (it ran
+            // to the empty body's height and then jumped open). A Fill body
+            // measures at most the clamped height there; shrinking to that
+            // collapsed it to its Fit children while closed (the chat text box
+            // never came back on re-opening).
+            let used_y = cx.turtle().used().y;
             if self.measure_body {
-                let used_y = cx.turtle().used().y;
                 if used_y > 0.0 {
                     self.rect_size = used_y;
                 }
+            } else if used_y > self.rect_size {
+                self.rect_size = used_y;
             }
             cx.end_turtle();
             cx.end_turtle_with_area(&mut self.area);
@@ -318,5 +322,38 @@ impl FoldHeaderRef {
     /// Where the header strip is; an empty rect if there is no fold here.
     pub fn header_rect(&self, cx: &Cx) -> Rect {
         self.borrow().map(|inner| inner.header_rect(cx)).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod settled_cut_tests {
+    use super::*;
+
+    /// A cut to the state the animator is already in, with nothing on its way, applies
+    /// nothing: a widget that sets its state as it draws re-applies (and redraws) nothing on
+    /// an unchanged draw. A cut to another state, or one while a track runs, still applies.
+    #[test]
+    fn a_cut_to_the_settled_state_applies_nothing_and_another_cut_applies() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fold = cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            let value = crate::script_eval!(vm, {use mod.widgets.* FoldHeader{}});
+            FoldHeader::script_from_value(vm, value)
+        });
+        fold.set_is_open(&mut cx, false, Animate::No);
+        assert_eq!(fold.opened(), 0.0, "the first cut applies its state");
+        // A value the animator did not write: an applied cut would put it back to 0.
+        fold.opened = 0.5;
+        fold.set_is_open(&mut cx, false, Animate::No);
+        assert_eq!(fold.opened(), 0.5, "a cut to the settled state applied");
+        fold.set_is_open(&mut cx, true, Animate::No);
+        assert_eq!(fold.opened(), 1.0, "a cut to another state did not apply");
+        // Settled in `off`, on its way to `on`: a cut back to `off` stops the track.
+        fold.set_is_open(&mut cx, false, Animate::No);
+        fold.set_is_open(&mut cx, true, Animate::Yes);
+        assert!(fold.animator.is_animating(), "no track to `on`");
+        fold.set_is_open(&mut cx, false, Animate::No);
+        assert!(!fold.animator.is_animating(), "a cut under a running track left it running");
+        assert_eq!(fold.opened(), 0.0);
     }
 }

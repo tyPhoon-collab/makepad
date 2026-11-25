@@ -243,6 +243,7 @@ impl Renderer {
         // Keep the worker threads for the next source.
         if let Some(old) = self.stream.take() { if old.workers.is_some() { self.stream_workers = old.workers; } }
         self.stream_casters.clear();
+        self.gpu_baker.csm_casters_changed();
         self.prune_texture_cache();
         let Some(source) = source else { return };
         let chunk_bounds: Vec<_> = (0..source.chunk_count()).map(|i| source.chunk_bounds(i)).collect();
@@ -510,6 +511,7 @@ impl Renderer {
         st.prop_list.sort_by_key(|p| p.0);
         stats.casters = casters.len();
         self.stream_casters = casters;
+        self.gpu_baker.csm_casters_changed();
         st.selection = selection;
         st.raster = raster;
         stats.resident_near = st.near.iter().filter(|s| s.resident()).count();
@@ -625,6 +627,9 @@ impl Renderer {
         // rather than not at all.
         let hdr = self.hdr_output;
         // Ready: the city lane's shader for this frame's features (variants.rs).
+        if let Some(c) = city.as_deref_mut() {
+            c.pbr.skinned.draw_vars.refresh_after_reload(cx.cx);
+        }
         let stock = city.as_ref().and_then(|c| c.pbr.skinned.draw_vars.draw_shader_id);
         let shader = if stock.is_some() { self.lane_shaders(cx.cx, super::variants::ModelLane::City, stock).0 } else { None };
         let ready = shader.is_some_and(|id| cx.cx.draw_shader_ready(id, hdr));
@@ -649,6 +654,7 @@ impl Renderer {
         };
         let opaque = match model_lane {
             Some(model_lane) => {
+                draw.base().draw_vars.refresh_after_reload(cx.cx);
                 let stock = draw.base().draw_vars.draw_shader_id;
                 let (full, opaque) = self.lane_shaders(cx.cx, model_lane, stock);
                 draw.base().draw_vars.draw_shader_id = full;

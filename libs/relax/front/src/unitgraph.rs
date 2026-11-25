@@ -124,12 +124,18 @@ pub fn unit_graph(sess: &std::sync::Arc<crate::Session>, workspace: &str, packag
     crate::resolve::unit_graph(sess, workspace, package, cargo_flags)
 }
 
+/// `makepad check`'s graph: its target flags are cargo check's (resolve.rs parse_check_flags),
+/// `--tests` the lib's and bins' unit tests and the integration tests, `--lib` the plain lib.
+pub fn check_unit_graph(sess: &std::sync::Arc<crate::Session>, workspace: &str, package: &str, cargo_flags: &[String]) -> Result<Units, String> {
+    crate::resolve::check_unit_graph(sess, workspace, package, cargo_flags)
+}
+
 pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
     let units = &g.units;
     let roots = &g.roots;
     let mut crates: Vec<CrateUnit> = Vec::new();
-    // per crate: its normalized source path (host and target copies of a crate are one crate)
-    let mut crate_paths: Vec<String> = Vec::new();
+    // Host and target copies share a crate; test and build modes do not.
+    let mut crate_paths: Vec<(String, bool)> = Vec::new();
     let mut pkg = Vec::new();
     let n_units = units.len();
     let mut map: Vec<usize> = vec![usize::MAX; n_units]; // unit index -> crate index or usize::MAX
@@ -190,12 +196,11 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
         if !(lib || pm || is_root_bin) {
             continue;
         }
-        // host and target copies of a crate parse the same files: one crate
-        let norm = crate::vfs::normalize_path(&src_path);
+        let norm = (crate::vfs::normalize_path(&src_path), mode == "test");
         if let Some(i) = crate_paths.iter().position(|p| *p == norm) {
             map[ui] = i;
             if u.host {
-                crates[i].host = Some(HostUnit { features, deps: udeps });
+                crates[i].host = Some(HostUnit { features, deps: udeps, build_outputs: None });
             }
             if is_root_bin || (root == usize::MAX && roots.contains(&ui)) { root = i; }
             continue;
@@ -218,7 +223,8 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
         if mode == "test" {
             test_crates.push(crates.len());
         }
-        crates.push(CrateUnit { name: tname, src_path, edition, features, deps: udeps, host: None, proc_macro: pm, bin, build_script: false, version: ver.clone(), registry: !u.pkg_id.starts_with("path+") });
+        let tname = if u.sysroot { tname } else { crate::crates::own_crate_name(tname) };
+        crates.push(CrateUnit { name: tname, src_path, edition, features, deps: udeps, host: None, proc_macro: pm, bin, harness: u.harness, build_script: false, version: ver.clone(), registry: !u.pkg_id.starts_with("path+") });
         crate_paths.push(norm);
         pkg.push((pkg_dir, pname, ver));
     }
@@ -289,7 +295,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
         env[ci].push(("CARGO_CRATE_NAME".to_string(), c.name.clone()));
     }
     // cargo's integration-test environment: CARGO_TARGET_TMPDIR and CARGO_BIN_EXE_<bin>
-    let integration_tests: Vec<usize> = test_crates.iter().copied().filter(|&ci| crates[ci].bin && units.iter().any(|u| crate::vfs::normalize_path(&u.src_path) == crate_paths[ci] && u.kind.iter().any(|k| k == "test"))).collect();
+    let integration_tests: Vec<usize> = test_crates.iter().copied().filter(|&ci| crates[ci].bin && units.iter().any(|u| crate::vfs::normalize_path(&u.src_path) == crate_paths[ci].0 && u.kind.iter().any(|k| k == "test"))).collect();
     if !integration_tests.is_empty() {
         let target_dir = crate::dirs::relax_dir();
         let tmpdir = target_dir.join("tmp");
@@ -405,6 +411,8 @@ pub enum ScriptRole {
     Platform,
     /// the script's `cargo:` lines as Relax knows them, without running it
     Answered(Vec<String>),
+    /// a Relax crate's own source stamp (libs/relax/self_stamp.rs): answered by `self_stamp_answer`
+    SelfStamp,
     /// to be removed from the source
     ToRemove,
 }
@@ -413,6 +421,9 @@ pub fn script_role(pkg: &str, features: &[String]) -> ScriptRole {
     let has = |f: &str| features.iter().any(|x| x == f);
     match pkg {
         "makepad-platform" => ScriptRole::Platform,
+        // Relax's crates compiled from source by a program (makepad-script-compute's non-provided
+        // code reaches relax-backend): their script only writes the source stamp
+        "relax-base" | "relax-lex" | "relax-session" | "relax-types" | "relax-backend" | "relax-codegen" | "relax-front" => ScriptRole::SelfStamp,
         // pending the GPU-kernel decision (no build scripts proposal)
         "makepad-ai-cuda" | "makepad-ai-metal" | "makepad-ai-llm" | "makepad-ai-common" | "makepad-ai-speech" => ScriptRole::Artefact,
         // pkg-config probes: the libraries of the enabled features (none with dlopen)
@@ -485,7 +496,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
     if sess.options.no_codegen {
         for bs in &g.build_scripts {
             let (_, pname, _) = &g.pkg[bs.krate];
-            if pname != "makepad-platform" {
+            if !matches!(script_role(pname, &bs.features), ScriptRole::Platform | ScriptRole::SelfStamp) && !noop::script(bs, &g.raw) {
                 return Err(format!("build scripts are not supported in no-codegen mode: {} ({})", pname, bs.src_path));
             }
         }
@@ -544,6 +555,18 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         for n in built.scripts {
             let also = g.build_scripts.iter().find(|b| b.krate == n.krate).map(|b| b.also.clone()).unwrap_or_default();
             for &k in std::iter::once(&n.krate).chain(&also) {
+                if n.host {
+                    if g.crates[k].host.is_some() {
+                        let (dir, name, ver) = &g.pkg[k];
+                        let mut env = pkg_env(dir, name, ver);
+                        env.push(("CARGO_CRATE_NAME".into(), g.crates[k].name.clone()));
+                        env.extend(n.env.iter().cloned());
+                        env.push(("OUT_DIR".into(), n.out_dir.clone()));
+                        // Keep host-feature cfgs out of the application crate.
+                        g.crates[k].host.as_mut().unwrap().build_outputs = Some((n.cfgs.clone(), env));
+                    }
+                    continue;
+                }
                 g.cfgs[k].extend(n.cfgs.iter().cloned());
                 g.env[k].extend(n.env.iter().cloned());
                 g.env[k].push(("OUT_DIR".to_string(), n.out_dir.clone()));
@@ -597,6 +620,12 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                     if !t.iter().any(|x| x.0 == pname) {
                         crate::zone_alloc::kept_with(|| t.push((pname.clone(), bs.src_path.clone())));
                     }
+                }
+                ScriptRole::SelfStamp => {
+                    let out_dir = format!("{}/build/{}-answered/out", target_dir, name);
+                    let r = std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e)).and_then(|_| self_stamp_answer(&dir, &pname, &bs.features, &out_dir));
+                    results.lock().unwrap().push((bs.krates(), r.map(|_| String::new()), out_dir));
+                    continue;
                 }
                 ScriptRole::Platform => {
                     let out_dir = format!("{}/build/{}-answered/out", target_dir, name);
@@ -869,11 +898,13 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         .env("CARGO_PKG_VERSION", ver)
         .env("CARGO_PKG_VERSION_PRE", version_parts(ver).1)
         .envs(crate::resolve::package_meta_env(dir))
-        // cargo gives scripts RUSTC; theirs is Relax itself, answering `--version` (relax_as_rustc).
+        // Both tools are the loader: RUSTC probes use its target model, CARGO metadata its
+        // resolver and VFS. The runner consumes `build-script` on entry, then marks tool calls.
         // RUSTDOC too (the `built` crate requires it); nothing documents here
         .env("RUSTC", &exe)
+        .env("CARGO", &exe)
         .env("RUSTDOC", "rustdoc")
-        .env("MAKEPAD_RUN_AS_RUSTC", "1")
+        .env("MAKEPAD_RUN_AS_RUSTC", "build-script")
         .env("MAKEPAD_RUN_SCRIPT_DEPTH", depth.to_string())
         .env_remove("MAKEPAD_RUN_SELF_EXEC")
         // the script is compiled and run for the machine (cargo: build scripts are host
@@ -899,6 +930,12 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         // MAKEPAD_RUN_WORKSPACE first: rustix's build.rs probed `src/backend/linux_raw/arch/x86_64.rs`
         // there, found nothing and chose its libc backend)
         cmd.current_dir(dir).env_remove("MAKEPAD_RUN_WORKSPACE");
+    }
+    // cargo's `[env]` configuration, after every variable set above (cargo apply_env_config)
+    for (k, v) in crate::crates::config_env() {
+        if !cmd.get_envs().any(|(n, _)| n == k.as_str()) {
+            cmd.env(k, v);
+        }
     }
     // cargo's rerun rules: the previous output stands while the script's units, the environment
     // it was given and its `rerun-if-changed` / `rerun-if-env-changed` inputs are unchanged (a
@@ -1103,7 +1140,7 @@ impl Drop for ScriptSlot {
 fn script_slot() -> ScriptSlot {
     let mut n = SCRIPT_RUNNING.lock().unwrap_or_else(|e| e.into_inner());
     while *n >= script_slots() {
-        n = SCRIPT_FREE.wait(n).unwrap_or_else(|e| e.into_inner());
+        n = crate::pool::wait(&SCRIPT_FREE, &SCRIPT_RUNNING, n).unwrap_or_else(|e| e.into_inner());
     }
     *n += 1;
     ScriptSlot
@@ -1126,6 +1163,62 @@ fn path_lock(path: &str) -> relax_session::sync::MutexGuard<'static, ()> {
         }
     };
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A Relax crate's build script (libs/relax/self_stamp.rs), answered without running it: its
+/// OUT_DIR/src_stamp.rs. The stamp hashes what the script hashes of the package itself (its files,
+/// nested packages, `target`, hidden entries and its tests, benches and examples left out, read
+/// through the VFS; the enabled features), with this crate's own build in place of rustc's
+/// toolchain and flags. Only relax-compiler's codegen identity reads a stamp, from its native
+/// build: a program compiling these crates from source never compares it.
+fn self_stamp_answer(dir: &str, pkg: &str, features: &[String], out_dir: &str) -> Result<(), String> {
+    fn files(dir: &std::path::Path, rel: &str, out: &mut Vec<(String, std::path::PathBuf)>) {
+        let Ok(mut rd) = crate::vfs::read_dir(dir) else { return };
+        rd.sort();
+        for (name, is_dir) in rd {
+            if name.starts_with('.') {
+                continue;
+            }
+            let p = dir.join(&name);
+            let r = if rel.is_empty() { name.clone() } else { format!("{}/{}", rel, name) };
+            if is_dir {
+                if name == "target" || crate::vfs::is_file(p.join("Cargo.toml")) || (rel.is_empty() && matches!(name.as_str(), "tests" | "benches" | "examples")) {
+                    continue;
+                }
+                files(&p, &r, out);
+            } else {
+                out.push((r, p));
+            }
+        }
+    }
+    let mut list = Vec::new();
+    files(std::path::Path::new(dir), "", &mut list);
+    let mut buf = Vec::new();
+    let put = |b: &[u8], buf: &mut Vec<u8>| {
+        buf.extend_from_slice(&(b.len() as u64).to_le_bytes());
+        buf.extend_from_slice(b);
+    };
+    put(b"relax-src-stamp 1", &mut buf);
+    put(pkg.as_bytes(), &mut buf);
+    for (rel, p) in &list {
+        put(rel.as_bytes(), &mut buf);
+        put(&crate::vfs::read(p).map_err(|e| format!("{}: {}", p.display(), e))?, &mut buf);
+    }
+    let mut fs: Vec<String> = features.iter().map(|f| format!("CARGO_FEATURE_{}", f.to_uppercase().replace('-', "_"))).collect();
+    fs.sort();
+    for f in &fs {
+        put(f.as_bytes(), &mut buf);
+    }
+    put(b"makepad run", &mut buf);
+    put(env!("CARGO_PKG_VERSION").as_bytes(), &mut buf);
+    let d = relax_base::sha256::sha256(&buf);
+    let stamp = u128::from_le_bytes(d[..16].try_into().unwrap());
+    let text = format!("/// This crate's source stamp (libs/relax/self_stamp.rs).\npub const SRC_STAMP: u128 = 0x{:032x};\n", stamp);
+    let out = format!("{}/src_stamp.rs", out_dir);
+    if std::fs::read_to_string(&out).ok().as_deref() != Some(text.as_str()) {
+        std::fs::write(&out, text).map_err(|e| format!("{}: {}", out, e))?;
+    }
+    Ok(())
 }
 
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1158,16 +1251,20 @@ fn platform_answer(sess: &std::sync::Arc<crate::Session>, out_dir: &str) -> Resu
 #[cfg(test)]
 mod platform_script_tests {
     use super::platform_gen;
-    use std::path::Path;
     use std::process::Command;
 
     /// platform/build.rs, compiled and run for real, writes the bytes `makepad run` answers with
     /// natively (both call platform/build_gen.rs): app_meta_gen.rs, app_icon_gen.rs and the cfg lines.
+    /// The script is this crate's build input, not a file read beside its sources: under the JIT
+    /// those are a virtual tree, and rustc, another process, reads only files on disk.
     #[test]
     fn native_answer_is_byte_identical_to_the_build_script() {
-        let platform = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../platform");
         let tmp = std::env::temp_dir().join(format!("relax-platform-script-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
+        let platform = tmp.join("platform");
+        std::fs::create_dir_all(&platform).unwrap();
+        std::fs::write(platform.join("build.rs"), include_str!("../../../../platform/build.rs")).unwrap();
+        std::fs::write(platform.join("build_gen.rs"), include_str!("../../../../platform/build_gen.rs")).unwrap();
         let root = tmp.join("some app");
         std::fs::create_dir_all(root.join("resources")).unwrap();
         std::fs::write(root.join("resources/icon_64.png"), b"png").unwrap();
@@ -1194,4 +1291,11 @@ mod platform_script_tests {
         assert!(platform_gen::app_icon_gen(&out).source.contains("icon_64.png"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&TO_REMOVE, Mutex::new(Vec::new()));
+    reset(&SCRIPT_RUNNING, Mutex::new(0));
 }

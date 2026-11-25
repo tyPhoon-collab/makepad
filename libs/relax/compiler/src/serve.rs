@@ -76,7 +76,7 @@ impl Session {
             }
         }
         let mut files = HashMap::new();
-        for (p, i) in unit.prog.current_source_files() { files.insert(p, i); }
+        for (p, i) in unit.prog.current_source_files(|_| true) { files.insert(p, i); }
         let mut front: HashMap<String, Vec<Diagnostic>> = HashMap::new();
         let mut parse_errors = HashMap::new();
         for e in errors {
@@ -97,7 +97,7 @@ impl Session {
         let mut primed = Vec::new();
         for (file, path) in hot {
             if let Ok(v) = unit.prog.parse_version(file, &path, sources[&path].clone()) {
-                if let Ok(plan) = crate::reload::classify(&unit.prog, file, &v.pf, &path) {
+                if let Ok(plan) = crate::reload::classify(&unit.prog, file, &v.pf, &path, &Default::default()) {
                     if plan.changes.is_empty() && plan.added.is_empty() && plan.removed.is_empty() && plan.removed_uses.is_empty() && !plan.attributes_changed {
                         if let Ok(f) = unit.prog.commit_body_version(v, &plan.pairs) {
                             unit.prog.lower_body_declarations(&[], &[f]);
@@ -189,7 +189,7 @@ impl Session {
                 // Check concrete instances reached in the package, with diagnostics owned by
                 // the caller. Closure bodies are already checked in their enclosing Body.
                 let cx = crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &state);
-                for (callee, args) in u.tcx.with_errors(&cx, || crate::jit::body_callees(&u.prog, &u.tcx, &body, false, None)).0 {
+                for (callee, args) in u.tcx.with_errors(&cx, || crate::jit::body_callees(&u.prog, &u.tcx, &body, &[], false, None)).0 {
                     edges.push(callee);
                     if self.own_crates.contains(&u.prog.def(callee).krate) && !args.is_empty() { queue.push((callee, args)); }
                 }
@@ -275,7 +275,7 @@ impl Session {
         let sess = &self.unit.prog.session.clone();
         let options = &sess.options;
         let start = Instant::now();
-        let trace = std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some();
+        let trace = crate::reload::reload_trace();
         if trace { crate::parse_work::begin(); }
         if crate::diag::enabled() {
             // Retained front-end errors still need their structured spans/suggestions
@@ -318,7 +318,7 @@ impl Session {
             };
             let krate = self.unit.prog.file_crate[file as usize];
             if self.front.get(&path).is_some_and(|v| !v.is_empty()) { rebuild.insert(krate); }
-            let plan = crate::reload::classify(&self.unit.prog, file, &v.pf, &path);
+            let plan = crate::reload::classify(&self.unit.prog, file, &v.pf, &path, &Default::default());
             let pairs = match plan {
                 Ok(plan) => {
                     if trace { eprintln!("makepad-run check plan: {}: {} changes, {} added, {} removed, {} uses removed", path, plan.changes.len(), plan.added.len(), plan.removed.len(), plan.removed_uses.len()); }
@@ -477,7 +477,7 @@ impl Session {
                 self.unit.tcx.errors.retain(|e| !self.files.iter().any(|(p, f)| self.unit.prog.file_crate[*f as usize] == krate && e.starts_with(p)));
                 self.unit.tcx.collect_check(&self.unit.prog, &defs);
             }
-            for (path, i) in self.unit.prog.current_source_files() {
+            for (path, i) in self.unit.prog.current_source_files(|_| true) {
                 self.files.insert(path.clone(), i);
                 self.sources.entry(path).or_insert_with(|| self.unit.prog.files[i as usize].src[..self.unit.prog.files[i as usize].src_len as usize].to_vec());
             }
@@ -581,7 +581,7 @@ impl Session {
         // replacement. Use the existing auxiliary-unit retirement protocol.
         unsafe { crate::jit::retire_unit(&mut *self.unit); }
         self.unit = Unit::new(prog, tcx, core);
-        self.files = self.unit.prog.current_source_files().into_iter().collect();
+        self.files = self.unit.prog.current_source_files(|_| true).into_iter().collect();
         for (path, file) in &self.files {
             self.sources.entry(path.clone()).or_insert_with(|| {
                 let pf = &self.unit.prog.files[*file as usize]; pf.src[..pf.src_len as usize].to_vec()

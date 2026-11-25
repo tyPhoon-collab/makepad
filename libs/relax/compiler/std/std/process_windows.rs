@@ -115,6 +115,9 @@ extern "C" {
     /// the exiting thread's fiber-local destructors (as unix's exit() skips the main thread's
     /// key destructors). ExitProcess would run them into JIT code during teardown.
     fn __relax_exit(code: i32);
+    /// Relax run.rs relax_self_spawn: the disk cache written before this program spawns itself
+    /// again.
+    fn __relax_self_spawn();
 }
 
 pub fn exit(code: i32) -> ! {
@@ -568,9 +571,7 @@ impl Command {
                 self.cwd = None;
                 self.env("MAKEPAD_RUN_WORKSPACE", abs.as_os_str());
                 self.env("MAKEPAD_RUN_VFS", crate::fs::vfs::mounts());
-                let r = self.spawn_now(default, needs_stdin);
-                self.cwd = Some(dir);
-                r
+                self.spawn_now(default, needs_stdin)
             }
             None => {
                 if crate::env::var_os("MAKEPAD_RUN_WORKSPACE").is_some() {
@@ -579,6 +580,7 @@ impl Command {
                 self.spawn_now(default, needs_stdin)
             }
         };
+        self.cwd = Some(dir);
         self.env = saved_env;
         r
     }
@@ -604,6 +606,11 @@ impl Command {
         }
         let program = resolve_exe(&self.program, child_paths.as_deref())?;
         let self_exec = self.self_exec_args(&program);
+        // the program again: what this process compiled goes to the disk cache first, so the new
+        // process starts from it (Relax run.rs relax_self_spawn)
+        if self_exec.is_some() {
+            unsafe { __relax_self_spawn() };
+        }
         let args: &[Arg] = match &self_exec {
             Some(v) => v,
             None => &self.args,

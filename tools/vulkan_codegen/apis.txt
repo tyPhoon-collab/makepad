@@ -294,6 +294,7 @@ value VkCommandBufferLevel PRIMARY
 value VkCommandBufferUsageFlags ONE_TIME_SUBMIT
 value VkCommandPoolCreateFlags RESET_COMMAND_BUFFER
 value VkCompareOp LESS_OR_EQUAL
+value VkCompareOp GREATER
 value VkCompositeAlphaFlagsKHR INHERIT
 value VkCompositeAlphaFlagsKHR OPAQUE
 value VkCompositeAlphaFlagsKHR POST_MULTIPLIED
@@ -546,6 +547,7 @@ device vkGetImageMemoryRequirements
 device vkGetImageSubresourceLayout
 device vkGetMemoryFdKHR
 device vkGetMemoryFdPropertiesKHR
+device vkGetPipelineCacheData
 device vkGetQueryPoolResults
 device vkGetSemaphoreCounterValue
 device vkGetSemaphoreFdKHR
@@ -833,6 +835,8 @@ value VkVideoEncodeH265TransformBlockSizeFlagsKHR TYPE_32
 # Vulkan Video encode quantization delta maps (foveated encode: a QP delta per region) and intra
 # refresh (a key picture spread over several pictures, no burst).
 const VK_KHR_VIDEO_ENCODE_QUANTIZATION_MAP_EXTENSION_NAME
+# the quantization map's requirement below Vulkan 1.3
+const VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME
 const VK_KHR_VIDEO_ENCODE_INTRA_REFRESH_EXTENSION_NAME
 type VkPhysicalDeviceVideoEncodeQuantizationMapFeaturesKHR
 type VkVideoEncodeQuantizationMapCapabilitiesKHR
@@ -857,3 +861,12 @@ value VkVideoEncodeIntraRefreshModeFlagsKHR PER_PICTURE_PARTITION
 value VkVideoEncodeIntraRefreshModeFlagsKHR BLOCK_BASED
 value VkVideoEncodeIntraRefreshModeFlagsKHR BLOCK_ROW_BASED
 value VkVideoEncodeIntraRefreshModeFlagsKHR BLOCK_COLUMN_BASED
+
+# Render HAL compute and indirect work.
+type VkPhysicalDeviceBufferDeviceAddressFeatures
+const VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME
+value VkDescriptorType STORAGE_IMAGE
+value VkBufferUsageFlags INDIRECT_BUFFER
+value VkImageUsageFlags STORAGE
+value VkFormatFeatureFlags STORAGE_IMAGE
+device vkCmdDispatchIndirect

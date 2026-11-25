@@ -38,8 +38,8 @@ pub mod names {
     pub const SET_ROWS: &str = "set_rows";
     pub const SOFTMAX_MASK: &str = "softmax_mask";
     pub const FLASH_DECODE: &str = "flash_decode";
-    pub const FATTN_MMA_F16: &str = "fattn_mma_f16";
-    pub const FATTN_VEC_F16: &str = "fattn_vec_f16";
+    pub const FATTN_MMA: &str = "fattn_mma";
+    pub const FATTN_VEC: &str = "fattn_vec";
     pub const NORM: &str = "norm";
     pub const LAYER_NORM: &str = "layer_norm";
     pub const RMS_NORM_MUL: &str = "rms_norm_mul";
@@ -53,6 +53,7 @@ pub mod names {
     pub const COPY_STRIDED: &str = "copy_strided";
     pub const SSM_CONV: &str = "ssm_conv";
     pub const GATED_DELTA_NET: &str = "gated_delta_net";
+    pub const SAMPLE_WEIGH: &str = "sample_weigh";
 }
 
 /// GGUF block kind passed to quantized MMV/MMQ launchers.
@@ -373,9 +374,10 @@ mod ffi {
             m_nb1: usize,
             d_nb1: usize,
             d_nb2: usize,
+            kv_q8: i32,
             stream: Stream,
         ) -> CudaError;
-        pub fn mkllm_fattn_mma_f16(
+        pub fn mkllm_fattn_mma(
             q: *const c_void,
             k: *const c_void,
             v: *const c_void,
@@ -399,12 +401,13 @@ mod ffi {
             d_nb2: usize,
             nsm: i32,
             cc: i32,
+            kv_q8: i32,
             tmp_fixup: *mut f32,
             stream: Stream,
         ) -> CudaError;
         pub fn mkllm_fattn_mma_fixup_bytes(nsm: i32) -> usize;
         pub fn mkllm_fattn_vec_tmp_bytes(n_q: i32, h: i32, kc: i32) -> usize;
-        pub fn mkllm_fattn_vec_f16(
+        pub fn mkllm_fattn_vec(
             q: *const c_void,
             k: *const c_void,
             v: *const c_void,
@@ -427,6 +430,7 @@ mod ffi {
             d_nb1: usize,
             d_nb2: usize,
             nsm: i32,
+            kv_q8: i32,
             tmp: *mut f32,
             stream: Stream,
         ) -> CudaError;
@@ -708,6 +712,29 @@ mod ffi {
             v_t_elems: usize,
             v_s_elems: usize,
             state_checkpoints: i32,
+            state_cache: *mut c_void,
+            state_read_rows: *const c_void,
+            state_write_rows: *const c_void,
+            state_row_stride: i64,
+            stream: Stream,
+        ) -> CudaError;
+        pub fn mkllm_sample_weigh(
+            logits: *const c_void,
+            logits_stride: usize,
+            row_idx: *const i32,
+            vocab: i32,
+            rows: i32,
+            pen_off: *const i32,
+            pen_tok: *const u32,
+            pen_val: *const f32,
+            temps: *const f32,
+            w: *mut f32,
+            w_stride: usize,
+            cmax: *mut f32,
+            csum: *mut f32,
+            cap: i32,
+            out: *mut c_void,
+            out_stride: usize,
             stream: Stream,
         ) -> CudaError;
     }
@@ -998,6 +1025,30 @@ cuda_forward!(set_rows(
     stream: Stream,
 ) -> CudaError { mkllm_set_rows });
 
+// The sampler's weighing (defined by makepad-ai-llm's `sampler.rs`): per row,
+// penalised logits, the maximum, `exp_poly((l - m) / T)` summed in 1024-token
+// halving-stride trees, and the heaviest `cap` tokens as rank keys. Strides are
+// in floats; `out` rows are `16 + 8 * cap` bytes.
+cuda_forward!(sample_weigh(
+    logits: *const c_void,
+    logits_stride: usize,
+    row_idx: *const i32,
+    vocab: i32,
+    rows: i32,
+    pen_off: *const i32,
+    pen_tok: *const u32,
+    pen_val: *const f32,
+    temps: *const f32,
+    w: *mut f32,
+    w_stride: usize,
+    cmax: *mut f32,
+    csum: *mut f32,
+    cap: i32,
+    out: *mut c_void,
+    out_stride: usize,
+    stream: Stream,
+) -> CudaError { mkllm_sample_weigh });
+
 cuda_forward!(softmax_mask(
     x: *const c_void,
     mask: *const c_void,
@@ -1036,10 +1087,11 @@ cuda_forward!(flash_decode(
     m_nb1: usize,
     d_nb1: usize,
     d_nb2: usize,
+    kv_q8: i32,
     stream: Stream,
 ) -> CudaError { mkllm_flash_decode });
 
-cuda_forward!(fattn_mma_f16(
+cuda_forward!(fattn_mma(
     q: *const c_void,
     k: *const c_void,
     v: *const c_void,
@@ -1063,11 +1115,12 @@ cuda_forward!(fattn_mma_f16(
     d_nb2: usize,
     nsm: i32,
     cc: i32,
+    kv_q8: i32,
     tmp_fixup: *mut f32,
     stream: Stream,
-) -> CudaError { mkllm_fattn_mma_f16 });
+) -> CudaError { mkllm_fattn_mma });
 
-cuda_forward!(fattn_vec_f16(
+cuda_forward!(fattn_vec(
     q: *const c_void,
     k: *const c_void,
     v: *const c_void,
@@ -1090,9 +1143,10 @@ cuda_forward!(fattn_vec_f16(
     d_nb1: usize,
     d_nb2: usize,
     nsm: i32,
+    kv_q8: i32,
     tmp: *mut f32,
     stream: Stream,
-) -> CudaError { mkllm_fattn_vec_f16 });
+) -> CudaError { mkllm_fattn_vec });
 
 cuda_forward!(norm(
     l2: i32,
@@ -1390,6 +1444,10 @@ cuda_forward!(gated_delta_net(
     v_t_elems: usize,
     v_s_elems: usize,
     state_checkpoints: i32,
+    state_cache: *mut c_void,
+    state_read_rows: *const c_void,
+    state_write_rows: *const c_void,
+    state_row_stride: i64,
     stream: Stream,
 ) -> CudaError { mkllm_gated_delta_net });
 

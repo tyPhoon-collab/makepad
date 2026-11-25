@@ -14,7 +14,8 @@ use crate::backend::exec::{self, LentState};
 use super::chain::Layered;
 use super::dcomp::{self, Item, Segment};
 use crate::buffers::{id_at, read_ids, read_pairs, read_rects, CmdView};
-use crate::ledger::Kind;
+use crate::gpu_prof::{self, ShaderFacts};
+use crate::ledger::{Kind, Pool};
 use crate::session::{LentRef, Session, TextureObj, HOST};
 use crate::types::*;
 use makepad_windows_sys::Win32::Foundation::RECT;
@@ -110,8 +111,17 @@ struct Prepared {
     depth_state: usize,
     cull: usize,
     scissor: RECT,
+    storage: Vec<(u32, Option<ID3D11ShaderResourceView>)>,
     index_first: u32,
     index_count: u32,
+}
+
+/// What the GPU profiler records of the pass being encoded ([`gpu_prof::record_pass`]).
+#[derive(Default)]
+pub(super) struct ProfRecords {
+    records: Vec<gpu_prof::DrawRecord>,
+    attach: String,
+    bytes: u64,
 }
 
 /// The target of an upper segment's pass: its image and the window pixel of its top left.
@@ -195,7 +205,7 @@ impl D3d11 {
                 Some(t) => t.clone(),
                 None => {
                     let t = Texture::new(self.dev.clone(), TextureObj { format: format::BGRA8, w: size[0], h: size[1], depth: 1, mips: 1,
-                        usage: usage::RENDER_TARGET | usage::SAMPLED, bytes: 0, imported: false, uploaded: 0, lent: None })?;
+                        usage: usage::RENDER_TARGET | usage::SAMPLED, bytes: 0, imported: false, uploaded: 0, lent: None })?.in_pool(Pool::WindowCopies);
                     self.segments.insert(key, t.clone());
                     t
                 }
@@ -207,7 +217,8 @@ impl D3d11 {
                 match self.segment_depths.get(&key).filter(|t| [t.desc.w, t.desc.h] == size && t.desc.format == source.desc.format) {
                     Some(t) => Some(t.clone()),
                     None => {
-                        let t = Texture::new(self.dev.clone(), TextureObj { w: size[0], h: size[1], depth: 1, mips: 1, bytes: 0, imported: false, uploaded: 0, lent: None, ..source.desc.clone() })?;
+                        let t = Texture::new(self.dev.clone(), TextureObj { w: size[0], h: size[1], depth: 1, mips: 1, bytes: 0, imported: false, uploaded: 0, lent: None, ..source.desc.clone() })?
+                            .in_pool(Pool::WindowCopies);
                         self.segment_depths.insert(key, t.clone());
                         Some(t)
                     }
@@ -272,9 +283,9 @@ impl D3d11 {
             makepad_windows_sys::core::add_ref(t.as_raw());
             makepad_windows_sys::core::release(t.as_raw()) == 1
         };
-        self.captures.retain(|(size, _)| *size == [w, h]);
-        let cap = match self.captures.iter().find(|(_, t)| free(t)) {
-            Some((_, t)) => t.clone(),
+        self.captures.retain(|(size, ..)| *size == [w, h]);
+        let cap = match self.captures.iter().find(|(_, t, _)| free(t)) {
+            Some((_, t, _)) => t.clone(),
             None if self.captures.len() < 3 => {
                 let desc = D3D11_TEXTURE2D_DESC {
                     Width: w,
@@ -293,7 +304,7 @@ impl D3d11 {
                     return;
                 }
                 let Some(t) = t else { return };
-                self.captures.push(([w, h], t.clone()));
+                self.captures.push(([w, h], t.clone(), self.dev.pools.charge(Pool::Capture, w as u64 * h as u64 * 4)));
                 t
             }
             None => return,
@@ -367,13 +378,25 @@ impl D3d11 {
             None => {
                 let tex = Texture::new(self.dev.clone(), TextureObj { format: format::BGRA8, w: base.desc.w, h: base.desc.h, depth: 1, mips: 1,
                     usage: usage::RENDER_TARGET | usage::SAMPLED, bytes: 0, imported: false, uploaded: 0, lent: None })
-                    .map_err(|e| eprintln!("[hal-d3d11] badge layer image: {e}")).ok()?;
+                    .map_err(|e| eprintln!("[hal-d3d11] badge layer image: {e}")).ok()?.in_pool(Pool::WindowCopies);
                 self.badged.insert(key.1.index, Some(Tex { gen: key.1.gen, tex: tex.clone() }));
                 tex
             }
         };
         unsafe { self.dev.ctx.CopyResource(composed.res.as_ID3D11Resource(), base.res.as_ID3D11Resource()) };
         Some(composed)
+    }
+
+    /// A composed window layer's texture `layer` takes the borrower's newest frame of host window
+    /// `window` (`Gpu::layer_copy`): the window's retained image (every frame renders into it),
+    /// over the area both have.
+    pub(super) fn copy_into_layer(&mut self, s: &mut Session, window: Id, layer: Id) -> bool {
+        let Some(source) = self.win.get(&(HOST, window.index)).filter(|t| t.gen == window.gen).map(|t| t.tex.clone()) else { return true };
+        let Some(image) = self.resolve(s, layer) else { return true };
+        if source.desc.format != image.desc.format || Arc::ptr_eq(&source, &image) { return true }
+        let area = D3D11_BOX { left: 0, top: 0, front: 0, right: source.desc.w.min(image.desc.w), bottom: source.desc.h.min(image.desc.h), back: 1 };
+        unsafe { self.dev.ctx.CopySubresourceRegion(image.res.as_ID3D11Resource(), 0, 0, 0, 0, source.res.as_ID3D11Resource(), 0, Some(&area)) };
+        true
     }
 
     /// A 1x1 texture of a shape, sampled where a draw names no texture.
@@ -393,7 +416,7 @@ impl D3d11 {
         };
         let desc = TextureObj { format: fmt, w: 1, h: 1, depth: layers, mips: 1, usage: if format::is_depth(fmt) { usage::SAMPLED | usage::RENDER_TARGET } else { usage::SAMPLED },
             bytes: 0, imported: false, uploaded: 0, lent: None };
-        let t = Texture::new(self.dev.clone(), desc)?;
+        let t = Texture::new(self.dev.clone(), desc)?.in_pool(Pool::Fallback);
         if format::is_depth(fmt) {
             for v in &t.dsv {
                 unsafe { self.dev.ctx.ClearDepthStencilView(v, D3D11_CLEAR_DEPTH.0 as u32, 1.0, 0) };
@@ -420,6 +443,7 @@ impl D3d11 {
             s.bad();
             return None;
         }
+        if !self.compute_ready(sid, &view.passes[pr.clone()], view) { return None; }
         s.frame = packet.frame;
         s.font_frames.submitted(packet.frame);
         s.stats.max_frame_ns = s.stats.max_frame_ns.max(packet.meta.build_end_ns.saturating_sub(packet.meta.build_start_ns));
@@ -433,11 +457,12 @@ impl D3d11 {
         let badges = layered && kind & target::BADGES != 0;
         if badges {
             self.compose = self.begin_compose(key);
-            // an opaque panel (`target::OVERLAY`) needs nothing under it: with no frame of the
-            // window kept yet (an app parked before it drew under the layer) the window's
-            // retained image is made at the panel's size and composed over as it is
+            // an opaque panel or a window layer (`target::OVERLAY`) needs nothing under it: with
+            // no frame of the window kept yet (an app parked before it drew under the layer) the
+            // window's retained image is made at the window pass's size and composed over as it is
             if self.compose.is_none() && kind & target::OVERLAY != 0 {
-                if let Some(v) = view.passes[pr.clone()].first().map(|p| p.viewport) {
+                let window_pass = view.passes[pr.clone()].iter().find(|p| p.kind != crate::types::pass_kind::COMPUTE && p.color.iter().all(|c| c.is_none()));
+                if let Some(v) = window_pass.map(|p| p.viewport) {
                     let size = [(v[0] + v[2]).ceil().max(1.0) as u32, (v[1] + v[3]).ceil().max(1.0) as u32];
                     if self.window_storage(s, target, size, now).is_ok() {
                         self.compose = self.begin_compose(key);
@@ -458,7 +483,15 @@ impl D3d11 {
         let mut window_image = None;
         let mut batch = std::mem::take(&mut self.batch);
         // the frame's GPU span: a disjoint query around two timestamps
-        let timer = if replay { None } else { self.complete.timers.take(&self.dev) };
+        let mut timer = if replay { None } else { self.complete.timers.take(&self.dev) };
+        // a frame the GPU profiler records times each pass between two more timestamps
+        let prof_key = gpu_prof::current(sid);
+        if let Some(key) = prof_key {
+            gpu_prof::with_frame(key, |b| b.packet(packet.frame, is_window && !pick, &packet.meta));
+            if let Some(t) = timer.as_mut() {
+                t.prof = Some((key, Vec::new()));
+            }
+        }
         if let Some(t) = &timer {
             unsafe {
                 self.dev.ctx.Begin(t.disjoint.as_ID3D11Asynchronous());
@@ -478,7 +511,7 @@ impl D3d11 {
         let split_pass = if native && !records.is_empty() {
             let inside = |p: &Pass| records.iter().all(|g| g.kind != Layer::DRAWS
                 || (g.draws.off >= p.draws.off && g.draws.off as u64 + g.draws.len as u64 <= p.draws.off as u64 + p.draws.len as u64));
-            let found = view.passes[pr.clone()].iter().position(|p| p.color.iter().all(|c| c.is_none()) && inside(p));
+            let found = view.passes[pr.clone()].iter().position(|p| p.kind == crate::types::pass_kind::DRAW && p.color.iter().all(|c| c.is_none()) && inside(p));
             if found.is_none() {
                 eprintln!("[hal-d3d11] window {sid}:{}: native layer records outside the window pass", target.index);
                 s.bad();
@@ -493,11 +526,42 @@ impl D3d11 {
             let before = s.stats.skipped_draws;
             let missing = pick && draws.iter().any(|d| read_ids(view.arena, d.pick_tex).any(|t| self.pick_pending.contains(&(sid, t))));
             let mut failed = false;
-            let encoded = if split_pass == Some(pass_index) {
+            let stamps = match (prof_key, timer.as_mut()) {
+                (Some(_), Some(t)) => t.stamp_pair(&self.dev),
+                _ => None,
+            };
+            if prof_key.is_some() {
+                self.prof = Some(ProfRecords::default());
+            }
+            if let (Some(q), Some(t)) = (stamps, &timer) {
+                unsafe { self.dev.ctx.End(t.stamp(q).as_ID3D11Asynchronous()) };
+            }
+            let encoded = if pass.kind == crate::types::pass_kind::COMPUTE {
+                self.encode_compute(s, pass, view, timer.as_mut()).map(|_| None)
+            } else if split_pass == Some(pass_index) {
                 self.encode_split(s, target, pass, records, view, now, &mut deps).map(|(image, sp)| { split = Some(sp); image })
             } else {
                 self.encode_pass(s, target, is_window, pick, pass, draws, view, now, &mut deps)
             };
+            if let (Some(q), Some(t)) = (stamps, &timer) {
+                unsafe { self.dev.ctx.End(t.stamp(q + 1).as_ID3D11Asynchronous()) };
+            }
+            if let (Some(key), Some(rec)) = (prof_key, self.prof.take()) {
+                let timed = stamps.is_some() && encoded.is_ok();
+                let v = pass.viewport;
+                let (pipes, session): (_, &Session) = (&self.pipe, s);
+                let pi = if pass.kind == crate::types::pass_kind::COMPUTE {
+                    gpu_prof::with_frame(key, |b| {
+                        if timed { b.expect(1); } else { b.untimed(1); }
+                        b.pass(session.string(pass.name).unwrap_or("compute"), makepad_gpu_trace::kind::COMPUTE, 0, 0, "", 0)
+                    })
+                } else { gpu_prof::record_pass(key, session, sid, pass.name, pick, v[2] as u32, v[3] as u32, &rec.attach, rec.bytes, &rec.records, timed, |pipeline| {
+                    pipes.get(&(sid, pipeline.index)).map(|p| ShaderFacts { name: gpu_prof::shader_name(session, &p.state.src.desc), stats: None, source: None })
+                }) };
+                if let (Some(pi), Some(q), Some((_, passes))) = (pi.filter(|_| timed), stamps, timer.as_mut().and_then(|t| t.prof.as_mut())) {
+                    passes.push((pi, q));
+                }
+            }
             // whatever happened, no shared image stays held past its pass
             self.give_back_shared();
             match encoded {
@@ -568,6 +632,9 @@ impl D3d11 {
                     self.capture(s, target, &image);
                 }
             }
+        }
+        if let Some(key) = prof_key.filter(|_| presented && !pick) {
+            gpu_prof::with_frame(key, |b| b.present(crate::clock_ns()));
         }
         if let Some(t) = &timer {
             unsafe {
@@ -665,6 +732,22 @@ impl D3d11 {
         let target_size = [colors.iter().map(|(i, c)| plane_size(c, pass.layer[*i])[0]).chain(depth.iter().map(|d| d.desc.w)).min().unwrap(),
             colors.iter().map(|(i, c)| plane_size(c, pass.layer[*i])[1]).chain(depth.iter().map(|d| d.desc.h)).min().unwrap()];
 
+        if let Some(rec) = self.prof.as_mut() {
+            let pixels = v[2] as u64 * v[3] as u64;
+            let load = |l: u8| match l { pass_load::LOAD => "load", pass_load::CLEAR => "clear", _ => "dontcare" };
+            let mut parts = Vec::new();
+            for (i, c) in &colors {
+                let l = pass.load[*i];
+                rec.bytes += pixels * format::texel_bytes(c.desc.format) * ((l == pass_load::LOAD) as u64 + 1);
+                parts.push(format!("{} {}/store", format::name(c.desc.format).to_lowercase(), load(l)));
+            }
+            if let Some(d) = &depth {
+                let l = pass.load[4];
+                rec.bytes += pixels * format::texel_bytes(d.desc.format) * ((l == pass_load::LOAD) as u64 + 1);
+                parts.push(format!("{} {}/store", format::name(d.desc.format).to_lowercase(), load(l)));
+            }
+            rec.attach = parts.join(", ");
+        }
         // ---- lay out the draws' transient bytes
         let mut sc = std::mem::take(&mut self.scratch);
         sc.clear();
@@ -674,7 +757,14 @@ impl D3d11 {
                 continue;
             }
             match self.prepare(s, pass, d, view.arena, pick, &colors, &depth, target_size, &mut sc, now, deps) {
-                Ok(Some(p)) => sc.prepared.push(p),
+                Ok(Some(p)) => {
+                    if let Some(rec) = self.prof.as_mut() {
+                        let size = |id: Id| self.buf.get(&(s.id, id.index)).filter(|b| b.gen == id.gen).map_or(0, |b| b.buf.size);
+                        let geo = size(d.vb) + size(d.ib);
+                        rec.records.push(gpu_prof::DrawRecord::new(s, d, view.arena, v[2], v[3], depth.is_some(), p.program.desc.instance_stride as u64 * 4, geo, p.program.textures.len()));
+                    }
+                    sc.prepared.push(p)
+                }
                 Ok(None) => s.stats.skipped_draws += 1,
                 Err(e) => {
                     eprintln!("[hal-d3d11] draw: {e}");
@@ -759,6 +849,10 @@ impl D3d11 {
                         None => self.word_arena.words.clone(),
                     };
                     ctx.VSSetShaderResources(slot, Some(&[view]));
+                }
+                for (slot, srv) in &p.storage {
+                    ctx.VSSetShaderResources(*slot, Some(std::slice::from_ref(srv)));
+                    ctx.PSSetShaderResources(*slot, Some(std::slice::from_ref(srv)));
                 }
                 for (_, count, base_cb) in &sc.ranges[p.ranges.clone()] {
                     if p.program.instance_slot().is_some() {
@@ -954,7 +1048,7 @@ impl D3d11 {
             }
         }
         let blend = self.dev.blend_state(modes, program.desc.blend & pipeline_blend::MAX != 0);
-        let depth_state = if depth.is_none() { 0 } else if d.flags & Draw::DEPTH_WRITE != 0 { 1 } else { 2 };
+        let depth_state = if depth.is_none() { 0 } else { (if d.flags & Draw::DEPTH_WRITE != 0 { 1 } else { 2 }) + if d.flags & Draw::DEPTH_GREATER != 0 { 2 } else { 0 } };
         let cull = if d.flags & Draw::CULL != 0 { 1 } else { 0 };
         let scissor = if d.scissor.iter().any(|n| n.is_nan()) {
             RECT { left: 0, top: 0, right: target_size[0] as i32, bottom: target_size[1] as i32 }
@@ -979,8 +1073,17 @@ impl D3d11 {
             s.ledger.touch(Kind::Buffer, id.index, id.gen, s.frame, now);
         }
         let index_format = if width == 4 { DXGI_FORMAT_R32_UINT } else { DXGI_FORMAT_R16_UINT };
+        crate::compute::validate_draw(s, d, arena, &program.storage)?;
+        if d.storage_buffers.len as usize != program.storage.len() { return Err("draw storage count mismatch".into()); }
+        let mut storage = Vec::new();
+        for (i, binding) in program.storage.iter().enumerate() {
+            let id = id_at(arena, d.storage_buffers, i);
+            let b = self.buf.get(&(s.id, id.index)).filter(|b| b.gen == id.gen).ok_or("stale draw storage buffer")?;
+            storage.push((binding.index, b.buf.words.clone()));
+            s.ledger.touch(Kind::Buffer, id.index, id.gen, s.frame, now);
+        }
         Ok(Some(Prepared {
-            program,
+            storage, program,
             vb: vb.map(|b| b.buf.clone()),
             ib: ib.buf.clone(),
             index_format,

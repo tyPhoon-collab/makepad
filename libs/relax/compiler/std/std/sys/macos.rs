@@ -161,6 +161,7 @@ extern "C" {
     pub fn stat(path: *const c_char, buf: *mut stat_t) -> c_int;
     pub fn lstat(path: *const c_char, buf: *mut stat_t) -> c_int;
     pub fn fstat(fd: c_int, buf: *mut stat_t) -> c_int;
+    pub fn mkstemp(template: *mut c_char) -> c_int;
     pub fn readdir(dir: *mut c_void) -> *mut dirent_t;
     fn pthread_setname_np(name: *const c_char) -> c_int;
     fn _NSGetEnviron() -> *mut *const *const c_char;
@@ -181,6 +182,11 @@ pub fn errno_location() -> *mut c_int {
 
 pub fn environ() -> *const *const c_char {
     unsafe { *_NSGetEnviron() }
+}
+
+/// Makes `env` this process's environment (the array is the caller's to keep alive).
+pub unsafe fn set_environ(env: *const *const c_char) {
+    *_NSGetEnviron() = env;
 }
 
 /// The program's argv (`makepad run P -- a b` gives [P, a, b]), as on Linux: the process's own

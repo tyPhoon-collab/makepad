@@ -17,9 +17,11 @@ mod frame;
 mod layers;
 mod media;
 mod pipeline;
+mod compute;
 mod readback;
 mod resources;
 mod timing;
+pub(crate) use timing::end_run;
 
 use super::super::exec::{self, Gpu, OsCmd, PipeStatus};
 use super::shell::Shared;
@@ -42,11 +44,13 @@ const TRANSIENT_IDLE_NS: u64 = 3_000_000_000;
 const CAPTURE_IDLE_NS: u64 = 2_000_000_000;
 /// The device is asked how much it holds, and transient targets are looked at, this often.
 const HOUSEKEEPING_NS: u64 = 250_000_000;
+/// How long the compiled pipelines of a closed session wait for the next session to take them
+/// (`pipeline::Compiled`), from the close or from the last one taken.
+const KEPT_NS: u64 = 30_000_000_000;
 /// Retained instance data the HAL may drop is dropped, least recently used first, once the
 /// device holds more than this fraction of its recommended working set, down to the low mark.
 const RESIDENCY_HIGH: (u64, u64) = (3, 4);
 const RESIDENCY_LOW: (u64, u64) = (5, 8);
-
 /// The autorelease pool of a call into the backend: the thread that drives it has no run loop.
 struct Pool(ObjcId);
 
@@ -74,11 +78,13 @@ struct Win {
 }
 
 pub struct Metal {
+    leases: crate::lease::Pool<compute::LeaseBlock>,
     dev: Device,
     info: HalInfo,
     tex: FastMap<(u32, u32), Tex>,
     buf: FastMap<(u32, u32), Buf>,
     pipe: FastMap<(u32, u32), pipeline::Pipe>,
+    compute: FastMap<(u32, u32), compute::Pipe>,
     win: FastMap<(u32, u32), Win>,
     /// App aliases resolve to host storage; lending never moves or frees that storage.
     window_aliases: FastMap<(u32, Id), Id>,
@@ -107,7 +113,7 @@ pub struct Metal {
     native_windows: layers::Windows,
     native_sync: bool,
     /// the size the ledger last saw of each real window's drawables
-    layer_sizes: FastMap<(u32, u32), (u32, u32, u32)>,
+    layer_sizes: FastMap<(u32, u32), LayerSize>,
     /// video playback, audio, camera ...: everything of os/apple that is not Metal or AppKit
     media: Media,
     /// the pool of capture buffers a recorder's frames are copied into, and when it was last used
@@ -122,6 +128,12 @@ pub struct Metal {
     /// Draws left out so far for a pipeline variant still compiling (a frame that adds to it is
     /// partial, `FramePartial`).
     pending_draws: u64,
+    /// Failed command buffers must not silently strand their clients.
+    lost_posted: bool,
+    /// the compiled pipelines of the app session that closed last, for the next one to take
+    /// (`pipeline::Compiled`), and when that session closed or the next took one
+    kept: Vec<pipeline::Compiled>,
+    kept_ns: u64,
 }
 
 impl Metal {
@@ -153,11 +165,12 @@ impl Metal {
         if !texture_compression.1 {
             formats &= !(1 << format::ASTC4X4);
         }
+        let threads: MTLSize = unsafe { msg_send![dev.device, maxThreadsPerThreadgroup] };
         let info = HalInfo {
             session: 0,
             backend: backend_id::METAL,
             dialect: dialect::MSL,
-            flags: info_flags::WINDOW_LAYERS
+            flags: info_flags::WINDOW_LAYERS | info_flags::COMPUTE | info_flags::DRAW_STORAGE_BUFFERS
                 | if shell.is_some() { info_flags::DISPLAY_CLOCK } else { 0 }
                 | if shell.is_some() && cfg!(target_os = "macos") { info_flags::WINDOW_BADGES } else { 0 },
             formats,
@@ -172,6 +185,9 @@ impl Metal {
             // card reports its own name and no unified memory.
             device_kind: if dev.unified_memory { device_kind::INTEGRATED } else { device_kind::DISCRETE },
             device_name: Default::default(),
+            storage_formats: (1 << format::R16F) | (1 << format::R8) | (1 << format::R32F) | (1 << format::R32UINT) | (1 << format::RGBA8) | (1 << format::RGBA16F),
+            max_workgroup_size: [threads.width as u32, threads.height as u32, threads.depth as u32],
+            max_workgroup_invocations: threads.width as u32,
         };
         let mut info = info;
         info.set_device_name(&dev.name);
@@ -179,8 +195,10 @@ impl Metal {
             dev,
             info,
             tex: FastMap::default(),
+            leases: Default::default(),
             buf: FastMap::default(),
             pipe: FastMap::default(),
+            compute: FastMap::default(),
             win: FastMap::default(),
             window_aliases: FastMap::default(),
             overlays: FastMap::default(),
@@ -205,6 +223,9 @@ impl Metal {
             prof: Vec::new(),
             prof_key: None,
             pending_draws: 0,
+            lost_posted: false,
+            kept: Vec::new(),
+            kept_ns: 0,
         })
     }
 
@@ -246,9 +267,16 @@ impl Metal {
 
     /// Applies what finished on the GPU to the sessions: events, counters.
     fn drain(&mut self, world: &mut World) {
-        for done in self.dev.mailbox.take() {
+        let completions = self.dev.mailbox.take();
+        // Announce loss before any completion in the same drain can retire its
+        // dispatch metadata or publish bytes from a later command buffer.
+        if !self.lost_posted && completions.iter().any(|done| matches!(done, Done::Frame { failed: true, .. } | Done::BufferLeases { status: crate::readback::DEVICE_LOST, .. })) {
+            exec::device_lost(world);
+            self.lost_posted = true;
+        }
+        for done in completions {
             let (sid, incarnation) = match &done {
-                Done::Frame { sid, incarnation, .. } | Done::Readback { sid, incarnation, .. }
+                Done::Frame { sid, incarnation, .. } | Done::DispatchTime { sid, incarnation, .. } | Done::Readback { sid, incarnation, .. } | Done::BufferLeases { sid, incarnation, .. }
                 | Done::Pick { sid, incarnation, .. } | Done::PipelineReady { sid, incarnation, .. }
                 | Done::PipelineFailed { sid, incarnation, .. } | Done::Surface { sid, incarnation, .. } => (*sid, incarnation),
             };
@@ -259,6 +287,7 @@ impl Metal {
                 continue;
             }
             match done {
+                Done::DispatchTime { sid, name, gpu_ns, .. } => world.to_session(sid, |q| q.dispatch_time(name.as_bytes(), gpu_ns)),
                 Done::Frame { sid, target, frame, gpu_ns, present_ns, gpu_span, failed, partial, window, kind, .. } => {
                     if window && !failed && kind & target::OVERLAY == 0 {
                         world.window_presented(sid, target, frame, gpu_ns, present_ns);
@@ -288,6 +317,7 @@ impl Metal {
                     // the session is gone: nobody takes the buffer
                     None => unsafe { CFRelease(buffer as *const std::ffi::c_void) },
                 },
+                Done::BufferLeases { sid, req, status, leases, .. } => world.to_session(sid, |q| q.buffer_leases(req, status, leases)),
                 Done::Readback { sid, req, status, rect, pixels, .. } => {
                     if let Some(s) = world.session_mut(sid) {
                         s.events.readback(req, status, rect, &pixels);
@@ -303,6 +333,9 @@ impl Metal {
                     if let Some(s) = world.session_mut(sid) {
                         if s.pipelines.get(sid, id).is_ok() {
                             Self::announce(&mut self.pipe, s, id);
+                            if let Some(p) = self.compute.get_mut(&(sid, id.index)).filter(|p| p.gen == id.gen) {
+                                if !std::mem::replace(&mut p.announced, true) { s.pipelines_pending = s.pipelines_pending.saturating_sub(1); }
+                            }
                             s.events.pipeline_ready(id);
                         }
                     }
@@ -311,6 +344,9 @@ impl Metal {
                     if let Some(s) = world.session_mut(sid) {
                         if s.pipelines.get(sid, id).is_ok() {
                             Self::announce(&mut self.pipe, s, id);
+                            if let Some(p) = self.compute.get_mut(&(sid, id.index)).filter(|p| p.gen == id.gen) {
+                                if !std::mem::replace(&mut p.announced, true) { s.pipelines_pending = s.pipelines_pending.saturating_sub(1); }
+                            }
                             s.events.pipeline_failed(id, log.as_bytes());
                         }
                     }
@@ -332,11 +368,29 @@ impl Metal {
         if self.capture.is_some() && now.saturating_sub(self.capture_ns) > CAPTURE_IDLE_NS {
             self.capture = None;
         }
+        // what the backend keeps and nothing uses goes; what it holds goes on the host's ledger
+        let clock = crate::clock_ns();
+        self.dev.arena_trim(clock);
+        self.leases.trim(clock);
+        if let Some(Some(pass_clock)) = &self.dev.clock { pass_clock.trim(clock); }
+        // what the session before left and the running one did not take for a while
+        if !self.kept.is_empty() && clock.saturating_sub(self.kept_ns) > KEPT_NS {
+            self.kept = Vec::new();
+        }
+        self.dev.pools.set_count(crate::ledger::Pool::KeptPipelines, self.kept.len() as u64);
+        // the queue keeps driver memory for the most command buffers it had at once
+        self.dev.pools.set_count(crate::ledger::Pool::CommandBuffers, self.dev.peak_in_flight);
+        if let Some(host) = world.session_mut(HOST) {
+            let frame = host.frame;
+            host.ledger.set_pools(&self.dev.pools, frame, now);
+        }
         let allocated = self.dev.device_allocated();
+        let os_graphics = device::graphics_footprint();
         let completed = self.dev.completed.load(std::sync::atomic::Ordering::Acquire);
         for sid in world.session_ids() {
             let Some(s) = world.session_mut(sid) else { continue };
             s.ledger.device_allocated = Some(allocated);
+            s.ledger.os_graphics = os_graphics;
             // transient render targets idle for a while give their storage back; the app is told
             // and produces them again when they are next needed
             let idle: Vec<Id> = s
@@ -491,7 +545,14 @@ impl Backend for Metal {
                 self.dev.retire(Box::new(b));
             }
         }
+        // an app session's compiled pipelines wait for the next session (a restart in place makes
+        // the same ones again); what the session before left and this one did not take goes
+        if sid != HOST {
+            self.kept = self.pipe.iter().filter(|(k, _)| own(k)).filter_map(|(_, p)| p.state.compiled(&p.desc)).collect();
+            self.kept_ns = crate::clock_ns();
+        }
         self.pipe.retain(|k, _| !own(k));
+        self.compute.retain(|k, _| !own(k));
         let win: Vec<_> = self.win.keys().filter(|k| own(k)).copied().collect();
         for k in win {
             if let Some(w) = self.win.remove(&k) {
@@ -601,6 +662,29 @@ impl Gpu for Metal {
     }
 
     fn buffer_update(&mut self, s: &mut Session, id: Id, b: &mut BufferObj, off: u64, data: &[u8]) {
+        let Some(size) = self.buf.get(&(s.id, id.index)).filter(|b| b.gen == id.gen).map(|b| b.size) else { s.bad(); return; };
+        if off.checked_add(data.len() as u64).is_none_or(|end| end > size) {
+            eprintln!("[hal-metal] buffer {id:?} upload offset={off} bytes={} exceeds buffer size={size}", data.len());
+            s.bad(); return;
+        }
+        if b.kind & buffer_kind::KIND_MASK == buffer_kind::STORAGE {
+            // Storage may contain GPU writes: never copy its contents on the CPU.
+            // A queued blit preserves untouched bytes and orders the update with dispatches.
+            let Some(dst) = self.buf.get(&(s.id, id.index)).filter(|b| b.gen == id.gen).map(|b| b.buffer.clone()) else { return; };
+            if data.is_empty() { return; }
+            let staging: ObjcId = unsafe { msg_send![self.dev.device, newBufferWithBytes: data.as_ptr() as *const std::ffi::c_void length: data.len() as u64 options: MTLResourceOptions::StorageModeShared] };
+            let Some(staging) = NonNull::new(staging).map(RcObjcId::from_owned) else { s.bad(); return; };
+            let (cb, seq) = self.ensure_batch();
+            self.flush_uploads();
+            unsafe {
+                let encoder: ObjcId = msg_send![cb, blitCommandEncoder];
+                let _: () = msg_send![encoder, copyFromBuffer: staging.as_id() sourceOffset: 0u64 toBuffer: dst.as_id() destinationOffset: off size: data.len() as u64];
+                let _: () = msg_send![encoder, endEncoding];
+            }
+            self.buf.get_mut(&(s.id, id.index)).unwrap().last_bound = seq;
+            self.dev.retire(Box::new(staging));
+            return;
+        }
         let completed = self.dev.completed.load(std::sync::atomic::Ordering::Acquire);
         let Some(buf) = self.buf.get_mut(&(s.id, id.index)).filter(|x| x.gen == id.gen) else { return };
         if !writable_in_place(buf, completed) {
@@ -617,8 +701,10 @@ impl Gpu for Metal {
                 }
             }
         }
-        fill(buf, off, data);
+        if let Err(error) = fill(buf, off, data) { eprintln!("[hal-metal] {error}"); s.bad(); }
     }
+
+    fn buffer_readbacks(&mut self, s: &mut Session, req: u32, ranges: &[BufferReadRange]) { self.read_compute_buffers(s, req, ranges); }
 
     fn buffer_destroy(&mut self, sid: u32, id: Id) {
         if self.buf.get(&(sid, id.index)).is_some_and(|b| b.gen <= id.gen) {
@@ -638,15 +724,26 @@ impl Gpu for Metal {
         if dialect != self::dialect::MSL {
             return PipeStatus::Failed(format!("the Metal backend takes MSL, not dialect {dialect}"));
         }
+        if blob.desc.compute.len != 0 { return self.create_compute(s, id, blob); }
         let Ok(source) = std::str::from_utf8(blob.code) else { return PipeStatus::Failed("the pipeline source is not utf8".into()) };
-        let state = pipeline::create(&self.dev, s.id, id, s.font_frames.clone(), source, &blob.desc);
+        // the same pipeline of the session before (a restart in place): its states, no compile
+        let taken = self.kept.iter().position(|c| c.is(source, &blob.desc)).map(|i| self.kept.swap_remove(i));
+        let ready = taken.is_some();
+        if ready {
+            self.kept_ns = crate::clock_ns();
+            s.stats.pipelines_taken += 1;
+        }
+        let state = pipeline::create(&self.dev, s.id, id, s.font_frames.clone(), source, &blob.desc, taken);
         let stats = crate::gpu_prof::source_stats(source).into();
-        let kept = crate::gpu_prof::keep_sources().then(|| source.into());
-        self.pipe.insert((s.id, id.index), pipeline::Pipe { gen: id.gen, state, desc: blob.desc, bindings: blob.bindings.as_slice().into(), announced: false, stats, source: kept });
-        PipeStatus::Pending
+        let prof_source = crate::gpu_prof::keep_sources().then(|| state.source.clone());
+        self.pipe.insert((s.id, id.index), pipeline::Pipe { gen: id.gen, state, desc: blob.desc, storage: crate::compute::records(blob.raw, blob.desc.storage_buffers).unwrap_or_default(), bindings: blob.bindings.as_slice().into(), announced: ready, stats, source: prof_source });
+        if ready { PipeStatus::Ready } else { PipeStatus::Pending }
     }
 
     fn pipeline_destroy(&mut self, sid: u32, id: Id) -> bool {
+        if self.compute.get(&(sid, id.index)).is_some_and(|p| p.gen <= id.gen) {
+            return self.compute.remove(&(sid, id.index)).is_some_and(|p| !p.announced);
+        }
         if self.pipe.get(&(sid, id.index)).is_some_and(|p| p.gen <= id.gen) {
             return self.pipe.remove(&(sid, id.index)).is_some_and(|p| !p.announced);
         }
@@ -687,8 +784,10 @@ impl Gpu for Metal {
         self.set_overlay(s, id, rect, layer, now);
     }
 
-    /// Panels are composed here (`set_overlay`, `composite_overlay`), over the base frame kept for them.
+    /// Panels and window layers are composed here (`set_overlay`, `composite_overlay`,
+    /// `copy_layer_image`), over the base frame kept for them.
     fn overlays(&self) -> bool { true }
+    fn layers(&self) -> bool { true }
 
     fn badge_layer(&mut self, window: Id, on: bool) {
         if on {
@@ -732,6 +831,17 @@ impl Gpu for Metal {
     }
 }
 
+/// What a real window's layer holds (`Metal::layer_sizes`): its drawables' size, how many it
+/// keeps (`maximumDrawableCount`) and the bytes of each (the drawable texture's `allocatedSize`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LayerSize {
+    pub gen: u32,
+    pub w: u32,
+    pub h: u32,
+    pub drawables: u64,
+    pub drawable_bytes: u64,
+}
+
 /// A window's ledger row: what the offscreen target holds.
 pub(crate) fn window_row(index: u32, gen: u32, bytes: u64, w: u32, h: u32, now: u64, frame: u64) -> LedgerEntry {
     LedgerEntry {
@@ -749,5 +859,7 @@ pub(crate) fn window_row(index: u32, gen: u32, bytes: u64, w: u32, h: u32, now: 
         created_frame: frame,
         last_used_frame: 0,
         last_used_ns: 0,
+        objects: 1,
+        note: "",
     }
 }

@@ -56,7 +56,7 @@ pub enum Life {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Home {
     /// A fresh folder of its own (`SANDBOX_HOME`/`MAKEPAD_HOME`), deleted
-    /// after it exits: a demo starts from a clean state.
+    /// after it exits: the child starts from a clean state.
     Scratch,
     /// The person's own home: what the child keeps (a browser profile)
     /// survives it.
@@ -226,7 +226,6 @@ struct Closing {
     label: String,
     child: Option<Child>,
     reaper: Option<TaskHandle<()>>,
-    busy_logged: bool,
     folder: PathBuf,
 }
 
@@ -404,9 +403,9 @@ impl<K: Clone + PartialEq, X> Children<K, X> {
             } else {
                 launch::kill_child_group(&mut child, launch::GROUP_KILL_GRACE, &self.pool);
             }
-            self.closing.push(Closing { label: slot.label.clone(), child: Some(child), reaper: None, busy_logged: false, folder: slot.folder.clone() });
+            self.closing.push(Closing { label: slot.label.clone(), child: Some(child), reaper: None, folder: slot.folder.clone() });
         }
-        self.retry_closing(cx);
+        self.poll_closing();
     }
 
     /// Quit every child.
@@ -424,16 +423,8 @@ impl<K: Clone + PartialEq, X> Children<K, X> {
         self.hub_failed = false;
     }
 
-    fn retry_closing(&mut self, cx: &mut Cx) {
-        if self.poll_closing() {
-            self.wake_at(cx, Cx::monotonic_now() + 0.05);
-        }
-    }
-
-    /// True when a reaper could not start (the pool is busy): the owner
-    /// of the pump retries a moment later.
-    fn poll_closing(&mut self) -> bool {
-        let mut busy = false;
+    /// Submit each pending reaper once; a closed pool stops its child group.
+    fn poll_closing(&mut self) {
         self.closing.retain(|closing| !closing.reaper.as_ref().is_some_and(TaskHandle::is_finished));
         for closing in &mut self.closing {
             let Some(child) = closing.child.take() else { continue };
@@ -441,16 +432,12 @@ impl<K: Clone + PartialEq, X> Children<K, X> {
             match launch::reap_closed_child(child, &self.pool, move || clear_folder(&folder)) {
                 Ok(task) => closing.reaper = Some(task),
                 Err(child) => {
-                    if !closing.busy_logged {
-                        log!("{} {}: shutdown worker busy; retrying", self.name, closing.label);
-                    }
-                    closing.busy_logged = true;
-                    closing.child = Some(child);
-                    busy = true;
+                    log!("{} {}: shutdown worker unavailable; stopping process group", self.name, closing.label);
+                    launch::reap_child_group(child, launch::GROUP_KILL_GRACE, &self.pool);
                 }
             }
         }
-        busy
+        self.closing.retain(|closing| closing.child.is_some() || closing.reaper.is_some());
     }
 
     /// Pump the hub once at monotonic time `at` (an owner's deadline: a
@@ -513,7 +500,7 @@ impl<K: Clone + PartialEq, X> Children<K, X> {
     }
 
     fn pump(&mut self, cx: &mut Cx) {
-        self.retry_closing(cx);
+        self.poll_closing();
         while let Some(event) = self.hub.as_ref().and_then(|hub| hub.rx.try_recv().ok()) {
             match event {
                 HubEvent::Connected { client, socket, sender } => {
@@ -607,7 +594,7 @@ impl<K: Clone + PartialEq, X> Children<K, X> {
         if let Some(mut child) = slot.child.take() {
             // It may not read this host's Kill: its process group goes.
             launch::kill_child_group(&mut child, launch::GROUP_KILL_GRACE, &self.pool);
-            self.closing.push(Closing { label: slot.label.clone(), child: Some(child), reaper: None, busy_logged: false, folder: slot.folder.clone() });
+            self.closing.push(Closing { label: slot.label.clone(), child: Some(child), reaper: None, folder: slot.folder.clone() });
         }
         slot.sender = None;
         slot.launch = None;
@@ -618,7 +605,7 @@ impl<K: Clone + PartialEq, X> Children<K, X> {
         slot.life = Life::Missing(stale_message(&label, makepad_app_registry::repo_root().is_some()));
         self.events.push(ChildEvent::Changed(slot.key.clone()));
         self.slots.insert(at, slot);
-        self.retry_closing(cx);
+        self.poll_closing();
     }
 
     /// Send what the hosted windows queued.
@@ -727,7 +714,7 @@ impl<K, X> Drop for Children<K, X> {
                 } else {
                     launch::kill_child_group(&mut child, launch::GROUP_KILL_GRACE, &self.pool);
                 }
-                self.closing.push(Closing { label: slot.label.clone(), child: Some(child), reaper: None, busy_logged: false, folder: slot.folder.clone() });
+                self.closing.push(Closing { label: slot.label.clone(), child: Some(child), reaper: None, folder: slot.folder.clone() });
             }
         }
         for closing in &mut self.closing {
@@ -765,7 +752,7 @@ fn clear_folder(folder: &Path) {
 /// is the environment variable (empty when unset), `${NAME:-text}` is the
 /// variable or, when unset or empty, `text`; a leading `~` (alone or before
 /// a `/`), after that, is the home folder. So a host names a folder on any
-/// machine: `["--cwd", "${MAKEPAD_DEMO_REPO:-~/makepad}"]`. A `${` without
+/// machine: `["--cwd", "${WORKSPACE_ROOT:-~/workspace}"]`. A `${` without
 /// its `}` stays as written.
 pub fn expand_home(value: &str) -> String {
     expand_with(value, &|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
@@ -912,7 +899,7 @@ mod tests {
         assert_eq!(expand_with("${REPO}/local", &env), "/srv/repo/local");
         assert_eq!(expand_with("${REPO:-~/makepad}/local", &env), "/srv/repo/local");
         assert_eq!(expand_with("${MISSING:-~/makepad}", &env), "/home/me/makepad");
-        assert_eq!(expand_with("${MISSING:-~/makepad}/local/scope-demo/home", &env), "/home/me/makepad/local/scope-demo/home");
+        assert_eq!(expand_with("${MISSING:-~/workspace}/src", &env), format!("{}/workspace/src", env("HOME").unwrap()));
         assert_eq!(expand_with("a${MISSING}b", &env), "ab");
         assert_eq!(expand_with("${A:-x}-${B:-y}", &env), "x-y");
         assert_eq!(expand_with("${unterminated", &env), "${unterminated");

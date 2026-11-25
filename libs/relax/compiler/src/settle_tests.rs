@@ -1,51 +1,266 @@
 //! Settling must be invisible to generated O1 code and to later closure rebuilds.
 use super::*;
 
+/// Slot-owned allocations must never pin the front-end chunks replaced by a settle rebuild.
 #[test]
-fn fn_entry_size() {
-    isolated_test!(fn_entry_size);
-    // The original layout measures the inline cost on the same target as FnEntry.
-    #[allow(dead_code)]
-    struct InlineFnEntry {
-        key: FnKey,
-        name: String,
-        code: u64,
-        code_len: u32,
-        pc_map: PcMap,
-        file: u32,
-        prev: Vec<(u64, u32, PcMap, u32)>,
-        compiled: bool,
-        patch_gen: u32,
-        rir: Option<std::sync::Arc<relax_backend::rir::Func>>,
-        refs: u32,
-        rir_refs: Box<[u32]>,
-        entry_ref: AtomicBool,
-        entry_ref_counted: bool,
-        building: bool,
-        build_err: Option<String>,
-        inlined_into: Vec<u32>,
-        build_ns: u64,
-        cg_ns: u64,
-        version: u32,
-        retired: Vec<(u64, u32, PcMap)>,
-        inflight: bool,
-        spec: Option<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>, bool)>,
-        spec_state: u8,
-        spec_depth: u8,
-        baseline_hint: AtomicBool,
-        hot_hint: AtomicBool,
-        o3: AtomicBool,
-        base_code: AtomicBool,
-        unverified: AtomicBool,
-        d3_lowered: AtomicBool,
-        calls: Box<[u32]>,
+fn settle_rebuild_segregates_slot_lifetimes() {
+    isolated_test!(settle_rebuild_segregates_slot_lifetimes);
+    std::env::set_var("MAKEPAD_RUN_COMPILER_ARENA", "1");
+    std::env::set_var("MAKEPAD_RUN_CACHE", "on");
+    crate::borrowck::lazy::disable_gandalf();
+    let dir = std::env::temp_dir().join(format!("relax-slot-lifetimes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::dirs::set_relax_dir(dir.join("run"));
+    let path = dir.join("lib.rs");
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"slot_lifetimes\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n").unwrap();
+    let mut source = String::from("#![no_std]\n#[inline(never)] fn identity<T>(x: T) -> T { x }\nfn bad() -> u32 { false }\n");
+    // Populate real cold parse/type-check state between slot creations, across many chunks.
+    for i in 0..320 {
+        source.push_str(&format!("fn slot_{i}(x: u32) -> u32 {{ {} identity::<u32>(x) ^ {i} }}\n", "let _ = x; ".repeat(128)));
     }
-    let before = std::mem::size_of::<InlineFnEntry>();
-    let after = std::mem::size_of::<FnEntry>();
-    eprintln!("size_of::<FnEntry>(): {before} -> {after} bytes");
-    assert!(after < before);
-    #[cfg(target_pointer_width = "64")]
-    assert_eq!(before - after, 152);
+    std::fs::write(&path, source).unwrap();
+    let mut session = crate::Session::default();
+    session.options.ctfe = crate::options::Ctfe::Off;
+    session.options.opt = vec!["-inline".into()];
+    let session = std::sync::Arc::new(session);
+    let cfg = crate::cfg::CfgSet::host(&session, &[]);
+    let pre = vec![crate::preload::PreCrate {
+        name: "slot_lifetimes".into(), root: path.to_string_lossy().into_owned(), edition: 2021,
+        cfg: cfg.clone(), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![],
+    }];
+    settle_rebuild::remember_boot(&pre);
+    let _compiler = crate::zone_alloc::compiler();
+    assert!(crate::zone_alloc::compiler_arena_enabled());
+    let mut prog = Program::new(&session);
+    prog.record_front = true;
+    prog.front_sink = Some(crate::cache::FrontSink::for_dir(&crate::dirs::cache_dir()));
+    prog.preload(pre.clone());
+    prog.load_crate("slot_lifetimes", path.to_str().unwrap(), 2021, cfg, vec![]).unwrap();
+    prog.resolve_imports();
+    assert!(prog.errors.is_empty(), "{:?}", prog.errors);
+    crate::cache::ColdFront::default().finish_in(&mut prog, crate::dirs::cache_dir());
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, 0);
+    let up = &mut *u as *mut Unit;
+    crate::owner::call(crate::owner::Class::Program, || {
+        let cache = crate::cache::Cache::open(&u, crate::cache::Mode::On).unwrap();
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        for i in 0..320 {
+            let name = format!("slot_{i}");
+            let def = u.prog.defs.iter().enumerate().find_map(|(d, _)| {
+                (u.prog.name(DefId(d as u32)) == name).then_some(DefId(d as u32))
+            }).unwrap();
+            let id = u.fn_id(FnKey::Inst(def, vec![]));
+            if i < 8 {
+                assert!(unsafe { spec_build(up, id) });
+                assert!(u.fns[id as usize].spec.is_some(), "real speculative build for {name}");
+            } else {
+                let (code, map, relocs) = unsafe { compile_fn(up, id) }.unwrap();
+                u.install(id, &code, &relocs, map.clone(), 0).unwrap();
+                if i % 8 == 0 {
+                    u.install(id, &code, &relocs, map, 1).unwrap();
+                    u.restore_before(id, 1);
+                }
+            }
+        }
+        let bad = u.prog.defs.iter().enumerate().find_map(|(d, _)| {
+            (u.prog.name(DefId(d as u32)) == "bad").then_some(DefId(d as u32))
+        }).unwrap();
+        let id = u.fn_id(FnKey::Inst(bad, vec![]));
+        let error = unsafe { compile_fn(up, id) }.expect_err("invalid function must fail");
+        unsafe { install_error(up, id, &error) };
+    });
+    let check_slots = |u: &Unit| {
+        let check = |p: *const u8, n: usize, field: &str| {
+            if n != 0 {
+                let placement = crate::zone_alloc::placement(p);
+                assert_ne!(placement, 0, "{field} pins an old compiler chunk");
+                assert_eq!(placement, 4, "{field} must be allocated in slots");
+            }
+        };
+        let mut populated = [false; 8];
+        for f in u.fns.iter() {
+            check((f as *const FnEntry).cast(), 1, "fns chunk");
+            check(f.name.as_ptr(), f.name.len(), "name");
+            match &f.key {
+                FnKey::Inst(_, args) | FnKey::Shim(ShimInstance { args, .. }) => {
+                    populated[0] |= !args.is_empty();
+                    check(args.as_ptr().cast(), args.capacity(), "key");
+                }
+                _ => {}
+            }
+            let map = |m: &PcMap| {
+                if let Some(p) = m.own_ptr() { check(p, m.bytes(), "pc map"); }
+            };
+            populated[1] |= f.pc_map.bytes() != 0;
+            map(&f.pc_map);
+            if let Some(h) = &f.history {
+                populated[2] |= !h.prev.is_empty() || !h.retired.is_empty();
+                check((&**h as *const SlotHistory).cast(), 1, "history");
+                check(h.prev.as_ptr().cast(), h.prev.capacity(), "previous versions");
+                check(h.retired.as_ptr().cast(), h.retired.capacity(), "retired versions");
+                check(h.inlined_into.as_ptr().cast(), h.inlined_into.capacity(), "inlining callers");
+                for p in &h.prev { map(&p.2); }
+                for p in &h.retired { map(&p.2); }
+            }
+            populated[3] |= !f.calls.is_empty();
+            populated[4] |= !f.rir_refs.is_empty();
+            check(f.calls.as_ptr().cast(), f.calls.len(), "calls");
+            check(f.rir_refs.as_ptr().cast(), f.rir_refs.len(), "RIR refs");
+            if let Some(e) = &f.build_err {
+                populated[5] = true;
+                check(e.as_ptr(), e.len(), "build error");
+            }
+            if let Some(s) = &f.spec {
+                populated[6] |= !s.code.is_empty();
+                populated[7] |= !s.map.is_empty() && !s.relocs.is_empty();
+                check((&**s as *const SpecCode).cast(), 1, "spec");
+                check(s.code.as_ptr(), s.code.capacity(), "spec code");
+                check(s.map.as_ptr().cast(), s.map.capacity(), "spec map");
+                check(s.relocs.as_ptr().cast(), s.relocs.capacity(), "spec relocations");
+            }
+        }
+        populated
+    };
+    let before_fields = crate::owner::call(crate::owner::Class::Program, || check_slots(&u));
+    assert!(before_fields.into_iter().all(|p| p), "fixture must exercise each slot field: {before_fields:?}");
+    crate::owner::call(crate::owner::Class::Program, crate::zone_alloc::compiler_hand_back);
+    crate::zone_alloc::compiler_hand_back();
+    crate::zone_alloc::compiler_mark_old();
+    let before = crate::zone_alloc::arena_states().0;
+    assert!(before[21] > 0 && before[22] > 0, "fixture must populate cold compiler chunks");
+    let retired_front = u.front.clone();
+    queue::queue().lock().unwrap().push(queue::Job::Ahead(retired_front.clone(), AheadWork::Slot(0)), wall_ns());
+    assert_eq!(queue::counts()[0], 1, "fixture queues work against the old front");
+    FIRST_PRESENT.store(true, Ordering::Release);
+    match settle_rebuild::run(up, false) {
+        settle_rebuild::Outcome::Done => {}
+        settle_rebuild::Outcome::Retry(why) | settle_rebuild::Outcome::Refused(why) => panic!("settle rebuild did not replace: {why}"),
+    }
+    assert_eq!(queue::counts()[0], 0, "settle discards jobs against the replaced front");
+    queue::queue().lock().unwrap().push(queue::Job::Ahead(retired_front.clone(), AheadWork::Slot(0)), wall_ns());
+    assert_eq!(queue::counts()[0], 0, "late producers cannot enqueue a retired front");
+    drop(retired_front);
+    crate::owner::call(crate::owner::Class::Program, || {
+        let after_fields = check_slots(&u);
+        assert!(!after_fields[5], "rebuild clears build errors");
+        assert!(after_fields[..5].iter().chain(&after_fields[6..]).all(|p| *p));
+        assert!(u.fns.iter().all(|f| f.rir.is_none()), "replace drops disposable RIR");
+        assert!(settle_rebuild::replaced_fronts_alive().is_empty(), "nothing may keep the replaced front state alive");
+        crate::zone_alloc::compiler_hand_back();
+    });
+    crate::zone_alloc::compiler_hand_back();
+    crate::zone_alloc::compiler_trim();
+    let after = crate::zone_alloc::arena_states().0;
+    eprintln!("slot segregation: old chunks {} -> {}, old live slot bytes {} -> {}", before[21], after[21], before[22], after[22]);
+    assert!(after[22] < before[22] / 4, "old live bytes must fall below a quarter: {} -> {} (chunks {} -> {})", before[22], after[22], before[21], after[21]);
+    assert!(after[21] < before[21], "empty cold chunks must be released");
+    // the same program again: the store holds its image now, so the rebuild restores that and
+    // encodes nothing (a warm launch's rebuild)
+    let encodes = settle_rebuild::encodes();
+    match settle_rebuild::run(up, false) {
+        settle_rebuild::Outcome::Done => {}
+        settle_rebuild::Outcome::Retry(why) | settle_rebuild::Outcome::Refused(why) => panic!("the second settle rebuild did not replace: {why}"),
+    }
+    assert_eq!(settle_rebuild::encodes(), encodes, "a rebuild of a program the store holds encodes nothing");
+    crate::owner::call(crate::owner::Class::Program, || {
+        let fields = check_slots(&u);
+        assert!(fields[..5].iter().chain(&fields[6..]).all(|p| *p), "slot fields survive a rebuild from the stored image");
+        assert!(u.fns.iter().all(|f| f.rir.is_none()));
+    });
+    // The isolated process owns the runtime globals; no workers survive the child.
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A run that added a crate at run time (an app domain's: modules::add_crates) gets its settle
+/// rebuild: the image covers the added crate, the rebuilt program is the running one (the
+/// replace compares them), and the added crate's code compiles from it. It was refused for the
+/// life of the process ("crates were added at run time").
+#[test]
+fn settle_rebuild_covers_a_crate_added_at_run_time() {
+    isolated_test!(settle_rebuild_covers_a_crate_added_at_run_time);
+    std::env::set_var("MAKEPAD_RUN_CACHE", "on");
+    crate::borrowck::lazy::disable_gandalf();
+    let dir = std::env::temp_dir().join(format!("relax-added-crate-{}", std::process::id()));
+    let (host, added) = (dir.join("host"), dir.join("added"));
+    std::fs::create_dir_all(&host).unwrap();
+    std::fs::create_dir_all(&added).unwrap();
+    crate::dirs::set_relax_dir(dir.join("run"));
+    let manifest = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n");
+    std::fs::write(host.join("Cargo.toml"), manifest("settle_host")).unwrap();
+    std::fs::write(host.join("lib.rs"), "#![no_std]\npub fn host_value(x: u32) -> u32 { x * 3 }\n").unwrap();
+    std::fs::write(added.join("Cargo.toml"), manifest("settle_added")).unwrap();
+    std::fs::write(added.join("lib.rs"), "#![no_std]\nmod part;\npub use part::Part;\npub fn added_value(x: u32) -> u32 { settle_host::host_value(x) + Part { n: 4 }.n }\n").unwrap();
+    std::fs::write(added.join("part.rs"), "pub struct Part { pub n: u32 }\n").unwrap();
+    let mut session = crate::Session::default();
+    session.options.ctfe = crate::options::Ctfe::Off;
+    let session = std::sync::Arc::new(session);
+    let cfg = crate::cfg::CfgSet::host(&session, &[]);
+    let root = host.join("lib.rs").to_string_lossy().into_owned();
+    let pre = vec![crate::preload::PreCrate {
+        name: "settle_host".into(), root: root.clone(), edition: 2021,
+        cfg: cfg.clone(), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![],
+    }];
+    settle_rebuild::remember_boot(&pre);
+    let _compiler = crate::zone_alloc::compiler();
+    let mut prog = Program::new(&session);
+    prog.record_front = true;
+    prog.front_sink = Some(crate::cache::FrontSink::for_dir(&crate::dirs::cache_dir()));
+    prog.preload(pre.clone());
+    prog.load_crate("settle_host", &root, 2021, cfg.clone(), vec![]).unwrap();
+    prog.resolve_imports();
+    assert!(prog.errors.is_empty(), "{:?}", prog.errors);
+    crate::cache::ColdFront::default().finish_in(&mut prog, crate::dirs::cache_dir());
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, 0);
+    let up = &mut *u as *mut Unit;
+    fn named(u: &Unit, name: &str) -> Option<DefId> {
+        (0..u.prog.defs.len()).map(|d| DefId(d as u32)).find(|&d| u.prog.name(d) == name)
+    }
+    let slot = crate::owner::call(crate::owner::Class::Program, || {
+        let cache = crate::cache::Cache::open(&u, crate::cache::Mode::On).unwrap();
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        // the domain's crate, loaded into the running program
+        let new = [crate::modules::NewCrate {
+            name: "settle_added".into(), path: added.join("lib.rs").to_string_lossy().into_owned(), edition: 2021, cfg: cfg.clone(),
+            deps: vec![("settle_host".into(), crate::modules::Dep::Existing(0))], proc_macro: false,
+        }];
+        let loaded = unsafe { crate::modules::add_crates(up, &new, false, None) }.unwrap_or_else(|e| panic!("the crate did not load: {e:?}"));
+        assert!(loaded.errs.is_empty(), "{:?}", loaded.errs);
+        let id = u.fn_id(FnKey::Inst(named(&u, "added_value").expect("the added crate's fn"), vec![]));
+        let (code, map, relocs) = unsafe { compile_fn(up, id) }.unwrap();
+        u.install(id, &code, &relocs, map, 0).unwrap();
+        id
+    });
+    FIRST_PRESENT.store(true, Ordering::Release);
+    let encodes = settle_rebuild::encodes();
+    match settle_rebuild::run(up, false) {
+        settle_rebuild::Outcome::Done => {}
+        settle_rebuild::Outcome::Retry(why) | settle_rebuild::Outcome::Refused(why) => panic!("settle rebuild did not replace: {why}"),
+    }
+    assert_eq!(settle_rebuild::encodes(), encodes + 1, "the image of the whole program is recorded");
+    crate::owner::call(crate::owner::Class::Program, || {
+        assert_eq!(u.prog.crates.len(), 2, "the rebuilt program has the added crate");
+        assert_eq!(u.prog.syms.str(u.prog.crates[1].name), "settle_added");
+        assert!(named(&u, "Part").is_some_and(|d| u.prog.file_paths[u.prog.def(d).file as usize].ends_with("part.rs")));
+        assert!(u.fns.iter().all(|f| f.rir.is_none()), "replace drops disposable RIR");
+        // the added crate's code compiles from the rebuilt program
+        unsafe { compile_fn(up, slot) }.expect("the added crate's fn compiles after the rebuild");
+    });
+    // the same program again: the store holds the image of it, added crate included
+    match settle_rebuild::run(up, false) {
+        settle_rebuild::Outcome::Done => {}
+        settle_rebuild::Outcome::Retry(why) | settle_rebuild::Outcome::Refused(why) => panic!("the second settle rebuild did not replace: {why}"),
+    }
+    assert_eq!(settle_rebuild::encodes(), encodes + 1, "a rebuild of a program the store holds encodes nothing");
+    // The isolated process owns the runtime globals; no workers survive the child.
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 // Rounds 49-50: restarting leaves the running solver answers and native code intact.
@@ -220,7 +435,7 @@ fn allocator_swap_serves_background_finish() {
     began_rx.recv().unwrap();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let pauser = std::thread::spawn(move || {
-        pause_compile_jobs(false);
+        pause_compile_jobs("test pause", false);
         done_tx.send(()).unwrap();
         resume_compile_jobs(false);
     });
@@ -302,8 +517,8 @@ fn main() {}
             assert_eq!(u.stats.tier1_installed, 0, "warm linking must not rebuild O3");
             assert!(u.fns[id as usize].rir.is_none());
             assert_eq!(unsafe { (*tier_rec(&u.slots, id).add(3)).load(Ordering::Acquire) }, T_QUEUED);
-            assert!(TIER_QUEUE.lock().unwrap().is_empty());
-            assert!(O2_QUEUE.lock().unwrap().is_empty());
+            assert_eq!(queue::counts()[2], 0, "warm linking must not queue O3");
+            assert_eq!(queue::counts()[1], 0, "warm linking must not queue O2");
         }
         id
     });
@@ -441,6 +656,46 @@ fn main() {}
 }
 
 #[test]
+fn prebuild_builds_callees_that_ran_before() {
+    isolated_test!(prebuild_builds_callees_that_ran_before);
+    // A warm session's startup image links baseline code that inlined tiny drop glue and core fns;
+    // an O2 build over that code (the SETTLE-TIER sweep) calls
+    // them. Those that ran in the image's session are built before the replacement's install, not
+    // on the program's threads at its first call; a callee with no sign of having run stays lazy.
+    crate::borrowck::lazy::disable_gandalf();
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-prebuild-ran-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("input.rs"), "pub fn ran(x: u32) -> u32 { x + 1 }\npub fn never(x: u32) -> u32 { x + 2 }\nfn main() {}\n").unwrap();
+    let session = std::sync::Arc::new(crate::Session::default());
+    let (prog, core, krate) = crate::load_with_std(&session, dir.join("input.rs").to_str().unwrap(), "prebuild_ran", false).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| (d.krate == krate && prog.name(DefId(i as u32)) == name).then_some(DefId(i as u32))).unwrap();
+    let (ran, never) = (def("ran"), def("never"));
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    let (ran, never) = crate::owner::call(crate::owner::Class::Program, || {
+        let ran = u.fn_id(FnKey::Inst(ran, Vec::new()));
+        // (as the startup image's prelink marks the callees its code inlined)
+        u.fns[ran as usize].ran_before.store(true, Ordering::Relaxed);
+        (ran, u.fn_id(FnKey::Inst(never, Vec::new())))
+    });
+    FIRST_PRESENT.store(true, Ordering::Release);
+    {
+        let _job = compile_job();
+        let call = |c| relax_backend::rir::RelocAt { at: 0, kind: relax_backend::rir::RelocKind::Pool64, target: relax_backend::rir::Reloc::Call(c) };
+        unsafe { prebuild_callees(up, &[call(ran), call(never)], &[]) };
+    }
+    let (ran, never) = crate::owner::call(crate::owner::Class::Program, || (u.fns[ran as usize].compiled, u.fns[never as usize].compiled));
+    assert!(ran, "a callee that ran in the image's session is built before the install");
+    assert!(!never, "a callee with no sign of having run stays lazy");
+    std::mem::forget(u);
+}
+
+#[test]
 fn settle_rebuild_pins_tier1_and_closure_history() {
     isolated_test!(settle_rebuild_pins_tier1_and_closure_history);
     // Unit installs process-global runtime state. Cache fixtures in the same harness can
@@ -554,9 +809,9 @@ fn unrelated(x: u32) -> u32 { x + 1 }
         let unrelated = u.fn_id(FnKey::Inst(unrelated_def, Vec::new()));
         let code = unsafe { compile_fn(up, unrelated) }.unwrap();
         u.install(unrelated, &code.0, &code.2, code.1, 0).unwrap();
-        let saved_refs = std::mem::replace(&mut u.fns[id as usize].rir_refs, vec![unrelated].into_boxed_slice());
+        let saved_refs = std::mem::replace(&mut u.fns[id as usize].rir_refs, crate::zone_alloc::slots_with(|| vec![unrelated].into_boxed_slice()));
         // Pending and popped/in-flight O3 jobs both pin their input slots.
-        TIER_QUEUE.lock().unwrap().push((id, Q_CALLS, wall_ns(), 0));
+        queue::queue().lock().unwrap().push(queue::Job::O3((id, Q_CALLS, wall_ns(), 0)), wall_ns());
         TIER_ACTIVE.lock().unwrap().push(closure);
         let active = TierActive(closure);
         let generation = reclaim_generation();
@@ -567,12 +822,12 @@ fn unrelated(x: u32) -> u32 { x + 1 }
         assert!(u.fns[closure as usize].rir.is_some());
         assert!(u.fns[unrelated as usize].rir.is_some(), "queued readers pin their known callee inputs too");
         u.fns[id as usize].rir_refs = saved_refs;
-        TIER_QUEUE.lock().unwrap().clear();
+        queue::retain(|job| !matches!(job, queue::Job::O3(_)));
         drop(active);
         assert!(reclaim_generation() > generation, "finishing the last reader must wake reclamation without a new install");
         // A suspended O1 front must keep all of its not-yet-snapshotted candidates.
         u.fns[id as usize].building = true;
-        let saved_calls = std::mem::replace(&mut u.fns[id as usize].calls, vec![closure].into_boxed_slice());
+        let saved_calls = std::mem::replace(&mut u.fns[id as usize].calls, crate::zone_alloc::slots_with(|| vec![closure].into_boxed_slice()));
         let checking = FRONT_RW.read().unwrap();
         let partial = unsafe { settle_drop(up) };
         assert!(partial.front_pending, "a busy ahead checker postpones only shared memo removal");
@@ -598,7 +853,7 @@ fn unrelated(x: u32) -> u32 { x + 1 }
         assert!(retired.upgrade().is_some(), "unlinking must defer destruction until after unlocking");
         (verify, rir, calls, closure, closure_rir, dropped, retired)
     });
-    dropped.release_rir();
+    dropped.release();
     crate::owner::call(crate::owner::Class::Program, || {
         assert!(retired.upgrade().is_none(), "retired RIR must actually be released off the unit lock");
         assert_eq!(u.fns[id as usize].calls, calls);
@@ -802,6 +1057,61 @@ fn round50_initializer_reload_policy() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// Live edits grow the compiler arena by what each version keeps (the edited file's text, tokens
+/// and tree stay for the code and closures of that version), never by more per edit as edits
+/// pile up: a patch's working state goes when it is installed.
+#[test]
+fn edit_cost_does_not_grow_with_edits() {
+    isolated_test!(edit_cost_does_not_grow_with_edits);
+    const CHILD: &str = "MAKEPAD_RUN_EDIT_COST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "jit::settle_tests::edit_cost_does_not_grow_with_edits", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0").output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    crate::borrowck::lazy::disable_gandalf();
+    let source = |n: u32| format!("#![no_std] fn helper(x: u32) -> u32 {{ x * 3 + 1 }} fn read(out: *mut u32) {{ unsafe {{ *out = helper({n}); }} }}");
+    let path = std::env::temp_dir().join(format!("relax-edit-cost-{}.rs", std::process::id()));
+    std::fs::write(&path, source(0)).unwrap();
+    let mut session = crate::Session::default();
+    session.options.opt = vec!["-inline".into()];
+    let session = std::sync::Arc::new(session);
+    let mut prog = Program::new(&session);
+    prog.load_crate("edit_cost", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+    let read = prog.defs.iter().enumerate().find_map(|(i, _)| (prog.name(DefId(i as u32)) == "read").then_some(DefId(i as u32))).unwrap();
+    let mut tcx = Tcx::new(); tcx.collect(&prog);
+    let mut u = Unit::new(prog, tcx, 0);
+    let up = &mut *u as *mut Unit;
+    let entry = u.entry(u.fn_id(FnKey::Inst(read, vec![])));
+    let mut result = 0u32;
+    unsafe { call_jit(up, entry, &mut result as *mut u32 as u64).unwrap_or_else(|p| panic!("{}", p.message)); }
+    assert_eq!(result, 1);
+    // the compiler arena's live bytes after edit k (the calling thread's chunks handed back)
+    let live = || {
+        crate::zone_alloc::compiler_hand_back();
+        crate::owner::call(crate::owner::Class::Program, crate::zone_alloc::compiler_hand_back);
+        crate::zone_alloc::compiler_stats().1
+    };
+    let mut at = Vec::new();
+    for k in 1..=40u32 {
+        let file = u.prog.def(read).file;
+        let outcome = unsafe { crate::reload::apply(up, vec![crate::reload::Edit { file, path: path.to_string_lossy().into_owned(), src: source(k).into_bytes() }]) };
+        assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
+        unsafe { call_jit(up, entry, &mut result as *mut u32 as u64).unwrap_or_else(|p| panic!("{}", p.message)); }
+        assert_eq!(result, k * 3 + 1, "edit {k} runs");
+        at.push(live());
+    }
+    // after the first edits warm the reload machinery up, edits 25-40 may not add more than
+    // edits 10-25 did (with slack for one chunk's rounding): a cost per edit that grows with
+    // the edits before it (state copied or re-kept per edit) shows here
+    let (earlier, later) = (at[24].saturating_sub(at[9]), at[39].saturating_sub(at[24]));
+    eprintln!("compiler arena live after edits 10/25/40: {} / {} / {} bytes", at[9], at[24], at[39]);
+    assert!(later <= earlier + (64 << 10), "the compiler arena grows faster with every edit: +{earlier} bytes over edits 10-25, +{later} over edits 25-40");
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn round50_opaque_body_invalidates_solver_answer() {
     isolated_test!(round50_opaque_body_invalidates_solver_answer);
@@ -819,34 +1129,43 @@ fn round50_opaque_body_invalidates_solver_answer() {
     std::fs::write(&path, source).unwrap();
     let session = std::sync::Arc::new(crate::Session::default());
     let mut prog = Program::new(&session);
-    prog.load_crate("reload_opaque", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+    let krate = prog.load_crate("reload_opaque", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
     let owner = prog.defs.iter().enumerate().find_map(|(i, _)| (prog.name(DefId(i as u32)) == "owner").then_some(DefId(i as u32))).unwrap();
     let opaque = prog.opaque_types_defined_by[&owner][0];
+    let (module, name) = (prog.crates[krate as usize].root_mod, prog.def(owner).name);
     let mut tcx = Tcx::new(); tcx.collect(&prog);
     let mut u = Unit::new(prog, tcx, 0);
     let up = &mut *u as *mut Unit;
-    let hidden = |u: &Unit| {
+    let hidden = |u: &Unit, opaque: DefId| {
         let alias = u.tcx.alias_ty_with_args(crate::types::AliasTyKind::Opaque { def_id: opaque }, &[]);
         u.tcx.try_normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), alias).unwrap()
     };
-    assert_eq!(hidden(&u), u.tcx.tys.u8_);
+    // the opaque type of the `owner` the program names now
+    let current = |u: &Unit| u.prog.opaque_types_defined_by[&u.prog.mods[module as usize].values[&name]][0];
+    assert_eq!(hidden(&u, opaque), u.tcx.tys.u8_);
     let outcome = unsafe { crate::reload::apply(up, vec![crate::reload::Edit { file: u.prog.def(owner).file, path: path.to_string_lossy().into_owned(), src: source.replace("1u8", "2u32").into_bytes() }]) };
     assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
-    assert_eq!(hidden(&u), u.tcx.tys.u32_);
+    // a fn returning an opaque type is replaced when its body changes (its callers' code is built
+    // for the type the body makes): the new one's opaque reveals the new body's type, the old
+    // one's (the code built before the edit) its own
+    let replaced = current(&u);
+    assert_ne!(replaced, opaque);
+    assert_eq!(hidden(&u, replaced), u.tcx.tys.u32_);
+    assert_eq!(hidden(&u, opaque), u.tcx.tys.u8_);
     unsafe { crate::reload::rollback(up, outcome.undo.unwrap(), "test"); }
-    assert_eq!(hidden(&u), u.tcx.tys.u8_);
+    assert_eq!(current(&u), opaque);
+    assert_eq!(hidden(&u, opaque), u.tcx.tys.u8_);
     std::fs::remove_file(path).unwrap();
 }
 
 // T11: reload evaluates candidates with running native code; owner: codegen2.
 #[test]
-#[ignore = "T11: candidate CTFE must be transaction-staged or restart; codegen2"]
 fn round50_foldable_const_with_native_dependent() {
     isolated_test!(round50_foldable_const_with_native_dependent);
     const CHILD: &str = "MAKEPAD_RUN_R50_FOLDED_DEPENDENT_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "jit::settle_tests::round50_foldable_const_with_native_dependent", "--ignored", "--nocapture", "--test-threads=1"])
+            .args(["--exact", "jit::settle_tests::round50_foldable_const_with_native_dependent", "--nocapture", "--test-threads=1"])
             .env(CHILD, "1").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0").output().unwrap();
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return;
@@ -880,13 +1199,75 @@ fn round50_foldable_const_with_native_dependent() {
 // T11: new inline constants reach native CTFE during the reload transaction.
 // Owner: codegen2; retained separately so ordinary body checks remain enabled.
 #[test]
-#[ignore = "T11: inline-const candidate CTFE must be transaction-staged or restart; codegen2"]
 fn round50_inline_const_reload() {
     isolated_test!(round50_inline_const_reload);
     let result = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "jit::settle_tests::round50_initializer_reload_policy", "--nocapture", "--test-threads=1"])
         .env("MAKEPAD_RUN_R50_INITIALIZER_CHILD", "inline_literal").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0").output().unwrap();
     assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+}
+
+#[test]
+fn copy_versions_move_with_the_flags_their_code_reads() {
+    isolated_test!(copy_versions_move_with_the_flags_their_code_reads);
+    // Copy versions (note_guard_reads): code that reads patch flags notes the copy versions it
+    // reads under each. A flag set before the install moves them at the install (a callee patched
+    // before it is caught), one set after moves them at the patch (set_patched); a slot whose code
+    // reads no flag that was set keeps its version. The disk cache never stores code naming a
+    // version that moved: a later session's starts at 0 and would reach the value again while the
+    // code's copies may be stale. Control: the same record naming a version at 0 is encoded.
+    crate::borrowck::lazy::disable_gandalf();
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-copy-versions-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("input.rs"), "pub fn hot(out: &mut u32) { *out = 7; }\npub fn cool(out: &mut u32) { *out = 8; }\npub fn early() {}\npub fn late() {}\nfn main() {}\n").unwrap();
+    std::env::set_var("MAKEPAD_RUN_CACHE_DIR", dir.join("cache"));
+    let session = std::sync::Arc::new(crate::Session::default());
+    let (prog, core, krate) = crate::load_with_std(&session, dir.join("input.rs").to_str().unwrap(), "copy_versions", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| (d.krate == krate && prog.name(DefId(i as u32)) == name).then_some(DefId(i as u32))).unwrap();
+    let defs = [def("hot"), def("cool"), def("early"), def("late")];
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    crate::owner::call(crate::owner::Class::Program, || {
+        let [hot, cool, early, late] = defs.map(|d| u.fn_id(FnKey::Inst(d, Vec::new())));
+        let at = |u: &Unit, id: u32, off: i64| {
+            let s = loop_counter_sym(u, id);
+            relax_backend::rir::Sym { id: s.id, off: s.off + off }
+        };
+        let ver = |u: &Unit, id: u32| unsafe { (*tier_rec(&u.slots, id).add((TIER_COPY / 8) as usize)).load(Ordering::Acquire) };
+        set_patched(&u, early);
+        let reads = [at(&u, early, PATCH_FLAG_OFF), at(&u, late, PATCH_FLAG_OFF), at(&u, hot, COPY_VER_OFF)];
+        note_guard_reads(&mut u, reads.into_iter());
+        assert_eq!(ver(&u, hot), 1, "a callee patched before the install is caught at it");
+        set_patched(&u, late);
+        assert_eq!(ver(&u, hot), 2, "a callee patched after the install moves the version at the patch");
+        let reads = [at(&u, cool, COPY_VER_OFF)];
+        note_guard_reads(&mut u, reads.into_iter());
+        assert_eq!(ver(&u, cool), 0, "code that reads no flag keeps its version");
+        let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
+        cache.mode = crate::cache::Mode::On;
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        for (id, stored) in [(cool, true), (hot, false)] {
+            let built = unsafe { compile_fn(up, id) }.unwrap();
+            // the code with a pool word naming the slot's copy version (unlinked: zero)
+            let mut code = built.0.clone();
+            let word = code.len() as u32;
+            code.extend([0u8; 8]);
+            let mut relocs = built.2.clone();
+            relocs.push(relax_backend::rir::RelocAt { at: word, kind: relax_backend::rir::RelocKind::Pool64, target: relax_backend::rir::Reloc::Sym(at(&u, id, COPY_VER_OFF)) });
+            let mut cache = u.cache.take().unwrap();
+            let before = cache.stats.recorded;
+            let pending = cache.defer_record(&u, id, &code, &relocs, &built.1).expect("a fresh install is deferrable");
+            cache.record_pending(&u, &pending);
+            assert_eq!(cache.stats.recorded > before, stored, "{}: a record naming a copy version at {} is {}", u.fns[id as usize].name, ver(&u, id), if stored { "encoded" } else { "never encoded" });
+            u.cache = Some(cache);
+        }
+    });
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::mem::forget(u);
 }
 
 #[test]
@@ -1041,4 +1422,92 @@ fn preempted_check_under_a_front_read_gives_way() {
     assert!(gave_way, "a preempted check holding another front read waited for the writer (the writer waits for that read)");
     drop(u);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The run monitor's settle sweep runs in steps, one owner request each (JITOWNER: one request
+/// over every slot held the owner 10-50 ms while a cold Fab's UI dragged): a main-thread request
+/// that comes during a step is served when that step ends, while the sweep still has steps to go,
+/// and the stepped sweep still ends with every eligible slot's RIR and body taken (freed by its
+/// requester, not on the owner).
+#[test]
+fn a_settle_sweep_lets_main_through_between_steps() {
+    isolated_test!(a_settle_sweep_lets_main_through_between_steps);
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    let mut source = String::from("#![no_std]\n");
+    // (the first four with a closure: a slot keeps its checked body for its closures)
+    for i in 0..200 {
+        let body = if i < 4 { format!("let _g = |y: u32| y ^ {i}; x") } else { format!("x ^ {i}") };
+        source.push_str(&format!("fn f{i}(x: u32) -> u32 {{ {body} }}\n"));
+    }
+    let path = std::env::temp_dir().join(format!("relax-settle-steps-{}.rs", std::process::id()));
+    std::fs::write(&path, &source).unwrap();
+    let mut session = crate::Session::default();
+    session.options.ctfe = crate::options::Ctfe::Off;
+    let session = std::sync::Arc::new(session);
+    let mut prog = Program::new(&session);
+    prog.load_crate("settle_steps", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let defs: Vec<DefId> = (0..200).map(|i| {
+        let name = format!("f{i}");
+        (0..prog.defs.len() as u32).map(DefId).find(|&d| prog.name(d) == name).unwrap()
+    }).collect();
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, 0);
+    let up = &mut *u as *mut Unit;
+    // 200 slots; four compiled and installed, with their RIR kept (and the bodies they hold)
+    let (built, bodies, rir_kept) = crate::owner::call(crate::owner::Class::Program, || {
+        let ids: Vec<u32> = defs.iter().map(|&d| u.fn_id(FnKey::Inst(d, Vec::new()))).collect();
+        let built: Vec<u32> = ids[..4].to_vec();
+        for &id in &built {
+            let c = unsafe { compile_fn(up, id) }.unwrap();
+            u.install(id, &c.0, &c.2, c.1, 0).unwrap();
+            unsafe { build_rir(up, id) }.unwrap();
+        }
+        let bodies = built.iter().filter(|&&id| u.bodies.contains_key(&id)).count();
+        let rir_kept = built.iter().all(|&id| u.fns[id as usize].rir.is_some());
+        (built, bodies, rir_kept)
+    });
+    assert!(rir_kept && bodies > 0, "the fixture's compiled slots have RIR ({rir_kept}) and checked bodies ({bodies})");
+    // this thread is the program's main thread; the sweep's driver plays the run monitor
+    crate::jit::MAIN_TID.store(crate::os::thread::current(), Ordering::SeqCst);
+    static STEPS: AtomicU32 = AtomicU32::new(0);
+    static ASK: AtomicBool = AtomicBool::new(false);
+    let upn = up as usize;
+    let driver = std::thread::spawn(move || {
+        let mut sweep = SettleSweep::default();
+        while !crate::owner::call(crate::owner::Class::Program, || {
+            let n = STEPS.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 3 {
+                // main asks while this step runs on the owner
+                ASK.store(true, Ordering::SeqCst);
+                let t = std::time::Instant::now();
+                while !crate::owner::program_waiting() {
+                    assert!(t.elapsed().as_secs() < 10, "main's request never queued");
+                    std::hint::spin_loop();
+                }
+            }
+            unsafe { sweep.step(upn as *mut Unit, 16) }
+        }) {}
+        sweep.drops
+    });
+    while !ASK.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    let served_after = crate::owner::call(crate::owner::Class::Program, || STEPS.load(Ordering::SeqCst));
+    let mut drops = driver.join().unwrap();
+    let steps = STEPS.load(Ordering::SeqCst);
+    assert_eq!(served_after, 3, "main's request waited for more than the step it came in");
+    assert!(steps > 6, "the sweep of 200 slots took {steps} steps of 16 slots");
+    assert_eq!(drops.fns, built.len(), "the stepped sweep took the RIR of every compiled slot");
+    crate::owner::call(crate::owner::Class::Program, || {
+        for &id in &built {
+            assert!(u.fns[id as usize].rir.is_none() && !u.bodies.contains_key(&id), "slot {id} kept its RIR or body");
+        }
+    });
+    assert!(drops.retired_bodies.len() == bodies && drops.retired_rir.len() == built.len(), "the bodies and RIR are freed by the requester");
+    drops.release();
+    assert!(drops.retired_bodies.is_empty() && drops.retired_rir.is_empty());
+    drop(u);
 }

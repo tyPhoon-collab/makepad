@@ -37,7 +37,7 @@ pub struct BorrowedFd<'fd> {
     _phantom: PhantomData<&'fd OwnedFd>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const F_DUPFD_CLOEXEC: core::ffi::c_int = 67;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const F_DUPFD_CLOEXEC: core::ffi::c_int = 1030;
@@ -128,6 +128,36 @@ impl<T: AsFd + ?Sized> AsFd for &T {
 impl<T: AsFd + ?Sized> AsFd for &mut T {
     fn as_fd(&self) -> BorrowedFd<'_> {
         T::as_fd(self)
+    }
+}
+impl<T: AsFd + ?Sized> AsFd for alloc::boxed::Box<T> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        (**self).as_fd()
+    }
+}
+impl<T: AsFd + ?Sized> AsFd for alloc::rc::Rc<T> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        (**self).as_fd()
+    }
+}
+impl<T: AsFd + ?Sized> AsFd for alloc::sync::Arc<T> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        (**self).as_fd()
+    }
+}
+impl<T: AsRawFd> AsRawFd for alloc::boxed::Box<T> {
+    fn as_raw_fd(&self) -> RawFd {
+        (**self).as_raw_fd()
+    }
+}
+impl<T: AsRawFd> AsRawFd for alloc::rc::Rc<T> {
+    fn as_raw_fd(&self) -> RawFd {
+        (**self).as_raw_fd()
+    }
+}
+impl<T: AsRawFd> AsRawFd for alloc::sync::Arc<T> {
+    fn as_raw_fd(&self) -> RawFd {
+        (**self).as_raw_fd()
     }
 }
 

@@ -149,7 +149,7 @@ fn place_all(u: &Unit) -> Result<HashMap<String, u64>, String> {
             }
         }
     }
-    let exports = exported_fns(u);
+    let exports = exported_fns(&u.prog);
     for (ci, c) in assembled.iter().enumerate() {
         let local: HashMap<&str, u64> = c.out.defs.iter().map(|d| (d.name.as_str(), bases[ci][d.section as usize] + d.offset as u64)).collect();
         let resolve = |name: &str| -> Result<u64, String> {
@@ -225,7 +225,7 @@ fn place_all(u: &Unit) -> Result<HashMap<String, u64>, String> {
 
 /// The C name of an assembly symbol: Mach-O prefixes C names with `_` (dlsym, extern blocks and
 /// `#[no_mangle]` know them without it).
-fn c_name(n: &str) -> &str {
+pub(crate) fn c_name(n: &str) -> &str {
     if cfg!(target_vendor = "apple") {
         n.strip_prefix('_').unwrap_or(n)
     } else {
@@ -237,11 +237,13 @@ fn c_name(n: &str) -> &str {
 /// br x16; .quad target -- IP0, as AAPCS64 lets veneers use it).
 fn veneer(arch: Arch, b: &mut Vec<u8>, target: u64) {
     match arch {
+        #[cfg(not(target_arch = "aarch64"))]
         Arch::X64 => {
             b.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
             b.extend_from_slice(&target.to_le_bytes());
             b.extend_from_slice(&[0xcc, 0xcc]);
         }
+        #[cfg(target_arch = "aarch64")]
         Arch::Arm64 => {
             b.extend_from_slice(&0x5800_0050u32.to_le_bytes());
             b.extend_from_slice(&0xd61f_0200u32.to_le_bytes());
@@ -251,11 +253,15 @@ fn veneer(arch: Arch, b: &mut Vec<u8>, target: u64) {
 }
 
 /// The program's `#[no_mangle]` / `#[export_name]` fns by symbol.
-fn exported_fns(u: &Unit) -> HashMap<String, DefId> {
-    let prog = &u.prog;
+pub(crate) fn exported_fns(prog: &crate::program::Program) -> HashMap<String, DefId> {
+    exported_fns_of(prog, |_| true)
+}
+
+/// `exported_fns` of the crates `in_crate` keeps (a domain's own).
+pub(crate) fn exported_fns_of(prog: &crate::program::Program, in_crate: impl Fn(u32) -> bool) -> HashMap<String, DefId> {
     let mut out = HashMap::new();
     for (di, d) in prog.defs.iter().enumerate() {
-        if d.kind != DefKind::Fn {
+        if d.kind != DefKind::Fn || !in_crate(d.krate) {
             continue;
         }
         let f = &prog.files[d.file as usize];
@@ -274,7 +280,7 @@ fn exported_fns(u: &Unit) -> HashMap<String, DefId> {
 }
 
 /// A fn item's callable address (its slot; compiled on its first call).
-fn fn_addr(u: &Unit, d: DefId) -> Result<u64, String> {
+pub(crate) fn fn_addr(u: &Unit, d: DefId) -> Result<u64, String> {
     let instance = crate::instance::Instance::resolve_for_fn_ptr(&u.tcx, &u.prog, d, &[]).map_err(|_| format!("`{}`: a generic fn cannot be a global_asm! symbol", u.prog.def_path(d)))?;
     Ok(u.entry(u.instance_fn_id(instance)))
 }

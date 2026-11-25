@@ -79,7 +79,7 @@ pub const REFUSE_TAKE: u8 = 1;
 pub const REFUSE_PROFILE_GONE: u8 = 2;
 pub const REFUSE_WHY: [&str; 3] = ["not allowed (borrow-check verdict pending, or a patch without a clean verdict)", "its snapshot bailed (a front could not be made off the owner)", "its counted profile is gone (patched or rebuilt)"];
 
-pub const Q_WHY: [&str; 5] = ["calls", "loop", "retier", "marked", "profiled"];
+pub const Q_WHY: [&str; 6] = ["calls", "loop", "retier", "marked", "profiled", "stored"];
 
 /// One decision.
 #[derive(Clone, Copy, Default)]
@@ -221,10 +221,40 @@ pub fn history(id: u32) -> (Option<Hist>, u64, u64) {
     }
 }
 
-/// Every tracked slot's counts of kind `k` (why-tier over many slots; `top` lists).
-pub fn count_of(id: u32, k: u8) -> u32 {
+/// The slots first queued for O3 at or after `after_ms` of the run, by that time: the late tier-up
+/// that keeps a warm run from settling (run.rs verbose exit line).
+pub fn queued_after(after_ms: u32) -> Vec<(u32, Hist)> {
+    drain();
     let g = STORE.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref().and_then(|st| st.by.get(&id)).map_or(0, |h| h.n[k as usize])
+    let Some(st) = g.as_ref() else { return Vec::new() };
+    let q = ev::QUEUE as usize;
+    let mut v: Vec<(u32, Hist)> = st.by.iter().filter(|(_, h)| h.n[q] > 0 && h.first_ms[q] >= after_ms).map(|(&id, h)| (id, h.clone())).collect();
+    v.sort_by_key(|(id, h)| (h.first_ms[q], *id));
+    v
+}
+
+/// What became of a queued slot, in a word: its O3 code installed, parked in counted code, counting
+/// (its counted window open), its build dropped or refused, taken by a worker, or still queued.
+pub fn outcome(h: &Hist) -> &'static str {
+    let n = |e: u8| h.n[e as usize] > 0;
+    if n(ev::O3_INSTALLED) {
+        "O3"
+    } else if n(ev::PARKED) {
+        "parked"
+    } else if n(ev::O3_DROPPED) || n(ev::O3_REFUSED) || n(ev::O3_PANIC) {
+        "dropped"
+    } else if n(ev::COUNTED) {
+        "counting"
+    } else if n(ev::POP) {
+        "taken"
+    } else {
+        "queued"
+    }
+}
+
+/// The code a slot was first queued on (its count stub's code), when its history still has it.
+pub fn queued_on(h: &Hist) -> Option<u64> {
+    h.recent.iter().find(|e| e.ev == ev::QUEUE && e.b != 0).map(|e| e.b).or_else(|| h.windows.iter().find(|w| w.1 > 0).map(|w| w.0))
 }
 
 /// The words the inspect answer prints for one event (`code` names a code address: tier origin).
@@ -253,6 +283,42 @@ pub fn describe(e: &Ev, code: &dyn Fn(u64) -> String) -> String {
 
 /// `why-tier uncounted`: the slots whose count stub is out of the slot while they still count
 /// (other code was installed over it): their calls are not counted.
+/// `why-tier stuck`: how many hot fns ended below O3 with nothing pending, by reason.
+fn cmd_stuck(req: &super::Req, out: &mut super::Out) {
+    let n = req.num("n", 20) as usize;
+    let up = crate::jit::current_unit();
+    if up.is_null() {
+        return out.err("no running unit");
+    }
+    let r = crate::owner::call_within(crate::owner::Class::Job, 10_000, move || {
+        let u = unsafe { &*up };
+        let stuck = crate::jit::tier_stuck(u);
+        let mut rows = vec![format!("{} hot fns are stuck below O3: their calls stopped being counted, and no queue, build, counted window or verdict is pending", stuck.len())];
+        for (why, ids) in crate::jit::tier_stuck_reasons(&stuck) {
+            rows.push(format!("{} x {}", ids.len(), why));
+            rows.push("| slot | fn | code |".into());
+            rows.push("|---|---|---|".into());
+            for id in ids.iter().take(n) {
+                let f = &u.fns[*id as usize];
+                rows.push(format!("| S{} | `{}` | {} |", id, super::short(&super::display_name(u, *id, 0), 80), super::codever::label(super::codever::kind_at(u, f.code))));
+            }
+            if ids.len() > n {
+                rows.push(format!("+{} more (n=)", ids.len() - n));
+            }
+        }
+        rows
+    });
+    match r {
+        Some(rows) => {
+            for l in rows {
+                out.line(&l);
+            }
+            out.always("more: why-tier @<slot>");
+        }
+        None => out.err("the owner did not answer in 10 s"),
+    }
+}
+
 fn cmd_uncounted(req: &super::Req, out: &mut super::Out) {
     let n = req.num("n", 20) as usize;
     let up = crate::jit::current_unit();
@@ -297,10 +363,13 @@ pub fn at_s(t_ns: u64) -> String {
 /// tier-up state now and its decision history (counts by kind, the last events).
 pub fn cmd_why_tier(req: &super::Req, out: &mut super::Out) {
     let Some(q) = req.pos.first().cloned() else {
-        return out.err("usage: why-tier <fn|file:line|@slot> | why-tier uncounted [n=20]");
+        return out.err("usage: why-tier <fn|file:line|@slot> | why-tier stuck [n=20] | why-tier uncounted [n=20]");
     };
     if q == "uncounted" {
         return cmd_uncounted(req, out);
+    }
+    if q == "stuck" {
+        return cmd_stuck(req, out);
     }
     let q2 = q.clone();
     let up = crate::jit::current_unit();
@@ -385,4 +454,13 @@ mod tests {
         assert_eq!(h.windows, vec![(0x1000, 0, 2), (0x2000, 1, 0)]);
         assert_eq!(h.recent.len(), 4);
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    // the ring stays (its slot numbers are the ended run's): the next run reads from its end
+    let cursor = STORE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |st| st.cursor);
+    let cursor = RING.get().map_or(0, |r| r.read(cursor, &mut |_, _| {}).0);
+    reset(&STORE, Mutex::new(Some(Store { cursor, lost: 0, untracked: 0, by: HashMap::new() })));
 }

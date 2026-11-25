@@ -68,9 +68,10 @@ fn hot_fraction() -> f64 {
     *F.get_or_init(|| std::env::var("MAKEPAD_RUN_WASM_EXPORT_HOT").ok().and_then(|v| v.parse().ok()).unwrap_or(0.99))
 }
 
+static HOT: std::sync::OnceLock<Option<std::collections::HashSet<u32>>> = std::sync::OnceLock::new();
+
 /// Slot `id` is in the sampled hot set (hot_fraction) of the run that is exporting.
 pub(crate) fn sampled_hot(id: u32) -> bool {
-    static HOT: std::sync::OnceLock<Option<std::collections::HashSet<u32>>> = std::sync::OnceLock::new();
     let hot = HOT.get_or_init(|| {
         let frac = hot_fraction();
         if frac >= 1.0 {
@@ -111,6 +112,16 @@ pub fn startup() {
         std::env::set_var("MAKEPAD_RUN_CACHE", "off");
         crate::coverage::enable();
     }
+}
+
+fn stats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some())
+}
+
+fn untraced_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_UNTRACED").is_some())
 }
 
 /// Block shaking: remove native coverage effects from the captured RIR and
@@ -171,7 +182,7 @@ fn shake_blocks(f: &mut Func, hits: &HashMap<(u64, u64), bool>, trap: bool, keep
             if let Some(n) = stub.as_deref_mut() {
                 // the replay gate's build: the trap names the block (`env.u(id)` of an id past
                 // every slot)
-                if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_UNTRACED").is_some() {
+                if untraced_on() {
                     eprintln!("  block stub {} = {} b{}", *n, fname, bi);
                 }
                 b.insts.push(Inst::Call(relax_backend::rir::Callee::Fn(*n), Vec::new(), Vec::new()));
@@ -714,6 +725,8 @@ pub fn finish(u: &Unit) {
 }
 
 /// One module of the captured set with options `optv` (`-tee,remat,...`), written to `path`.
+/// Every trained function must ship as a body or inline: the gate compares replays against
+/// what shipped, including functions called only by compile-time static initializers.
 fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet<u32>, kept_failed: usize, hits: &HashMap<(u64, u64), bool>, forced: &std::collections::BTreeSet<u32>, optv: &str, path: &str) {
     let options = u.prog.session.options.clone();
     // the web player's profile: panics abort, one thread (TLS keys and waits built in)
@@ -823,7 +836,21 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     address_taken(u, funcs.values(), &mut seeds, &mut std::collections::HashSet::new());
     seeds.sort_unstable();
     seeds.dedup();
-    let reached = reach(u, funcs, &seeds);
+    let mut reached = reach(u, funcs, &seeds);
+    if !block_profile() && module_inline_on() {
+        let mut carried: std::collections::BTreeSet<u32> = reached.iter().copied().collect();
+        for id in &reached { carried.extend(funcs[id].inl_slots.iter().copied()); }
+        let lost: Vec<u32> = forced.iter().copied().filter(|id| funcs.contains_key(id) && !carried.contains(id)).collect();
+        if !lost.is_empty() {
+            if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
+                eprintln!("wasm export: {} trained functions neither called nor carried inline, shipped as roots", lost.len());
+            }
+            seeds.extend(lost);
+            seeds.sort_unstable();
+            seeds.dedup();
+            reached = reach(u, funcs, &seeds);
+        }
+    }
     if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
         eprintln!("wasm export: {} roots (entry + address-taken), {} of {} captured reached", seeds.len(), reached.len(), funcs.len());
         // the untraced callees (slot, name), for the stub ids `env.u(id)` reports
@@ -977,7 +1004,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
             Some(SymKind::Rt("web_memory_base")) => 0,
             _ => {
                 n_unlinked += 1;
-                if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
+                if stats_on() {
                     eprintln!("wasm export: unlinked symbol {}: {}", id, crate::syms::describe(u, Sym::new(id)));
                 }
                 u.syms.value(Sym::new(id))
@@ -1380,7 +1407,7 @@ fn web_binding(name: &str) -> Option<HostBind> {
 fn single_thread(name: &str) -> Option<HostBind> {
     Some(match name {
         "pthread_create" | "pthread_join" | "pthread_detach" | "pthread_attr_init" | "pthread_attr_setstacksize" | "pthread_attr_destroy" | "pthread_setname_np" => HostBind::Trap,
-        n if n.starts_with("__relax_domain_") => HostBind::Trap,
+        n if n.starts_with("__relax_domain_") || n == "__relax_thread_spawn" => HostBind::Trap,
         // Linux std's only syscall is futex wait/wake (std sys/linux.rs): a no-op returning 0, as
         // macOS's __ulock_*
         "syscall" | "__relax_wait_enter" | "__relax_wait_leave" | "__relax_wake" | "__ulock_wake" | "__ulock_wait" | "pthread_threadid_np" | "sched_yield" | "__relax_key_delete" => HostBind::Builtin(Builtin::Nop),
@@ -1648,7 +1675,8 @@ pub(crate) fn o3_policy() -> O3Policy {
 
 /// One profile switch for capture, closure, emission and gate semantics.
 fn block_profile() -> bool {
-    std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_BLOCKS").is_some_and(|v| v != "0")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_BLOCKS").is_some_and(|v| v != "0"))
 }
 
 /// Apply only semantics shared by every requested emission variant. These are
@@ -1957,4 +1985,25 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
         eprintln!("wasm export: size first: {} cold O1 bodies shipped their size-first build; {} slots sampled", shipped, sampled);
     }
     Ok((kept, failed))
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&CAPTURED, Mutex::new(None));
+    reset(&ENTRY, std::sync::atomic::AtomicU32::new(u32::MAX));
+    reset(&FAILED, std::sync::atomic::AtomicBool::new(false));
+    reset(&CLOSURE_ORIGINS, Mutex::new(BTreeMap::new()));
+    reset(&CLOSURE_PARENTS, Mutex::new(BTreeMap::new()));
+    reset(&CLOSURE_VIA, Mutex::new(BTreeMap::new()));
+    reset(&CLOSURE_VTABLES, Mutex::new(BTreeMap::new()));
+    reset(&SAMPLES, Mutex::new(None));
+    reset(&HOT, std::sync::OnceLock::new());
+    reset(&O3_BODIES, Mutex::new(None));
+    reset(&POSTOPT_EFFECTS, [const { std::sync::atomic::AtomicUsize::new(0) }; 5]);
+    reset(&ROOTS, Mutex::new(Vec::new()));
+    reset(&FINISHED, std::sync::atomic::AtomicBool::new(false));
+    reset(&FORCING, std::sync::atomic::AtomicBool::new(false));
+    reset(&SIZE_FIRST, Mutex::new(None));
+    reset(&SIZE_FIRST_SHIPPED, Mutex::new(None));
 }

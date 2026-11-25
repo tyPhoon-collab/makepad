@@ -22,6 +22,7 @@ fn config(dir: &std::path::Path, host: &str, port: u16) -> ServiceConfig {
 }
 
 fn answers(addr: SocketAddr) -> bool {
+    let addr = if addr.ip().is_unspecified() { SocketAddr::from(([127, 0, 0, 1], addr.port())) } else { addr };
     TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
 }
 
@@ -45,6 +46,28 @@ fn install_identity() {
     });
 }
 
+/// A hub that stops closes its streams: a client hears it (a session that would never answer
+/// ends as lost) and the stop does not wait for the client to leave. The session stays held
+/// until the stop returned: that hold kept a stopping hub up and its client at 0 iterations.
+#[cfg(feature = "kernel")]
+#[test]
+fn a_stopping_hub_closes_its_streams_and_no_client_holds_it_up() {
+    use makepad_ai_hub::kernel_client::{KernelNode, KernelStream};
+    use makepad_ai_hub::program_client::{RemoteConfig, RemoteSession};
+    use makepad_compute_program::{Program, ProgramError};
+    let handle = start_service(config(&scratch("stop-stream"), "127.0.0.1", 0)).unwrap();
+    let stream = std::sync::Arc::new(KernelStream::open(&KernelNode::new(&format!("http://{}", handle.addr))).unwrap());
+    let silent = RemoteSession::open(&stream, &Program::new("t.splash", "{run: fn(s, p) { s.wait_inbox() return 1 }}"), RemoteConfig::default()).unwrap();
+    let (stopped, told) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        handle.stop();
+        let _ = stopped.send(());
+    });
+    told.recv_timeout(Duration::from_secs(30)).expect("the stop ends with the client still connected");
+    assert!(matches!(silent.wait_end(), Err(ProgramError::Lost(_))), "the session ends as lost");
+    assert!(stream.is_closed());
+}
+
 #[test]
 fn a_stopped_service_closes_its_ports_and_starts_again() {
     // Loopback node.
@@ -58,20 +81,20 @@ fn a_stopped_service_closes_its_ports_and_starts_again() {
     assert!(answers(again.addr));
     again.stop();
 
-    // A fleet node (TLS front + beacon) on this machine's private LAN address, when it has one.
-    let Some(ip) = makepad_ai_hub::discovery::network_addresses().into_iter().find(|ip| ip.is_private()) else {
-        eprintln!("no private LAN address here: the fleet-front half is skipped");
-        return;
-    };
+    // a non-loopback bind is a LAN listener, which the Networked AI hub setting must allow
+    std::env::set_var("MAKEPAD_NETWORKED_AI_HUB", "1");
+    // A non-loopback bind selects the TLS front; dial it over loopback so
+    // this check needs no LAN interface or external fleet node.
+    let host = "0.0.0.0";
     let dir = scratch("stop-fleet");
     install_identity();
-    let handle = start_service(config(&dir, &ip.to_string(), 0)).unwrap();
+    let handle = start_service(config(&dir, host, 0)).unwrap();
     let addr = handle.addr;
     assert!(!addr.ip().is_loopback());
     assert!(answers(addr), "the TLS front listens");
     handle.stop();
     assert!(!answers(addr), "the TLS front is closed after stop");
-    let again = start_service(config(&dir, &ip.to_string(), addr.port())).expect("same port again");
+    let again = start_service(config(&dir, host, addr.port())).expect("same port again");
     assert!(answers(again.addr));
     again.stop();
 }

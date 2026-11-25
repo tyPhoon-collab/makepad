@@ -18,8 +18,8 @@
 //! bind time, never a wrong call.
 //!
 //! Before binding, every registered crate present in the program must match the loader's
-//! library source closure (srchash.rs). A mismatch is always an error naming changed, added
-//! and removed inputs and feature/version differences; it never selects a second source copy.
+//! library source closure (srchash.rs). A mismatch offers a loader update with the changed
+//! inputs; it never binds the stale library or selects a second source copy.
 
 use crate::lang_items::LangItem;
 use crate::program::{DefId, DefKind, Program};
@@ -168,12 +168,93 @@ fn binding_identity(
 /// (check_sources); only they bind.
 static MATCHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// Compares every registered crate present in the program against its embedded library
-/// closure. Any mismatch fails with file and feature/version differences; absent crates skip.
+/// A provided library changed on disk. These are source paths, including removed files, not
+/// a parsed diagnostic. They also identify the landing and the inputs of the loader rebuild.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvidedChange {
+    pub crate_name: String,
+    pub files: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceCheckError {
+    Changed(ProvidedChange),
+    Invalid(String),
+}
+
+impl From<String> for SourceCheckError {
+    fn from(message: String) -> Self { Self::Invalid(message) }
+}
+
+fn check_manifest(name: &str, source: u64, manifest: &[u8], current: &crate::srchash::Manifest, pkgs: &[crate::srchash::SrcPkg]) -> Result<(), SourceCheckError> {
+    if crate::srchash::manifest_hash(current) == source { return Ok(()); }
+    let built = crate::srchash::decode_manifest(manifest)?;
+    let mut files = std::collections::BTreeSet::new();
+    for (package, path) in crate::srchash::diff_entries(&built, current) {
+        let package = package.strip_prefix("host:").unwrap_or(package);
+        let Some((name, _version)) = package.rsplit_once('@') else { continue };
+        for pkg in pkgs.iter().filter(|p| p.name.replace('-', "_") == name) {
+            // A feature/version change has no file entry of its own. Watch its manifest too.
+            let path = if path.starts_with('\0') { "Cargo.toml" } else { path.as_str() };
+            files.insert(crate::vfs::normalize_path(&std::path::Path::new(&pkg.dir).join(path).to_string_lossy()));
+        }
+    }
+    Err(SourceCheckError::Changed(ProvidedChange { crate_name: name.into(), files: files.into_iter().collect() }))
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    use crate::srchash::{encode_manifest, manifest_hash, Manifest, SrcPkg};
+
+    #[test]
+    fn provided_source_outcome_preserves_changed_inputs() {
+        let pkgs = [SrcPkg { name: "fixture-dep".into(), version: "1".into(), dir: "fixture".into(), features: Vec::new(), deps: Vec::new(), proc_macro: false }];
+        let mut built = Manifest::new();
+        // More than the diagnostic's display limit: no input is lost from the typed outcome.
+        for i in 0..24 { built.insert(("fixture_dep@1".into(), format!("src/file{i}.rs")), "old".into()); }
+        built.insert(("fixture_dep@1".into(), "src/removed.rs".into()), "removed".into());
+        built.insert(("fixture_dep@1".into(), "src/unchanged.rs".into()), "same".into());
+        built.insert(("host:fixture_dep@1".into(), "src/file0.rs".into()), "old".into());
+        built.insert(("fixture_dep@1".into(), "\0features".into()), "".into());
+        let source = manifest_hash(&built);
+        let encoded = encode_manifest(&built);
+        assert_eq!(check_manifest("fixture", source, &encoded, &built, &pkgs), Ok(()));
+
+        let mut current = built.clone();
+        for i in 0..24 { current.insert(("fixture_dep@1".into(), format!("src/file{i}.rs")), "new".into()); }
+        current.remove(&("fixture_dep@1".into(), "src/removed.rs".into()));
+        current.insert(("fixture_dep@1".into(), "src/added.rs".into()), "added".into());
+        current.insert(("host:fixture_dep@1".into(), "src/file0.rs".into()), "new".into());
+        current.insert(("fixture_dep@1".into(), "\0features".into()), "enabled".into());
+        let Err(SourceCheckError::Changed(change)) = check_manifest("fixture", source, &encoded, &current, &pkgs) else { panic!("source edits must be an update offer") };
+        assert_eq!(change.crate_name, "fixture");
+        let mut expected: Vec<_> = (0..24).map(|i| format!("fixture/src/file{i}.rs")).collect();
+        expected.extend(["fixture/Cargo.toml".into(), "fixture/src/removed.rs".into(), "fixture/src/added.rs".into()]);
+        expected.sort();
+        assert_eq!(change.files, expected);
+
+        // A feature-only mismatch still needs an update; corrupt embedded data remains an error.
+        let mut features = built.clone();
+        features.insert(("fixture_dep@1".into(), "\0features".into()), "enabled".into());
+        assert_eq!(check_manifest("fixture", source, &encoded, &features, &pkgs), Err(SourceCheckError::Changed(ProvidedChange { crate_name: "fixture".into(), files: vec!["fixture/Cargo.toml".into()] })));
+        assert!(matches!(check_manifest("fixture", source, &[1], &current, &pkgs), Err(SourceCheckError::Invalid(_))));
+    }
+}
+
+/// The one crate a test harness binds. Its other crates are the tests' subject, built from source;
+/// the CPU budget is the process's one, and a copy built from source would admit the tests' pool
+/// beside the JIT, neither seeing the other.
+pub const HARNESS_BINDS: &str = "makepad_cpu_budget";
+
 const IDENTITY_THREADS: usize = 4;
 
-pub fn check_sources(pkgs: &[crate::srchash::SrcPkg]) -> Result<(), String> {
-    let reg: Vec<_> = REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|p| (p.name.clone(), p.source, p.manifest)).collect();
+/// Compares registered crates (`only`: that one) against the embedded library closure; absent
+/// crates skip.
+pub fn check_sources(pkgs: &[crate::srchash::SrcPkg], only: Option<&str>) -> Result<(), SourceCheckError> {
+    let reg: Vec<_> = REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter()
+        .filter(|p| only.is_none_or(|o| p.name == o))
+        .map(|p| (p.name.clone(), p.source, p.manifest)).collect();
     let mut verified = Vec::new();
     let mut files = std::collections::HashMap::new();
     // the identity files of every package folder the registered crates reach, read and hashed
@@ -204,10 +285,7 @@ pub fn check_sources(pkgs: &[crate::srchash::SrcPkg]) -> Result<(), String> {
     for (name, source, manifest) in &reg {
         for (root, _) in pkgs.iter().enumerate().filter(|(_, k)| k.name.replace('-', "_") == *name) {
             let current = crate::srchash::closure_manifest_with(pkgs, root, &mut files);
-            if crate::srchash::manifest_hash(&current) != *source {
-                let built = crate::srchash::decode_manifest(manifest)?;
-                return Err(crate::srchash::diff_message(name, &built, &current));
-            }
+            check_manifest(name, *source, manifest, &current, pkgs)?;
             if !verified.contains(name) { verified.push(name.clone()); }
         }
     }
@@ -221,50 +299,51 @@ pub fn check_sources(pkgs: &[crate::srchash::SrcPkg]) -> Result<(), String> {
 }
 
 /// The boot's source check, running beside the load (`check_sources_later`).
-static PENDING: Mutex<Option<std::thread::JoinHandle<Result<(), String>>>> = Mutex::new(None);
+static PENDING: Mutex<Option<std::thread::JoinHandle<Result<(), SourceCheckError>>>> = Mutex::new(None);
 
 /// `check_sources`, on a thread of its own. The boot starts it as early as `check_sources` could
 /// run and goes on loading; nothing may bind a provided crate before `finish_sources` has
 /// returned Ok (`take_for`, `take_for_crates` and the boot's own join before the unit is built
 /// call it). The hashes, the manifests and the error are those of `check_sources`.
-pub fn check_sources_later(pkgs: std::sync::Arc<Vec<crate::srchash::SrcPkg>>) {
+pub fn check_sources_later(pkgs: std::sync::Arc<Vec<crate::srchash::SrcPkg>>, only: Option<&'static str>) {
     let _k = crate::zone_alloc::kept();
-    let spawned = std::thread::Builder::new().name("run-provided-sources".into()).spawn(move || {
+    let spawned = crate::run_threads::spawn("run-provided-sources", move || {
         let _z = crate::zone_alloc::compiler_thread();
         let t = std::time::Instant::now();
-        let verdict = check_sources(&pkgs);
+        let verdict = check_sources(&pkgs, only);
         if crate::preload::trace() { eprintln!("boot-trace: provided sources checked in {:.1} ms (beside the load)", t.elapsed().as_secs_f64() * 1e3); }
         verdict
     });
     match spawned {
         Ok(h) => *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(h),
-        Err(e) => *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::spawn(move || Err(format!("provided source check: {e}")))),
+        Err(e) => *VERDICT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(SourceCheckError::Invalid(format!("provided source check: {e}")))),
     }
 }
 
 /// The verdict of the check `check_sources_later` started, once it has ended.
-static VERDICT: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+static VERDICT: Mutex<Option<Result<(), SourceCheckError>>> = Mutex::new(None);
 
 /// Waits for the check `check_sources_later` started, if one is running: its verdict (every
 /// caller gets it, the proc-macro world's unit as well as the program's). Ok when none started.
-pub fn finish_sources() -> Result<(), String> {
+pub fn finish_sources() -> Result<(), SourceCheckError> {
     let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(h) = pending.take() {
-        let verdict = h.join().unwrap_or_else(|_| Err("provided source check: the thread panicked".into()));
+        let verdict = h.join().unwrap_or_else(|_| Err(SourceCheckError::Invalid("provided source check: the thread panicked".into())));
         *VERDICT.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_clone(&verdict));
     }
     VERDICT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(Ok(()))
 }
 
 /// Reads what `check_sources` reads, for the identity of every registered crate in the program,
-/// and nothing else. A check for another target binds nothing, but the run on that target
-/// (the phone) compares these identities: `pack-src` records the files this reads so its archive
-/// holds them.
+/// and nothing else, each package folder once. A check for another target binds nothing, but the
+/// run on that target (the phone) compares these identities: `pack-src` records the files this
+/// reads so its archive holds them (run.rs calls it only while the read log records).
 pub fn read_identity_files(pkgs: &[crate::srchash::SrcPkg]) {
     let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut files = std::collections::HashMap::new();
     for p in reg.iter() {
         for (root, _) in pkgs.iter().enumerate().filter(|(_, k)| k.name.replace('-', "_") == p.name) {
-            let _ = crate::srchash::closure_hash(pkgs, root);
+            let _ = crate::srchash::closure_manifest_with(pkgs, root, &mut files);
         }
     }
 }
@@ -327,6 +406,41 @@ fn is_transparent(prog: &Program, d: DefId) -> bool {
 /// `krate` is the provided crate: pointers to its own types are opaque handles.
 pub fn trusted(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32) -> bool {
     trusted_in(prog, tcx, krate, t, depth, false)
+}
+
+/// Diagnose plain fields with the same rules and depth as `trusted` on their ADT.
+pub fn first_untrusted_field(prog: &Program, tcx: &Tcx, krate: u32, d: DefId) -> Option<(String, TyId)> {
+    tcx.adts.get(&d)?.variants.iter().flat_map(|v| &v.fields)
+        .find(|f| !trusted_in(prog, tcx, krate, f.ty, 1, true))
+        .map(|f| (prog.syms.str(f.name).to_string(), f.ty))
+}
+
+/// Locate the nested part that refuses crossing for diagnostics only; `trusted_in` owns the rules.
+pub fn untrusted_path(prog: &Program, tcx: &Tcx, krate: u32, t: TyId) -> String {
+    let mut ty = t;
+    let mut path = String::new();
+    for _ in 0..8 {
+        ty = match tcx.tys.kind(ty) {
+            TyKind::Array(e, _) | TyKind::Slice(e) => {
+                path.push_str("[_]");
+                *e
+            }
+            TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) => *x,
+            // std's own types are named, not opened (their fields are no API)
+            TyKind::Adt(d, a, _) if a.is_empty() && tcx.adts.contains_key(d) && !is_std(prog, prog.def(*d).krate) => {
+                let Some((name, field_ty)) = first_untrusted_field(prog, tcx, krate, *d) else { break };
+                path.push('.');
+                path.push_str(&name);
+                field_ty
+            }
+            _ => break,
+        };
+    }
+    if !path.is_empty() {
+        format!("`{}: {}`", path, crate::typeck::ty_to_string(false, prog, tcx, ty))
+    } else {
+        String::new()
+    }
 }
 
 /// `field`: `t` is a field of a provided type, where a pointer to a trait object may pass
@@ -596,6 +710,13 @@ pub fn sig_norm(s: &str) -> String {
     out
 }
 
+/// The first parameter or result that refuses binding, shared with lowering diagnostics.
+pub fn first_untrusted_signature_type(prog: &Program, tcx: &Tcx, krate: u32, d: DefId, opaque: &dyn Fn(DefId) -> bool) -> Option<TyId> {
+    let s = tcx.fn_sig(prog, d)?;
+    let crosses = |t: TyId| trusted(prog, tcx, krate, t, 0) || matches!(tcx.tys.kind(t), TyKind::Adt(d, a, _) if a.is_empty() && opaque(*d));
+    s.params.iter().chain(std::iter::once(&s.ret)).copied().find(|t| !crosses(*t))
+}
+
 /// Why `d` (a fn of provided crate `krate`) is compiled from source instead of bound to a shim;
 /// None: it is bound.
 pub fn unbound_reason(prog: &Program, tcx: &Tcx, krate: u32, d: DefId, opaque: &dyn Fn(DefId) -> bool) -> Option<&'static str> {
@@ -628,26 +749,10 @@ pub fn unbound_reason(prog: &Program, tcx: &Tcx, krate: u32, d: DefId, opaque: &
     if parent.kind == DefKind::Impl && tcx.impl_trait.get(&def.parent).is_some_and(|t| tcx.lang_items.get(LangItem::Drop) == Some(*t)) {
         return Some("Drop::drop (in the drop shim)");
     }
-    let crosses = |t: TyId| trusted(prog, tcx, krate, t, 0) || matches!(tcx.tys.kind(t), TyKind::Adt(d, a, _) if a.is_empty() && opaque(*d));
-    if !s.params.iter().chain(std::iter::once(&s.ret)).all(|t| crosses(*t)) {
+    if first_untrusted_signature_type(prog, tcx, krate, d, opaque).is_some() {
         return Some("signature not C-shaped");
     }
     None
-}
-
-/// Is ADT `d` of crate `krate` one that may be marked `#[relax_api(handle)]` (rustc's size/align, drop shim):
-/// a public non-generic struct or enum that is not `trusted` by value.
-pub fn opaque_candidate(prog: &Program, tcx: &Tcx, krate: u32, d: DefId) -> bool {
-    let def = prog.def(d);
-    if def.krate != krate || !def.is_pub || !matches!(def.kind, DefKind::Struct | DefKind::Enum) {
-        return false;
-    }
-    match tcx.adts.get(&d) {
-        Some(a) if a.n_generics == 0 && !a.is_union => {}
-        _ => return false,
-    }
-    let t = tcx.tys.intern(TyKind::Adt(d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
-    !trusted(prog, tcx, krate, t, 0)
 }
 
 /// The types whose values cross between the provided crates' rustc code and JIT-compiled code:
@@ -745,11 +850,16 @@ fn rustc_vec_words() -> Option<([usize; 3], usize)> {
 /// the other's (both allocate through the loader's allocator; zone_alloc dealloc_layout frees a
 /// block of any heap).
 #[derive(Clone, Copy)]
-struct StdSame {
+pub struct StdSame {
     /// `Vec` (the ADT of `String`'s one field), with `String`
     vec: DefId,
     /// `Option<String>` / `Option<Vec<T>>`: rustc's niche (None in the capacity word)
     option: bool,
+}
+
+/// The String / Vec agreement of the two stds (`StdSame`), probed on a layout table of its own.
+pub fn std_same(prog: &Program, tcx: &Tcx) -> Option<StdSame> {
+    std_vec_same(prog, tcx, &crate::layout::Layouts::new())
 }
 
 fn std_vec_same(prog: &Program, tcx: &Tcx, probe: &crate::layout::Layouts) -> Option<StdSame> {
@@ -855,6 +965,16 @@ pub fn same_layout_handles(prog: &Program, tcx: &Tcx, cands: &[(DefId, u32, u32,
     v
 }
 
+/// Is field `t` of an opaque handle of provided crate `krate` the same bytes on both sides, so
+/// JIT-compiled code reaches it at rustc's offset (Unit::provided_handle_field)? The rule of
+/// `same_layout_handles` for one field: `trusted` data, a handle laid out as rustc does (`laid`),
+/// or a `String` / `Vec<T>` of such data (and `Option` of one) when the two stds agree
+/// (`std_same`): ScriptTokenizer's `tokens: Vec<ScriptTokenPos>` in a handle that its `State` keeps
+/// opaque. A HashMap (rustc's std's own table) or an opaque handle's elements stay rustc's alone.
+pub fn handle_field_same(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, std_same: Option<StdSame>, laid: &dyn Fn(DefId) -> bool, opaque: &dyn Fn(DefId) -> bool) -> bool {
+    same_bytes(prog, tcx, krate, t, laid, std_same, opaque, 0)
+}
+
 /// Is a field of type `t` (in a handle of provided crate `krate`) the same bytes on both sides
 /// (same_layout_handles)?
 fn same_bytes(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, ok: &dyn Fn(DefId) -> bool, std_same: Option<StdSame>, opaque: &dyn Fn(DefId) -> bool, depth: u32) -> bool {
@@ -885,4 +1005,12 @@ fn same_bytes(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, ok: &dyn Fn(DefId)
         }
     }
     trusted_in(prog, tcx, krate, t, 0, true)
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&MATCHED, Mutex::new(Vec::new()));
+    reset(&PENDING, Mutex::new(None));
+    reset(&VERDICT, Mutex::new(None));
 }

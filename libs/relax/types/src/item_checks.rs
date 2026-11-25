@@ -3,6 +3,7 @@
 //! indirection (E0072, rustc_ty_utils representability.rs).
 
 use crate::ast;
+use crate::mir::transform::const_check::is_live_default;
 use crate::program::{DefId, DefKind, Program, NO_DEF};
 use crate::tcx::Tcx;
 use crate::types::{TyId, TyKind};
@@ -49,6 +50,7 @@ pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
         let d = DefId(i as u32);
         let def = prog.def(d);
         if !own.get(def.krate as usize).copied().unwrap_or(false) || def.parent == NO_DEF { continue; }
+        if is_live_default(prog, d) { continue; }
         if !matches!(prog.def(def.parent).kind, DefKind::Mod | DefKind::Trait) { continue; }
         // only items the module's source declares (not the compiler's own definitions)
         if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
@@ -154,6 +156,12 @@ pub fn private_assoc_types(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<Strin
     let mut errors = Vec::new();
     // (a definition an expansion wrote has no visibility the AST states: its checks are skipped)
     let written = |d: DefId| { let def = prog.def(d); def.item.0 != u32::MAX && prog.files.get(def.file as usize).is_some_and(|f| f.ast.items.get(def.item.0 as usize).is_some_and(|it| it.lo < f.src_len)) };
+    // the associated types of each impl, in definition order
+    let mut assoc_tys: std::collections::HashMap<DefId, Vec<DefId>> = std::collections::HashMap::new();
+    for j in 0..prog.defs.len() {
+        let adef = prog.def(DefId(j as u32));
+        if adef.kind == DefKind::AssocTy && adef.parent != NO_DEF { assoc_tys.entry(adef.parent).or_default().push(DefId(j as u32)); }
+    }
     for i in 0..prog.defs.len() {
         let imp = DefId(i as u32);
         let idef = prog.def(imp);
@@ -176,10 +184,8 @@ pub fn private_assoc_types(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<Strin
             }
         }
         if !known { continue; }
-        for j in 0..prog.defs.len() {
-            let ad = DefId(j as u32);
+        for &ad in assoc_tys.get(&imp).into_iter().flatten() {
             let adef = prog.def(ad);
-            if adef.kind != DefKind::AssocTy || adef.parent != imp { continue; }
             let Ok(t) = tcx.type_of(prog, ad) else { continue };
             let mut used = Vec::new();
             adts(prog, tcx, t, &mut used, 0);
@@ -776,7 +782,21 @@ pub fn entry_point(prog: &Program, root: u32) -> Vec<String> {
     if !sig.generics.where_.is_empty() {
         return err("E0646: `main` function is not allowed to have a `where` clause");
     }
-    Vec::new()
+    // rustc_hir_analysis check/entry.rs check_main: the entry point only, a `main` of a library or
+    // under the test harness is a function like any other
+    let p = prog.src(def.file);
+    let mut errors = Vec::new();
+    for a in ast.list(item.attrs) {
+        let lo = a.toks.lo as usize;
+        if a.toks.hi as usize <= lo || p.tok(lo).lo >= prog.files[def.file as usize].src_len { continue; }
+        let what = match crate::cfg::tok_str(p, lo) {
+            b"track_caller" => "be `#[track_caller]`",
+            b"target_feature" => "have `#[target_feature]`",
+            _ => continue,
+        };
+        errors.push(prog.record_uncoded_error(def.file, p.tok(lo).lo, "typeck", format!("`main` function is not allowed to {what}")));
+    }
+    errors
 }
 
 fn no_main_error(prog: &Program, root: u32, file: u32) -> String {
@@ -1143,10 +1163,6 @@ pub fn attribute_safety(prog: &Program, d: DefId) -> Vec<String> {
                 errors.push(prog.record_uncoded_error(def.file, pos, "typeck", format!("`{}` is not an unsafe attribute", String::from_utf8_lossy(&name))));
             }
             continue;
-        }
-        if from_source && matches!(name.as_slice(), b"track_caller" | b"target_feature") && def.kind == DefKind::Fn && prog.syms.str(def.name) == "main" && prog.def(def.parent).kind == DefKind::Mod && prog.mods[prog.def(def.parent).sub as usize].parent_mod.is_none() && crate::wfcheck::obligations::is_entry_main(prog, d) {
-            let what = if name == b"track_caller" { "be `#[track_caller]`" } else { "have `#[target_feature]`" };
-            errors.push(prog.record_uncoded_error(def.file, pos, "typeck", format!("`main` function is not allowed to {what}")));
         }
         if from_source && name == b"deprecated" && ast.list(ast.item(def.item).attrs).iter().take_while(|b| b.toks.lo != a.toks.lo).any(|b| b.toks.hi > b.toks.lo && crate::cfg::tok_str(p, b.toks.lo as usize) == b"deprecated") {
             errors.push(prog.record_uncoded_error(def.file, pos, "typeck", "multiple `deprecated` attributes".to_string()));
@@ -1522,7 +1538,7 @@ pub fn duplicate_symbols(prog: &Program, own: &[bool]) -> Vec<String> {
     for i in 0..prog.defs.len() {
         let d = DefId(i as u32);
         let def = prog.def(d);
-        if !own.get(def.krate as usize).copied().unwrap_or(false) || !matches!(def.kind, K::Fn | K::AssocFn | K::Static) { continue; }
+        if !own.get(def.krate as usize).copied().unwrap_or(false) || is_live_default(prog, d) || !matches!(def.kind, K::Fn | K::AssocFn | K::Static) { continue; }
         if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
         // (an inherent method's symbol clash is left to a build: the check-pass test
         // lint/non-snake-case/non-snake-ffi-issue-31924 has one)
@@ -1768,17 +1784,27 @@ fn precise_capture_lifetimes(prog: &Program, tcx: &Tcx, owner: DefId, opaque: De
     errors
 }
 
-/// rustc_builtin_macros global_allocator.rs / rustc_metadata allocator.rs / rustc_passes weak_lang_items.rs /
-/// check_attr.rs: `#[global_allocator]` is for statics and there is one per program; a `#[panic_handler]` of a
-/// crate that links `std` duplicates `std`'s; `#[no_mangle]` is not for the language items.
-pub fn global_allocators_and_lang_items(prog: &Program, own: &[bool]) -> Vec<String> {
+/// rustc_builtin_macros global_allocator.rs / rustc_metadata creader.rs inject_allocator_crate /
+/// rustc_passes weak_lang_items.rs / check_attr.rs: `#[global_allocator]` is for statics; a crate
+/// defines at most one ("cannot define multiple global allocators", at the second), and a compiled
+/// binary (`binaries`: a bin, or a test target of `makepad test`) links at most one across itself and
+/// its dependencies (ConflictingGlobalAlloc). Every test target of a package is its own binary, so
+/// two of them each defining one is no conflict. A `#[panic_handler]` of a crate that links `std`
+/// duplicates `std`'s; `#[no_mangle]` is not for the language items.
+pub fn global_allocators_and_lang_items(prog: &Program, own: &[bool], binaries: &[u32]) -> Vec<String> {
     use crate::program::DefKind as K;
     let mut errors = Vec::new();
-    let mut allocators = 0usize;
+    // the crates the binaries link: their allocators decide the conflicts
+    let linked = |k: u32| binaries.iter().any(|&b| prog.crate_sees(b, k));
+    // per crate: its first allocator seen (the def), so a second in the same crate is reported
+    let mut first_allocator: Vec<Option<DefId>> = vec![None; prog.crates.len()];
     for i in 0..prog.defs.len() {
         let d = DefId(i as u32);
         let def = prog.def(d);
-        if !own.get(def.krate as usize).copied().unwrap_or(false) || !matches!(def.kind, K::Fn | K::AssocFn | K::Static | K::Const | K::Struct | K::Enum | K::Impl | K::TypeAlias | K::Trait) { continue; }
+        let is_own = own.get(def.krate as usize).copied().unwrap_or(false);
+        // a dependency's items are only asked whether they are its global allocator
+        if !is_own && (def.kind != K::Static || !linked(def.krate)) { continue; }
+        if !matches!(def.kind, K::Fn | K::AssocFn | K::Static | K::Const | K::Struct | K::Enum | K::Impl | K::TypeAlias | K::Trait) { continue; }
         if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
         let pf = &prog.files[def.file as usize];
         let ast = &pf.ast;
@@ -1799,13 +1825,15 @@ pub fn global_allocators_and_lang_items(prog: &Program, own: &[bool]) -> Vec<Str
         if allocator.is_some() {
             if def.kind != K::Static {
                 errors.push(prog.record_uncoded_error(def.file, item.lo, "typeck", "allocators must be statics".to_string()));
-            } else {
-                allocators += 1;
-                if allocators > 1 {
+            } else if first_allocator[def.krate as usize].is_some() {
+                if is_own {
                     errors.push(prog.record_uncoded_error(def.file, item.lo, "typeck", "cannot define multiple global allocators".to_string()));
                 }
+            } else {
+                first_allocator[def.krate as usize] = Some(d);
             }
         }
+        if !is_own { continue; }
         if panic_handler.is_some() {
             let root_file = prog.mods[prog.crates[def.krate as usize].root_mod as usize].file;
             let no_std = prog.files[root_file as usize].ast.root_attrs.iter().any(|a| a.toks.hi > a.toks.lo && prog.files[root_file as usize].tok_text(a.toks.lo) == "no_std");
@@ -1814,6 +1842,22 @@ pub fn global_allocators_and_lang_items(prog: &Program, own: &[bool]) -> Vec<Str
             }
             if let Some(nm) = no_mangle {
                 errors.push(prog.record_uncoded_error(def.file, nm, "typeck", "`#[no_mangle]` cannot be used on internal language items".to_string()));
+            }
+        }
+    }
+    // per binary, as rustc's inject_allocator_crate: the binary's own allocator first ("this
+    // crate"), then its dependencies' in crate order; each further one conflicts with the first
+    for &b in binaries {
+        let mut first: Option<String> = first_allocator[b as usize].map(|_| "this crate".to_string());
+        for k in 0..prog.crates.len() as u32 {
+            if k == b || first_allocator[k as usize].is_none() || !prog.crate_sees(b, k) { continue; }
+            let name = prog.crates[k as usize].crate_name(prog).into_owned();
+            match &first {
+                Some(other) => {
+                    let file = prog.mods[prog.crates[b as usize].root_mod as usize].file;
+                    errors.push(prog.record_uncoded_error(file, 0, "typeck", format!("the `#[global_allocator]` in {other} conflicts with global allocator in: {name}")));
+                }
+                None => first = Some(name),
             }
         }
     }
@@ -1836,6 +1880,7 @@ pub fn gated_syntax(prog: &Program, own: &[bool]) -> Vec<String> {
                 "coroutines" => "coroutine syntax is experimental",
                 "async_trait_bounds" => "`async` trait bounds are unstable",
                 "closure_track_caller" => "`#[track_caller]` on closures is currently unstable",
+                "default_field_values" => "default values on fields are experimental",
                 _ => continue,
             };
             errors.push(prog.record_error(f as u32, pos, "typeck", format!("E0658: {msg}")));

@@ -265,6 +265,7 @@ pub(super) struct MacroPart {
 }
 fields!(MacroPart, definitions, aliases, uses, modules, expansions, s2_fmt);
 impl MacroPart {
+    pub(super) fn definitions(&self) -> &[Arc<crate::macros::MacroDef>] { &self.definitions }
     fn referenced_size(&self) -> usize {
         4 + self.definitions.len() * 16 + self.aliases.plain_size() + self.uses.plain_size()
             + self.modules.plain_size() + self.expansions.plain_size() + 1
@@ -305,7 +306,17 @@ impl MacroPart {
     pub(super) fn finish_capture(&mut self, table: &crate::macros::MacroTable, krate: &str) {
         // Only the current crate's maps; definitions were already encountered
         // while publishing the outline, never rescan/sort the whole table.
-        self.definitions.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut files = HashMap::default();
+        for def in &self.definitions {
+            let next = files.len();
+            files.entry(def.def_file.clone()).or_insert(next);
+        }
+        // Scans find authored definitions before outlining adds generated ones.
+        // Restore their lexical order within each file, retaining DFS file order.
+        self.definitions.sort_by(|a, b| a.name.cmp(&b.name)
+            .then_with(|| files[&a.def_file].cmp(&files[&b.def_file]))
+            .then_with(|| a.scope_pos.unwrap_or(a.def_pos).cmp(&b.scope_pos.unwrap_or(b.def_pos)))
+            .then_with(|| a.def_pos.cmp(&b.def_pos)));
         self.aliases = table.aliases.get(krate).cloned().unwrap_or_default();
         self.uses = table.macro_use.get(krate).cloned().unwrap_or_default();
         self.modules = table.crates.get(krate).cloned();
@@ -314,11 +325,13 @@ impl MacroPart {
     }
     pub(super) fn publish(&self, table: &mut crate::macros::MacroTable, krate: &str) {
         table.clear_lookup_cache();
-        let mut existing = table.defs.iter().map(|(name, defs)|
-            (name.clone(), defs.iter().filter(|def| def.krate == krate).count())).collect::<HashMap<_, _>>();
+        // Replace this crate's raw scan, preserving the completed outline's
+        // declaration order. Counting same-named definitions loses replacements
+        // made by proc macros and can let an earlier generated macro shadow a
+        // later authored declaration.
+        for defs in table.defs.values_mut() { defs.retain(|d| d.krate != krate); }
         for def in &self.definitions {
-            let count = existing.entry(def.name.clone()).or_default();
-            if *count > 0 { *count -= 1; } else { table.push(def.clone()); }
+            table.push(def.clone());
         }
         table.aliases.insert(krate.to_owned(), self.aliases.clone());
         table.macro_use.insert(krate.to_owned(), self.uses.clone());
@@ -393,6 +406,16 @@ impl Recording {
     }
 }
 impl DemandImage {
+    /// The macro definitions this plan's outline of crate `ci` found (its files' and their
+    /// expansions'), while the load still holds the outlines (the recording, until it is
+    /// written). A restored plan keeps only part headers: None.
+    pub(crate) fn outline_macros(&self, ci: usize) -> Option<Vec<Arc<crate::macros::MacroDef>>> {
+        let recording = self.recording.as_ref()?;
+        if let Some((_, _, parts)) = recording.pending.lock().unwrap().as_ref() {
+            return parts.get(ci).map(|p| p.macros.definitions().to_vec());
+        }
+        recording.ready.lock().unwrap().get(ci).map(|p| p.macros.definitions().to_vec())
+    }
     pub fn recorded_parts(&self) -> Vec<Arc<DemandPart>> {
         let _mem = crate::memstat::tag(crate::memstat::Tag::Planner);
         let Some(recording) = &self.recording else { return self.parts.clone(); };

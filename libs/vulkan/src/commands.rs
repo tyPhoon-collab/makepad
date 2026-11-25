@@ -26,6 +26,7 @@ pub type PfnCmdCopyBufferToImage = unsafe extern "system" fn(CommandBuffer, Buff
 pub type PfnCmdCopyImage = unsafe extern "system" fn(CommandBuffer, Image, ImageLayout, Image, ImageLayout, u32, *const ImageCopy) -> ();
 pub type PfnCmdCopyImageToBuffer = unsafe extern "system" fn(CommandBuffer, Image, ImageLayout, Buffer, u32, *const BufferImageCopy) -> ();
 pub type PfnCmdDispatch = unsafe extern "system" fn(CommandBuffer, u32, u32, u32) -> ();
+pub type PfnCmdDispatchIndirect = unsafe extern "system" fn(CommandBuffer, Buffer, DeviceSize) -> ();
 pub type PfnCmdDraw = unsafe extern "system" fn(CommandBuffer, u32, u32, u32, u32) -> ();
 pub type PfnCmdDrawIndexed = unsafe extern "system" fn(CommandBuffer, u32, u32, u32, i32, u32) -> ();
 pub type PfnCmdEncodeVideoKHR = unsafe extern "system" fn(CommandBuffer, *const VideoEncodeInfoKHR) -> ();
@@ -143,6 +144,7 @@ pub type PfnGetPhysicalDeviceVideoCapabilitiesKHR = unsafe extern "system" fn(Ph
 pub type PfnGetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR = unsafe extern "system" fn(PhysicalDevice, *const PhysicalDeviceVideoEncodeQualityLevelInfoKHR, *mut VideoEncodeQualityLevelPropertiesKHR) -> Result;
 pub type PfnGetPhysicalDeviceVideoFormatPropertiesKHR = unsafe extern "system" fn(PhysicalDevice, *const PhysicalDeviceVideoFormatInfoKHR, *mut u32, *mut VideoFormatPropertiesKHR) -> Result;
 pub type PfnGetPhysicalDeviceWaylandPresentationSupportKHR = unsafe extern "system" fn(PhysicalDevice, u32, *mut WlDisplay) -> Bool32;
+pub type PfnGetPipelineCacheData = unsafe extern "system" fn(Device, PipelineCache, *mut usize, *mut core::ffi::c_void) -> Result;
 pub type PfnGetQueryPoolResults = unsafe extern "system" fn(Device, QueryPool, u32, u32, usize, *mut core::ffi::c_void, DeviceSize, QueryResultFlags) -> Result;
 pub type PfnGetSemaphoreCounterValue = unsafe extern "system" fn(Device, Semaphore, *mut u64) -> Result;
 pub type PfnGetSemaphoreFdKHR = unsafe extern "system" fn(Device, *const SemaphoreGetFdInfoKHR, *mut i32) -> Result;
@@ -298,6 +300,7 @@ pub struct DeviceTable {
     pub cmd_copy_image: Option<PfnCmdCopyImage>,
     pub cmd_copy_image_to_buffer: Option<PfnCmdCopyImageToBuffer>,
     pub cmd_dispatch: Option<PfnCmdDispatch>,
+    pub cmd_dispatch_indirect: Option<PfnCmdDispatchIndirect>,
     pub cmd_draw: Option<PfnCmdDraw>,
     pub cmd_draw_indexed: Option<PfnCmdDrawIndexed>,
     pub cmd_encode_video_khr: Option<PfnCmdEncodeVideoKHR>,
@@ -371,6 +374,7 @@ pub struct DeviceTable {
     pub get_image_subresource_layout: Option<PfnGetImageSubresourceLayout>,
     pub get_memory_fd_khr: Option<PfnGetMemoryFdKHR>,
     pub get_memory_fd_properties_khr: Option<PfnGetMemoryFdPropertiesKHR>,
+    pub get_pipeline_cache_data: Option<PfnGetPipelineCacheData>,
     pub get_query_pool_results: Option<PfnGetQueryPoolResults>,
     pub get_semaphore_counter_value: Option<PfnGetSemaphoreCounterValue>,
     pub get_semaphore_fd_khr: Option<PfnGetSemaphoreFdKHR>,
@@ -419,6 +423,7 @@ impl DeviceTable { pub unsafe fn load(handle: Device, get: PfnGetDeviceProcAddr)
         cmd_copy_image: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdCopyImage>>(lookup(c"vkCmdCopyImage")),
         cmd_copy_image_to_buffer: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdCopyImageToBuffer>>(lookup(c"vkCmdCopyImageToBuffer")),
         cmd_dispatch: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdDispatch>>(lookup(c"vkCmdDispatch")),
+        cmd_dispatch_indirect: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdDispatchIndirect>>(lookup(c"vkCmdDispatchIndirect")),
         cmd_draw: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdDraw>>(lookup(c"vkCmdDraw")),
         cmd_draw_indexed: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdDrawIndexed>>(lookup(c"vkCmdDrawIndexed")),
         cmd_encode_video_khr: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdEncodeVideoKHR>>(lookup(c"vkCmdEncodeVideoKHR")),
@@ -492,6 +497,7 @@ impl DeviceTable { pub unsafe fn load(handle: Device, get: PfnGetDeviceProcAddr)
         get_image_subresource_layout: core::mem::transmute::<PfnVoidFunction, Option<PfnGetImageSubresourceLayout>>(lookup(c"vkGetImageSubresourceLayout")),
         get_memory_fd_khr: core::mem::transmute::<PfnVoidFunction, Option<PfnGetMemoryFdKHR>>(lookup(c"vkGetMemoryFdKHR")),
         get_memory_fd_properties_khr: core::mem::transmute::<PfnVoidFunction, Option<PfnGetMemoryFdPropertiesKHR>>(lookup(c"vkGetMemoryFdPropertiesKHR")),
+        get_pipeline_cache_data: core::mem::transmute::<PfnVoidFunction, Option<PfnGetPipelineCacheData>>(lookup(c"vkGetPipelineCacheData")),
         get_query_pool_results: core::mem::transmute::<PfnVoidFunction, Option<PfnGetQueryPoolResults>>(lookup(c"vkGetQueryPoolResults")),
         get_semaphore_counter_value: core::mem::transmute::<PfnVoidFunction, Option<PfnGetSemaphoreCounterValue>>(lookup(c"vkGetSemaphoreCounterValue").or_else(|| lookup(c"vkGetSemaphoreCounterValueKHR"))),
         get_semaphore_fd_khr: core::mem::transmute::<PfnVoidFunction, Option<PfnGetSemaphoreFdKHR>>(lookup(c"vkGetSemaphoreFdKHR")),
@@ -716,6 +722,14 @@ impl crate::Device {
     pub unsafe fn cmd_dispatch(&self, command_buffer: CommandBuffer, group_count_x: u32, group_count_y: u32, group_count_z: u32) -> () {
         let call = self.table.cmd_dispatch.expect("vkCmdDispatch is unavailable");
         call(command_buffer, group_count_x, group_count_y, group_count_z);
+        ()
+    }
+}
+impl crate::Device {
+    #[inline]
+    pub unsafe fn cmd_dispatch_indirect(&self, command_buffer: CommandBuffer, buffer: Buffer, offset: DeviceSize) -> () {
+        let call = self.table.cmd_dispatch_indirect.expect("vkCmdDispatchIndirect is unavailable");
+        call(command_buffer, buffer, offset);
         ()
     }
 }
@@ -1818,6 +1832,23 @@ impl crate::Instance {
     pub unsafe fn get_physical_device_wayland_presentation_support(&self, physical_device: PhysicalDevice, queue_family_index: u32, display: *mut WlDisplay) -> Bool32 {
         let call = self.table.get_physical_device_wayland_presentation_support_khr.expect("vkGetPhysicalDeviceWaylandPresentationSupportKHR is unavailable");
         call(physical_device, queue_family_index, display)
+    }
+}
+impl crate::Device {
+    #[inline]
+    pub unsafe fn get_pipeline_cache_data(&self, pipeline_cache: PipelineCache) -> std::result::Result<Vec<u8>, Result> {
+        let call = self.table.get_pipeline_cache_data.expect("vkGetPipelineCacheData is unavailable");
+        loop {
+            let mut count: usize = 0;
+            call(self.handle, pipeline_cache, &mut count, core::ptr::null_mut()).result()?;
+            let mut values: Vec<u8> = Vec::with_capacity(count as usize);
+            values.resize(count as usize, u8::default());
+            let code = call(self.handle, pipeline_cache, &mut count, values.as_mut_ptr().cast());
+            if code == Result::INCOMPLETE { continue; }
+            code.result()?;
+            values.truncate(count as usize);
+            return Ok(values);
+        }
     }
 }
 impl crate::Device {

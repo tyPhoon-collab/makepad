@@ -398,6 +398,12 @@ pub fn dispatch_ui(local: bool, req: *const u8, len: usize, limit: usize, ctx: *
     let Some(req) = makepad_remote::Req::from_wire(unsafe { std::slice::from_raw_parts(req, len) }) else { return 0 };
     let mut w = UiWriter { ctx, write };
     let mut out = makepad_remote::Out::new(&mut w, limit);
+    // Validate before a host router can fan out or forward the request.
+    if req.cmd == "ui" {
+        if let Some(params) = makepad_remote::params::ui(req.pos.first().map_or("", String::as_str)) {
+            if let Err(e) = req.validate_params(params) { out.err(&e); return UI_ANSWERED; }
+        }
+    }
     let answered = if local { dispatch_mirrors(&req, &mut out) } else { dispatch_routed(&req, &mut out) };
     answered as u32 * UI_ANSWERED | out.truncated as u32 * UI_TRUNCATED
 }
@@ -408,7 +414,13 @@ fn dispatch_routed(req: &makepad_remote::Req, out: &mut makepad_remote::Out) -> 
     if !routers.is_empty() {
         let wire = req.to_wire();
         for route in routers {
-            let r = route(wire.as_ptr(), wire.len(), out.remaining(), out as *mut makepad_remote::Out as *mut u8, relay_to_out);
+            let mut r = 0;
+            let (remaining, reply) = (out.remaining(), out as *mut makepad_remote::Out as *mut u8);
+            if !makepad_relax_api::app_call(|| r = route(wire.as_ptr(), wire.len(), remaining, reply, relay_to_out)) {
+                // its code's run has ended
+                lock(&UI_ROUTERS).retain(|existing| *existing as usize != route as usize);
+                continue;
+            }
             out.truncated |= r & UI_TRUNCATED != 0;
             if r & UI_ANSWERED != 0 {
                 return true;
@@ -447,9 +459,20 @@ pub fn dispatch_local(req: &makepad_remote::Req, out: &mut makepad_remote::Out) 
 #[cfg(not(target_arch = "wasm32"))]
 fn dispatch_mirrors(req: &makepad_remote::Req, out: &mut makepad_remote::Out) -> bool {
     if req.cmd != "ui" { return false; }
-    static SNAPSHOTS: OnceLock<remote::Snapshots> = OnceLock::new();
     remote::dispatch(req, out, &Native, SNAPSHOTS.get_or_init(Default::default));
     true
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static SNAPSHOTS: OnceLock<remote::Snapshots> = OnceLock::new();
+
+/// (`hal::end_run`) A router in ended code goes at its next call (`dispatch_across`), the
+/// completions with the session.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn end_run() {
+    if let Some(snapshots) = SNAPSHOTS.get() {
+        snapshots.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
 }
 
 #[cfg(test)]

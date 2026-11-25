@@ -10,8 +10,10 @@ pub static PASS_NS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::ato
 /// Per-pass timing is opt-in (MAKEPAD_RUN_PASS_TIMES): the thread CPU clock is a syscall.
 /// MAKEPAD_RUN_OPT diagnostic toggles beyond OptCfg's fields: `-freecap` (no size allowance for
 /// O3 free inlines: R13's 1.9 MB functions, to exercise arm64 branch relaxation),
-/// `-costmodel` (rustc MIR cost admission); `+single` turns the single-caller admission on;
-/// `-ic` disables the InstCombine subset (nonnull, phi compares, convs, niches, sinking).
+/// `-costmodel` (rustc MIR cost admission);
+/// `-ic` disables the InstCombine subset (nonnull, phi compares, convs, niches, sinking);
+/// `-guard` inlines a live session's patchable callees unguarded (`Func::patch_flag`: the guard's
+/// cost, A/B; a patch then misses the copies inlined before it).
 pub fn opt_off(options: &relax_session::Options, tok: &str) -> bool {
     options.opt.iter().any(|t| t.trim() == tok)
 }
@@ -30,7 +32,7 @@ pub fn pass_clock() -> u64 {
             static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
             T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64 + 1
         } else {
-            crate::cpu_ns()
+            relax_session::clock::cpu_ns()
         }
     } else {
         0
@@ -72,3 +74,9 @@ pub fn pass_time(i: usize, t0: u64) {
 }
 
 pub const PASS_NAMES: [&str; 16] = ["fold", "cse", "lcopy", "dce", "jumps", "inline", "sink", "layout", "sroa", "live_dce", "licm", "regalloc", "emit", "verify", "compact", "thread_known"];
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&PASS_NS, [const { std::sync::atomic::AtomicU64::new(0) }; 16]);
+}

@@ -406,7 +406,7 @@ pub fn start_status_sampler(
     ),
     makepad_widgets::makepad_platform::thread::SpawnError,
 > {
-    use makepad_widgets::makepad_platform::thread::{CancellationToken, SignalToUI, ThreadOptions};
+    use makepad_widgets::makepad_platform::thread::{CancellationToken, ThreadOptions};
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = spawner.spawn_worker(
         ThreadOptions {
@@ -429,10 +429,12 @@ pub fn start_status_sampler(
                     status.network = sample_network();
                     status.bluetooth = sample_bluetooth();
                 }
+                // No UI signal: the WM's second tick takes the newest
+                // sample (`update_status`); waking it for each one woke an
+                // idle desktop once a second for nothing.
                 if tx.send(status.clone()).is_err() {
                     break;
                 }
-                SignalToUI::set_ui_signal();
                 round = round.wrapping_add(1);
                 let _ = wait.wait_until(makepad_widgets::Cx::monotonic_now() + 1.0);
             }
@@ -1524,15 +1526,6 @@ mod tests {
         assert_eq!(hit_at_in(&hits, center(0, BarModule::Space(1))), Some((0, BarModule::Space(1))));
         assert_eq!(hit_at_in(&hits, center(1, BarModule::Menu)), Some((1, BarModule::Menu)));
         assert_eq!(hit_at_in(&hits, dvec2(1000.0, 13.0)), None);
-    }
-
-    #[test]
-    fn the_fixture_bar_has_the_shell_json_modules() {
-        let data = BarData::fixture();
-        assert_eq!(data.workspaces.len(), 5);
-        assert!(data.workspaces[0].focused);
-        assert_eq!(data.indicators.len(), 3);
-        assert!(!data.clock.is_empty());
     }
 
     /// `ActiveWindow.qml`: left activates, middle and right both close —

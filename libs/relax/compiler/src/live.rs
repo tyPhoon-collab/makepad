@@ -37,21 +37,22 @@ fn run_tests(u: &mut Unit, tests: &[DefId]) -> Option<jit::PanicInfo> {
 
 /// The files of an edit step: a file (the crate root's new text) or a directory (an overlay:
 /// each file in it replaces the loaded file at the same path relative to the crate root's
-/// directory). All of a step's files apply as one transaction.
+/// directory; its other files, include_str!/include_bytes! inputs, are written over the
+/// crate's copies). All of a step's files apply as one transaction.
 fn step_files(arg: &str, root_dir: &str) -> Result<Vec<(String, String)>, String> {
     let p = std::path::Path::new(arg);
-    if !p.is_dir() {
+    if !crate::vfs::is_dir(p) {
         return Ok(vec![(String::new(), arg.to_string())]);
     }
     let mut out = Vec::new();
     let mut stack = vec![p.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let rd = std::fs::read_dir(&d).map_err(|e| format!("{}: {}", d.display(), e))?;
-        for e in rd.flatten() {
-            let q = e.path();
-            if q.is_dir() {
+        let rd = crate::vfs::read_dir(&d).map_err(|e| format!("{}: {}", d.display(), e))?;
+        for (name, _) in rd {
+            let q = d.join(name);
+            if crate::vfs::is_dir(&q) {
                 stack.push(q);
-            } else if q.extension().map_or(false, |x| x == "rs" || x == "context") {
+            } else {
                 let rel = q.strip_prefix(p).unwrap().to_string_lossy().into_owned();
                 out.push((format!("{}/{}", root_dir, rel), q.to_string_lossy().into_owned()));
             }
@@ -65,7 +66,8 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     let options = &sess.options;
     // a live session from the first parse (derive.rs: `#[rust(expr)]` field defaults)
     crate::pmhost::install();
-    let (prog, core, krate) = match crate::load_with_std(sess, &args[0], "live", true) {
+    let root = crate::workspace_file_path(&args[0]);
+    let (prog, core, krate) = match crate::load_with_std(sess, &root, "live", true) {
         Ok(x) => x,
         Err(e) => {
             for m in e {
@@ -84,7 +86,7 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     let tests = jit::find_tests(&prog, krate);
     // loaded path -> its running file index (a patch makes a new version)
     let mut running: Vec<(String, u32)> = prog.file_paths.iter().enumerate().map(|(i, p)| (p.clone(), i as u32)).collect();
-    let root_dir = crate::program::dir_of(&args[0]).to_string();
+    let root_dir = crate::program::dir_of(&root).to_string();
     let mut u = Unit::new(prog, tcx, core);
     let enum_errors = u.tcx.check_enum_discriminants(&u.prog, krate);
     if !enum_errors.is_empty() {
@@ -92,13 +94,30 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         return 1;
     }
     jit::enable_pipelining(options);
+    // the platform's start code runs the program's constructors before the harness (sections.rs)
+    if let Err(e) = unsafe { crate::sections::run_constructors(&mut *u, krate, None) } {
+        eprintln!("error: {e}");
+        return 101;
+    }
     println!("v0: first run (lazy compile on first call)");
     run_tests(&mut u, &tests);
+    // MAKEPAD_RUN_LIVE_SETTLE (a case's env): the second run starts once the first run's O3 work
+    // is done and stays done a moment (a thread the first run left running turns its code hot
+    // meanwhile), so the edits meet settled code: O3 builds and the guarded copies they inline
+    if std::env::var_os("MAKEPAD_RUN_LIVE_SETTLE").is_some() {
+        let up: *const Unit = &*u;
+        let mut quiet = 0;
+        while quiet < 20 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let settled = crate::owner::call(crate::owner::Class::Program, || jit::o3_settled(unsafe { &*up }));
+            quiet = if settled { quiet + 1 } else { 0 };
+        }
+    }
     println!("v0: second run (all compiled)");
     run_tests(&mut u, &tests);
     let mut undos: Vec<crate::reload::Undo> = Vec::new();
     for step in &args[1..] {
-        let files = match step_files(step, &root_dir) {
+        let files = match step_files(&crate::workspace_file_path(step), &root_dir) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("{}", e);
@@ -108,8 +127,28 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         let read_started = Instant::now();
         let mut edits = Vec::new();
         let mut bad = None;
+        let mut included = Vec::new();
+        let mut sources = Vec::new();
+        // the Rust files the code include!d: no file of the running crate, their includers' text
+        let late = crate::sip::late_files();
         for (loaded, src_path) in files {
-            let loaded = if loaded.is_empty() { args[0].clone() } else { loaded };
+            let rust_included = loaded.ends_with(".rs") && !running.iter().any(|(p, _)| *p == loaded) && late.contains(&crate::vfs::normalize_path(&loaded));
+            if !loaded.is_empty() && (!loaded.ends_with(".rs") || rust_included) && !loaded.ends_with(".context") {
+                // an included file: its includers take the edit
+                let text = match crate::vfs::read(&src_path).and_then(|b| std::fs::write(&loaded, &b).map(|_| b)) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        bad = Some(format!("{}: {}", src_path, e));
+                        break;
+                    }
+                };
+                let path = crate::vfs::normalize_path(&loaded);
+                // the includer's parse registers an included Rust file's text: the edit's snapshot
+                if rust_included { sources.push(crate::reload::Edit { file: u32::MAX, path: path.clone(), src: text }); }
+                included.push(path);
+                continue;
+            }
+            let loaded = if loaded.is_empty() { root.clone() } else { loaded };
             let file = match running.iter().find(|(p, _)| *p == loaded) {
                 Some((_, f)) => *f,
                 None => {
@@ -117,7 +156,7 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
                     break;
                 }
             };
-            match std::fs::read(&src_path) {
+            match crate::vfs::read(&src_path) {
                 Ok(src) => edits.push(crate::reload::Edit { file, path: src_path.clone(), src }),
                 Err(e) => {
                     bad = Some(format!("{}: {}", src_path, e));
@@ -129,7 +168,11 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             println!("edit {}: rung=refuse {}", step, b);
             continue;
         }
-        crate::reload::trace_input(0.0, read_started.elapsed().as_secs_f64() * 1000., edits.len());
+        if !included.is_empty() {
+            let skip: Vec<String> = edits.iter().map(|e| u.prog.file_paths[e.file as usize].clone()).collect();
+            edits.extend(crate::reload::include_edits(&u.prog, &included, &skip));
+        }
+        crate::reload::trace_input(0.0, 0.0, read_started.elapsed().as_secs_f64() * 1000., edits.len());
         let olds: Vec<u32> = edits.iter().map(|e| e.file).collect();
         let up: *mut Unit = &mut *u;
         let o = if options.live_stream && edits.len() == 1 {
@@ -141,7 +184,7 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             let path = u.prog.file_paths[edit.file as usize].clone();
             unsafe { crate::reload::apply_stream(up, &path, edit.src) }
         } else {
-            unsafe { crate::reload::apply(up, edits) }
+            unsafe { crate::reload::apply_with_sources(up, edits, &sources) }
         };
         println!(
             "edit {}: rung={} {} changed item(s), {} fn(s) installed {:?}; parse+classify {:.3} ms, check {:.3} ms, compile {:.3} ms, install {:.3} ms",

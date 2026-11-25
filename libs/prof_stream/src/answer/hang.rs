@@ -43,6 +43,7 @@ pub fn why_hung(a: &mut Answer) {
         let state = if w.is_empty() { format!("{}, {}% CPU", s(t, "state"), f(t, "cpu_pct") as i64) } else { format!("waits {}", a.names.text(w)) };
         a.line(&format!("\n{} ({}): {}", s(t, "thread"), s(t, "id"), state));
         a.body.push_str(&fr.compact(&mut a.names, "  "));
+        stops(a, t);
         ids.push(s(t, "id").to_string());
     }
     if let Some(o) = a.take1("other_threads") {
@@ -202,12 +203,62 @@ pub fn owner(a: &mut Answer) {
     let Some(v) = a.take1("serving") else { return };
     let q = v.get("queued");
     let total = q.map_or(0.0, |q| f(q, "total"));
-    a.head = format!("Owner thread: {}; {} request{} queued.", s(&v, "serving"), total, if total == 1.0 { "" } else { "s" });
+    let span = match v.get("since") {
+        Some(_) => format!(" Snapshot {}: the {} s since snapshot {}.", f(&v, "seq"), sig(f(&v, "s")), f(&v, "since")),
+        None if v.get("seq").is_some() => format!(" Snapshot {}: the whole run.", f(&v, "seq")),
+        None => String::new(),
+    };
+    a.head = format!("Owner thread: {}; {} request{} queued.{}", s(&v, "serving"), total, if total == 1.0 { "" } else { "s" }, span);
     if let Some(Value::Obj(p)) = q {
         let parts: Vec<String> = p.iter().filter(|(k, _)| k != "total").map(|(k, x)| format!("{} {}", k, super::num(Some(x)).unwrap_or(0.0))).collect();
         if total > 0.0 {
             a.line(&format!("queued by class: {}", parts.join(", ")));
         }
+    }
+    // [count, ms] pairs
+    let pair = |x: Option<&Value>| match x.and_then(Value::as_arr) {
+        Some([n, ms]) => format!("{}x {} ms", sig(super::num(Some(n)).unwrap_or(0.0)), sig(super::num(Some(ms)).unwrap_or(0.0))),
+        _ => "-".to_string(),
+    };
+    let obj_pairs = |x: Option<&Value>| match x {
+        Some(Value::Obj(p)) => p.iter().map(|(k, x)| format!("{} {}", k, pair(Some(x)))).collect::<Vec<_>>().join(", "),
+        _ => String::new(),
+    };
+    if let Some(m) = v.get("main_requests") {
+        a.line(&format!("main's program requests: {} waited {} ms (queued {}, wake {}); by wait: {}.",
+            sig(f(m, "n")), sig(f(m, "wait_ms")), sig(f(m, "queue_ms")), sig(f(m, "wake_ms")), obj_pairs(m.get("by_wait"))));
+    }
+    if v.get("main_queued_behind").is_some() {
+        a.line(&format!("main queued (program and publish requests, after the first present) behind: {}.", obj_pairs(v.get("main_queued_behind"))));
+    }
+    let _ = a.take1("holds");
+    let rows = a.take("site");
+    if !rows.is_empty() {
+        a.line("Holds of the owner by request site, most main-thread queue time behind them first:");
+        let mut t = Table::new(&["site", "class", "requests", "owner ms", "longest ms", "held for (ms: count)", "of it waiting ms", "main behind it"]);
+        for r in &rows {
+            let hist = match r.get("hist_ms") {
+                Some(Value::Obj(h)) => h.iter().map(|(k, x)| format!("{}: {}", k, sig(super::num(Some(x)).unwrap_or(0.0)))).collect::<Vec<_>>().join(", "),
+                _ => String::new(),
+            };
+            let longest = if r.get("max_ms").is_some() { sig(f(r, "max_ms")) } else { "-".to_string() };
+            t.row(vec![s(r, "site").into(), s(r, "class").into(), sig(f(r, "n")), sig(f(r, "ms")), longest, hist, sig(f(r, "waiting_ms")), pair(r.get("main_behind"))]);
+        }
+        a.line(&t.md());
+    }
+    let _ = a.take1("waits");
+    let waits = a.take("wait");
+    if !waits.is_empty() {
+        a.line("The owner's waits inside requests (no program request is served meanwhile), longest first:");
+        let mut t = Table::new(&["wait", "in request", "waits", "ms", "of it serving ms", "longest ms"]);
+        for r in &waits {
+            let longest = if r.get("max_ms").is_some() { sig(f(r, "max_ms")) } else { "-".to_string() };
+            t.row(vec![s(r, "wait").into(), s(r, "in").into(), sig(f(r, "n")), sig(f(r, "ms")), sig(f(r, "serving_ms")), longest]);
+        }
+        a.line(&t.md());
+    }
+    if let Some(n) = a.take1("next") {
+        a.more(s(&n, "next").to_string());
     }
 }
 
@@ -233,6 +284,7 @@ pub fn stacks(a: &mut Answer) {
         let doing = fr.doing(&mut a.names);
         a.line(&format!("\n{} -- {}: {}", names.join(", "), s(g, "state"), doing));
         a.body.push_str(&fr.compact(&mut a.names, "  "));
+        stops(a, g);
     }
     a.head = if picked {
         format!("Stack{} of {}:", if n_threads == 1 { "" } else { "s" }, groups.iter().flat_map(|g| arr(g, "threads").iter().filter_map(Value::as_str)).collect::<Vec<_>>().join(", "))
@@ -248,4 +300,13 @@ pub fn stacks(a: &mut Answer) {
     }
     a.more("stacks thread=<id> depth=24");
     a.more("why-hung");
+}
+
+/// Where a stack walk ended short of the stack's outermost frame, and why ("walk stops at <pc>:
+/// <why>"; the walker never guesses a caller: the frames above are all it could prove).
+fn stops(a: &mut Answer, t: &Value) {
+    let stops = s(t, "stops");
+    if !stops.is_empty() {
+        a.body.push_str(&format!("  {}\n", stops));
+    }
 }

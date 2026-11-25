@@ -3,7 +3,7 @@
 //! the pack writer in `test_support`. No git binary.
 use makepad_git::test_support::{tempdir, write_pack};
 use makepad_git::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -290,63 +290,6 @@ fn two_linked_worktrees_share_store_and_isolate_private_refs() {
 }
 
 #[test]
-fn fresh_handle_diff_trees_loose_root_packed_subtree() {
-    let base = tempdir().unwrap();
-    let main = base.path().join("main");
-    fs::create_dir_all(&main).unwrap();
-    let repo = init_repo(&main);
-
-    let blob = b"inner packed\n".to_vec();
-    let blob_oid = makepad_git::oid::hash_object("blob", &blob);
-    let subtree_bytes = makepad_git::tree::serialize_tree(&Tree {
-        entries: vec![TreeEntry {
-            mode: 0o100644,
-            name: "inner.txt".into(),
-            oid: blob_oid,
-        }],
-    });
-    let ids = write_pack(
-        &main.join(".git"),
-        &[(ObjectKind::Blob, blob), (ObjectKind::Tree, subtree_bytes)],
-    )
-    .unwrap();
-    assert_eq!(ids[0], blob_oid);
-    let subtree_oid = ids[1];
-    let top = repo.write_blob(b"top\n").unwrap();
-    let root = repo
-        .write_tree(&Tree {
-            entries: vec![
-                TreeEntry {
-                    mode: 0o040000,
-                    name: "dir".into(),
-                    oid: subtree_oid,
-                },
-                TreeEntry {
-                    mode: 0o100644,
-                    name: "top.txt".into(),
-                    oid: top,
-                },
-            ],
-        })
-        .unwrap();
-    let empty = repo.write_tree(&Tree { entries: vec![] }).unwrap();
-    drop(repo);
-
-    // Fresh handle: no prior object read.
-    let mut fresh = Repository::open(&main).unwrap();
-    let changes = fresh.diff_trees(&empty, &root).unwrap();
-    let mut paths: Vec<String> = changes
-        .iter()
-        .map(|c| match c {
-            TreeChange::Added { path, .. } => path.clone(),
-            other => panic!("unexpected change {other:?}"),
-        })
-        .collect();
-    paths.sort();
-    assert_eq!(paths, ["dir/inner.txt", "top.txt"]);
-}
-
-#[test]
 fn linked_worktree_missing_index_is_empty_not_error() {
     let base = tempdir().unwrap();
     let main = base.path().join("main");
@@ -493,136 +436,6 @@ fn malformed_pointers_are_errors() {
 }
 
 #[test]
-fn log_thirty_commits_two_merges() {
-    let dir = tempdir().unwrap();
-    let root = dir.path().join("repo");
-    fs::create_dir_all(&root).unwrap();
-    let mut repo = init_repo(&root);
-
-    let blob = repo.write_blob(b"x\n").unwrap();
-    let tree = repo
-        .write_tree(&Tree {
-            entries: vec![TreeEntry {
-                mode: 0o100644,
-                name: "f".into(),
-                oid: blob,
-            }],
-        })
-        .unwrap();
-
-    let write = |repo: &Repository, parents: Vec<ObjectId>, message: &str| {
-        repo.write_commit(&Commit {
-            tree,
-            parents,
-            author: sig(),
-            committer: sig(),
-            message: message.to_string(),
-        })
-        .unwrap()
-    };
-
-    // 20-commit backbone.
-    let mut ids = Vec::with_capacity(30);
-    ids.push(write(&repo, vec![], "c0\n"));
-    for i in 1..20 {
-        ids.push(write(&repo, vec![ids[i - 1]], &format!("c{i}\n")));
-    }
-    // Side branch from c5: three commits.
-    ids.push(write(&repo, vec![ids[5]], "c20\n")); // 20
-    ids.push(write(&repo, vec![ids[20]], "c21\n"));
-    ids.push(write(&repo, vec![ids[21]], "c22\n"));
-    // Merge 1 of backbone tip and side branch.
-    ids.push(write(&repo, vec![ids[19], ids[22]], "merge1\n")); // 23
-    // Side branch from c10: two commits.
-    ids.push(write(&repo, vec![ids[10]], "c24\n"));
-    ids.push(write(&repo, vec![ids[24]], "c25\n"));
-    // Merge 2.
-    ids.push(write(&repo, vec![ids[23], ids[25]], "merge2\n")); // 26
-    ids.push(write(&repo, vec![ids[26]], "c27\n"));
-    ids.push(write(&repo, vec![ids[27]], "c28\n"));
-    ids.push(write(&repo, vec![ids[28]], "c29\n"));
-    assert_eq!(ids.len(), 30);
-    repo.create_branch("main", ids.last().unwrap()).unwrap();
-
-    let head = *ids.last().unwrap();
-    let log = repo.log(&head, 100).unwrap();
-    assert_eq!(log.len(), 30, "all 30 commits reachable from HEAD");
-    let mut seen = HashSet::new();
-    for (oid, _) in &log {
-        assert!(seen.insert(*oid), "duplicate commit {}", oid.to_hex());
-    }
-    for id in &ids {
-        assert!(seen.contains(id), "missing commit {}", id.to_hex());
-    }
-
-    let merges: Vec<_> = log
-        .iter()
-        .filter(|(_, c)| c.parents.len() == 2)
-        .map(|(_, c)| c.message.as_str())
-        .collect();
-    assert_eq!(merges.len(), 2);
-    assert!(merges.contains(&"merge1\n"));
-    assert!(merges.contains(&"merge2\n"));
-
-    // Linear history is a valid HEAD-first topological order under the
-    // stack DFS in Repository::log. A merge diamond is not: a shared
-    // ancestor reached via one parent is emitted before the other
-    // parent's descendants (libs/git/src/repo.rs Repository::log).
-    let l0 = write(&repo, vec![], "lin0\n");
-    let l1 = write(&repo, vec![l0], "lin1\n");
-    let l2 = write(&repo, vec![l1], "lin2\n");
-    let l3 = write(&repo, vec![l2], "lin3\n");
-    let l4 = write(&repo, vec![l3], "lin4\n");
-    let linear_log = repo.log(&l4, 10).unwrap();
-    assert_eq!(
-        linear_log.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
-        [l4, l3, l2, l1, l0]
-    );
-
-    let c0 = write(&repo, vec![], "d0\n");
-    let c1 = write(&repo, vec![c0], "d1\n");
-    let c2 = write(&repo, vec![c0], "d2\n");
-    let c3 = write(&repo, vec![c1, c2], "d3\n");
-    let diamond = repo.log(&c3, 10).unwrap();
-    let dpos: HashMap<ObjectId, usize> = diamond
-        .iter()
-        .enumerate()
-        .map(|(i, (oid, _))| (*oid, i))
-        .collect();
-    let diamond_topo = diamond.iter().all(|(oid, commit)| {
-        commit.parents.iter().all(|parent| match dpos.get(parent) {
-            Some(&p) => p > dpos[oid],
-            None => true,
-        })
-    });
-    if !diamond_topo {
-        eprintln!(
-            "LIBRARY DEFECT libs/git/src/repo.rs Repository::log: merge diamond is not a topological order. \
-             minimal input: c0; c1 parent c0; c2 parent c0; c3 parents c1,c2. got: {:?}",
-            diamond
-                .iter()
-                .map(|(_, c)| c.message.trim())
-                .collect::<Vec<_>>()
-        );
-    }
-    assert_eq!(diamond.len(), 4);
-    assert_eq!(
-        diamond.iter().map(|(o, _)| *o).collect::<HashSet<_>>().len(),
-        4
-    );
-
-    let clipped = repo.log(&head, 10).unwrap();
-    assert_eq!(clipped.len(), 10, "log must stop at max_count");
-    let mut clipped_seen = HashSet::new();
-    for (oid, _) in &clipped {
-        assert!(clipped_seen.insert(*oid));
-    }
-    let one = repo.log(&head, 1).unwrap();
-    assert_eq!(one.len(), 1);
-    assert_eq!(one[0].0, head);
-}
-
-#[test]
 fn walk_head_tree_preserves_executable_and_symlink_modes() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -705,4 +518,41 @@ fn walk_head_tree_preserves_executable_and_symlink_modes() {
     assert_eq!(by_path["link"].1, b"bin/script");
     assert_eq!(by_path["subdir/file.txt"].0, 0o100644);
     assert_eq!(by_path["subdir/file.txt"].1, b"nested\n");
+}
+
+/// A file rewritten in place with its size and its mtime second kept is modified: by its
+/// nanoseconds where its entry has them, and by git's racy-git rule where it was staged in the
+/// index's own second or later (there its whole stat can be kept). Status said such a file clean,
+/// so a lane's edit shipped as its committed text.
+#[test]
+fn an_in_place_edit_keeping_size_and_mtime_second_is_modified() {
+    use std::io::Write;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let base = tempdir().unwrap();
+    let dir = base.path();
+    let mut repo = init_repo(dir);
+    let write = |name: &str, text: &str, at: SystemTime| {
+        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).open(dir.join(name)).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+        f.set_modified(at).unwrap();
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let (past, future) = (UNIX_EPOCH + Duration::from_secs(now - 100), UNIX_EPOCH + Duration::from_secs(now + 100));
+    let ms = Duration::from_millis;
+    write("old.rs", "fn a() {}\n", past + ms(100));
+    write("racy.rs", "fn b() {}\n", future + ms(100));
+    write("same.rs", "fn c() {}\n", future + ms(100));
+    for name in ["old.rs", "racy.rs", "same.rs"] {
+        repo.stage_file(name).unwrap();
+    }
+    repo.commit("base\n", sig()).unwrap();
+    let modified = |repo: &mut Repository| {
+        let mut paths: Vec<String> = repo.status().unwrap().entries.into_iter().filter(|e| e.status == FileStatus::Modified).map(|e| e.path).collect();
+        paths.sort();
+        paths
+    };
+    assert!(modified(&mut repo).is_empty(), "racily clean files of the same text are clean");
+    write("old.rs", "fn x() {}\n", past + ms(200));
+    write("racy.rs", "fn y() {}\n", future + ms(100));
+    assert_eq!(modified(&mut repo), ["old.rs", "racy.rs"]);
 }

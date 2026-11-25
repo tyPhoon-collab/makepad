@@ -5,23 +5,24 @@
 //!
 //! `all`: every running app, including ones started later: `watch` returns the first event of any
 //! of them; `events follow=1` streams all of them; other commands run on each in turn.
+//!
+//! An app name and `all` reach only what this caller started, or anything for someone at a
+//! terminal; other apps are named by pid ([`makepad_remote::discovery::Caller`]).
 
 use std::io::Write;
 
-pub struct App {
-    pub pid: u32,
-    pub app: String,
-    pub socket: String,
-}
+pub use makepad_remote::discovery::App;
+use makepad_remote::discovery::{named, Caller};
 
 /// The running apps (discovery files `makepad-remote-<pid>.json`; stale ones of ended processes are removed).
 pub fn apps() -> Vec<App> {
-    makepad_remote::discovery::apps().into_iter().map(|a| App { pid: a.pid, app: a.app, socket: a.socket }).collect()
+    makepad_remote::discovery::apps()
 }
 
 fn usage() -> i32 {
-    eprintln!("usage: makepad inspect <pid|app|all|list> <command> [args]   (makepad inspect <pid> help: the commands)");
-    eprintln!("       makepad inspect <host>:<app|pid> <command> | <host>:list | <host>:session <launch|kill> .. | hosts | all:list");
+    eprintln!("usage: makepad inspect <pid|list> <command> [args]   (makepad inspect <pid> help: the commands)");
+    eprintln!("       makepad inspect <app|all> <command> [args]   (at a terminal, or the apps of your own lease; anything else is named by pid)");
+    eprintln!("       makepad inspect <host>:<pid> <command> | <host>:list | <host>:session <launch|kill> .. | hosts | all:list");
     eprintln!("       makepad inspect <pid|app> pf <query> [s=3] [save=x.mkpf] | file=<x.mkpf> pf <query> [base=y.mkpf]   (pf help: the profiler queries)");
     2
 }
@@ -52,7 +53,8 @@ pub fn main(args: &[String]) -> i32 {
     }
     if target == "list" {
         for a in apps() {
-            println!("{{\"pid\":{},\"app\":{},\"socket\":{}}}", a.pid, super::json_str(&a.app), super::json_str(&a.socket));
+            let error = a.text("socket_error").map_or(String::new(), |why| format!(",\"socket_error\":{}", super::json_str(&why)));
+            println!("{{\"pid\":{},\"app\":{},\"socket\":{}{}}}", a.pid, super::json_str(&a.app), super::json_str(&a.socket), error);
         }
         return 0;
     }
@@ -60,32 +62,44 @@ pub fn main(args: &[String]) -> i32 {
         return remote::hosts();
     }
     if let Some((host, app)) = target.split_once(':') {
-        let line = request_line(&args[1..]);
+        let line = makepad_remote::app::typed_line(&args[1..]);
         return remote::main(host, app, &line, text_out);
     }
     if target == "schema" {
         println!("{}", super::schema());
         return 0;
     }
-    let line = request_line(&args[1..]);
+    let line = makepad_remote::app::typed_line(&args[1..]);
     let cmd = line.split_whitespace().next().unwrap_or("").to_string();
     let text = text_out;
-    if target == "all" {
-        return all(&line, &cmd, text);
-    }
+    let caller = Caller::command_line();
     let list = apps();
-    let chosen: Vec<&App> = match target.parse::<u32>() {
-        Ok(pid) => list.iter().filter(|a| a.pid == pid).collect(),
-        Err(_) => list.iter().filter(|a| &a.app == target).collect(),
-    };
-    let app = match chosen.as_slice() {
-        [] => {
-            eprintln!("makepad inspect: no running app `{}` (running: {})", target, list.iter().map(|a| format!("{} {}", a.pid, a.app)).collect::<Vec<_>>().join(", "));
+    if target == "all" {
+        if let Some(why) = caller.all_refused(&list) {
+            eprintln!("makepad inspect: {why}");
             return 2;
         }
-        // the most recent of several with that name
-        many => many[many.len() - 1],
+        return all(&line, &cmd, text, &caller);
+    }
+    let chosen = match target.parse::<u32>() {
+        Ok(pid) => list.iter().rfind(|a| a.answers_to(pid)).cloned(),
+        Err(_) if list.iter().any(|a| &a.app == target) => match named(&list, target, &caller) {
+            Ok(a) => Some(a),
+            Err(why) => {
+                eprintln!("makepad inspect: {why}");
+                return 2;
+            }
+        },
+        Err(_) => None,
     };
+    let Some(app) = &chosen else {
+        eprintln!("makepad inspect: no running app `{}` (running: {})", target, list.iter().map(|a| format!("{} {}", a.pid, a.app)).collect::<Vec<_>>().join(", "));
+        return 2;
+    };
+    if let Some(why) = app.unreachable() {
+        eprintln!("makepad inspect: {why}");
+        return 2;
+    }
     if args.get(1).map(String::as_str) == Some("pf") {
         return super::pf::live_main(app, &args[2..]);
     }
@@ -125,74 +139,25 @@ fn json_wanted(words: &[String]) -> bool {
     words.iter().any(|w| w == "as=json" || w == "--json")
 }
 
-/// The request line of a command's words. Code an agent passes (`eval <expr>`, `probe add <hook>
-/// <code>`) keeps its text: it goes as a JSON request (`key=value` words split it otherwise).
-fn request_line(words: &[String]) -> String {
-    if words.is_empty() {
-        return "help".to_string();
-    }
-    let opt = |w: &str| -> Option<(String, String)> {
-        let w = w.trim_start_matches("--");
-        let (k, v) = w.split_once('=').unwrap_or((w, ""));
-        matches!(k, "in" | "mutate" | "panic" | "domain").then(|| (k.to_string(), if v.is_empty() && k == "mutate" { "1".to_string() } else { v.to_string() }))
-    };
-    let json = |cmd: &str, kv: &[(String, String)]| {
-        let mut s = format!("{{\"cmd\":{}", super::json_str(cmd));
-        for (k, v) in kv {
-            s.push_str(&format!(",{}:{}", super::json_str(k), super::json_str(v)));
-        }
-        s.push('}');
-        s
-    };
-    match words[0].as_str() {
-        "eval" => {
-            // options first (`--in path` or `in=path`, `mutate=1`, `panic=P1`), then the expression
-            let mut kv = Vec::new();
-            let mut i = 1;
-            while i < words.len() {
-                if words[i] == "--in" && i + 1 < words.len() {
-                    kv.push(("in".to_string(), words[i + 1].clone()));
-                    i += 2;
-                } else if let Some(o) = words[i].contains('=').then(|| opt(&words[i])).flatten().or_else(|| (words[i] == "--mutate").then(|| ("mutate".to_string(), "1".to_string()))) {
-                    kv.push(o);
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            kv.push(("expr".to_string(), words[i..].join(" ")));
-            json("eval", &kv)
-        }
-        "probe" if words.get(1).map(String::as_str) == Some("add") && words.len() > 3 => {
-            let mut rest: Vec<String> = words[3..].to_vec();
-            let mut kv = Vec::new();
-            while rest.last().is_some_and(|w| w == "mutate=1" || w == "--mutate") {
-                rest.pop();
-                kv.push(("mutate".to_string(), "1".to_string()));
-            }
-            kv.push(("code".to_string(), rest.join(" ")));
-            json(&format!("probe add {}", words[2]), &kv)
-        }
-        _ => words.join(" "),
-    }
-}
-
 /// Sends one request; `each` gets every answer line but the end line (false: stop reading).
 /// Ok(true) when the answer had an error line.
 fn ask(app: &App, line: &str, each: &mut dyn FnMut(&str) -> bool) -> std::io::Result<bool> {
     let to_io = |e: makepad_remote::link::Error| std::io::Error::other(e.to_string());
+    if let Some(why) = app.unreachable() {
+        return Err(std::io::Error::other(why));
+    }
     let client = makepad_remote::Client::connect(&app.socket).map_err(to_io)?;
     // the commands that are images (`grab`, `gseq`, `gq`) are answered client side from the
     // `frames` service, like `makepad-remote app` does: the same library function
     makepad_remote::app::run_line(&client, line, each).map_err(to_io)
 }
 
-/// `all`: every app now and every app that starts while this runs.
-fn all(line: &str, cmd: &str, text: bool) -> i32 {
+/// `all`: every app of `caller` now and every one that starts while this runs.
+fn all(line: &str, cmd: &str, text: bool, caller: &Caller) -> i32 {
     let streaming = cmd == "watch" || (cmd == "events" && line.contains("follow=1"));
     if !streaming {
         let mut code = 0;
-        for a in apps() {
+        for a in apps().into_iter().filter(|a| caller.reaches(a)) {
             if text {
                 println!("## {} (pid {})", a.app, a.pid);
             } else {
@@ -223,7 +188,7 @@ fn all(line: &str, cmd: &str, text: bool) -> i32 {
     let mut seen: Vec<u32> = Vec::new();
     let once = cmd == "watch";
     loop {
-        for a in apps() {
+        for a in apps().into_iter().filter(|a| caller.reaches(a)) {
             if seen.contains(&a.pid) {
                 continue;
             }

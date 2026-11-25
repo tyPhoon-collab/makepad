@@ -532,7 +532,9 @@ impl Widget for Tip {
     fn semantics(&self, cx: &Cx, node: &mut a11y_tree::Node) {
         let _ = cx;
         node.role = a11y_tree::Role::Tooltip;
-        makepad_platform::a11y::set_string(&mut node.name, &self.text());
+        // the tip describes the control it wraps (its own `text`: the Widget trait's `text()`
+        // is empty here); the control keeps its name
+        makepad_platform::a11y::set_string(&mut node.description, &self.text);
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -581,6 +583,14 @@ impl Widget for Tip {
             return;
         }
         let uid = self.widget_uid();
+        // A control that went away takes its tip with it: the pointer may never move again over
+        // it, and a key focus stays on an area nothing draws any more.
+        if (self.hovered || self.focused) && self.children_all_hidden() {
+            self.hovered = false;
+            self.focused = false;
+            cx.widget_action(uid, TipAction::HoverOut);
+            return;
+        }
         let claimed = || {
             let claimed_after = event.pointer_claimed_area();
             claimed_after != claimed_before && !claimed_after.is_empty()
@@ -727,6 +737,12 @@ impl ScriptHook for TipLayer {
 }
 
 impl TipLayer {
+    /// The text of the tip pending or on screen.
+    #[cfg(test)]
+    pub(crate) fn held_text(&self) -> Option<String> {
+        self.pending.as_ref().or(self.showing.as_ref()).map(|tip| tip.text.clone())
+    }
+
     fn show_pending(&mut self, cx: &mut Cx) {
         if let Some(tip) = self.pending.take() {
             self.showing = Some(tip);
@@ -756,7 +772,9 @@ impl Widget for TipLayer {
     fn semantics(&self, cx: &Cx, node: &mut a11y_tree::Node) {
         let _ = cx;
         node.role = a11y_tree::Role::Tooltip;
-        makepad_platform::a11y::set_string(&mut node.name, &self.text());
+        // the tip on screen, by its text (the Widget trait's `text()` is empty here); nothing
+        // shown, no name
+        makepad_platform::a11y::set_string(&mut node.name, self.showing.as_ref().map_or("", |tip| tip.text.as_str()));
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -1339,6 +1357,30 @@ mod tests {
         });
         layer.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
         assert_eq!(focus(&mut cx, &mut root, &mut layer, Area::Empty).as_deref(), Some("host"));
+        });
+    }
+
+    /// A control that hides with its tip up takes the tip with it, on the next event of any
+    /// kind: nothing else would, with the pointer still or the key focus left behind on it.
+    #[test]
+    fn a_control_that_hides_takes_its_tip_with_it() {
+        crate::on_test_cx(|| {
+        let mut cx = cx();
+        cx.init_cx_os();
+        let mut root = view(&mut cx, script! {
+            use mod.prelude.widgets.*
+            View{ width: 300 height: 20 flow: Right
+                Tip{ text: "first" View{ width: 50 height: 20 } }
+            }
+        });
+        let mut layer = tip_layer(&mut cx);
+        let mut target = Target::new(&mut cx, dvec2(300.0, 20.0));
+        target.draw(&mut cx, &mut root);
+        let to = at(&root, &[0]).area();
+        assert_eq!(focus(&mut cx, &mut root, &mut layer, to).as_deref(), Some("first"));
+        assert_eq!(deliver(&mut cx, &mut root, &mut layer, &Event::Signal).as_deref(), Some("first"), "the control is still there");
+        at(&root, &[0, 0]).set_visible(&mut cx, false);
+        assert_eq!(deliver(&mut cx, &mut root, &mut layer, &Event::Signal), None, "the control went, and the tip");
         });
     }
 

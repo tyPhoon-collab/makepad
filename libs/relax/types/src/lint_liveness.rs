@@ -68,6 +68,8 @@ struct Report {
     pos: u32,
     msg: String,
     scope: usize,
+    /// the unit (the body, a closure in it) that reports it
+    unit: u32,
 }
 
 struct LoopCx {
@@ -88,6 +90,8 @@ pub struct Cx<'a> {
     locals_by_name: HashMap<String, Vec<u32>>,
     scopes: Vec<Vec<Attr>>,
     reports: Vec<Report>,
+    /// each unit's (parent unit, position of its closure expression); the body is unit 0
+    units: Vec<(u32, u32)>,
     closure_memo: HashMap<u32, Vec<(u32, bool)>>,
     /// the pattern analysis context (inhabitedness of call results), made on first use
     pcx: Option<crate::pattern_analysis::Cx<'a>>,
@@ -108,6 +112,8 @@ struct Unit<'c, 'a> {
     cur_scope: usize,
     /// the closure kind: FnMut closures run again after returning
     closure: Option<ClosureInfo>,
+    /// this unit in Cx::units
+    id: u32,
     decl_scopes: HashMap<u32, usize>,
     pos0: u32,
 }
@@ -136,7 +142,7 @@ pub fn check(prog: &Program, tcx: &Tcx, body: &Body, params: &[(PatId, List<Attr
     for (i, l) in body.locals.iter().enumerate() {
         locals_by_name.entry(prog.syms.str(l.name).to_string()).or_default().push(i as u32);
     }
-    let mut cx = Cx { prog, tcx, body, ast, fmt_named, locals_by_name, scopes: vec![Vec::new()], reports: Vec::new(), closure_memo: HashMap::new(), pcx: None };
+    let mut cx = Cx { prog, tcx, body, ast, fmt_named, locals_by_name, scopes: vec![Vec::new()], reports: Vec::new(), units: Vec::new(), closure_memo: HashMap::new(), pcx: None };
     {
         let mut u = Unit::new(&mut cx, None);
         for &(p, attrs) in params {
@@ -148,16 +154,45 @@ pub fn check(prog: &Program, tcx: &Tcx, body: &Body, params: &[(PatId, List<Attr
         if let Some(e) = expr { u.expr(e); }
         u.finish();
     }
-    let mut reports = std::mem::take(&mut cx.reports);
-    reports.sort_by_key(|r| r.pos);
-    for r in reports {
+    for r in rustc_order(std::mem::take(&mut cx.reports), &cx.units) {
         lint::emit_in(prog, body.def, &cx.scopes[r.scope], r.lint, body.file, r.pos, &r.msg);
     }
 }
 
+/// The reports in rustc's order (rustc_mir_transform liveness.rs): the body's backward analysis
+/// reaches its closures from the last to the first, and each closure's check_liveness reports
+/// (its own closures first, the same way) before the body does; a unit then reports its unused
+/// variables (report_fully_unused), then its unused assignments, each in place order.
+fn rustc_order(reports: Vec<Report>, units: &[(u32, u32)]) -> Vec<Report> {
+    let mut children: Vec<Vec<u32>> = vec![Vec::new(); units.len()];
+    for (u, &(parent, _)) in units.iter().enumerate() {
+        if parent != NONE { children[parent as usize].push(u as u32); }
+    }
+    for c in &mut children { c.sort_by_key(|&u| std::cmp::Reverse(units[u as usize].1)); }
+    let mut rank = vec![0u32; units.len()];
+    let mut next = 0;
+    // (post-order: a unit after its closures; an explicit stack, closures nest deep)
+    let mut stack: Vec<(u32, usize)> = vec![(0, 0)];
+    while let Some(&mut (u, ref mut i)) = stack.last_mut() {
+        if let Some(&c) = children[u as usize].get(*i) {
+            *i += 1;
+            stack.push((c, 0));
+        } else {
+            rank[u as usize] = next;
+            next += 1;
+            stack.pop();
+        }
+    }
+    let mut reports = reports;
+    reports.sort_by_key(|r| (rank.get(r.unit as usize).copied().unwrap_or(u32::MAX), r.lint.name != lint::UNUSED_VARIABLES.name, r.pos));
+    reports
+}
+
 impl<'c, 'a> Unit<'c, 'a> {
     fn new(cx: &'c mut Cx<'a>, closure: Option<ClosureInfo>) -> Self {
-        let mut u = Unit {
+        let id = cx.units.len() as u32;
+        cx.units.push((NONE, 0));
+        let mut u = Unit { id,
             cx, vars: Vec::new(), var_of: HashMap::new(), declared: HashSet::new(), nodes: Vec::new(), accesses: Vec::new(),
             cur: None, entry: 0, exit: 0, loops: Vec::new(), scope_stack: vec![0], cur_scope: 0, closure, decl_scopes: HashMap::new(), pos0: 0,
         };
@@ -294,6 +329,29 @@ impl<'c, 'a> Unit<'c, 'a> {
         }
     }
 
+    /// The variables pattern `p` binds by reference (`ref x`, or `x` under a reference default
+    /// binding mode).
+    fn by_ref_bindings(&mut self, p: PatId, out: &mut Vec<u32>) {
+        let ast = self.cx.ast;
+        match *ast.pat(p) {
+            Pat::Ident { by_ref, sub, .. } => {
+                if self.cx.body.pat_res.get(&p.0).is_none() && (by_ref || self.cx.body.pat_bind_ref.get(&p.0).is_some_and(|&m| m != 0)) {
+                    if let Some(&l) = self.cx.body.pat_local.get(&p.0) {
+                        let v = self.var(l);
+                        if !out.contains(&v) { out.push(v); }
+                    }
+                }
+                if let Some(s) = sub { self.by_ref_bindings(s, out); }
+            }
+            Pat::Lit(_) | Pat::Range(..) | Pat::Path(_) | Pat::Wild | Pat::Rest | Pat::Mac(_) => {}
+            Pat::Or(ps) | Pat::TupleStruct(_, ps) | Pat::Tuple(ps) | Pat::Slice(ps) => {
+                for &x in ast.list(ps) { self.by_ref_bindings(x, out); }
+            }
+            Pat::Struct(_, fs, _) => { for f in ast.list(fs) { self.by_ref_bindings(f.pat, out); } }
+            Pat::Ref(_, x) | Pat::Paren(x) | Pat::Box(x) => self.by_ref_bindings(x, out),
+        }
+    }
+
     /// A parameter pattern: a plain name is the argument itself (its value is the entry access).
     fn param(&mut self, p: PatId) {
         let ast = self.cx.ast;
@@ -357,13 +415,64 @@ impl<'c, 'a> Unit<'c, 'a> {
                             self.cur = start;
                             self.bind_pat(l.pat, true);
                         } else {
+                            let from = self.accesses.len();
                             self.bind_pat(l.pat, true);
+                            self.init_at_tails(l.pat, init, from);
                         }
                     }
                     None => self.bind_pat(l.pat, false),
                 }
                 self.leave();
             }
+        }
+    }
+
+    /// A plain `let x = init;` is written where `init` makes its value (rustc_mir_build
+    /// expr_into_pattern: expr_into_dest), at each tail of `init` that does not diverge: a dead
+    /// initial value is reported there, and not at all inside an external macro (`vec![..]`).
+    /// `from`: the first access `bind_pat` recorded.
+    fn init_at_tails(&mut self, pat: PatId, init: ExprId, from: usize) {
+        let ast = self.cx.ast;
+        let mut q = pat;
+        while let Pat::Paren(x) = *ast.pat(q) { q = x; }
+        if !matches!(*ast.pat(q), Pat::Ident { sub: None, by_ref: false, .. }) || self.accesses.len() != from + 1 { return; }
+        let mut tails = Vec::new();
+        self.value_tails(init, &mut tails);
+        if tails.is_empty() { return; }
+        let a = self.accesses.pop().unwrap();
+        for key in tails {
+            self.accesses.push(Access { var: a.var, kind: a.kind, key, node: a.node, at_entry: a.at_entry, direct: a.direct, scope: a.scope, init: a.init });
+        }
+    }
+
+    /// The spans of the expressions whose values become the value of `e`.
+    fn value_tails(&self, e: ExprId, out: &mut Vec<(u32, u32)>) {
+        let ast = self.cx.ast;
+        let ex = *ast.expr(e);
+        if self.is_never(e) { return; }
+        match ex.kind {
+            ExprKind::Paren(x) => self.value_tails(x, out),
+            ExprKind::Block(b, label) if label.get().is_none() => self.block_value_tails(b, e, out),
+            ExprKind::Unsafe(b) => self.block_value_tails(b, e, out),
+            ExprKind::If(_, then, els) if els.get().is_some() => {
+                self.block_value_tails(then, e, out);
+                if let Some(x) = els.get() { self.value_tails(x, out); }
+            }
+            ExprKind::Match(_, arms) => { for a in ast.list(arms) { self.value_tails(a.body, out); } }
+            _ => out.push((ex.lo, ex.hi)),
+        }
+    }
+
+    fn block_value_tails(&self, b: BlockId, e: ExprId, out: &mut Vec<(u32, u32)>) {
+        let ast = self.cx.ast;
+        let tail = match ast.stmts(b).last() {
+            Some(&Stmt::Expr(t, false)) => Some(t),
+            Some(&Stmt::Attrs(r)) if !ast.row(r).semi => Some(ast.row(r).expr),
+            _ => None,
+        };
+        match tail {
+            Some(t) => self.value_tails(t, out),
+            None => { let ex = ast.expr(e); out.push((ex.lo, ex.hi)); }
         }
     }
 
@@ -644,6 +753,12 @@ impl<'c, 'a> Unit<'c, 'a> {
             self.enter(a.attrs);
             self.bind_pat(a.pat, true);
             if let Some(g) = a.guard {
+                // a by-reference binding of a guarded arm is made before the guard, which gets a
+                // reference to it (rustc_mir_build bind_matched_candidate_for_guard: the guard's
+                // local is `&arm_local`), so the arm's binding is read even when nothing names it
+                let mut by_ref = Vec::new();
+                self.by_ref_bindings(a.pat, &mut by_ref);
+                if !by_ref.is_empty() { self.step(by_ref, NONE); }
                 let ok = self.new_node();
                 let next = starts.get(i + 1).copied().unwrap_or(join);
                 // a failed guard falls through to the next arm (or nowhere: exhaustive)
@@ -742,6 +857,10 @@ impl<'c, 'a> Unit<'c, 'a> {
                 self.expr(i);
                 let overloaded = self.cx.body.ov_index.get(&e.0).is_some() || self.cx.body.index_derefs(e.0) > 0;
                 let deref = matches!(self.ty_kind_of(a), Some(TyKind::Ref(..) | TyKind::Ptr(..) | TyKind::Slice(_))) || self.is_box(a) || overloaded;
+                // the bounds check of an array index reads the array (rustc_mir_build
+                // len_of_slice_or_array: FakeRead ForIndex of the base), so writing `a[i]` is a
+                // use of `a` that kills nothing
+                if let Some(l) = r { if !ind && !deref { self.use_local(l); } }
                 (r, false, ind || deref)
             }
             ExprKind::Unary(UnOp::Deref, x) => {
@@ -822,7 +941,13 @@ impl<'c, 'a> Unit<'c, 'a> {
         if let Some(p) = args.pat {
             // matches!(e, pat if guard)
             self.bind_pat(p, true);
-            if let Some(g) = args.guard { self.expr(g); }
+            if let Some(g) = args.guard {
+                // by-reference bindings are read by the guard's reference to them (match_expr)
+                let mut by_ref = Vec::new();
+                self.by_ref_bindings(p, &mut by_ref);
+                if !by_ref.is_empty() { self.step(by_ref, NONE); }
+                self.expr(g);
+            }
         } else if let Some(g) = args.guard {
             self.expr(g);
         }
@@ -871,7 +996,9 @@ impl<'c, 'a> Unit<'c, 'a> {
         let scope = self.cur_scope;
         let pos0 = self.cx.ast.expr(e).lo;
         let res = {
+            let parent = self.id;
             let mut u = Unit::new(&mut *self.cx, Some(info));
+            u.cx.units[u.id as usize] = (parent, pos0);
             u.scope_stack = vec![scope];
             u.cur_scope = scope;
             u.pos0 = pos0;
@@ -1012,7 +1139,7 @@ impl<'c, 'a> Unit<'c, 'a> {
                 if statements.is_empty() {
                     if !referenced[v] { continue; }
                     let scope = self.decl_scope(v);
-                    reports.push(Report { lint: &lint::UNUSED_VARIABLES, pos: def_pos, msg: format!("unused variable: `{}`", var.name), scope });
+                    reports.push(Report { lint: &lint::UNUSED_VARIABLES, pos: def_pos, msg: format!("unused variable: `{}`", var.name), scope, unit: 0 });
                     continue;
                 }
                 if drop_guard() {
@@ -1020,7 +1147,7 @@ impl<'c, 'a> Unit<'c, 'a> {
                     if statements.is_empty() { continue; }
                 }
                 let scope = self.decl_scope(v);
-                reports.push(Report { lint: &lint::UNUSED_VARIABLES, pos: def_pos, msg: format!("variable `{}` is assigned to, but never used", var.name), scope });
+                reports.push(Report { lint: &lint::UNUSED_VARIABLES, pos: def_pos, msg: format!("variable `{}` is assigned to, but never used", var.name), scope, unit: 0 });
             }
             if !var.own && !ever[v] { continue; }
             // dead assignments
@@ -1033,22 +1160,23 @@ impl<'c, 'a> Unit<'c, 'a> {
                 match m.kind {
                     AccessKind::Assign => {
                         if lint::external(prog, file, m.key.0) { continue; }
-                        reports.push(Report { lint: &lint::UNUSED_ASSIGNMENTS, pos: m.key.0, msg: format!("value assigned to `{}` is never read", var.name), scope: m.scope });
+                        reports.push(Report { lint: &lint::UNUSED_ASSIGNMENTS, pos: m.key.0, msg: format!("value assigned to `{}` is never read", var.name), scope: m.scope, unit: 0 });
                     }
                     AccessKind::Param => {
                         // an unused parameter is reported as an unused variable
                         if var.own && !ever[v] { continue; }
                         if lint::external(prog, file, m.key.0) { continue; }
-                        reports.push(Report { lint: &lint::UNUSED_ASSIGNMENTS, pos: m.key.0, msg: format!("value passed to `{}` is never read", var.name), scope: m.scope });
+                        reports.push(Report { lint: &lint::UNUSED_ASSIGNMENTS, pos: m.key.0, msg: format!("value passed to `{}` is never read", var.name), scope: m.scope, unit: 0 });
                     }
                     AccessKind::Capture => {
-                        reports.push(Report { lint: &lint::UNUSED_ASSIGNMENTS, pos: self.pos0, msg: format!("value captured by `{}` is never read", var.name), scope: m.scope });
+                        reports.push(Report { lint: &lint::UNUSED_ASSIGNMENTS, pos: self.pos0, msg: format!("value captured by `{}` is never read", var.name), scope: m.scope, unit: 0 });
                     }
                 }
             }
         }
         // report in the unit's lint sink
-        self.cx.reports.extend(reports.into_iter().filter(|r| !lint::external(prog, file, r.pos)));
+        let unit = self.id;
+        self.cx.reports.extend(reports.into_iter().filter(|r| !lint::external(prog, file, r.pos)).map(|r| Report { unit, ..r }));
         // the captures
         (0..nv).filter(|&v| !self.vars[v].own).map(|v| (self.vars[v].local, !ever[v])).collect()
     }
@@ -1058,5 +1186,26 @@ impl<'c, 'a> Unit<'c, 'a> {
     /// The lint scope at the declaration of variable `v`.
     fn decl_scope(&self, v: usize) -> usize {
         self.decl_scopes.get(&(v as u32)).copied().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// rustc's order: the closures' reports first, the later closure before the earlier one and a
+    /// closure's own closures before it, the body last; in each, unused variables before unused
+    /// assignments, each in place order.
+    #[test]
+    fn closures_report_last_first_then_the_body() {
+        let r = |unit, lint: &'static Lint, pos| Report { lint, pos, msg: String::new(), scope: 0, unit };
+        // unit 0 the body; 1 a closure at 10 with closure 3 at 12 inside; 2 a closure at 20
+        let units = [(NONE, 0), (0, 10), (0, 20), (1, 12)];
+        let reports = vec![
+            r(0, &lint::UNUSED_ASSIGNMENTS, 2), r(0, &lint::UNUSED_VARIABLES, 30), r(0, &lint::UNUSED_VARIABLES, 5),
+            r(1, &lint::UNUSED_VARIABLES, 11), r(3, &lint::UNUSED_VARIABLES, 13), r(2, &lint::UNUSED_ASSIGNMENTS, 22), r(2, &lint::UNUSED_VARIABLES, 21),
+        ];
+        let order: Vec<(u32, u32)> = rustc_order(reports, &units).iter().map(|r| (r.unit, r.pos)).collect();
+        assert_eq!(order, [(2, 21), (2, 22), (3, 13), (1, 11), (0, 5), (0, 30), (0, 2)]);
     }
 }

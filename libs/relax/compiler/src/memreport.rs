@@ -39,7 +39,7 @@ pub fn unit_sizes(u: &crate::jit::Unit) -> Vec<(String, u64)> {
     for (fi, f) in p.files.iter().enumerate() {
         let a = &f.ast;
         let ab = vbytes(&a.exprs) + vbytes(&a.pats) + vbytes(&a.tys) + vbytes(&a.items) + vbytes(&a.blocks) + vbytes(&a.mac_args);
-        let sb = (f.exp_map.heap_bytes() as u64) + (f.tok_origin.heap_bytes() as u64) + (f.token_origins.heap_bytes() as u64) + (f.rules_exp.heap_bytes() as u64) + (f.body_origin.heap_bytes() as u64) + f.line_starts.get().map_or(0, |l| vbytes(l));
+        let sb = (f.exp_map.heap_bytes() as u64) + (f.tok_origin.heap_bytes() as u64) + (f.token_origins.heap_bytes() as u64) + (f.rules_exp.heap_bytes() as u64) + (f.body_origin.heap_bytes() as u64) + (f.pm_editions.heap_bytes() as u64) + f.line_starts.get().map_or(0, |l| vbytes(l));
         src += f.src.heap_bytes() as u64;
         toks += f.toks.heap_bytes() as u64;
         ast += ab;
@@ -114,10 +114,9 @@ pub fn unit_sizes(u: &crate::jit::Unit) -> Vec<(String, u64)> {
             spec += std::mem::size_of::<crate::jit::SpecCode>() as u64 + vbytes(&s.code) + vbytes(&s.map) + vbytes(&s.relocs);
         }
     }
-    // where the per-slot blocks live (compiler arena old / new chunks, burst, other heaps): a
-    // settle rebuild keeps the slots, so their cold-start blocks pin the cold chunks
+    // Per-slot placement: unit-lifetime data belongs in slots, apart from disposable RIR.
     {
-        let mut pl = [[0u64; 4]; 9];
+        let mut pl = [[0u64; 5]; 9];
         let mut put = |k: usize, p: *const u8, n: usize| {
             if n != 0 {
                 pl[k][crate::zone_alloc::placement(p)] += n as u64;
@@ -130,6 +129,9 @@ pub fn unit_sizes(u: &crate::jit::Unit) -> Vec<(String, u64)> {
             }
             if let Some(h) = &f.history {
                 put(2, (&**h as *const crate::jit::SlotHistory).cast(), std::mem::size_of::<crate::jit::SlotHistory>());
+                put(2, h.prev.as_ptr().cast(), h.prev.capacity() * std::mem::size_of::<(u64, u32, crate::jit::PcMap, u32)>());
+                put(2, h.retired.as_ptr().cast(), h.retired.capacity() * std::mem::size_of::<(u64, u32, crate::jit::PcMap)>());
+                put(2, h.inlined_into.as_ptr().cast(), h.inlined_into.capacity() * 4);
                 for x in h.prev.iter() {
                     if let Some(p) = x.2.own_ptr() { put(1, p, x.2.bytes()); }
                 }
@@ -141,10 +143,16 @@ pub fn unit_sizes(u: &crate::jit::Unit) -> Vec<(String, u64)> {
                 put(3, std::sync::Arc::as_ptr(r).cast(), rir_bytes(r) as usize);
             }
             if let Some(sc) = &f.spec {
+                put(4, (&**sc as *const crate::jit::SpecCode).cast(), std::mem::size_of::<crate::jit::SpecCode>());
                 put(4, sc.code.as_ptr(), sc.code.capacity());
+                put(4, sc.map.as_ptr().cast(), sc.map.capacity() * std::mem::size_of::<(u32, u64)>());
+                put(4, sc.relocs.as_ptr().cast(), sc.relocs.capacity() * std::mem::size_of::<relax_backend::rir::RelocAt>());
             }
-            if let crate::jit::FnKey::Inst(_, v) = &f.key {
-                put(5, v.as_ptr().cast(), v.capacity() * std::mem::size_of::<relax_types::types::TyId>());
+            match &f.key {
+                crate::jit::FnKey::Inst(_, v) | crate::jit::FnKey::Shim(crate::jit::ShimInstance { args: v, .. }) => {
+                    put(5, v.as_ptr().cast(), v.capacity() * std::mem::size_of::<relax_types::types::TyId>());
+                }
+                _ => {}
             }
             put(6, f.calls.as_ptr().cast(), f.calls.len() * 4);
             put(7, f.rir_refs().as_ptr().cast(), f.rir_refs().len() * 4);
@@ -154,7 +162,14 @@ pub fn unit_sizes(u: &crate::jit::Unit) -> Vec<(String, u64)> {
         }
         for (k, name) in ["names", "pc maps", "histories", "RIR kept", "spec code", "keys (type args)", "calls", "RIR refs", "build errors"].iter().enumerate() {
             let mb = |b: u64| b as f64 / 1048576.0;
-            out.push((format!("placement of slot {name}: compiler old {:.1} / compiler new {:.1} / burst {:.1} / other {:.1} MB", mb(pl[k][0]), mb(pl[k][1]), mb(pl[k][2]), mb(pl[k][3])), pl[k][0] + pl[k][1]));
+            out.push((format!("placement of slot {name}: compiler old {:.1} / compiler new {:.1} / burst {:.1} / other {:.1} / slots {:.1} MB", mb(pl[k][0]), mb(pl[k][1]), mb(pl[k][2]), mb(pl[k][3]), mb(pl[k][4])), pl[k].iter().sum()));
+        }
+    }
+    // a replaced front state is dropped with the settle rebuild's old state: one still alive is
+    // held by something that outlived the replace, and pins the cold state's chunks
+    for f in crate::jit::settle_rebuild::replaced_fronts_alive() {
+        for (k, v) in f.mem_lines() {
+            out.push((format!("replaced front state still alive: {k}"), v));
         }
     }
     out.push((format!("slots ({}; FnEntry)", n_fns), n_fns * std::mem::size_of::<crate::jit::FnEntry>() as u64));
@@ -243,11 +258,11 @@ fn file_arrays(p: &crate::program::Program) -> Vec<(String, u64)> {
         }
         arrays!("main.", f, src);
         add_toks(&mut totals, "main.toks".into(), &f.toks);
-        tables!("main.", f, exp_map, tok_origin, token_origins, rules_exp, body_origin);
+        tables!("main.", f, exp_map, tok_origin, token_origins, rules_exp, body_origin, pm_editions);
         for part in f.parts() {
             arrays!("part.", part, ext);
             add_toks(&mut totals, "part.toks".into(), &part.toks);
-            tables!("part.", part, exp_map, tok_origin, token_origins, rules_exp, body_origin);
+            tables!("part.", part, exp_map, tok_origin, token_origins, rules_exp, body_origin, pm_editions);
         }
         let mut a = Some(&f.ast);
         let mut prefix = "main.ast.";

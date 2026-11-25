@@ -352,6 +352,7 @@ impl Renderer {
     /// boundary instead of turning static architecture into a per-frame
     /// "mover" merely to get a shadow.
     pub(super) fn rebuild_csm_static_casters(&mut self) {
+        self.gpu_baker.csm_casters_changed();
         self.csm_static_casters.clear();
         // First entry per id, as the linear find it replaces (a forest is
         // thousands of copies of a few models; every model install rebuilds).
@@ -367,7 +368,7 @@ impl Renderer {
             if model.lm_source.is_some() && self.world_atlas_required() {
                 continue;
             }
-            let (min, max) = crate::lightmap::world_bounds(&inst.transform, (model.min, model.max));
+            let (mut min, mut max) = crate::lightmap::world_bounds(&inst.transform, (model.min, model.max));
             if model.lm_source.is_none() && !casts_as_caster_only(
                 self.model_casts_shadow.get(&inst.model).copied(),
                 model.prelit,
@@ -377,6 +378,10 @@ impl Renderer {
                 continue;
             }
             if self.model_casts_shadow.get(&inst.model) == Some(&false) { continue; }
+            if let Some((lo, hi)) = self.element_reach {
+                min = vec3f(min.x.min(lo.x), min.y.min(lo.y), min.z.min(lo.z));
+                max = vec3f(max.x.max(hi.x), max.y.max(hi.y), max.z.max(hi.z));
+            }
             // A model with a far stand-in casts its own layers into the near
             // cascade and the stand-in into the others
             // (gpu_lightmap::CasterBand). A masked layer (leaf cards, the
@@ -576,8 +581,7 @@ impl Renderer {
 
     /// Install only a successfully frontend-compiled material. Failure keeps
     /// the previous draw (or the stock fallback), never a blank model.
-    pub fn install_custom_material(&mut self, name: String, material: impl Into<CustomMaterial>) -> bool {
-        let material = material.into();
+    pub fn install_custom_material(&mut self, name: String, material: CustomMaterial) -> bool {
         if !material.draw.draw_vars.can_instance() { return false; }
         self.custom_draws.insert(name, Box::new(material));
         true
@@ -649,31 +653,60 @@ impl Renderer {
         self.splat_draw = Some(draw);
     }
 
+    /// Whether a resident model has a layer `holds` says yes to, in any of
+    /// its levels of detail: a lane's shaders are built for a model that
+    /// draws through them, no sooner.
+    pub(super) fn a_resident_layer(&self, holds: impl Fn(&crate::material_surface::UploadedSurface) -> bool) -> bool {
+        fn any(model: &LoadedModel, holds: &impl Fn(&crate::material_surface::UploadedSurface) -> bool) -> bool {
+            std::iter::once(&model.material).chain(model.extra_draws.iter().map(|l| &l.4))
+                .any(|m| m.surface.as_ref().is_some_and(holds))
+                || model.lods.iter().any(|(_, lod)| any(lod, holds))
+        }
+        self.static_models.iter().any(|(_, model)| any(model, &holds))
+    }
+
     /// Decide once per frame, before any model pass, whether painted
-    /// terrain takes its own lane this frame.
+    /// terrain takes its own lane this frame. Its shaders are built when a
+    /// resident model has a painted layer.
     pub(super) fn prepare_splat_lane(&mut self, cx: &mut Cx) {
+        self.splat_ready = false;
+        if !self.pbr_materials_enabled || !self.a_resident_layer(|s| s.splat.is_some()) {
+            return;
+        }
         if self.splat_draw.is_none() {
             self.splat_draw = cx.try_with_vm(|vm| Box::new(crate::shaders::DrawSceneSplat::script_new_with_default(vm)));
         }
         let hdr = self.hdr_output;
+        if let Some(d) = self.splat_draw.as_deref_mut() {
+            d.pbr.skinned.draw_vars.refresh_after_reload(cx);
+        }
         let stock = self.splat_draw.as_ref().and_then(|d| d.pbr.skinned.draw_vars.draw_shader_id);
         let shader = if stock.is_some() { self.lane_shaders(cx, super::variants::ModelLane::Splat, stock).0 } else { None };
-        self.splat_ready = self.pbr_materials_enabled && shader.is_some_and(|id| cx.draw_shader_ready(id, hdr));
+        self.splat_ready = shader.is_some_and(|id| cx.draw_shader_ready(id, hdr));
     }
 
     /// Decide once per frame, before any model pass, whether foliage takes
-    /// its own lane this frame.
+    /// its own lane this frame. Its shaders are built when a resident model
+    /// has a layer in the wind.
     pub(super) fn prepare_foliage_lane(&mut self, cx: &mut Cx) {
+        self.foliage_ready = false;
+        if !self.pbr_materials_enabled
+            || std::env::var_os("MAKEPAD_FOLIAGE_LANE").is_some_and(|v| v == "0")
+            || !self.a_resident_layer(|s| s.definition.wind > 0.0)
+        {
+            return;
+        }
         if self.foliage_draw.is_none() {
             self.foliage_draw = cx.try_with_vm(|vm| Box::new(crate::shaders::DrawSceneFoliageLit::script_new_with_default(vm)));
         }
         let hdr = self.hdr_output;
         // Ready: the foliage lane's shader for this frame's features (variants.rs).
+        if let Some(d) = self.foliage_draw.as_deref_mut() {
+            d.pbr.skinned.draw_vars.refresh_after_reload(cx);
+        }
         let stock = self.foliage_draw.as_ref().and_then(|d| d.pbr.skinned.draw_vars.draw_shader_id);
         let shader = if stock.is_some() { self.lane_shaders(cx, super::variants::ModelLane::Foliage, stock).0 } else { None };
-        self.foliage_ready = self.pbr_materials_enabled
-            && std::env::var_os("MAKEPAD_FOLIAGE_LANE").is_none_or(|v| v != "0")
-            && shader.is_some_and(|id| cx.draw_shader_ready(id, hdr));
+        self.foliage_ready = shader.is_some_and(|id| cx.draw_shader_ready(id, hdr));
     }
 
     pub(super) fn draw_custom_models(

@@ -74,6 +74,9 @@ pub const OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u32 = 90;
 pub const OP_IMAGE_FETCH: u32 = 95;
 pub const OP_IMAGE_GATHER: u32 = 96;
 pub const OP_IMAGE_DREF_GATHER: u32 = 97;
+pub const OP_IMAGE_WRITE: u32 = 99;
+pub const CAP_STORAGE_IMAGE_EXTENDED_FORMATS: u32 = 49;
+pub const DECO_NON_READABLE: u32 = 25;
 pub const OP_IMAGE_QUERY_SIZE_LOD: u32 = 103;
 pub const OP_IMAGE_QUERY_LEVELS: u32 = 106;
 pub const OP_CONVERT_F_TO_U: u32 = 109;
@@ -141,6 +144,10 @@ pub const OP_BIT_FIELD_S_EXTRACT: u32 = 202;
 pub const OP_BIT_FIELD_U_EXTRACT: u32 = 203;
 pub const OP_CONTROL_BARRIER: u32 = 224;
 pub const OP_ATOMIC_I_ADD: u32 = 234;
+pub const OP_ATOMIC_S_MIN: u32 = 236;
+pub const OP_ATOMIC_U_MIN: u32 = 237;
+pub const OP_ATOMIC_S_MAX: u32 = 238;
+pub const OP_ATOMIC_U_MAX: u32 = 239;
 pub const OP_GROUP_NON_UNIFORM_BROADCAST_FIRST: u32 = 338;
 pub const OP_GROUP_NON_UNIFORM_SHUFFLE: u32 = 345;
 pub const OP_GROUP_NON_UNIFORM_SHUFFLE_XOR: u32 = 346;
@@ -164,6 +171,7 @@ pub const OP_FWIDTH_FINE: u32 = 212;
 pub const OP_DPDX_COARSE: u32 = 213;
 pub const OP_DPDY_COARSE: u32 = 214;
 pub const OP_FWIDTH_COARSE: u32 = 215;
+pub const OP_PHI: u32 = 245;
 pub const OP_LOOP_MERGE: u32 = 246;
 pub const OP_SELECTION_MERGE: u32 = 247;
 pub const OP_LABEL: u32 = 248;
@@ -500,6 +508,9 @@ impl SpvBuilder {
             OP_TYPE_IMAGE,
             &[sampled, dim, depth as u32, arrayed as u32, 0, 1, IMAGE_FORMAT_UNKNOWN],
         )
+    }
+    pub fn type_storage_image(&mut self, scalar: u32, format: u32) -> u32 {
+        self.intern_type(OP_TYPE_IMAGE, &[scalar, DIM_2D, 0, 0, 0, 2, format])
     }
     /// A sized array, decorated with its stride on first use.
     pub fn type_array(&mut self, element: u32, len: u32, stride: u32) -> u32 {

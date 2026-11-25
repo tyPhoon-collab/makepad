@@ -1030,6 +1030,10 @@ impl BoundVarContext<'_> {
         let angle_args = |s: &ast::PathSeg| matches!(ast.gargs(s.args()), Some(GenericArgs::Angle(a)) if !ast.list(*a).is_empty());
         let resolved_len = if ast.qself(path).is_some() || ast.segs(path.segs).iter().any(angle_args) { self.resolved_prefix_len(path) } else { 0 };
         let resolved = ast::Path { segs: path.segs.prefix(resolved_len), ..*path };
+        // rustc visit_qpath, QPath::TypeRelative: the defaults such a path induces would need
+        // type-dependent resolution, so inside it the default is indeterminate (E0228 in an item)
+        let type_relative = resolved_len < path.segs.len();
+        if type_relative { self.scopes.push(Scope::ObjectLifetimeDefault(None)); }
         // an inferred path's segments that elide lifetimes (asked only for a written constraint)
         let mut elided: Option<Vec<(usize, u32)>> = None;
         if let Some(qself) = ast.qself(path) {
@@ -1107,6 +1111,7 @@ impl BoundVarContext<'_> {
             self.visit_ty(qself.ty);
             self.scopes.pop();
         }
+        if type_relative { self.scopes.pop(); }
     }
 
     /// resolve_bound_vars.rs:2000-2094: only the resolved declaration's
@@ -1327,6 +1332,35 @@ mod tests {
         }
         assert!(std::sync::Arc::ptr_eq(&before[2], &tcx.typeck(&prog, owners[2])));
         eprintln!("round49 file inputs: 2 edited-file owners recomputed; 1 other-file owner reused; revert correct");
+    }
+
+    #[test]
+    fn a_body_edit_renews_the_lifetime_names_of_an_owner_without_a_body() {
+        // A struct's lifetime names are keyed by its file's nodes too (the anonymous `&` by its
+        // type node): an edit of a body before it renumbers them, so they follow the file's
+        // version as a fn's do. A Fab edit was refused with "lifetime resolved before
+        // bound-variable collection" for a struct like S: its names stayed the version before
+        // the edit's, its bound variables were resolved on the edited one.
+        let text = "#![no_std] fn f() { let _x = 1u8; } struct S<'s> { h: &'s (dyn Fn(&u8) + Sync) }";
+        let (mut prog, mut tcx) = source(text, 2021);
+        let (f, s) = (named(&prog, "f"), named(&prog, "S"));
+        let old = prog.def(s).file;
+        let before = tcx.resolve_lifetime_names(&prog, s);
+        let reference = |names: &LifetimeResolution| names.uses.keys().copied().find(|k| matches!(k, LifetimeKey::Reference(_))).expect("the anonymous reference");
+        let edited = text.replace("let _x = 1u8;", "let _x: u8 = 1;");
+        let version = prog.parse_version(old, "struct_names.rs", edited.into_bytes()).unwrap();
+        let pairs: Vec<_> = (0..version.pf.ast.items.len() as u32).map(|i| (i, i)).collect();
+        let new = prog.commit_body_version(version, &pairs).unwrap();
+        prog.lower_body_declarations(&[f], &[new]);
+        tcx.publish_file_bodies(&[old, new]);
+        assert_eq!(prog.def(s).file, new);
+        let fresh = crate::tcx::lifetime_resolve::resolve_lifetimes(&tcx, &prog, s, None);
+        assert_ne!(reference(&before), reference(&fresh), "the edit renumbers the struct's type nodes");
+        let after = tcx.resolve_bound_vars(&prog, s);
+        assert_eq!(reference(&after.names), reference(&fresh));
+        prog.revert_version(old, new, &pairs);
+        tcx.publish_file_bodies(&[old, new]);
+        assert_eq!(reference(&tcx.resolve_bound_vars(&prog, s).names), reference(&before));
     }
 
     #[test]
@@ -1557,16 +1591,15 @@ mod tests {
         assert_eq!(tcx.dcx.err_count(), 0);
     }
     #[test]
-    fn round33_lifetime_type_relative_paths_take_the_enclosing_object_default() {
-        // resolve_bound_vars.rs:1686-1809 (visit_segment_args runs for resolved paths only):
-        // `X::A<dyn Tr>` (type-relative) pushes no object default scope, so a signature's
-        // `'static` applies (no E0228); `<X as G>::A<dyn Tr>` is resolved and takes A's
+    fn round33_lifetime_type_relative_paths_have_no_object_default() {
+        // resolve_bound_vars.rs visit_qpath: `X::A<dyn Tr>` (type-relative) has an indeterminate
+        // object default (E0228 in a signature); `<X as G>::A<dyn Tr>` is resolved and takes A's
         // declared default.
         let (prog, tcx) = source("#![no_std] trait Tr {} trait G { type A<T: ?Sized>; } fn relative<X: G>(_: X::A<dyn Tr>) {} fn qualified<X: G>(_: <X as G>::A<dyn Tr>) {}", 2021);
-        for name in ["relative", "qualified"] {
-            tcx.fn_sig(&prog, named(&prog, name));
-            assert!(sig_errors(&tcx, &prog, name).is_empty(), "{name}: {:?}", sig_errors(&tcx, &prog, name));
-        }
+        tcx.fn_sig(&prog, named(&prog, "relative"));
+        assert!(sig_errors(&tcx, &prog, "relative").iter().any(|e| e.contains("E0228")), "{:?}", sig_errors(&tcx, &prog, "relative"));
+        tcx.fn_sig(&prog, named(&prog, "qualified"));
+        assert!(sig_errors(&tcx, &prog, "qualified").is_empty(), "{:?}", sig_errors(&tcx, &prog, "qualified"));
         assert_eq!(object_default(&tcx, &prog, named(&prog, "qualified")), [RegionKind::ReStatic]);
     }
     #[test]
@@ -1744,3 +1777,9 @@ crate::collected_enum!(LifetimeKey; 0 => Named(a,b), 1 => Reference(n), 2 => Sel
 crate::collected_enum!(ResolvedArg; 0 => StaticLifetime, 1 => EarlyBound(id), 2 => LateBound(d,v,id), 3 => Free(d,id), 4 => Error);
 crate::collected_fields!(ResolveBoundVars, names, named_variable_map, late_bound_vars_map, opaque_captured_lifetimes, early_indices, generic_indices);
 crate::collected_enum!(BoundVariableKind; 0 => Ty, 1 => Region(r), 2 => Const);
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&TRIVIAL, relax_session::sync::Mutex::new(None));
+}

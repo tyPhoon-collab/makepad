@@ -94,6 +94,7 @@ pub fn reserve_unit(code: usize, rest: usize) -> u64 {
     }
     MISC_NEXT.store(BASE + MISC_AT, Ordering::Release);
     ON.store(true, Ordering::Release);
+    crate::jit::window_tls_block();
     at
 }
 
@@ -142,6 +143,11 @@ fn map_rw(at: u64, len: usize) -> u64 {
     at
 }
 
+/// Whether native address `a` is in the window's misc region (where `alloc` places blocks).
+pub fn in_misc(a: u64) -> bool {
+    a >= BASE + MISC_AT && a < BASE + MISC_END
+}
+
 /// Zeroed read-write memory in the window's misc region (native address; page granular).
 pub fn alloc(size: usize) -> u64 {
     let len = (size as u64 + 0xfff) & !0xfff;
@@ -162,11 +168,12 @@ pub fn alloc(size: usize) -> u64 {
     a
 }
 
+static NEXT: relax_session::sync::Mutex<(u64, u64)> = relax_session::sync::Mutex::new((0, 0));
+
 /// Zeroed 8-byte words in the window's misc region for the life of the process (native address):
 /// a counted body's block counters (profile::instrument), which the program's code increments
 /// through its window addressing. Carved from 64 KB `alloc` chunks (counted code is never freed).
 pub fn alloc_counters(words: usize) -> u64 {
-    static NEXT: relax_session::sync::Mutex<(u64, u64)> = relax_session::sync::Mutex::new((0, 0));
     let len = (words.max(1) * 8) as u64;
     let mut g = NEXT.lock().unwrap_or_else(|e| e.into_inner());
     if g.0 + len > g.1 {
@@ -185,9 +192,18 @@ pub fn free(a: u64, size: usize) {
     FREE.lock().unwrap_or_else(|e| e.into_inner()).push((a, len));
 }
 
-/// Names the thread-local words of the shadow stack (Unit::new).
-pub fn set_ss_off(off: u32) {
-    SS_OFF.store(off as u64, Ordering::Release);
+/// The thread-local words of the shadow stack (Unit::new): the run's first unit places them
+/// (`alloc`), the others use them there.
+pub fn ss_off_or(alloc: impl FnOnce() -> u32) -> u32 {
+    let at = SS_OFF.load(Ordering::Acquire);
+    if at != 0 {
+        return at as u32;
+    }
+    let off = alloc() as u64;
+    match SS_OFF.compare_exchange(0, off, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => off as u32,
+        Err(placed) => placed as u32,
+    }
 }
 
 fn ss_words() -> *mut u64 {
@@ -364,4 +380,16 @@ pub fn symbol(name: &[u8]) -> Option<usize> {
 /// A runtime key whose destructor is program code (a code offset).
 extern "C" fn w32_key_create(dtor: u64, late: u32) -> u32 {
     crate::domain_threads::key_create(native(dtor) as usize, late)
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&ON, AtomicBool::new(false));
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    reset(&SLOTS_NEXT, AtomicU64::new(SLOTS_AT));
+    reset(&MISC_NEXT, AtomicU64::new(0));
+    reset(&FREE, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&SS_OFF, AtomicU64::new(0));
+    reset(&NEXT, relax_session::sync::Mutex::new((0, 0)));
 }

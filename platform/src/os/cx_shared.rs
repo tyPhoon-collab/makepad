@@ -68,7 +68,14 @@ impl Cx {
         let held = self.xr_offscreen() && !self.window_redrawn && self.screenshot_requests.is_empty() && self.run_view_frame_requests.is_empty();
         for draw_pass_id in self.passes.id_iter() {
             let pass = &self.passes[draw_pass_id];
-            if pass.paint_dirty && !(held && !pass.repaint_requested && self.pass_root_window(draw_pass_id).is_some()) {
+            if !pass.paint_dirty { continue; }
+            let window = self.pass_root_window(draw_pass_id);
+            if window.is_some_and(|window| {
+                self.windows[window].paint_paused && !self.windows[window].paint_once
+            }) {
+                continue;
+            }
+            if !(held && !pass.repaint_requested && window.is_some()) {
                 return true;
             }
         }
@@ -118,6 +125,9 @@ impl Cx {
     /// Explicit `repaint_pass` users are untouched: this gates only the time
     /// repaint, and dirty propagation to parents is unchanged.
     fn pass_live_for_time_repaint(&self, pass_id: DrawPassId) -> bool {
+        if self.pass_root_window(pass_id).is_some_and(|window| self.windows[window].paint_paused) {
+            return false;
+        }
         let pass = &self.passes[pass_id];
         let Some(list_id) = pass.main_draw_list_id else {
             return false;
@@ -310,6 +320,17 @@ impl Cx {
         } else {
             self.window_redrawn = false;
         }
+        // A paused window keeps its drawable and all of its producers. Offscreen work is
+        // independent. Keep dirty bits so resuming cannot lose updates made while paused.
+        passes_todo.retain(|id| self.pass_root_window(*id).is_none_or(|window| {
+            self.windows.is_valid(window)
+                && (!self.windows[window].paint_paused || self.windows[window].paint_once)
+        }));
+        for id in passes_todo.iter() {
+            if let CxDrawPassParent::Window(window) = self.passes[*id].parent {
+                self.windows[window].paint_once = false;
+            }
+        }
         if passes_todo.iter().any(|id| self.pass_root_window(*id).is_some()) {
             self.window_paints += 1;
         }
@@ -485,6 +506,7 @@ impl Cx {
                     self.windows.is_valid(*parent_id)
                         && self.windows[*parent_id].is_created
                         && !self.windows[*parent_id].is_popup
+                        && !self.windows[*parent_id].paint_paused
                 })
                 .and_then(|parent_id| self.windows[parent_id].main_pass_id)
             else {
@@ -702,7 +724,7 @@ impl Cx {
         }
         self.run_view_frame_encode_in_flight = true;
         let sender = self.run_view_frame_results.sender();
-        if let Ok(task) = self.task_pool().submit_internal(crate::thread::Lane::Heavy, move || {
+        if let Ok(task) = self.task_pool().submit_internal(crate::thread::Class::Background, move || {
             let result = Cx::prepare_studio_run_view_rgba(&request, width, height, rgba).and_then(
                 |(width, height, rgba)| {
                     Cx::encode_rgba_as_png(width, height, &rgba).map(|png| RunViewFrameData {
@@ -1270,10 +1292,18 @@ impl Cx {
     /// Wake and redraw after an installed compiler patch, including while idle.
     #[cfg(relax)]
     fn poll_live_patch(&mut self) {
+        self.take_in_live_patches(false);
+    }
+
+    /// Takes in the installed compiler patches this context has not (re-runs the designs they
+    /// changed, redraws). On a patch's wake; `now`: also before its wake is served, for a grab,
+    /// whose frame shows every patch installed before it was asked for.
+    #[cfg(relax)]
+    pub(crate) fn take_in_live_patches(&mut self, now: bool) {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         static INSTALLED: AtomicBool = AtomicBool::new(false);
         static CHANGED: AtomicBool = AtomicBool::new(false);
-        // the patch count the designs were last re-run for (std::relax::patched_files)
+        // the patch count the designs were last re-run for (std::relax::patched)
         static SEEN: AtomicU64 = AtomicU64::new(0);
         extern "C" fn wake() {
             CHANGED.store(true, Ordering::Release);
@@ -1283,21 +1313,33 @@ impl Cx {
             std::relax::on_patch(wake);
             // patches before this run's first look built nothing of this run: skip them
             let mut seen = 0;
-            std::relax::patched_files(&mut seen);
+            std::relax::patched(&mut seen);
             SEEN.store(seen, Ordering::Relaxed);
+            self.live_patches = seen;
         }
-        if CHANGED.swap(false, Ordering::AcqRel) {
-            // a design (script_mod!) is evaluated from its fn once: a patched file's designs
-            // run again, from the patched code
-            let mut seen = SEEN.load(Ordering::Relaxed);
-            for file in std::relax::patched_files(&mut seen) {
-                self.live_code_patched(&file);
+        let woke = CHANGED.swap(false, Ordering::AcqRel);
+        if !woke && !now {
+            return;
+        }
+        // a design (script_mod!) is evaluated once, from its `script_mod` fn: when a patch
+        // changed that code, the patched files' designs run again from it. Any other edit
+        // only redraws (a handle_event edit in an app's main.rs re-ran the whole app's design:
+        // 330 ms from patch to frame, 1.3 s the first time)
+        let mut seen = SEEN.load(Ordering::Relaxed);
+        let patched = std::relax::patched(&mut seen);
+        if !woke && seen == SEEN.load(Ordering::Relaxed) {
+            return;
+        }
+        if patched.items.as_ref().is_none_or(|items| items.iter().any(|i| i == "script_mod")) {
+            for file in &patched.files {
+                self.live_code_patched(file);
             }
-            SEEN.store(seen, Ordering::Relaxed);
-            self.redraw_all();
-            // the wake may be a restart request (std::relax::restart_requested)
-            crate::restart::poll_requested();
         }
+        SEEN.store(seen, Ordering::Relaxed);
+        self.live_patches = seen;
+        self.redraw_all();
+        // the wake may be a restart request (std::relax::restart_requested)
+        crate::restart::poll_requested();
     }
 
     /// Drain the global control channel and dispatch each message as an event.
@@ -1340,8 +1382,10 @@ impl Cx {
         //
         // 1. `LiveEditTrigger::FileChange` — file watcher delivered a
         //    hot-reloaded `script_mod!` block (or studio websocket sent
-        //    a `LiveChange`). The DSL itself changed; shader caches may
-        //    be stale, so `reset_for_live_reload` runs. Any preference
+        //    a `LiveChange`). The DSL itself changed: its draw objects
+        //    are new, so `reset_for_design_rerun` drops the object-keyed
+        //    shader cache (the content-keyed function cache stays, and
+        //    only the edited module's shaders generate again). Any preference
         //    re-broadcast in the LiveEdit handler propagates immediately
         //    via the same-tick `ScriptReapply` follow-up — file changes
         //    are a live-coding scenario where the user wants to see the
@@ -1370,11 +1414,13 @@ impl Cx {
         use crate::live_reload::LiveEditTrigger;
         match self.handle_live_edit() {
             LiveEditTrigger::FileChange => {
-                self.draw_shaders.reset_for_live_reload();
+                let t0 = Cx::time_now();
+                self.draw_shaders.reset_for_design_rerun();
                 self.pending_script_reapply = false;
                 self.live_edit_apply = crate::makepad_script::Apply::Reload;
                 self.call_event_handler(&Event::LiveEdit);
                 self.redraw_all();
+                crate::trace!("design", "live edit event {:.1} ms; {} shader(s), {} to compile", (Cx::time_now() - t0) * 1e3, self.draw_shaders.shaders.len(), self.draw_shaders.compile_set.len());
                 if self.pending_script_reapply {
                     self.pending_script_reapply = false;
                     self.call_event_handler(&Event::ScriptReapply);
@@ -1639,6 +1685,11 @@ impl Cx {
     }
 
     pub(crate) fn call_event_handler(&mut self, event: &Event) {
+        // One dispatch for every backend, including remote input. Hover and plain
+        // pointer motion leave startup warm-up alone; an actual gesture ends it.
+        if crate::thread::ends_warmup(event) {
+            makepad_cpu_budget::end_warmup();
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if matches!(event, Event::Shutdown) {
             self.splash_trace_exit();
@@ -1809,6 +1860,15 @@ impl Cx {
         self.handle_pending_clear_hover();
         if matches!(event, Event::Shutdown) {
             crate::thread::service_scheduler(self, event);
+            #[cfg(any(
+                target_os = "android",
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "windows"
+            ))]
+            self.finish_native_storage_writes();
             self.close_task_pool();
             self.thread_spawner.close_runtime();
         }
@@ -1824,6 +1884,7 @@ impl Cx {
     #[allow(dead_code)]
     pub(crate) fn recover_after_caught_panic(&mut self) {
         self.in_draw_event = false;
+        self.in_draw_redraws.clear();
         // contained at the turn: no dispatch is running any more. An unwind that skipped the
         // dispatch guard (a fault turned into a panic in code without a landing pad for it) left
         // the flag set, and every later event -- NextFrame, Draw, QuitRequested, Shutdown -- was
@@ -1870,6 +1931,7 @@ impl Cx {
         // one drawing, however many draw contexts the handler makes
         self.drawing_id += 1;
         self.drawing_start = self.redraw_id;
+        self.in_draw_redraws.clear();
         self.in_draw_event = true;
         crate::frame_trace::note_drawn();
         // The flag comes down whether the draw returned or unwound: a
@@ -1884,6 +1946,7 @@ impl Cx {
         if let Err(payload) = drawn {
             std::panic::resume_unwind(payload);
         }
+        self.carry_in_draw_redraws();
         self.validate_scoped_sweep_locks_after_draw();
         self.keep_unrepeated_recordings();
         if let Some(mut hook) = self.post_draw_hook.take() {
@@ -2188,6 +2251,114 @@ mod tests {
         assert_eq!(cx.drawing_id(), first + 2);
         cx.begin_draw_context();
         assert_eq!(cx.drawing_id(), first + 3);
+    }
+
+    type Draw = Rc<std::cell::RefCell<Box<dyn FnMut(&mut Cx, &DrawEvent)>>>;
+
+    /// A Cx whose draw event runs `draw` (set per frame) in one draw context.
+    fn drawing_cx() -> (Cx, Draw) {
+        let draw: Draw = Rc::new(std::cell::RefCell::new(Box::new(|_, _| {})));
+        let d = draw.clone();
+        let cx = Cx::new(Box::new(move |cx, event| {
+            if let Event::Draw(de) = event {
+                cx.begin_draw_context();
+                (d.borrow_mut())(cx, de);
+            }
+        }));
+        (cx, draw)
+    }
+
+    /// `list` records as a draw context records it (`DrawList2d::begin_maybe` redrawing).
+    fn record_list(cx: &mut Cx, list: DrawListId) {
+        let (recording_gen, uniforms_gen) = (cx.next_uniform_gen(), cx.next_uniform_gen());
+        let redraw = cx.redraw_id;
+        cx.draw_lists[list].clear_draw_items(redraw, recording_gen, uniforms_gen);
+    }
+
+    #[test]
+    fn a_redraw_in_the_draw_records_a_list_not_recorded_yet_in_it_and_a_recorded_one_next_frame() {
+        let (mut cx, draw) = drawing_cx();
+        let lists = [DrawList::new(&mut cx), DrawList::new(&mut cx), DrawList::new(&mut cx)];
+        let [first, panel, row] = [lists[0].id(), lists[1].id(), lists[2].id()];
+        cx.draw_lists[row].codeflow_parent_id = Some(panel);
+        let seen = Rc::new(Cell::new(None));
+        let s = seen.clone();
+        *draw.borrow_mut() = Box::new(move |cx, de| {
+            record_list(cx, first);
+            // a pull-model panel sees its row change before the walk reaches them, and the
+            // list already recorded changes too
+            cx.redraw_list(row);
+            cx.redraw_list(first);
+            s.set(Some((de.draw_list_will_redraw(cx, row), de.draw_list_will_redraw(cx, panel), de.draw_list_will_redraw(cx, first))));
+            record_list(cx, panel);
+            record_list(cx, row);
+        });
+        let start = cx.frame_requests();
+        cx.call_draw_event(0.0);
+        assert_eq!(seen.get(), Some((true, true, false)), "the row and the panel around it record in this frame, the first list not again");
+        assert_eq!(cx.new_draw_event.draw_lists, vec![first], "the first list records in the next frame");
+        assert_eq!(cx.frame_requests(), start + 1, "and asks for it");
+        // a frame that asks for nothing asks for no frame after it
+        *draw.borrow_mut() = Box::new(move |cx, _| {
+            for list in [first, panel, row] {
+                record_list(cx, list);
+            }
+        });
+        cx.call_draw_event(0.0);
+        assert!(cx.new_draw_event.draw_lists.is_empty());
+        assert_eq!(cx.frame_requests(), start + 1);
+    }
+
+    #[test]
+    fn a_redraw_in_the_draw_of_a_list_it_never_reaches_records_in_the_next_frame() {
+        let (mut cx, draw) = drawing_cx();
+        let lists = [DrawList::new(&mut cx), DrawList::new(&mut cx)];
+        let [shown, kept] = [lists[0].id(), lists[1].id()];
+        // `kept` sits inside a list this frame reuses: the walk never comes to it
+        *draw.borrow_mut() = Box::new(move |cx, _| {
+            record_list(cx, shown);
+            cx.redraw_list(kept);
+        });
+        let start = cx.frame_requests();
+        cx.call_draw_event(0.0);
+        assert_eq!(cx.new_draw_event.draw_lists, vec![kept]);
+        assert_eq!(cx.frame_requests(), start + 1);
+        *draw.borrow_mut() = Box::new(move |cx, de| {
+            assert!(de.draw_list_will_redraw(cx, kept));
+            record_list(cx, kept);
+        });
+        cx.call_draw_event(0.0);
+        assert!(cx.new_draw_event.draw_lists.is_empty());
+        assert_eq!(cx.frame_requests(), start + 1);
+    }
+
+    #[test]
+    fn a_draw_that_redraws_its_own_list_does_not_spin() {
+        let (mut cx, draw) = drawing_cx();
+        let list = DrawList::new(&mut cx);
+        let id = list.id();
+        let start = cx.frame_requests();
+        // before its turn, every frame (a widget that redraws on what it reads as it draws):
+        // spent by the frame itself, no frame after it
+        *draw.borrow_mut() = Box::new(move |cx, de| {
+            cx.redraw_list(id);
+            assert!(de.draw_list_will_redraw(cx, id));
+            record_list(cx, id);
+        });
+        for _ in 0..3 {
+            cx.call_draw_event(0.0);
+            assert!(cx.new_draw_event.draw_lists.is_empty());
+            assert_eq!(cx.frame_requests(), start);
+        }
+        // while it records: not recorded twice in the frame, once more in the next
+        *draw.borrow_mut() = Box::new(move |cx, de| {
+            record_list(cx, id);
+            cx.redraw_list(id);
+            assert!(!de.draw_list_will_redraw(cx, id));
+        });
+        cx.call_draw_event(0.0);
+        assert_eq!(cx.new_draw_event.draw_lists, vec![id]);
+        assert_eq!(cx.frame_requests(), start + 1);
     }
 
     /// The scripted drawing of the redraw tests: a main window's draw context

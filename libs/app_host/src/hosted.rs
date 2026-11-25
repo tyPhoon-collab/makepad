@@ -362,23 +362,28 @@ impl HostedApp {
     /// Whether the beat has anything to drive: a Tick the child asked for
     /// or input waits for, one still unanswered, the startup handshake, or
     /// the swapchain transport.
+    ///
+    /// The handshake and the first frame are owed only to a window the owner
+    /// gave a size: one it never laid out (a service's run view with its
+    /// dropdown closed) has no geometry to send and nothing to present, and
+    /// ticking it for that first frame woke owner and child every frame for
+    /// good. Its first layout wakes the beat (`ensure_swapchain_for_rect`).
     fn beat_needed(&self) -> bool {
         if self.at_rest() {
             return false;
         }
+        let sized = self.last_rect.size.x > 0.0 && self.last_rect.size.y > 0.0;
         if !self.paces_ticks {
             // The pacing window ticks the child; this one only owes it its
             // bootstrap and the pointer it holds.
             return self.pending_move.is_some()
-                || (self.app_ready_for_swapchain && !self.presenting())
-                || self.bootstrap_pending
+                || (sized && ((self.app_ready_for_swapchain && !self.presenting()) || self.bootstrap_pending))
                 || self.transport_busy();
         }
         self.tick_wanted
             || self.tick_outstanding.is_some()
             || self.pending_move.is_some()
-            || !self.presenting()
-            || self.bootstrap_pending
+            || (sized && (!self.presenting() || self.bootstrap_pending))
             || self.transport_busy()
     }
 
@@ -1106,8 +1111,8 @@ impl HostedApp {
             self.last_dpi_factor = dpi_factor;
             return;
         }
-        let min_width = ((rect.size.x * dpi_factor).ceil() as u32).max(1);
-        let min_height = ((rect.size.y * dpi_factor).ceil() as u32).max(1);
+        // the window's pixels, as the app's frames size them
+        let [min_width, min_height] = makepad_platform::makepad_hal::window_pixels([rect.size.x, rect.size.y], dpi_factor);
         #[cfg(target_os = "linux")]
         let live = self.live_resize;
         let needs_new_swapchain = self
@@ -1679,6 +1684,40 @@ mod pacing_tests {
         assert_eq!(made, 1);
     }
 
+    /// A tile's frames are exactly the shared images the WM makes for them, at every size and
+    /// scale. The WM sizes the images from its f64 rect and dpi; an app and the boot window size
+    /// their window pass from the same size and dpi as f32 (`HalEvent::Geom`, a session's
+    /// geometry); the HAL makes a frame's image the pass viewport's extent rounded up and shows it
+    /// only when the images hold it. All of them convert with `makepad_hal::window_pixels`: the
+    /// boot window's own f32 points × dpi made 1352 × 789 frames for the 1352 × 788 images of a
+    /// tile at 2.43, the HAL drew them offscreen, and the app behind it never started.
+    #[test]
+    fn a_tiles_frames_are_its_shared_images() {
+        let window_pixels = makepad_platform::makepad_hal::window_pixels;
+        let mut checked = 0;
+        for dpi in [1.0f64, 1.25, 1.3, 1.5, 1.75, 2.0, 2.25, 2.43, 2.5, 2.625, 3.0] {
+            for n in 1..4000u32 {
+                // a tile laid out in whole pixels, and tiles laid out in points between them
+                for frac in [0.0, 0.4, 0.5, 0.6] {
+                    let points = (n as f64 + frac) / dpi;
+                    let need = window_pixels([points, points], dpi);
+                    let images = swapchain_alloc(false, need);
+                    let grown = swapchain_alloc(true, need);
+                    let frame = window_pixels([points as f32 as f64; 2], dpi as f32 as f64);
+                    let viewport = [0.0, 0.0, frame[0] as f32, frame[1] as f32];
+                    let image = [(viewport[0] + viewport[2]).ceil() as u32, (viewport[1] + viewport[3]).ceil() as u32];
+                    assert_eq!(image, images, "{points} points at {dpi}: a {image:?} frame for {images:?} images");
+                    assert!(swapchain_size_holds(true, image, grown), "{points} points at {dpi}: a {image:?} frame for {grown:?} images");
+                    if frac == 0.0 {
+                        assert_eq!(need, [n, n], "{n} px at {dpi}: the window is {need:?} px");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 11 * 3999 * 4);
+    }
+
     #[test]
     fn no_request_no_tick() {
         at_ms(200.0);
@@ -1691,6 +1730,24 @@ mod pacing_tests {
         assert!(!app.beat_needed(), "nothing asked, nothing owed: no timer, no tick");
         app.tick_wanted = true;
         assert!(app.beat_needed());
+    }
+
+    /// A window the owner never laid out (a service's run view while its dropdown is closed)
+    /// is not ticked towards a first frame it cannot present: only what the child asks for
+    /// drives it. Once it has a size the handshake and the first frame are owed again.
+    #[test]
+    fn an_unsized_window_is_not_ticked_for_its_first_frame() {
+        at_ms(300.0);
+        let mut app = app();
+        app.bootstrap_pending = true;
+        app.tick_wanted = false;
+        assert!(!app.presenting());
+        assert!(!app.beat_needed(), "no size: no handshake, no first frame to wait for");
+        app.tick_wanted = true;
+        assert!(app.beat_needed(), "the child's own request is served");
+        app.tick_wanted = false;
+        app.last_rect = Rect { pos: dvec2(0.0, 0.0), size: dvec2(320.0, 200.0) };
+        assert!(app.beat_needed(), "laid out: the first frame is owed");
     }
 }
 

@@ -20,6 +20,7 @@
 //!
 //! HTTP API summary (JSON via makepad-micro-serde):
 //! - `GET  /health`          -> service name, version, GPU name, VRAM, loaded models
+//! - `GET  /fleet`           -> cached peer answers/models and hub network state
 //! - `GET  /models`          -> registry list + per-model state
 //!                              (absent / downloading{progress} / ready / loaded / error)
 //! - `POST /generate`        -> `{model, prompt, width, height, seed, steps, ...}` -> `{job_id}`
@@ -52,17 +53,23 @@ mod disk_volume;
 pub mod error;
 pub mod fabric;
 pub mod fleet;
+pub mod fleet_report;
 // Which hub routes each fleet role reaches (the front itself is
 // makepad_network::fleet).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fleet_routes;
 pub mod job;
-// Splash compute kernels on fleet CPUs: the wire and the client are
-// featureless; the node side is the `kernel` feature.
+pub mod board;
+// Long-running Splash compute programs (`makepad_compute_program`) on fleet nodes: the wire is
+// featureless, the client (the node's stream and the remote session) is the `program` feature,
+// the node side the `kernel` feature.
 pub mod kernel_wire;
+#[cfg(feature = "program")]
 pub mod kernel_client;
+#[cfg(feature = "program")]
+pub mod program_client;
 #[cfg(feature = "kernel")]
-pub mod kernel_compute;
+pub mod program_serve;
 pub mod gpu;
 pub mod gpu_yield;
 pub mod home;
@@ -104,6 +111,7 @@ pub mod motion_native_backend;
 pub mod motion_retarget;
 #[cfg(feature = "paint")]
 pub mod paint_backend;
+pub mod page_gate;
 pub mod peer;
 pub mod pipe;
 pub mod peer_fetch;

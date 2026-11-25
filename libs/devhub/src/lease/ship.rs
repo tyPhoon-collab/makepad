@@ -9,7 +9,11 @@
 //! older than the node's build artifacts made its cargo keep them, and build loaders from old
 //! sources). The node remembers the source's size and mtime of what it wrote, and the stat of the
 //! file it wrote, so `ship-have` still knows a file it holds as the source has it; and symlinks to `ship-link` (Unix nodes); then `ship-done` names
-//! what was shipped and deleted (the node undoes it at the lease's end). Up to [`WINDOW`] requests
+//! the complete shipped set, deletions and pinned base blobs. Tree leases undo these paths at
+//! release. Overlay leases keep exactly that set under the lane's edits folder: stale files go,
+//! each lease stages its transfer before publishing (equal-pin leases can ship concurrently);
+//! deletions become `.makepad-run-deleted`, and `.makepad-run-edits` records base blobs (`new`
+//! for additions). Live saves use the same complete set. Up to [`WINDOW`] requests
 //! are in flight on one routed channel per service.
 
 use makepad_remote::conn::Event;
@@ -20,12 +24,28 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 /// Paths that never leave their machine in a ship, whoever asks: agent configuration (`.claude`),
-/// build output (`target`, `__pycache__`), at any depth, and `local/` at the root of either repo.
+/// build output (`target`, `__pycache__`), at any depth, an atomic write's temp file, and `local/`
+/// at the root of either repo.
 /// Files git ignores are not in a dirty set to begin with, but the commercial repo does not share
 /// the root's `.gitignore`, so this holds for it too.
 pub fn never_ships(path: &str) -> bool {
     let rel = path.strip_prefix("apps/commercial/").unwrap_or(path);
-    rel == "local" || rel.starts_with("local/") || path.split('/').any(|c| matches!(c, ".claude" | "target" | "__pycache__"))
+    rel == "local" || rel.starts_with("local/") || never_ships_named(path)
+}
+
+/// What never ships even when a run names it (`DEVHUB_ALSO`): `local/` does then (a lane's
+/// bench scripts), build output, agent state and atomic writes' temp files never.
+pub fn never_ships_named(path: &str) -> bool {
+    path.split('/').any(|c| matches!(c, ".claude" | "target" | "__pycache__")) || path.rsplit('/').next().is_some_and(atomic_temp)
+}
+
+/// The temp file of an atomic write, `<name>.tmp.<pid>.<hex>`, renamed onto `<name>` once written:
+/// the final file ships, never it. A live session shipped `support.rs.tmp.81511.<hex>` after its
+/// rename, and the edit failed on its box (W3766, 11-06).
+fn atomic_temp(name: &str) -> bool {
+    let Some((base, tail)) = name.rsplit_once(".tmp.") else { return false };
+    let Some((pid, hex)) = tail.split_once('.') else { return false };
+    !base.is_empty() && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// The repo's main checkout rather than a linked worktree (a lane's): the work uncommitted there is
@@ -50,6 +70,33 @@ pub struct Entry {
     pub exec: bool,
     /// a symlink's target (shipped as a link, not its content)
     pub link: Option<String>,
+}
+
+/// Which source a run took on top of its commits: the pin, each shipped path's content hash (a
+/// link's: its target) and the deleted paths. The same files at one pin say the same, whichever
+/// lease ships them and however the list is ordered.
+pub fn source_id(pin: &str, files: &[(String, String)], deleted: &[String]) -> String {
+    let mut files: Vec<&(String, String)> = files.iter().collect();
+    files.sort();
+    let mut deleted: Vec<&String> = deleted.iter().collect();
+    deleted.sort();
+    let mut text = format!("{pin}\n");
+    for (path, hash) in files { text.push_str(&format!("f\t{path}\t{hash}\n")); }
+    for path in deleted { text.push_str(&format!("d\t{path}\n")); }
+    makepad_network::digest::sha256_hash(text.as_bytes())[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// [`source_id`] of the files as they are under `dir` (one it cannot read says so in the id).
+pub fn source_in(dir: &Path, pin: &str, shipped: &[String], deleted: &[String]) -> String {
+    let hash = |p: &String| {
+        let file = dir.join(p);
+        let bytes = match std::fs::read_link(&file) {
+            Ok(target) => Ok(target.to_string_lossy().into_owned().into_bytes()),
+            Err(_) => std::fs::read(&file),
+        };
+        bytes.map_or_else(|_| "unread".to_string(), |b| makepad_network::digest::sha256_hash(&b).iter().map(|x| format!("{x:02x}")).collect())
+    };
+    source_id(pin, &shipped.iter().map(|p| (p.clone(), hash(p))).collect::<Vec<_>>(), deleted)
 }
 
 fn b64(b: &[u8]) -> String {
@@ -109,9 +156,29 @@ fn manifest_line(e: &Entry) -> String {
 // ---- the node side (the lease executor calls these with the lease's work dir)
 
 /// A relative path that stays inside its root.
-fn inside(rel: &str) -> bool {
+pub(crate) fn inside(rel: &str) -> bool {
     let p = Path::new(rel);
-    !rel.is_empty() && !p.is_absolute() && !rel.contains('\\') && p.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+    !rel.is_empty() && !p.is_absolute() && !rel.contains(['\\', '\t', '\n', '\r']) && rel.split('/').all(|c| !matches!(c, "" | "." | "..")) && p.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// Clear cached staging paths whose file/directory shape changed since the previous save.
+pub fn stage(work: &Path, manifest_b64: &str) -> Result<(), String> {
+    let raw = unb64(manifest_b64).ok_or("ship-have: manifest is not base64")?;
+    for line in String::from_utf8_lossy(&raw).lines() {
+        let rel = line.split('\t').next().filter(|p| inside(p)).ok_or("ship-have: bad path")?;
+        let mut path = work.to_path_buf();
+        let mut parts = Path::new(rel).components().peekable();
+        while let Some(part) = parts.next() {
+            path.push(part.as_os_str());
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if parts.peek().is_some() && !m.is_dir() => std::fs::remove_file(&path).map_err(|e| e.to_string())?,
+                Ok(m) if parts.peek().is_none() && m.is_dir() => std::fs::remove_dir_all(&path).map_err(|e| e.to_string())?,
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `ship-have <b64 manifest>` (after the lease id): the indexes of the entries this work dir
@@ -231,12 +298,14 @@ struct Pipe {
     pending: VecDeque<String>,
     buf: String,
     what: String,
+    /// the node's own time on the answered requests (their `end` lines' ms)
+    node_ms: u64,
 }
 
 impl Pipe {
     fn open(c: &Client, node: &str, service: &str) -> Result<Pipe, String> {
         let ch = c.open("route", &format!("{node} {service} ")).map_err(|e| format!("{node} {service}: {e}"))?;
-        Ok(Pipe { ch, pending: VecDeque::new(), buf: String::new(), what: format!("{node} {service}") })
+        Ok(Pipe { ch, pending: VecDeque::new(), buf: String::new(), what: format!("{node} {service}"), node_ms: 0 })
     }
 
     /// Sends `line`; when the window is full, first takes the oldest answer (checked by `check`).
@@ -263,6 +332,7 @@ impl Pipe {
                     continue;
                 }
                 if l.starts_with("{\"end\":") {
+                    self.node_ms += makepad_strict_json::parse(l.as_bytes()).ok().and_then(|v| v.get("ms").and_then(super::num)).map_or(0, |ms| ms as u64);
                     return check(&tag, &lines);
                 }
                 if let Some(e) = makepad_strict_json::parse(l.as_bytes()).ok().and_then(|v| v.get("err").and_then(|x| x.as_str()).map(str::to_string)) {
@@ -293,10 +363,47 @@ pub struct Shipped {
     pub files: usize,
     pub sent: usize,
     pub bytes: u64,
+    /// the node's time on the puts and links (the rest of the send is the way there and back)
+    pub node_ms: u64,
 }
 
-/// Ships `entries` from `root` into lease `id`'s work dir on `node`.
-pub fn send(c: &Client, node: &str, id: &str, root: &Path, entries: &[Entry]) -> Result<Shipped, String> {
+/// Ships `entries` from `root` into lease `id`'s work dir on `node`. `placed`: the caller knows each
+/// entry's path holds a file on the node and its content changed since (a live session's edit of
+/// files it shipped before), so the node needs them all and no ship-have round trip asks which
+/// (~10 ms of a live edit's save -> frame).
+pub fn send(c: &Client, node: &str, id: &str, root: &Path, entries: &[Entry], placed: bool) -> Result<Shipped, String> {
+    let need = if placed { (0..entries.len()).collect() } else { need(c, node, id, entries)? };
+    let mut out = Shipped { files: entries.len(), ..Default::default() };
+    let mut ok = |_: &str, _: &[String]| Ok(());
+    let mut put = Pipe::open(c, node, "ship-put")?;
+    let mut links = Vec::new();
+    for &i in &need {
+        let e = &entries[i];
+        if let Some(t) = &e.link {
+            links.push((e.path.clone(), t.clone()));
+            continue;
+        }
+        let (bytes, mtime_us, exec) = read_stable(&root.join(&e.path)).map_err(|err| format!("{}: {err}", e.path))?;
+        put_bytes(&mut put, id, &e.path, &bytes, mtime_us, exec, &mut ok)?;
+        out.sent += 1;
+        out.bytes += bytes.len() as u64;
+    }
+    put.drain(&mut ok)?;
+    out.node_ms += put.node_ms;
+    if !links.is_empty() {
+        let mut lp = Pipe::open(c, node, "ship-link")?;
+        for (p, t) in links {
+            lp.send(format!("ship-link {id} {} {}", b64(p.as_bytes()), b64(t.as_bytes())), &mut ok)?;
+            out.sent += 1;
+        }
+        lp.drain(&mut ok)?;
+        out.node_ms += lp.node_ms;
+    }
+    Ok(out)
+}
+
+/// The indexes of `entries` the node's work dir lacks or holds differently (ship-have).
+fn need(c: &Client, node: &str, id: &str, entries: &[Entry]) -> Result<Vec<usize>, String> {
     let mut have = Pipe::open(c, node, "ship-have").map_err(|e| format!("{e} (a node hub from before the link ship has no ship-have: update its devhub)"))?;
     let mut need: Vec<usize> = Vec::new();
     let mut base = 0usize;
@@ -320,31 +427,7 @@ pub fn send(c: &Client, node: &str, id: &str, root: &Path, entries: &[Entry]) ->
     }
     have.drain(&mut |_, lines| take_need(&mut bases, lines, &mut need))?;
     need.sort_unstable();
-    let mut out = Shipped { files: entries.len(), ..Default::default() };
-    let mut ok = |_: &str, _: &[String]| Ok(());
-    let mut put = Pipe::open(c, node, "ship-put")?;
-    let mut links = Vec::new();
-    for &i in &need {
-        let e = &entries[i];
-        if let Some(t) = &e.link {
-            links.push((e.path.clone(), t.clone()));
-            continue;
-        }
-        let (bytes, mtime_us, exec) = read_stable(&root.join(&e.path)).map_err(|err| format!("{}: {err}", e.path))?;
-        put_bytes(&mut put, id, &e.path, &bytes, mtime_us, exec, &mut ok)?;
-        out.sent += 1;
-        out.bytes += bytes.len() as u64;
-    }
-    put.drain(&mut ok)?;
-    if !links.is_empty() {
-        let mut lp = Pipe::open(c, node, "ship-link")?;
-        for (p, t) in links {
-            lp.send(format!("ship-link {id} {} {}", b64(p.as_bytes()), b64(t.as_bytes())), &mut ok)?;
-            out.sent += 1;
-        }
-        lp.drain(&mut ok)?;
-    }
-    Ok(out)
+    Ok(need)
 }
 
 /// A file's bytes with the mtime they were written at. The manifest's stat is older than the read
@@ -405,11 +488,53 @@ mod read_tests {
         assert_ne!(mtime, listed[0].mtime_us, "not the listing's");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A file rewritten in place with its size and its mtime second kept ships its new text at
+    /// once: by its nanoseconds, and where git staged it in its index's second or later (there
+    /// its whole stat can be kept), by its content. Status went by the size and the second, so
+    /// such an edit stayed the committed text on the node (11-06).
+    #[cfg(feature = "checkout")]
+    #[test]
+    fn an_in_place_edit_keeping_size_and_mtime_second_ships() {
+        use std::io::Write;
+        use std::time::Duration;
+        let repo = std::env::temp_dir().join(format!("devhub-ship-racy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| crate::orch::git(&repo, &[&["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"][..], args].concat()).unwrap().trim().to_string();
+        let write = |p: &str, text: &str, at: std::time::SystemTime| {
+            let mut f = std::fs::File::create(repo.join(p)).unwrap();
+            f.write_all(text.as_bytes()).unwrap();
+            f.set_modified(at).unwrap();
+        };
+        let now = crate::proto::wall_ms() / 1000;
+        let at = |secs: u64, ms: u64| UNIX_EPOCH + Duration::from_secs(secs) + Duration::from_millis(ms);
+        write("old.rs", "fn a() {}\n", at(now - 100, 100));
+        write("racy.rs", "fn b() {}\n", at(now + 100, 100));
+        git(&["init", "-q", "-b", "work"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        let pin = crate::lease::Pin { makepad: git(&["rev-parse", "HEAD"]), commercial: None };
+        assert_eq!(uncommitted(&repo, &pin).unwrap(), (vec![], vec![]), "racily clean files of their text are clean");
+        write("old.rs", "fn x() {}\n", at(now - 100, 200));
+        write("racy.rs", "fn y() {}\n", at(now + 100, 100));
+        assert_eq!(uncommitted(&repo, &pin).unwrap().0, ["old.rs", "racy.rs"]);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_atomic_writes_temp_file_never_ships() {
+        assert!(never_ships("libs/demo/src/support.rs.tmp.81511.2d68cbffff10"));
+        assert!(never_ships_named("src/lib.rs.tmp.7.ab"));
+        for keep in ["src/a.tmp.rs", "src/tmp.1.ab", "src/a.rs.tmp.81511", "src/a.rs.tmp.x1.ab", "src/a.rs.tmp.1.xyz", "src/a.rs"] {
+            assert!(!never_ships(keep), "{keep}");
+        }
+    }
 
     #[test]
     fn have_put_link_on_a_work_dir() {
@@ -494,4 +619,114 @@ mod tests {
         assert_eq!(have(&work, &man).unwrap(), r#"{"need":[0]}"#);
         let _ = std::fs::remove_dir_all(&base);
     }
+}
+
+/// The repositories of a tree pinned at `pin`: (dir, commit, path prefix in the tree).
+fn pinned_repos(root: &Path, pin: &super::Pin) -> Vec<(PathBuf, String, &'static str)> {
+    std::iter::once((root.to_path_buf(), pin.makepad.clone(), "")).chain(pin.commercial.clone().map(|s| (root.join("apps/commercial"), s, "apps/commercial/"))).collect()
+}
+
+/// Whether `path` (in the tree) belongs to the repository with `prefix` under `pin`: the makepad
+/// side leaves a pinned nested commercial checkout's paths to it.
+fn in_repo(pin: &super::Pin, prefix: &str, path: &str) -> bool {
+    if prefix.is_empty() { !(pin.commercial.is_some() && path.starts_with("apps/commercial/")) } else { path.starts_with(prefix) }
+}
+
+/// The blob of the file at `path` in `tree` (a file or a symlink; None for nothing, a folder or a
+/// gitlink: what the node's `relaxgit::bases` table holds).
+fn blob_at(repo: &mut makepad_git::Repository, tree: &makepad_git::ObjectId, path: &str) -> Result<Option<makepad_git::ObjectId>, String> {
+    let parts: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    let mut at = *tree;
+    for (i, name) in parts.iter().enumerate() {
+        let t = repo.read_tree(&at).map_err(|e| format!("{path}: {e}"))?;
+        let Some(e) = t.entries.iter().find(|e| e.name == *name) else { return Ok(None) };
+        if i + 1 == parts.len() {
+            return Ok((e.is_blob() || e.mode == 0o120000).then_some(e.oid));
+        }
+        if !e.is_tree() { return Ok(None); }
+        at = e.oid;
+    }
+    Ok(None)
+}
+
+/// The pin's blob of each of `paths` ("new" where it has no file), per repository, read in process.
+fn pin_blobs(root: &Path, pin: &super::Pin, paths: &[String]) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut blobs = std::collections::HashMap::new();
+    for (dir, sha, prefix) in pinned_repos(root, pin) {
+        let mine: Vec<&String> = paths.iter().filter(|p| in_repo(pin, prefix, p)).collect();
+        if mine.is_empty() { continue; }
+        let found = crate::gitread::with(&dir, |p, repo| -> Result<Vec<Option<makepad_git::ObjectId>>, String> {
+            let commit = crate::gitread::resolve(p, repo, &sha).ok_or_else(|| format!("{}: no commit {sha}", dir.display()))?;
+            let tree = repo.read_commit(&commit).map_err(|e| format!("{sha}: {e}"))?.tree;
+            mine.iter().map(|path| blob_at(repo, &tree, &path[prefix.len()..])).collect()
+        }).ok_or_else(|| format!("{}: not a git repository", dir.display()))??;
+        for (path, blob) in mine.into_iter().zip(found) {
+            blobs.insert(path.clone(), blob.map_or_else(|| "new".to_string(), |b| b.to_hex()));
+        }
+    }
+    Ok(blobs)
+}
+
+/// The base blob of each shipped path at the pin, as `ship-done` sends them: `new` where the pin
+/// has no file. Read in process: no git process per ship (two `ls-tree -r` of whole trees were).
+pub fn bases_json(root: &Path, pin: &super::Pin, paths: &[String]) -> Result<String, String> {
+    let blobs = pin_blobs(root, pin, paths)?;
+    Ok(format!("{{{}}}", paths.iter().map(|p| format!("{}:{}", makepad_remote::json_str(p), makepad_remote::json_str(blobs.get(p).map_or("new", String::as_str)))).collect::<Vec<_>>().join(",")))
+}
+
+/// Current files and deletions against a fixed pin (a live run keeps that pin across saves), in
+/// process: each tree's status (what differs from its HEAD, untracked files not ignored), and when
+/// the lane committed since the pin, the files those commits changed. No git process.
+pub fn uncommitted(root: &Path, pin: &super::Pin) -> Result<(Vec<String>, Vec<String>), String> {
+    uncommitted_with(root, pin, |dir| {
+        let e = |e: makepad_git::GitError| format!("{}: {e}", dir.display());
+        let p = makepad_git::repository_paths(dir).map_err(e)?.ok_or_else(|| format!("{}: not a git worktree", dir.display()))?;
+        let head = makepad_git::refs::resolve_head_in(&p.git_dir, &p.common_dir).map_err(e)?.to_hex();
+        let status = crate::gitread::worktree(p).map_err(e)?.status().map_err(|err| format!("{}: status: {err}", dir.display()))?;
+        Ok((head, status.entries.into_iter().map(|s| s.path).collect()))
+    })
+}
+
+/// [`uncommitted`] from the master's file monitor: its dirty set of each tree, kept from file
+/// events, instead of a status. A live ship asked it with six git processes, 0.2-1 s of the save ->
+/// shipped time on the Mac (`git diff` against a commit re-reads a stale index each time).
+#[cfg(feature = "checkout")]
+pub fn uncommitted_seen(monitor: &crate::monitor::Monitor, root: &Path, pin: &super::Pin) -> Result<(Vec<String>, Vec<String>), String> {
+    uncommitted_with(root, pin, |dir| {
+        let d = monitor.dirty(dir)?;
+        Ok((d.head, d.changed.into_iter().chain(d.deleted).collect()))
+    })
+}
+
+/// `dirty(dir)`: a repository's HEAD and the paths that differ from it. Adds what changed between
+/// the pin and that HEAD (the lane's commits since), then sorts by what is on disk: a file there
+/// ships, a path gone is a deletion when the pin has it.
+fn uncommitted_with(root: &Path, pin: &super::Pin, dirty: impl Fn(&Path) -> Result<(String, Vec<String>), String>) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut paths = std::collections::BTreeSet::new();
+    for (dir, sha, prefix) in pinned_repos(root, pin) {
+        let (head, mut rel) = dirty(&dir)?;
+        if head != sha {
+            let id = |s: &str| makepad_git::ObjectId::from_hex(s).map_err(|e| format!("{s}: {e}"));
+            let (from, to) = (id(&sha)?, id(&head)?);
+            let changes = crate::gitread::with(&dir, |_, repo| repo.diff_commits(&from, &to).map_err(|e| format!("{}: {sha}..{head}: {e}", dir.display())))
+                .ok_or_else(|| format!("{}: not a git repository", dir.display()))??;
+            rel.extend(changes.into_iter().map(|c| match c {
+                makepad_git::TreeChange::Added { path, .. } | makepad_git::TreeChange::Modified { path, .. } | makepad_git::TreeChange::Deleted { path, .. } => path,
+            }));
+        }
+        paths.extend(rel.into_iter().map(|p| format!("{prefix}{p}")).filter(|p| in_repo(pin, prefix, p) && !never_ships(p)));
+    }
+    let (mut changed, mut gone) = (Vec::new(), Vec::new());
+    for p in paths {
+        match std::fs::symlink_metadata(root.join(&p)) {
+            Ok(m) if !m.is_dir() => changed.push(p),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => gone.push(p),
+            Err(e) => return Err(format!("{p}: {e}")),
+            _ => {}
+        }
+    }
+    // a file added after the pin and gone again is no deletion of the pin's
+    let blobs = pin_blobs(root, pin, &gone)?;
+    let deleted = gone.into_iter().filter(|p| blobs.get(p).is_some_and(|b| b != "new")).collect();
+    Ok((changed, deleted))
 }

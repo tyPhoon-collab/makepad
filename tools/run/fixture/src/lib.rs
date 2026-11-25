@@ -161,9 +161,10 @@ impl Drop for Registry {
     }
 }
 
-/// generic, so compiled by Relax: reads an opaque type's field, which Relax refuses (provided.rs)
-pub fn names_peek<T>(r: &Registry, _t: T) -> usize {
-    r.names.len()
+/// generic, so compiled by Relax: reads an opaque type's field whose bytes are rustc's alone (its
+/// std's HashMap), which Relax refuses (provided.rs)
+pub fn by_name_peek<T>(r: &Registry, _t: T) -> usize {
+    r.by_name.len()
 }
 
 /// Option<usize> by value (tag + payload in registers on Relax's side)
@@ -397,6 +398,25 @@ pub fn note_grow(mut n: Note) -> Note {
 #[relax_api]
 pub fn note_new(title: &str) -> Note {
     Note { title: title.to_string(), tags: vec![String::from("x")], alias: None, ..Note::default() }
+}
+
+/// A plain struct holding a String (the shape of the script VM's `ScriptLoc`: caller-owned, its
+/// methods stay on the constructing side): Rust's repr and not Copy, the structs a live session's
+/// layout gives an extension word in the application's own crates. JIT code builds it by a literal
+/// and reads it; no bound fn takes it (one that did would refuse it: a String is not C-shaped).
+#[relax_api(plain)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Loc {
+    pub file: String,
+    pub col: u32,
+    pub line: u32,
+}
+
+impl Loc {
+    /// compiled from source on the caller's side
+    pub fn next_line(&self) -> Loc {
+        Loc { file: self.file.clone(), col: 1, line: self.line + 1 }
+    }
 }
 
 /// Peak resident size so far, in the OS's unit (bytes on macOS and Windows, KiB on Linux).

@@ -14,7 +14,7 @@
 
 #![allow(dead_code)] // shell surface (icons, OSD, panels) built ahead of the flows that use it
 pub use makepad_widgets;
-use makepad_widgets::makepad_platform::thread::{Lane, SignalToUI, TaskHandle};
+use makepad_widgets::makepad_platform::thread::{Class, SignalToUI, TaskHandle};
 use makepad_widgets::makepad_platform::hosted_relay::HostRelayServer;
 use makepad_widgets::tween::{ClockPolicy, LagSmoothing, TweenClock};
 use makepad_widgets::*;
@@ -608,6 +608,13 @@ pub struct App {
     hub_link: HubLink,
     #[rust]
     devhub_link: DevhubLink,
+    /// The WM quits to restart its session for its services (`restart_session_for_services`):
+    /// its exit is 75, which its unit restarts.
+    #[rust]
+    session_restart: bool,
+    /// What the session restart waits for, as last told.
+    #[rust]
+    session_restart_said: Option<String>,
     /// The apps' tray icons in the bar's tray area (`trays`).
     #[rust]
     trays: WmTrays,
@@ -727,6 +734,11 @@ pub struct App {
     client_windows: ClientWindows,
     #[rust]
     tick: Timer,
+    /// While a first frame fades in: the scene's cached content follows (`note_arrival_fade`).
+    #[rust]
+    arrival_tick: Timer,
+    #[rust]
+    arrival_until: f64,
     /// Module instances whose root panicked, with when: their tiles show
     /// "crashed" for [`CRASH_HOLD_SECS`] before the WM closes them, so the
     /// person sees what happened instead of an app that just vanished.
@@ -784,10 +796,15 @@ pub struct App {
     /// a tile (see `WarmFrame`).
     #[rust]
     warm_frames: HashMap<ClientId, WarmFrame>,
-    /// Drives the dormant instances (see `pump_warm`).
+    /// Drives the dormant instances (see `pump_warm`): a one-shot timer
+    /// for the earliest Tick a connected warm instance is owed, off while
+    /// none is (`arm_warm_pump`).
     #[rust]
     warm_tick: Timer,
-    /// What the bar last showed (`update_bar`): it redraws only when that
+    /// When `warm_tick` fires.
+    #[rust]
+    warm_tick_due: f64,
+    /// What the bar last showed (`refresh_bar`): it redraws only when that
     /// changes, not on every second's tick — an idle phone repainted once a
     /// second for a clock that shows minutes.
     #[rust]
@@ -1273,12 +1290,12 @@ impl App {
         // It is a real window from here: out of the pool, into the layout
         // at the ordinary insertion point, focused like any launch.
         let area = self.desk_area(cx);
-        let window_id = self
+        let (window_id, app_drawn) = self
             .state_mut()
             .clients
             .get(&client)
-            .map(|s| s.window_id)
-            .unwrap_or(0);
+            .map(|s| (s.window_id, s.app_drawn))
+            .unwrap_or((0, false));
         {
             let state = self.state_mut();
             if let Some(slot) = state.clients.get_mut(&client) {
@@ -1299,6 +1316,7 @@ impl App {
             d.with_run_view(cx, client, |cx, v| {
                 v.set_run_target(cx, client, window_id, hub_port);
                 v.app_ready(cx, client, window_id);
+                v.set_app_drawn(app_drawn);
             })
         });
         self.activate_client(cx, client);
@@ -1433,8 +1451,9 @@ impl App {
             let (w, h) = (rect.w.max(1.0), rect.h.max(1.0));
             // The tile's own allocation rule, so a warm instance warms up
             // at the size a full-desk tile would have asked for.
-            let alloc = |px: f64| ((px * dpi).ceil() as u32).max(64).next_power_of_two();
-            let swapchain = HostSwapchain::new(window_id, alloc(w), alloc(h), cx);
+            let alloc = |px: u32| px.max(64).next_power_of_two();
+            let [pw, ph] = makepad_hal::window_pixels([w, h], dpi);
+            let swapchain = HostSwapchain::new(window_id, alloc(pw), alloc(ph), cx);
             let shared = shared_swapchain_from_host_swapchain(&swapchain, cx);
             let mut msgs = vec![
                 StudioToApp::WindowGeomChange {
@@ -1475,7 +1494,7 @@ impl App {
     /// `StudioToApp::Tick` — it flushes its platform ops there (which is
     /// how a window is ANNOUNCED at all), runs its timers, draws and
     /// repaints — and between ticks it blocks on its socket at no cost
-    /// whatsoever. A tile pumps its child every 8ms; a warm instance has
+    /// whatsoever. A tile ticks its child at the WM's frames; a warm instance has
     /// no tile, so the WM pumps it here instead: at the pump rate until it
     /// has drawn its first frame — without those first ticks it would
     /// never even send `CreateWindow`, and the pool would deadlock waiting
@@ -1484,7 +1503,7 @@ impl App {
     /// own half of the deal: no samplers, no refresh while dormant) that
     /// is what keeps a cached task manager from burning a core in the
     /// background.
-    fn pump_warm(&mut self, _cx: &mut Cx) {
+    fn pump_warm(&mut self, cx: &mut Cx) {
         let now = host::now();
         // A retired framebuffer outlives adoption only long enough for any
         // frame still in flight against it.
@@ -1496,24 +1515,11 @@ impl App {
         });
         let warm = self.warm_pool.clients();
         self.warm_last_tick.retain(|client, _| warm.contains(client));
-        let due: Vec<ClientId> = warm
-            .into_iter()
-            .filter(|client| {
-                // Still coming up (no window yet), or it has a framebuffer
-                // and has not drawn into it: full rate. Anything else —
-                // drawn, or a platform where a warm instance cannot be
-                // handed a framebuffer at all — only needs the heartbeat.
-                let warming = match self.warm_frames.get(client) {
-                    None => true,
-                    Some(frame) => frame.swapchain.is_some() && !frame.presented,
-                };
-                match self.warm_last_tick.get(client) {
-                    Some(t) if !warming => now - *t >= WARM_HEARTBEAT,
-                    _ => true,
-                }
-            })
-            .collect();
-        for client in due {
+        for client in warm {
+            // A timer may fire a little early: within a few ms counts as due.
+            if self.warm_due(client) > now + 0.005 {
+                continue;
+            }
             let Some(sender) = self
                 .state_mut()
                 .clients
@@ -1521,13 +1527,14 @@ impl App {
                 .and_then(|s| s.sender.clone())
             else {
                 // Not connected yet (still building, still starting): the
-                // pump has nothing to send it down.
+                // pump has nothing to send it down. Its connection arms the
+                // pump again (`arm_warm_pump` at the end of `drain_hub`).
                 continue;
             };
             #[cfg(not(target_os = "linux"))]
             if let Some(frame) = self.warm_frames.get(&client).filter(|frame| !frame.presented) {
                 if let Some(swapchain) = frame.swapchain.as_ref() {
-                    if let Some(shared) = shared_swapchain_from_host_swapchain(swapchain, _cx) {
+                    if let Some(shared) = shared_swapchain_from_host_swapchain(swapchain, cx) {
                         send_to_app(&sender, vec![StudioToApp::Swapchain(shared)]);
                     }
                 }
@@ -1535,21 +1542,96 @@ impl App {
             self.warm_last_tick.insert(client, now);
             send_to_app(&sender, vec![StudioToApp::Tick]);
         }
+        self.arm_warm_pump(cx);
+    }
+
+    /// When the warm instance `client` is next owed a Tick: at once if it
+    /// was never ticked; at the pump rate while it is still coming up (no
+    /// window yet), or has a framebuffer it has not drawn into; at the
+    /// heartbeat once it has drawn, or on a platform where a warm instance
+    /// cannot be handed a framebuffer at all.
+    fn warm_due(&self, client: ClientId) -> f64 {
+        let warming = match self.warm_frames.get(&client) {
+            None => true,
+            Some(frame) => frame.swapchain.is_some() && !frame.presented,
+        };
+        match self.warm_last_tick.get(&client) {
+            Some(t) => t + if warming { WARM_PUMP } else { WARM_HEARTBEAT },
+            None => 0.0,
+        }
+    }
+
+    /// Arm the pump for the earliest Tick a connected warm instance is owed,
+    /// and leave it off while none is: no pool, an empty one, or instances
+    /// still building (their connection arms it).
+    fn arm_warm_pump(&mut self, cx: &mut Cx) {
+        let next = match self.state.as_ref() {
+            Some(state) if !self.warm_pool.is_empty() => self
+                .warm_pool
+                .clients()
+                .into_iter()
+                .filter(|client| state.clients.get(client).is_some_and(|slot| slot.sender.is_some()))
+                .map(|client| self.warm_due(client))
+                .reduce(f64::min),
+            _ => None,
+        };
+        let Some(due) = next else {
+            if !self.warm_tick.is_empty() {
+                cx.stop_timer(self.warm_tick);
+                self.warm_tick = Timer::empty();
+            }
+            return;
+        };
+        // Armed for this moment or a sooner one already: that firing re-arms.
+        if !self.warm_tick.is_empty() && self.warm_tick_due <= due + 0.0005 {
+            return;
+        }
+        if !self.warm_tick.is_empty() {
+            cx.stop_timer(self.warm_tick);
+        }
+        self.warm_tick_due = due;
+        self.warm_tick = cx.start_timeout((due - host::now()).max(0.0));
     }
 
     /// The pool's honest measurement: how long from the launch gesture to
     /// this window's first frame ON THE DESK, and by which path.
-    fn note_first_frame(&mut self, client: ClientId) {
+    fn note_arrival_fade(&mut self, cx: &mut Cx, client: ClientId) {
+        let fading = self.desk(cx).borrow_mut::<WmDesk>().and_then(|mut d| d.with_run_view(cx, client, |_, v| v.arrival_fade() < 1.0));
+        if fading == Some(true) {
+            self.arrival_until = host::now() + run_view::ARRIVAL_FADE_SECS as f64 + 0.05;
+            if self.arrival_tick.is_empty() {
+                self.arrival_tick = cx.start_interval(1.0 / 60.0);
+            }
+        }
+    }
+
+    fn note_app_frame(&mut self, cx: &mut Cx, client: ClientId) {
+        let Some(slot) = self.state_mut().clients.get_mut(&client) else { return };
+        if !slot.app_drawn {
+            slot.app_drawn = true;
+            slot.starting = false;
+            log!("wm: {} client {} app first frame", slot.app, client);
+        }
+        let warm = slot.warm;
+        if self.ai_bus.is_pane(client) {
+            self.with_pane_run_view(cx, |_, v| v.set_app_drawn(true));
+        } else if !warm {
+            self.desk(cx).borrow_mut::<WmDesk>().map(|mut d| {
+                d.with_run_view(cx, client, |_, v| v.set_app_drawn(true))
+            });
+        }
+    }
+
+    fn note_first_frame(&mut self, cx: &mut Cx, client: ClientId) {
         let Some(slot) = self.state_mut().clients.get_mut(&client) else {
             return;
         };
-        if !slot.launch.as_ref().is_some_and(|l| l.runner() == makepad_app_registry::Runner::Jit) {
-            slot.starting = false;
-        }
-        let Some(at) = slot.open_at.take() else {
+        let app_frame = !slot.app_drawn && !slot.launch.as_ref().is_some_and(|l| l.runner() == makepad_app_registry::Runner::Jit);
+        let arrival = slot.open_at.take().map(|at| (at, slot.app.clone(), slot.opened_warm));
+        if app_frame { self.note_app_frame(cx, client); }
+        let Some((at, app, warm)) = arrival else {
             return;
         };
-        let (app, warm) = (slot.app.clone(), slot.opened_warm);
         log!(
             "wm: {} client {} first frame in {} ms ({})",
             app,
@@ -1575,14 +1657,6 @@ impl App {
         let mut latest: Vec<(ClientId, String, bool)> = Vec::new();
         if let Some(lines) = self.client_lines.as_ref() {
             while let Ok(line) = lines.rx.try_recv() {
-                // The app's own first frame: under the JIT the client's first frames are its
-                // load screen's (`note_first_frame`).
-                if matches!(&line.output, makepad_app_registry::ProcessOutput::Line(text) if text.contains(" first frame at ")) {
-                    if let Some(slot) = self.state.as_mut().and_then(|state| state.clients.get_mut(&line.client)) {
-                        slot.starting = false;
-                        log!("wm: {} client {} app first frame", slot.app, line.client);
-                    }
-                }
                 let Some(launch) = self.state.as_mut()
                     .and_then(|state| state.clients.get_mut(&line.client))
                     .and_then(|slot| slot.launch.as_mut()) else { continue };
@@ -2913,17 +2987,19 @@ impl App {
 
     /// The WM is going down: the pane's child has no window of its own
     /// and no tile, so nothing else would reap it.
-    fn kill_pane_child(&mut self, cx: &mut Cx) {
-        let Some(client) = self.ai_bus.pane_client else {
-            return;
-        };
-        let pool = cx.task_pool();
-        if let Some(slot) = self.state_mut().clients.get_mut(&client) {
-            if let Some(child) = slot.child.as_mut() {
-                log!("wm: shutdown kills the AI pane's child {}", client);
-                makepad_app_host::launch::kill_child_group(child, makepad_app_host::launch::GROUP_KILL_GRACE, &pool);
-            }
+    /// The WM goes and its apps go with it: each is asked what a closed tile is (`request_close`)
+    /// and has the time to save and leave, then what is left is killed. A kept service stays for
+    /// the next WM, and a client not connected yet has nothing to save (its slot's drop ends it).
+    fn end_apps_at_shutdown(&mut self) {
+        let mut children = Vec::new();
+        for slot in self.state_mut().clients.values_mut() {
+            let Some(sender) = slot.sender.as_ref().filter(|_| slot.parent.is_none() && !slot.service) else {
+                continue;
+            };
+            send_to_app(sender, vec![StudioToApp::Custom(WmEvent::CloseRequested.to_json()), StudioToApp::Kill]);
+            children.extend(slot.child.take());
         }
+        makepad_app_host::launch::end_asked_children(&mut children, makepad_app_host::launch::CLOSE_GRACE);
     }
 
     // ---- in-process instances (module_host.rs) ----
@@ -3357,6 +3433,8 @@ impl App {
                 }
             }
         }
+        // a warm instance connected, announced its window or drew
+        self.arm_warm_pump(cx);
     }
 
     /// The app `client` made another window (`window_id`): a window of its own on the desk,
@@ -3491,6 +3569,26 @@ impl App {
         }
     }
 
+    /// An app resizing its window while it is shown (`HostedResize`): on a floating desktop the
+    /// window takes the inner size (plus the desk's title bar) at its top-left corner, kept
+    /// within the usable area; a maximised or snapped window is released for it. Tiled layouts
+    /// own the size, so there it changes nothing.
+    fn apply_requested_resize(&mut self, cx: &mut Cx, tile: ClientId, w: f64, h: f64) {
+        if !self.state_mut().style.target.floating() || self.is_warm(tile) {
+            return;
+        }
+        let Some(screen) = self.state_mut().screens.screen_of(tile) else { return };
+        let mut area = self.screen_area(cx, screen);
+        let state = self.state_mut();
+        let reserve = state.layout_of(tile).desktop.shelf_reserve;
+        area.h = (area.h - reserve).max(1.0);
+        let title = state.style.title_height();
+        if state.layout_of_mut(tile).desktop.resize_to(tile, w, h + title, area) {
+            log!("wm: client {tile} resized to the {w}x{h} it asked for (within {:.0}x{:.0})", area.w, area.h);
+            self.redraw_all(cx);
+        }
+    }
+
     /// Put a later window on the screen at `at`, a point in the app's coordinates (those of
     /// the screens it was told: relative to its first window's tile).
     fn move_later_window(&mut self, cx: &mut Cx, client: ClientId, tile: ClientId, at: Vec2d) {
@@ -3526,6 +3624,10 @@ impl App {
                 // window: the tile stays where it is, its content refreshes.
                 let again = self.state_mut().clients.get(&client).is_some_and(|slot| slot.ready && slot.window_id == window_id && slot.parent.is_none());
                 if again {
+                    if let Some(slot) = self.state_mut().clients.get_mut(&client) {
+                        slot.app_drawn = false;
+                        slot.starting = true;
+                    }
                     log!("wm: client {client} announced its window {window_id} again (restarted in place): the same tile");
                 }
                 let first = again || self
@@ -3606,7 +3708,7 @@ impl App {
                     if let Some(mut scene) = self.ui.widget(cx, ids!(scene)).borrow_mut::<scene::WmScene>() {
                         scene.redraw_content_all(cx);
                     }
-                    self.note_first_frame(client);
+                    self.note_first_frame(cx, client);
                     return;
                 }
                 // Which of the phone's captures this frame may refresh: a
@@ -3620,7 +3722,8 @@ impl App {
                 // The hosted frame is produced in a separate capture pass;
                 // invalidate the outer cached scene explicitly.
                 self.redraw_scene_content(cx);
-                self.note_first_frame(client);
+                self.note_arrival_fade(cx, client);
+                self.note_first_frame(cx, client);
                 // A focus that couldn't land at launch (tile not yet
                 // drawn) lands now that the client has a frame.
                 // (Not when the person has gone to another space since: the
@@ -3766,6 +3869,10 @@ impl App {
                 self.send_relays(answers);
             }
             AppToStudio::Custom(json) => {
+                if makepad_hal::window_controls::HostedAppFrame::parse(&json).is_some() {
+                    self.note_app_frame(cx, client);
+                    return;
+                }
                 // A tray app's dropdown window: shown under its tray item, or hidden (dropdown.rs).
                 if let Some(dropdown) = makepad_widgets::makepad_platform::studio::HostedDropdown::parse(&json) {
                     self.dropdown_message(cx, client, dropdown);
@@ -3796,6 +3903,11 @@ impl App {
                             d.with_run_view(cx, tile, |_, v| v.hosted.set_pointer_caps(caps.clone()));
                         }
                     }
+                    return;
+                }
+                // The app resizes its tile's window.
+                if let Some(ask) = makepad_hal::window_controls::HostedResize::parse(&json) {
+                    self.apply_requested_resize(cx, client, ask.w, ask.h);
                     return;
                 }
                 // One of the app's later windows: closed by the app, or what it asked of it.
@@ -3980,7 +4092,7 @@ impl App {
         }
         self.backgrounds_pending = true;
         log!("wm: theme '{}' has no wallpapers; fetching them", name);
-        match cx.task_pool().submit(Lane::Heavy, move || {
+        match cx.task_pool().submit(Class::Background, move || {
                 let n = theme::fetch_backgrounds_if_missing(&name);
                 log!("wm: fetched {} wallpaper(s) for '{}'", n, name);
                 n
@@ -4026,11 +4138,17 @@ impl App {
         }
         // MAKEPAD_WM_BACKDROP names the procedural background to start on;
         // the warp desktop's own is the warp grid.
+        // No procedural layer on the phone: its desk paints its own wallpaper over the whole
+        // screen (mobile_surface.rs draw_wallpaper, opaque), so the layer under it is never seen,
+        // and on an Adreno 610 the warp grid alone was 44 ms of GPU a frame (13 fps; 28 without).
+        // MAKEPAD_WM_BACKDROP=plain asks for the same anywhere; a named kind still overrides.
+        let mobile = self.state_mut().style.target.mobile();
+        let plain = mobile || std::env::var("MAKEPAD_WM_BACKDROP").is_ok_and(|n| n == "plain");
         let choice = backdrop::env_kind()
             .filter(|_| index == 0 && !classic)
-            .or_else(|| (index == 0 && !classic).then_some(backdrop::Kind::WarpGrid))
+            .or_else(|| (index == 0 && !classic && !plain).then_some(backdrop::Kind::WarpGrid))
             .map(backdrop::Choice::Procedural)
-            .unwrap_or_else(|| choices[index % choices.len()].clone());
+            .unwrap_or_else(|| if plain && index == 0 { backdrop::Choice::Plain } else { choices[index % choices.len()].clone() });
         let kind = match &choice {
             backdrop::Choice::Procedural(kind) => Some(*kind),
             _ => None,
@@ -4403,6 +4521,36 @@ impl App {
         self.update_bar(cx);
     }
 
+    /// A service of the WM cannot start: the user's service manager is down (`hub_app::Manager`),
+    /// and only a new login session starts it again. The WM restarts its session for it (exit 75,
+    /// which its unit restarts; the new session's scope pulls the manager in) once no app holds
+    /// unsaved work; until then the person at the screen is told what it waits for.
+    #[cfg(target_os = "linux")]
+    fn restart_session_for_services(&mut self, cx: &mut Cx) {
+        if self.session_restart {
+            return;
+        }
+        let Some(want) = self.hub_link.session_restart().or_else(|| self.devhub_link.session_restart()) else { return };
+        let said = match hub_app::session_step(&want, &makepad_app_registry::machine::unsaved_work()) {
+            hub_app::SessionStep::Restart(why) => match hub_app::begin_session_restart(&crate::theme::makepad_home().join("wm"), &want) {
+                Ok(()) => {
+                    log!("wm: restarting the desktop session: {why}");
+                    self.session_restart = true;
+                    cx.quit();
+                    return;
+                }
+                // unrecorded, the next WM could restart again for the same outage
+                Err(e) => format!("{why}, but the WM cannot record the restart ({e}): not restarted"),
+            },
+            hub_app::SessionStep::Waits(text) => text,
+        };
+        if self.session_restart_said.as_deref() != Some(said.as_str()) {
+            log!("wm: desktop session restart: {said}");
+            self.notify(cx, "Desktop session restart", &said);
+            self.session_restart_said = Some(said);
+        }
+    }
+
     /// This node's AI hub: the app's start and restart, the yield report, and whether a game
     /// is being played. Once a second (the status tick).
     fn hub_poll(&mut self, cx: &mut Cx) {
@@ -4410,6 +4558,8 @@ impl App {
         let pool = cx.task_pool();
         self.hub_link.tick(processes, host::now(), &pool);
         self.devhub_link.tick(processes, host::now());
+        #[cfg(target_os = "linux")]
+        self.restart_session_for_services(cx);
         // Off (its Quit): the bar keeps a dim slot to start it again, until its own tray is back.
         let has_tray = |app: &str| self.state.as_ref().is_some_and(|s| s.clients.iter().any(|(id, c)| c.service && c.app == app && self.trays.has_tray(*id as u64)));
         let (hub_tray, devhub_tray) = (has_tray(clients::HUB_SERVICE_APP), has_tray(clients::DEVHUB_SERVICE_APP));
@@ -4605,9 +4755,10 @@ impl App {
     /// and the panel. `changed`: who is connected changed, so the bar is laid out again.
     fn sync_desk_link(&mut self, cx: &mut Cx, changed: bool) {
         let viewers = self.desk_link.viewers();
-        // a viewer attached may be a person watching this node (`activity`, the node's hub)
+        // a viewer showing this node (not paused: its tab selected, its window visible) may be a
+        // person watching it (`activity`, the node's hub); a tab merely connected is not
         #[cfg(not(target_arch = "wasm32"))]
-        makepad_hal::user_input::set_viewers(viewers.len());
+        makepad_hal::user_input::set_viewers(viewers.iter().filter(|v| !v.paused).count());
         if changed {
             self.bar_sample.desk_link = viewers.iter().map(|v| (v.name.clone(), v.peer.clone())).collect();
         }
@@ -4625,9 +4776,24 @@ impl App {
         }
     }
 
+    /// The bar follows a change of the desktop (a window, a workspace, a style): when what it
+    /// shows changed, the desktop records again with it.
     fn update_bar(&mut self, cx: &mut Cx) {
+        if self.refresh_bar(cx) {
+            self.redraw_all(cx);
+        }
+    }
+
+    /// The bar takes the current readings and redraws on its own when what it shows changed
+    /// (true then): the second's tick, where a new clock minute or meter reading changes the
+    /// bar and nothing else, so the rest of the desktop and the scene's cached content stay.
+    fn refresh_bar(&mut self, cx: &mut Cx) -> bool {
         self.sync_bar_placement(cx);
         if let Some(clock)=self.bar_sample.clock.split_whitespace().find(|s|s.contains(':')).map(str::to_string) {
+            // a phone draws its clock on its own surface, not in the bar
+            if self.state_mut().phone.clock != clock && self.state_mut().style.target.mobile() {
+                self.redraw_all(cx);
+            }
             self.state_mut().phone.clock=clock;
         }
         // One segment per live screen on a multi-screen desktop, else the
@@ -4680,7 +4846,7 @@ impl App {
         let launcher = self.state.as_ref().is_some_and(|s| s.style.target == desktop::DesktopStyle::Omarchy);
         let shown = format!("{:?} {:?} {} {}", data, segments, window_controls, launcher);
         if shown == self.bar_shown {
-            return;
+            return false;
         }
         self.bar_shown = shown;
         let bar = self.ui.widget(cx, ids!(shell_bar));
@@ -4694,7 +4860,8 @@ impl App {
                 b.launcher = launcher;
             }
         }
-        self.redraw_all(cx);
+        bar.redraw(cx);
+        true
     }
 
     /// Put the bar where `shell::bar::bar_placement` says: on one screen
@@ -5108,22 +5275,32 @@ impl App {
             // tick and WindowGeomChange): a DPI change does not bump the
             // generation, and the reconcile key is cheap to compare.
             // Elsewhere they are read once, when the gate changes.
-            // `MAKEPAD_WM_FAKE_SCREENS=name:x,y,w,h;name:x,y,w,h` (tests only): the
+            // `MAKEPAD_WM_FAKE_SCREENS=name:x,y,w,h;*name:x,y,w,h` (tests only): the
             // per-screen desk of the Linux direct backend, under a nested window.
+            // `*` marks the main screen (the dock's); without one it is the first.
             if let Some(spec) = std::env::var("MAKEPAD_WM_FAKE_SCREENS").ok().filter(|s| !s.is_empty()) {
                 let mut names = Vec::new();
                 let mut geoms = Vec::new();
+                let mut main_name = None;
                 for part in spec.split(';') {
                     let Some((name, r)) = part.split_once(':') else { continue };
                     let v: Vec<f64> = r.split(',').filter_map(|x| x.trim().parse().ok()).collect();
                     if v.len() == 4 {
+                        let name = match name.strip_prefix('*') {
+                            Some(main) => {
+                                main_name = Some(main.to_string());
+                                main
+                            }
+                            None => name,
+                        };
                         names.push(name.to_string());
                         geoms.push(LRect::new(v[0], v[1], v[2], v[3]));
                     }
                 }
                 if !names.is_empty() && !self.gallery {
+                    let main_name = main_name.or_else(|| names.first().cloned());
                     let state = self.state_mut();
-                    state.screen_source = desk::ScreenSource { per_screen: true, main_name: names.first().cloned(), geoms, names, generation };
+                    state.screen_source = desk::ScreenSource { per_screen: true, main_name, geoms, names, generation };
                     self.sync_geometry(cx);
                     self.drain_screens_changed(cx);
                     return;
@@ -6462,15 +6639,9 @@ impl MatchEvent for App {
         let manifest = AiBus::os_manifest(&self.registry_apps());
         self.pane_links.open_os(cx, manifest);
         self.tick = cx.start_interval(1.0);
-        // The warm pool's pump. Started even when the pool is off: it
-        // costs one no-op wakeup and keeps the timer id stable.
-        self.warm_tick = cx.start_interval(WARM_PUMP);
-        // Nothing to pump (no pool, or a phone, which keeps none): no 20 Hz
-        // wakeup of an idle WM.
-        if !self.warm_pool.enabled() || cfg!(target_os = "android") {
-            cx.stop_timer(self.warm_tick);
-            self.warm_tick = Timer::empty();
-        }
+        // The warm pool's pump runs only while a warm instance is owed a
+        // Tick (`arm_warm_pump`): an idle WM with no standby instances
+        // wakes for none.
         if !self.warm_pool.enabled() {
             if self.processes() {
                 log!("wm: warm pool disabled (MAKEPAD_WM_NO_WARM)");
@@ -6920,6 +7091,9 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        if let Event::LiveEdit = event {
+            self.module_host.follow_live_edit(cx);
+        }
         self.native_app_tick(cx, event);
         self.desk_link.handle_event(cx, event);
         // a virtual desktop that follows its viewer takes the window size of the viewer that connected last
@@ -7291,7 +7465,7 @@ impl AppMain for App {
             self.devhub_link.shutdown(&pool);
             if self.state.is_some() {
                 self.kill_warm_previews(cx);
-                self.kill_pane_child(cx);
+                self.end_apps_at_shutdown();
             }
             self.wifi_shutdown();
             #[cfg(target_os = "linux")]
@@ -7301,13 +7475,22 @@ impl AppMain for App {
                 // restart (`RestartForceExitStatus`/`SuccessExitStatus`).
                 // An ordinary quit is left alone and still exits 0 through
                 // the platform's own shutdown path.
-                let code = linux_controls::exit_code(self.restart_requested());
+                let code = linux_controls::exit_code(self.restart_requested() || self.session_restart);
                 if code != 0 {
                     std::process::exit(code);
                 }
             }
         }
         if let Event::Timer(te) = event {
+            // A tile's own redraw does not reach the scene's cached content: without this, an app
+            // that draws nothing after its first frame (an idle terminal) stays under its starting card.
+            if self.arrival_tick.is_timer(te).is_some() {
+                self.redraw_scene_content(cx);
+                if host::now() >= self.arrival_until {
+                    cx.stop_timer(self.arrival_tick);
+                    self.arrival_tick = Timer::empty();
+                }
+            }
             if self.tick.is_timer(te).is_some() && self.state.is_some() {
                 self.wayland_tick(cx);
                 self.hub_poll(cx);
@@ -7336,7 +7519,7 @@ impl AppMain for App {
                 // A hotplug published since, or a lost screen's removal
                 // debounce running out.
                 self.sync_screens(cx);
-                self.update_bar(cx);
+                self.refresh_bar(cx);
                 // The pool fills itself here: at startup, after an
                 // adoption, and after any death it healed from. One spawn
                 // per second, so a cold desktop never forks four cargo
@@ -7345,8 +7528,12 @@ impl AppMain for App {
                     self.top_up_warm_pool(cx);
                 }
             }
-            if self.warm_tick.is_timer(te).is_some() && self.state.is_some() {
-                self.pump_warm(cx);
+            if self.warm_tick.is_timer(te).is_some() {
+                // one-shot: spent; the pump arms the next one it needs
+                self.warm_tick = Timer::empty();
+                if self.state.is_some() {
+                    self.pump_warm(cx);
+                }
             }
         }
         if let Event::Signal = event {

@@ -26,15 +26,242 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use makepad_cpu_budget as budget;
+use std::cell::RefCell;
+use std::sync::atomic::AtomicU8;
+
+static THREAD_START: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Installed by the compiler before front-end scopes start.
+pub fn thread_start(start: fn()) { let _ = THREAD_START.set(start); }
+
+/// Compiler-owned queue policy; cache threads drain it alongside start-at-once scopes.
+pub trait Source: Sync {
+    fn run(&'static self);
+}
+
+/// Starts a queue drain on the same cache used by scopes. The source controls admission
+/// and the number of drains; no compiler job or queue representation leaks into base.
+pub fn drain(source: &'static dyn Source) {
+    let task: Task = zone_alloc::kept_with(|| Box::new(move || {
+        source.run();
+        Done(None)
+    }));
+    if let Err((_, error)) = dispatch(&POOL, task) {
+        panic!("failed to start JIT pool worker: {error}");
+    }
+}
+
+/// Shared with a waiter. Its short lock protects permit replacement at checkpoints;
+/// no admission, checkpoint or other blocking operation runs under that lock.
+pub struct JobClass {
+    desired: AtomicU8,
+    permit: Mutex<Option<u32>>,
+    label: &'static str,
+    thread: Mutex<budget::Wake>,
+    children: Mutex<Vec<std::sync::Weak<JobClass>>>,
+}
+impl JobClass {
+    pub fn class(&self) -> u8 { self.desired.load(Ordering::Acquire) }
+    pub fn reclass(&self, class: u8) {
+        let _kept = zone_alloc::kept();
+        self.desired.store(class, Ordering::Release);
+        self.thread.lock().unwrap_or_else(|e| e.into_inner()).unpark();
+        if let Some(permit) = *self.permit.lock().unwrap_or_else(|e| e.into_inner()) {
+            budget::reclass(permit, class);
+        }
+        let children: Vec<_> = self.children.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect();
+        for child in children { child.reclass(class); }
+    }
+}
+thread_local! {
+    static CURRENT: RefCell<Option<Arc<JobClass>>> = const { RefCell::new(None) };
+}
+
+/// Borrow the requester's admission while the owner executes its request. The requester
+/// is asleep; it remains the sole owner of the permit and releases it after this context ends.
+pub fn current_job() -> Option<Arc<JobClass>> {
+    CURRENT.try_with(|c| c.borrow().clone()).ok().flatten()
+}
+pub struct JobContext {
+    old: Option<Arc<JobClass>>,
+    active: Option<Arc<JobClass>>,
+    wake: Option<budget::Wake>,
+}
+pub fn enter_job(job: Option<Arc<JobClass>>) -> JobContext {
+    let class = job.as_ref().map_or(budget::INTERACTIVE, |j| j.class());
+    budget::set_thread_class(class);
+    let wake = job.as_ref().map(|j| {
+        std::mem::replace(&mut *j.thread.lock().unwrap_or_else(|e| e.into_inner()), budget::Wake::current())
+    });
+    JobContext { old: CURRENT.with(|c| c.replace(job.clone())), active: job, wake }
+}
+impl Drop for JobContext {
+    fn drop(&mut self) {
+        if let (Some(job), Some(wake)) = (&self.active, self.wake.take()) {
+            *job.thread.lock().unwrap_or_else(|e| e.into_inner()) = wake;
+        }
+        let old = self.old.take();
+        budget::set_thread_class(old.as_ref().map_or(budget::INTERACTIVE, |j| j.class()));
+        CURRENT.with(|c| c.replace(old));
+    }
+}
+
+pub fn current_class() -> u8 {
+    CURRENT.try_with(|c| c.borrow().as_ref().map_or(budget::INTERACTIVE, |j| j.class())).unwrap_or(budget::INTERACTIVE)
+}
+
+pub fn current_job_label() -> Option<&'static str> {
+    CURRENT.try_with(|c| c.borrow().as_ref().map(|job| job.label)).ok().flatten()
+}
+
+pub struct BudgetJob { old: Option<Arc<JobClass>>, job: Arc<JobClass> }
+impl BudgetJob {
+    pub fn from_permit(permit: u32, class: u8, label: &'static str) -> Self {
+        let job = zone_alloc::kept_with(|| Arc::new(JobClass {
+            desired: AtomicU8::new(class), permit: Mutex::new(Some(permit)), label, thread: Mutex::new(budget::Wake::current()), children: Mutex::new(Vec::new()),
+        }));
+        let old = CURRENT.with(|c| c.replace(Some(job.clone())));
+        Self { old, job }
+    }
+    /// A task of a section that `parent`'s job started: admitted as the job's child, its class
+    /// following the job's.
+    fn inherited(parent: Arc<JobClass>, label: &'static str) -> Self {
+        let _kept = zone_alloc::kept();
+        let job = Arc::new(JobClass {
+            desired: AtomicU8::new(parent.class()), permit: Mutex::new(None), label,
+            thread: Mutex::new(budget::Wake::current()), children: Mutex::new(Vec::new()),
+        });
+        {
+            let mut children = parent.children.lock().unwrap_or_else(|e| e.into_inner());
+            job.desired.store(parent.class(), Ordering::Release);
+            children.retain(|child| child.strong_count() != 0);
+            children.push(Arc::downgrade(&job));
+        }
+        let p = budget::admit_following(job.desired.as_ptr(), budget::JIT, label);
+        {
+            let mut permit = job.permit.lock().unwrap_or_else(|e| e.into_inner());
+            budget::reclass(p, job.class());
+            budget::set_thread_class(job.class());
+            *permit = Some(p);
+        }
+        let old = CURRENT.with(|c| c.replace(Some(job.clone())));
+        Self { old, job }
+    }
+    pub fn control(&self) -> Arc<JobClass> { self.job.clone() }
+    /// Whether the worker's next job, of `class` and `label`, runs on this job's permit: the same
+    /// class and label, and nobody of the class or above waits for a slot (budget::contended).
+    pub fn keeps(&self, class: u8, label: &'static str) -> bool {
+        self.job.class() == class && self.job.label == label
+            && self.job.permit.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|p| !budget::contended(p))
+    }
+}
+impl Drop for BudgetJob {
+    fn drop(&mut self) {
+        let _kept = zone_alloc::kept();
+        if let Some(p) = self.job.permit.lock().unwrap_or_else(|e| e.into_inner()).take() { budget::release(p); }
+        CURRENT.with(|c| { c.replace(self.old.take()); });
+    }
+}
+
+/// A pass boundary. UI-thread lazy builds have no pool permit and do nothing here.
+pub fn checkpoint(extra_locks: u32, extra_site: &str) {
+    let job = CURRENT.try_with(|c| c.borrow().clone()).ok().flatten();
+    let Some(job) = job else { return };
+    let _kept = zone_alloc::kept();
+    let (held, site) = relax_session::sync::held_lock();
+    let held = held.saturating_add(extra_locks);
+    let permit = job.permit.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(p) = permit {
+        budget::reclass(p, job.class());
+        let site = if extra_locks != 0 { extra_site.to_owned() } else { site.map_or_else(String::new, |s| format!("{}:{}", s.file(), s.line())) };
+        let p = budget::checkpoint_following(p, held, &site, job.desired.as_ptr());
+        let mut slot = job.permit.lock().unwrap_or_else(|e| e.into_inner());
+        budget::reclass(p, job.class());
+        budget::set_thread_class(job.class());
+        *slot = Some(p);
+    }
+}
+
+/// Return the CPU while waiting for another task. A compile job gives its permit up: drop only
+/// after releasing the wait's mutex, readmission may wait for a producer that needs that mutex.
+/// Any other thread (a program thread, under its own permit) lends its token (budget::lend), which
+/// comes back without a wait.
+pub struct BudgetWait { job: Option<Arc<JobClass>>, lent: bool }
+/// The token of the job the owner serves, back in the budget meanwhile (see `lend_served`).
+pub struct LentJob(Option<(Arc<JobClass>, u32)>);
+/// The owner is about to wait for a build for the job it serves: the job sleeps, and with one token
+/// in the machine that build could get no other. The permit moves out of the job, as at a checkpoint:
+/// its thread suspending at the same moment (a `Program` request) finds none to give up, and if it
+/// gave it up first there is none to lend. The owner never waits to take it back.
+pub fn lend_served() -> LentJob {
+    LentJob(current_job().and_then(|job| {
+        let permit = job.permit.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+        budget::lend_permit(permit);
+        Some((job, permit))
+    }))
+}
+impl Drop for LentJob {
+    fn drop(&mut self) {
+        let Some((job, permit)) = self.0.take() else { return };
+        let mut slot = job.permit.lock().unwrap_or_else(|e| e.into_inner());
+        budget::take_back_permit(permit);
+        // (a reclass meanwhile found no permit)
+        budget::reclass(permit, job.class());
+        *slot = Some(permit);
+    }
+}
+/// `suspend` for a wait a compile job sits out with its permit (its readmission could keep what the
+/// waited-for work needs waiting): only another thread's token goes back.
+pub fn suspend_program() -> BudgetWait {
+    if current_job().is_some() { return BudgetWait { job: None, lent: false }; }
+    suspend()
+}
+pub fn suspend() -> BudgetWait {
+    let job = CURRENT.try_with(|c| c.borrow().clone()).ok().flatten();
+    if job.is_none() { return BudgetWait { job: None, lent: budget::lend() }; }
+    let _kept = zone_alloc::kept();
+    let job = job.filter(|j| {
+        if let Some(p) = j.permit.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            budget::release(p);
+            true
+        } else { false }
+    });
+    BudgetWait { job, lent: false }
+}
+impl Drop for BudgetWait {
+    fn drop(&mut self) {
+        if self.lent { budget::take_back(); }
+        if let Some(job) = &self.job {
+            let _kept = zone_alloc::kept();
+            let p = budget::admit_following(job.desired.as_ptr(), budget::JIT, job.label);
+            let mut slot = job.permit.lock().unwrap_or_else(|e| e.into_inner());
+            budget::reclass(p, job.class());
+            budget::set_thread_class(job.class());
+            *slot = Some(p);
+        }
+    }
+}
+
+pub fn wait<'a, T>(cv: &Condvar, mutex: &'a Mutex<T>, guard: relax_session::sync::MutexGuard<'a, T>)
+    -> std::sync::LockResult<relax_session::sync::MutexGuard<'a, T>>
+{
+    let paused = suspend();
+    let result = cv.wait(guard);
+    drop(result);
+    drop(paused);
+    mutex.lock()
+}
+
 type Task = Box<dyn FnOnce() -> Done + Send + 'static>;
 
 /// A task's completion, handed from the task to its worker: dropping it finishes the task in its
 /// section (`ScopeData::finish_one`), also when it is dropped by an unwind.
-struct Done(Arc<ScopeData>);
+struct Done(Option<Arc<ScopeData>>);
 
 impl Drop for Done {
     fn drop(&mut self) {
-        self.0.finish_one();
+        if let Some(data) = &self.0 { data.finish_one(); }
     }
 }
 
@@ -100,6 +327,7 @@ impl Worker {
 
 fn worker_main(w: Arc<Worker>) {
     let _z = zone_alloc::compiler_thread();
+    if let Some(start) = THREAD_START.get() { start(); }
     loop {
         let task = {
             let mut s = w.slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -115,7 +343,9 @@ fn worker_main(w: Arc<Worker>) {
         // the task catches its own panics; a panic that escapes it (a result dropped in the task
         // itself) is handled the same way (its `Done` finished the task while unwinding)
         let done = std::panic::catch_unwind(AssertUnwindSafe(task)).ok();
-        if done.is_none() || TASK_PANICKED.with(|p| p.replace(false)) {
+        // (a thread the task left at the OS's idle policy cannot leave it: the next task, one a
+        // section waits for, would run below every other thread)
+        if done.is_none() || TASK_PANICKED.with(|p| p.replace(false)) || budget::thread_idle() {
             // end this worker: a fresh thread has none of the half-run task's thread-local state
             {
                 let _k = zone_alloc::kept();
@@ -153,7 +383,7 @@ fn dispatch(pool: &'static Pool, task: Task) -> Result<(), (Task, std::io::Error
         let id = pool.started.fetch_add(1, Ordering::Relaxed);
         pool.alive.fetch_add(1, Ordering::Relaxed);
         let w2 = w.clone();
-        let spawned = std::thread::Builder::new().name(format!("run-pool-{id}")).spawn(move || worker_main(w2));
+        let spawned = std::thread::Builder::new().name(format!("run-jit-{id}")).stack_size(crate::run_threads::COMPILER_STACK).spawn(move || worker_main(w2));
         (w, spawned)
     };
     match spawned {
@@ -235,7 +465,7 @@ impl ScopeData {
     fn wait_all(&self) {
         let mut g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         while self.pending.load(Ordering::Acquire) != 0 {
-            g = self.done.wait(g).unwrap_or_else(|e| e.into_inner());
+            g = wait(&self.done, &self.lock, g).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
@@ -261,6 +491,8 @@ pub struct Scope<'scope, 'env: 'scope> {
     pool: &'static Pool,
     scope: PhantomData<&'scope mut &'scope ()>,
     env: PhantomData<&'env mut &'env ()>,
+    class: u8,
+    parent: Option<Arc<JobClass>>,
 }
 
 /// Like `std::thread::ScopedJoinHandle`.
@@ -289,7 +521,7 @@ where
         lock: Mutex::new(()),
         done: Condvar::new(),
     }));
-    let scope = Scope { pool, data, scope: PhantomData, env: PhantomData };
+    let scope = Scope { pool, data, scope: PhantomData, env: PhantomData, class: current_class(), parent: CURRENT.try_with(|c| c.borrow().clone()).ok().flatten() };
     let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
     scope.data.wait_all();
     match result {
@@ -300,7 +532,8 @@ where
 }
 
 impl<'scope, 'env> Scope<'scope, 'env> {
-    /// Starts `f` on an idle worker (or a new one) and returns at once.
+    /// Starts a thread for `f` on an idle worker (or a new one) and returns at once.
+    /// CPU admission follows the scope class. Blocking waits must use `wait` or `suspend`.
     pub fn spawn<F, T>(&'scope self, f: F) -> ScopedJoinHandle<'scope, T>
     where
         F: FnOnce() -> T + Send + 'scope,
@@ -309,11 +542,23 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         let packet = zone_alloc::kept_with(|| Arc::new(Packet { result: Mutex::new(None), ready: Condvar::new(), scope: self.data.clone() }));
         self.data.pending.fetch_add(1, Ordering::Relaxed);
         let (p, data) = (packet.clone(), self.data.clone());
+        let class = self.class;
+        let parent = self.parent.clone();
         let main = move || {
             // finishes the task whatever happens below, also when dropping a result panics; on a
             // normal return the worker drops it once it is idle again
-            let done = Done(data);
-            let r = catch_unwind(AssertUnwindSafe(f));
+            let done = Done(Some(data));
+            let r = catch_unwind(AssertUnwindSafe(|| {
+                let _budget = match parent {
+                    Some(parent) => Some(BudgetJob::inherited(parent, "front section")),
+                    // a section of a thread outside admission (the UI thread, its owner, the load
+                    // before main): its tasks are that thread's own work and run at once, in its
+                    // class, as the thread does; admitting them would hold the thread that waits for
+                    // them behind a budget it is not under
+                    None => { budget::set_thread_class(class); None }
+                };
+                f()
+            }));
             if r.is_err() {
                 TASK_PANICKED.with(|t| t.set(true));
             }
@@ -346,7 +591,7 @@ impl<'scope, T> ScopedJoinHandle<'scope, T> {
             if let Some(v) = r.take() {
                 return v;
             }
-            r = self.packet.ready.wait(r).unwrap_or_else(|e| e.into_inner());
+            r = wait(&self.packet.ready, &self.packet.result, r).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
@@ -354,6 +599,36 @@ impl<'scope, T> ScopedJoinHandle<'scope, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The owner lends the token of the job it serves while that job's thread may suspend at the same
+    /// moment (a `Program` request's `owner::wait`). Whichever comes first has the permit and the
+    /// other finds none: the row goes once, and comes back on who took it.
+    #[test]
+    fn a_served_job_lent_and_suspended_at_once_keeps_one_permit() {
+        const LABEL: &str = "lent and suspended";
+        let rows = || budget::tokens().holders.into_iter().filter(|h| h.label == LABEL).map(|h| h.lent).collect::<Vec<_>>();
+        let job = BudgetJob::from_permit(budget::admit(budget::VISIBLE, budget::JIT, LABEL), budget::VISIBLE, LABEL);
+        // the owner first: the requester has nothing to give up
+        let lent = lend_served();
+        assert_eq!(rows(), [true]);
+        let wait = suspend();
+        assert_eq!(rows(), [true], "the row is the owner's until it takes the token back");
+        drop(lent);
+        assert_eq!(rows(), [false]);
+        drop(wait);
+        assert_eq!(rows(), [false], "the requester gave up nothing, so nothing more comes back");
+        // the requester first: the owner has nothing to lend
+        let wait = suspend();
+        assert!(rows().is_empty());
+        let lent = lend_served();
+        assert!(rows().is_empty());
+        drop(lent);
+        assert!(rows().is_empty());
+        drop(wait);
+        assert_eq!(rows(), [false]);
+        drop(job);
+        assert!(rows().is_empty());
+    }
+
     use std::sync::atomic::AtomicU64;
 
     #[test]
@@ -431,6 +706,9 @@ mod tests {
         scope(|s| {
             for _ in 0..6 {
                 s.spawn(|| {
+                    // All six tasks must rendezvous even on a smaller CPU budget.
+                    // Waiting returns the permit, just like a scope join or publication wait.
+                    let _wait = suspend();
                     barrier.wait();
                 });
             }
