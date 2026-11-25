@@ -79,6 +79,15 @@ fn domain_status(state: u32) -> DomainStatus {
     }
 }
 
+fn ime_text_input(kind: u32, text: &[u8]) -> (bool, String, bool) {
+    let input = String::from_utf8_lossy(text).into_owned();
+    match kind {
+        input::ime::START | input::ime::UPDATE => (true, input, true),
+        input::ime::CANCEL => (false, String::new(), true),
+        _ => (false, input, false),
+    }
+}
+
 fn touch_state(phase: u32) -> TouchState {
     match phase {
         input::touch::START => TouchState::Start,
@@ -498,24 +507,10 @@ impl Cx {
                     self.redraw_all();
                 }
             }
-            HalEvent::Ime { window: _, kind, start, end, text } => {
-                let input = String::from_utf8_lossy(text).into_owned();
-                // a composition preview replaces the previous preview; a commit replaces it when
-                // it ends a composition or names a replaced range
-                let (input, replace_last) = match kind {
-                    input::ime::START | input::ime::UPDATE => {
-                        self.hal.composing = true;
-                        (input, true)
-                    }
-                    input::ime::CANCEL => {
-                        self.hal.composing = false;
-                        (String::new(), true)
-                    }
-                    _ => {
-                        self.hal.composing = false;
-                        (input, end != start)
-                    }
-                };
+            HalEvent::Ime { window: _, kind, start: _, end: _, text } => {
+                // a composition preview replaces the previous preview; a commit finishes it
+                let (composing, input, replace_last) = ime_text_input(kind, text);
+                self.hal.composing = composing;
                 self.call_event_handler(&Event::TextInput(TextInputEvent { input, replace_last, was_paste: false, ..Default::default() }));
             }
 
@@ -1313,5 +1308,13 @@ mod tests {
         assert_eq!(touch_state(99), TouchState::Move);
         assert_eq!(pinch_phase(input::pinch::BEGIN), PinchPhase::Begin);
         assert_eq!(pinch_phase(7), PinchPhase::Update);
+    }
+
+    #[test]
+    fn ime_commit_clears_replace_last_while_preedit_and_cancel_replace() {
+        assert_eq!(ime_text_input(input::ime::START, "あ".as_bytes()), (true, "あ".into(), true));
+        assert_eq!(ime_text_input(input::ime::UPDATE, "あい".as_bytes()), (true, "あい".into(), true));
+        assert_eq!(ime_text_input(input::ime::CANCEL, b""), (false, String::new(), true));
+        assert_eq!(ime_text_input(input::ime::COMMIT, "愛".as_bytes()), (false, "愛".into(), false));
     }
 }
