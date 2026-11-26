@@ -2051,8 +2051,13 @@ impl MpTerm {
                     .map(|c| makepad_cell_width::char_width(c as u32).max(1) as usize)
                     .sum();
                 let w = (cols as f64 * cell_w).max(cell_w);
+                let (preedit_bg, preedit_underline, preedit_fg) = ime_preedit_colors(
+                    bg_fill,
+                    if global_inverse { default_bg } else { default_fg },
+                    cursor_color,
+                );
                 self.draw_cell_bg.new_draw_call(cx);
-                self.draw_cell_bg.color = vec4(0.18, 0.24, 0.38, 1.0);
+                self.draw_cell_bg.color = preedit_bg;
                 self.draw_cell_bg.draw_abs(
                     cx,
                     Rect {
@@ -2061,7 +2066,7 @@ impl MpTerm {
                     },
                 );
                 self.draw_underline.new_draw_call(cx);
-                self.draw_underline.color = vec4(0.48, 0.64, 0.97, 1.0);
+                self.draw_underline.color = preedit_underline;
                 self.draw_underline.kind = 1.0;
                 self.draw_underline.draw_abs(
                     cx,
@@ -2071,7 +2076,7 @@ impl MpTerm {
                     },
                 );
                 self.draw_text.new_draw_call(cx);
-                self.draw_text.color = vec4(0.95, 0.97, 1.0, 1.0);
+                self.draw_text.color = preedit_fg;
                 self.draw_text.draw_abs(cx, dvec2(x, y), &self.ime_preedit);
             }
         }
@@ -2740,9 +2745,23 @@ fn scroll_lines(
     Some((lines, scroll_y > 0.0))
 }
 
+fn ime_preedit_colors(bg: Rgb, fg: Rgb, cursor: Rgb) -> (Vec4f, Vec4f, Vec4f) {
+    let bg = MpTerm::rgb_to_vec4(bg, 1.0);
+    let fg = MpTerm::rgb_to_vec4(fg, 1.0);
+    let cursor = MpTerm::rgb_to_vec4(cursor, 1.0);
+    let preedit_bg = vec4(
+        bg.x * 0.85 + fg.x * 0.15,
+        bg.y * 0.85 + fg.y * 0.15,
+        bg.z * 0.85 + fg.z * 0.15,
+        1.0,
+    );
+    (preedit_bg, cursor, fg)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{scroll_lines, BellFlash};
+    use super::{ime_preedit_colors, scroll_lines, BellFlash};
+    use crate::term::color::Rgb;
     use makepad_widgets::event::ScrollPhase;
 
     #[test]
@@ -2787,5 +2806,20 @@ mod tests {
         assert_eq!(scroll_lines(f64::NAN, ScrollPhase::Changed, true, 16.0), None);
         assert_eq!(scroll_lines(40.0, ScrollPhase::None, true, 16.0), Some((1, true)));
         assert_eq!(scroll_lines(-32.0, ScrollPhase::Changed, false, 16.0), Some((2, false)));
+    }
+
+    #[test]
+    fn ime_preedit_colors_follows_terminal_theme() {
+        let (dark_bg, dark_ul, dark_fg) =
+            ime_preedit_colors(Rgb::new(0, 0, 0), Rgb::new(255, 255, 255), Rgb::new(255, 0, 0));
+        assert!(dark_bg.x > 0.1 && dark_bg.x < 0.2);
+        assert_eq!(dark_ul.x, 1.0);
+        assert_eq!(dark_ul.y, 0.0);
+        assert_eq!(dark_fg.x, 1.0);
+
+        let (light_bg, _, light_fg) =
+            ime_preedit_colors(Rgb::new(255, 255, 255), Rgb::new(0, 0, 0), Rgb::new(0, 0, 255));
+        assert!(light_bg.x > 0.8 && light_bg.x < 0.9);
+        assert_eq!(light_fg.x, 0.0);
     }
 }
