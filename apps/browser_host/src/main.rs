@@ -294,7 +294,7 @@ impl Page {
     }
 
     /// One of the window's input events, as CEF input.
-    fn input(&mut self, cx: &mut Cx, event: &Event) {
+    fn input(&mut self, _cx: &mut Cx, event: &Event) {
         let Some(browser) = &mut self.browser else { return };
         match event {
             Event::MouseDown(e) => {
@@ -371,9 +371,9 @@ impl Page {
                 let composing = std::mem::take(&mut self.composing);
                 match typed_char_event(text, composing) {
                     Some((windows_key_code, character)) => {
-                        let modifiers = cef_input::cef_modifiers(cx.keyboard.modifiers(), MouseButton::empty());
                         let native_key_code = cef_input::native_key_code_for_char(char::from_u32(character as u32).unwrap_or('\0'));
-                        let _ = browser.send_key_event(cef_input::KEY_EVENT_CHAR, modifiers, windows_key_code, native_key_code, character, character, false);
+                        // Committed text already reflects modifiers; forwarding stale `keys_down` modifiers suppresses input in CEF.
+                        let _ = browser.send_key_event(cef_input::KEY_EVENT_CHAR, cef_input::EVENTFLAG_NONE, windows_key_code, native_key_code, character, character, false);
                     }
                     _ => {
                         let _ = browser.ime_commit_text(&text.input);
