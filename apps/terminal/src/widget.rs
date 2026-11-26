@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use makepad_widgets::event::ScrollPhase;
 use makepad_widgets::text::geom::Point;
 use makepad_widgets::makepad_draw::shader::draw_text::{FontFamily, PreparedGlyph};
 use makepad_widgets::*;
@@ -1528,6 +1529,11 @@ impl MpTerm {
     }
 
     fn handle_scroll(&mut self, cx: &mut Cx, e: &FingerScrollEvent) {
+        let Some((lines, down)) =
+            scroll_lines(e.scroll.y, e.phase, e.device.is_mouse(), self.cell_h)
+        else {
+            return;
+        };
         let Some((alt_scroll, max)) = self.session.as_ref().map(|session| {
             let term = &session.terminal;
             (
@@ -1538,12 +1544,6 @@ impl MpTerm {
         }) else {
             return;
         };
-        let lines = if e.device.is_mouse() {
-            (e.scroll.y / 40.0).abs().ceil().max(1.0) as usize
-        } else {
-            ((e.scroll.y.abs() / self.cell_h).ceil()).max(1.0) as usize
-        };
-        let down = e.scroll.y > 0.0;
 
         let (tracking, _) = self.mouse_tracking();
         if tracking != MouseTracking::None && !e.modifiers.shift {
@@ -2726,9 +2726,24 @@ fn letter_key(ch: char) -> Option<Key> {
     })
 }
 
+fn scroll_lines(
+    scroll_y: f64,
+    phase: ScrollPhase,
+    is_mouse: bool,
+    cell_h: f64,
+) -> Option<(usize, bool)> {
+    if matches!(phase, ScrollPhase::Touched) || !scroll_y.is_finite() || scroll_y == 0.0 {
+        return None;
+    }
+    let step = if is_mouse { 40.0 } else { cell_h.max(1.0) };
+    let lines = (scroll_y.abs() / step).ceil().max(1.0) as usize;
+    Some((lines, scroll_y > 0.0))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::BellFlash;
+    use super::{scroll_lines, BellFlash};
+    use makepad_widgets::event::ScrollPhase;
 
     #[test]
     fn bell_ring_starts_rising() {
@@ -2760,5 +2775,17 @@ mod tests {
         assert!(bell.ring());
         bell.settle();
         assert_eq!(bell, BellFlash::None);
+    }
+
+    #[test]
+    fn scroll_lines_ignores_touch_and_zero_delta() {
+        assert_eq!(scroll_lines(0.0, ScrollPhase::Touched, true, 16.0), None);
+        assert_eq!(scroll_lines(-12.0, ScrollPhase::Touched, false, 16.0), None);
+        assert_eq!(scroll_lines(0.0, ScrollPhase::Began, true, 16.0), None);
+        assert_eq!(scroll_lines(0.0, ScrollPhase::Ended, true, 16.0), None);
+        assert_eq!(scroll_lines(0.0, ScrollPhase::MomentumEnded, false, 16.0), None);
+        assert_eq!(scroll_lines(f64::NAN, ScrollPhase::Changed, true, 16.0), None);
+        assert_eq!(scroll_lines(40.0, ScrollPhase::None, true, 16.0), Some((1, true)));
+        assert_eq!(scroll_lines(-32.0, ScrollPhase::Changed, false, 16.0), Some((2, false)));
     }
 }
