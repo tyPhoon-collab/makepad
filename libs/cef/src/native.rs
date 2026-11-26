@@ -1897,16 +1897,28 @@ fn ensure_initialized() -> Result<()> {
         let paths = runtime_paths()?;
         let has_bundled_framework =
             framework_dir_for_bundle_executable(&current_exe).as_ref() == Some(&paths.framework_dir);
-        let synthetic_bundle = ensure_synthetic_app_bundle(&paths, &current_exe)?;
-        if let Some(root) = synthetic_bundle.bundle_dir.parent() {
-            remove_unused_synthetic_bundles(root);
+        if let Some(helper) = has_bundled_framework
+            .then(|| bundled_helper_executable(&current_exe, &paths.framework_dir))
+            .flatten()
+        {
+            (
+                helper.to_string_lossy().to_string(),
+                root_cache_path.join("cef.log").to_string_lossy().to_string(),
+                None,
+                None,
+            )
+        } else {
+            let synthetic_bundle = ensure_synthetic_app_bundle(&paths, &current_exe)?;
+            if let Some(root) = synthetic_bundle.bundle_dir.parent() {
+                remove_unused_synthetic_bundles(root);
+            }
+            (
+                synthetic_bundle.helper_executable.to_string_lossy().to_string(),
+                synthetic_bundle.log_file.to_string_lossy().to_string(),
+                (!has_bundled_framework).then(|| synthetic_bundle.bundle_dir.to_string_lossy().to_string()),
+                (!has_bundled_framework).then(|| synthetic_bundle.framework_dir.to_string_lossy().to_string()),
+            )
         }
-        (
-            synthetic_bundle.helper_executable.to_string_lossy().to_string(),
-            synthetic_bundle.log_file.to_string_lossy().to_string(),
-            (!has_bundled_framework).then(|| synthetic_bundle.bundle_dir.to_string_lossy().to_string()),
-            (!has_bundled_framework).then(|| synthetic_bundle.framework_dir.to_string_lossy().to_string()),
-        )
     };
     #[cfg(target_os = "macos")]
     let main_bundle = main_bundle.map(|path| CefString::new(&runtime.api, path)).transpose()?;
@@ -2486,6 +2498,28 @@ fn ensure_framework_bundle_layout(
         &framework_dir.join("Resources"),
     )?;
     Ok(())
+}
+
+/// Returns the main CEF helper executable inside `Contents/Frameworks/` when all helper apps exist.
+#[cfg(target_os = "macos")]
+fn bundled_helper_executable(main_executable: &Path, framework_dir: &Path) -> Option<PathBuf> {
+    let frameworks_dir = framework_dir.parent()?;
+    let app_name = main_executable.file_stem()?.to_str()?;
+    let mut main_helper = None;
+    for (name_suffix, _) in HELPER_APP_SUFFIXES {
+        let helper_name = format!("{app_name} Helper{name_suffix}");
+        let helper_binary = frameworks_dir
+            .join(format!("{helper_name}.app"))
+            .join("Contents/MacOS")
+            .join(&helper_name);
+        if !helper_binary.is_file() {
+            return None;
+        }
+        if main_helper.is_none() {
+            main_helper = Some(helper_binary);
+        }
+    }
+    main_helper
 }
 
 #[cfg(target_os = "macos")]
@@ -7573,5 +7607,34 @@ mod tests {
         assert!(!is_external_app_url("mailto:"));
         assert!(!is_external_app_url("/relative/path:1"));
         assert!(!is_external_app_url("mailto:user@example.com\n"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundled_helper_executable_requires_all_helper_apps() {
+        let root = env::temp_dir().join(format!("makepad-cef-bundled-helper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let exe = root.join("Koma.app/Contents/MacOS/browser-host");
+        let framework = root.join("Koma.app/Contents/Frameworks/Chromium Embedded Framework.framework");
+        let frameworks_dir = framework.parent().unwrap();
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&framework).unwrap();
+
+        for (i, (suffix, _)) in HELPER_APP_SUFFIXES.iter().enumerate() {
+            assert_eq!(bundled_helper_executable(&exe, &framework), None);
+            let helper_name = format!("browser-host Helper{suffix}");
+            let helper_bin = frameworks_dir
+                .join(format!("{helper_name}.app/Contents/MacOS"))
+                .join(&helper_name);
+            std::fs::create_dir_all(helper_bin.parent().unwrap()).unwrap();
+            std::fs::write(&helper_bin, b"").unwrap();
+            if i + 1 == HELPER_APP_SUFFIXES.len() {
+                assert_eq!(
+                    bundled_helper_executable(&exe, &framework),
+                    Some(frameworks_dir.join("browser-host Helper.app/Contents/MacOS/browser-host Helper"))
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
