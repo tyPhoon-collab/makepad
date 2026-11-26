@@ -853,7 +853,10 @@ macro_rules! app_main {
         #[cfg(target_os = "macos")]
         const MAKEPAD_BUNDLE_NAME: &str = match option_env!("MAKEPAD_BUNDLE_NAME") {
             Some(name) => name,
-            None => $crate::app_meta::DEFAULT_BUNDLE_NAME,
+            None => match option_env!("CARGO_PKG_NAME") {
+                Some(name) => name,
+                None => "Makepad App",
+            },
         };
         #[cfg(target_os = "macos")]
         const MAKEPAD_BUNDLE_IDENTIFIER: Option<&str> = option_env!("MAKEPAD_BUNDLE_IDENTIFIER");

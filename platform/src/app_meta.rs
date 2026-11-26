@@ -12,8 +12,6 @@
 
 use std::sync::OnceLock;
 
-include!(concat!(env!("OUT_DIR"), "/app_meta_gen.rs"));
-
 /// The build inputs `app_main!` collects in the app crate.
 #[doc(hidden)]
 pub struct AppBuildMeta {
@@ -120,21 +118,6 @@ const INFO_PLIST_PARTS: [&str; 4] = [
 
 const DEFAULT_IDENTIFIER_PREFIX: &str = "dev.makepad.";
 
-const fn str_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
 /// Writes `src` at `at` (when `out` is given) and returns the end offset.
 /// `derive_id` lowercases ASCII and turns spaces into dashes, the default
 /// identifier's spelling of a bundle name.
@@ -162,9 +145,6 @@ const fn write_info_plist(mut out: Option<&mut [u8]>, name: &str, identifier: Op
     let mut at = put(&mut out, 0, INFO_PLIST_PARTS[0], false);
     at = match identifier {
         Some(identifier) => put(&mut out, at, identifier, false),
-        // The build script spelled the default name's identifier with
-        // Unicode lowercasing; any other name gets the ASCII spelling.
-        None if str_eq(name, DEFAULT_BUNDLE_NAME) => put(&mut out, at, DEFAULT_BUNDLE_IDENTIFIER, false),
         None => {
             let at = put(&mut out, at, DEFAULT_IDENTIFIER_PREFIX, false);
             put(&mut out, at, name, true)

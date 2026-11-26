@@ -30,17 +30,6 @@ pub fn bundle(out_dir: &Path) -> (String, String) {
     (name, id)
 }
 
-/// The text of OUT_DIR/app_meta_gen.rs.
-pub fn app_meta_gen(out_dir: &Path) -> String {
-    let (bundle_name, bundle_id) = bundle(out_dir);
-    format!(
-        "/// The bundle name when the app's build sets no MAKEPAD_BUNDLE_NAME.\n\
-         pub const DEFAULT_BUNDLE_NAME: &str = {bundle_name:?};\n\
-         /// The identifier that goes with [`DEFAULT_BUNDLE_NAME`].\n\
-         pub const DEFAULT_BUNDLE_IDENTIFIER: &str = {bundle_id:?};\n"
-    )
-}
-
 /// Window icons auto-discovered in `<workspace_root>/resources/` (the dir containing `target/`,
 /// 5 ancestors up from OUT_DIR, as in `detect_app_name`). An app's own icons (MAKEPAD_APP_ICON_*)
 /// are read by `app_main!` in the app crate instead (src/app_meta.rs).

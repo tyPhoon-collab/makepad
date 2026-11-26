@@ -24,16 +24,8 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target = env::var("TARGET").unwrap();
 
-    // The default macOS bundle name and identifier (build_gen.rs, shared with `makepad run`). An app
-    // overrides them with MAKEPAD_BUNDLE_NAME / MAKEPAD_BUNDLE_IDENTIFIER (typically in its
-    // `.cargo/config.toml` `[env]` section with `force = true`), which `app_main!` reads in the APP
-    // crate and embeds in its executable (see src/app_meta.rs): read here, a bundle build or another
-    // app's name rebuilt this crate and everything above it. The default depends only on where the
-    // target directory is.
-    let (bundle_name, bundle_id) = build_gen::bundle(Path::new(&out_dir));
-    std::fs::write(Path::new(&out_dir).join("app_meta_gen.rs"), build_gen::app_meta_gen(Path::new(&out_dir))).unwrap();
-
     if target_os == "macos" {
+        let (bundle_name, bundle_id) = build_gen::bundle(Path::new(&out_dir));
         // macOS uses CFBundleName from an Info.plist beside an unbundled
         // executable as the first menu bar item title for `cargo run`
         // launches, and it overrides whatever NSMenu title we pass to
