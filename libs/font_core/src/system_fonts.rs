@@ -576,12 +576,68 @@ mod imp {
     unsafe impl Send for Fc {}
 
     static FC: OnceLock<Option<Mutex<Fc>>> = OnceLock::new();
+    static FC_FONT_DIRS: OnceLock<Vec<std::path::PathBuf>> = OnceLock::new();
 
-    unsafe fn load() -> Option<Fc> {
+    unsafe fn dlopen_fontconfig() -> *mut c_void {
         let mut handle = dlopen(c"libfontconfig.so.1".as_ptr(), RTLD_NOW);
         if handle.is_null() {
             handle = dlopen(c"libfontconfig.so".as_ptr(), RTLD_NOW);
         }
+        handle
+    }
+
+    pub(super) fn fontconfig_font_dirs() -> &'static [std::path::PathBuf] {
+        FC_FONT_DIRS.get_or_init(|| unsafe { load_fontconfig_dirs() })
+    }
+
+    unsafe fn load_fontconfig_dirs() -> Vec<std::path::PathBuf> {
+        let handle = dlopen_fontconfig();
+        if handle.is_null() {
+            return Vec::new();
+        }
+        macro_rules! sym {
+            ($name:literal) => {{
+                let ptr = dlsym(handle, concat!($name, "\0").as_ptr() as *const c_char);
+                if ptr.is_null() {
+                    return Vec::new();
+                }
+                std::mem::transmute::<*mut c_void, _>(ptr)
+            }};
+        }
+        let init_config: unsafe extern "C" fn() -> *mut c_void = sym!("FcInitLoadConfig");
+        let get_font_dirs: unsafe extern "C" fn(*mut c_void) -> *mut c_void =
+            sym!("FcConfigGetFontDirs");
+        let str_list_next: unsafe extern "C" fn(*mut c_void) -> *const c_char =
+            sym!("FcStrListNext");
+        let str_list_done: unsafe extern "C" fn(*mut c_void) = sym!("FcStrListDone");
+        let config_destroy: unsafe extern "C" fn(*mut c_void) = sym!("FcConfigDestroy");
+
+        let config = init_config();
+        if config.is_null() {
+            return Vec::new();
+        }
+        let mut dirs = Vec::new();
+        let list = get_font_dirs(config);
+        if !list.is_null() {
+            loop {
+                let entry = str_list_next(list);
+                if entry.is_null() {
+                    break;
+                }
+                if let Ok(path) = CStr::from_ptr(entry).to_str() {
+                    if !path.is_empty() {
+                        dirs.push(std::path::PathBuf::from(path));
+                    }
+                }
+            }
+            str_list_done(list);
+        }
+        config_destroy(config);
+        dirs
+    }
+
+    unsafe fn load() -> Option<Fc> {
+        let handle = dlopen_fontconfig();
         if handle.is_null() {
             return None;
         }
@@ -881,5 +937,19 @@ mod tests {
         assert_eq!(fallback_script('あ'), fallback_script('カ'));
         assert_eq!(fallback_script('क'), Script::Devanagari);
         assert_eq!(fallback_script('ি'), Script::Bengali);
+    }
+
+    #[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+    #[test]
+    fn fontconfig_dirs_resolve_system_ui_and_fallback() {
+        let dirs = imp::fontconfig_font_dirs();
+        if dirs.is_empty() {
+            return;
+        }
+        assert!(dirs.iter().any(|d| d.is_dir()));
+        let ui = find_family(SYSTEM_UI_FAMILY, 400, false);
+        assert!(ui.as_ref().is_some_and(|f| f.path.is_file()));
+        let ja = fallback_candidates("日本語", false);
+        assert!(!ja.is_empty());
     }
 }

@@ -162,6 +162,8 @@ fn font_roots() -> Vec<PathBuf> {
         roots.extend(std::env::split_paths(&data_dirs)
             .filter(|path| !path.as_os_str().is_empty()).map(|path| path.join("fonts")));
         roots.extend([PathBuf::from("/usr/share/fonts"), PathBuf::from("/usr/local/share/fonts")]);
+        #[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+        roots.extend(super::imp::fontconfig_font_dirs().iter().cloned());
     }
     // Canonicalize on every query, including roots that were absent before.
     let mut seen = HashSet::new();
